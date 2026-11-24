@@ -168,6 +168,12 @@ def _train(root: Path, **extra):
 
     extra.setdefault("cams", ("main",))
     extra.setdefault("status_root", root.parent / "_status")
+    # Holdout early-stop has no epoch cap (the epochs= argument is only recorded).
+    # CPU training plus the 5-class object head can run 8-25 val epochs per call;
+    # four calls then overflow the suite's 600s timeout on CI (run 45381497346).
+    # exact_epochs=2 is the bound epochs=2 already asked for, and is enough for
+    # the checkpoint round-trip and low-space checks (len(vals) >= 2).
+    extra.setdefault("exact_epochs", 2)
     return train_directory(
         root,
         epochs=2,

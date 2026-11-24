@@ -3,7 +3,10 @@
 Several threads encode lossless PNG. One commit keeps state lines in
 capture order. The queue is bounded by item count and by the bytes of
 the arrays still waiting, so a slow disk does not grow without a limit.
-A full queue drops the tick, counts it, and the caller logs it.
+A full queue drops the tick, counts it, and the caller logs it: the
+capture loop never waits on disk. ``close`` flushes everything still queued;
+``flush_report`` says whether every enqueued tick reached disk, and the
+collector stops with ``writer_failed`` when it did not.
 """
 
 from __future__ import annotations
@@ -51,6 +54,9 @@ class RawWriteQueue:
         self._next = 1
         self._ready: dict[int, tuple[Any, dict[str, Any], int]] = {}
         self._stops = 0
+        self._closed = False
+        self._close_failed = False
+        self._unflushed = 0
         # Seconds the last encode and the last commit took, and the slowest
         # commit. The collector logs them per tick (ticks.jsonl).
         self._encode_s_last = 0.0
@@ -126,19 +132,60 @@ class RawWriteQueue:
                 return False
             time.sleep(0.01)
 
-    def close(self, timeout_s: float = 120.0) -> None:
+    def close(self, timeout_s: float = 120.0) -> dict[str, Any]:
+        """Flush every queued tick, stop the threads, close the writer. Idempotent.
+
+        Returns ``flush_report()``. It does not raise: the caller checks
+        ``flush_report()["ok"]`` and fails the run loudly (``writer_failed``).
+        Ticks still in flight when ``timeout_s`` runs out count as
+        ``unflushed``; a writer ``close`` error becomes ``error``.
+        """
+        if self._closed:
+            return self.flush_report()
+        self._closed = True
         for _ in self._threads:
             self._q.put(_STOP)
-        deadline = timeout_s
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
         for thread in self._threads:
-            thread.join(timeout=max(0.1, float(deadline)))
-        self._commit.join(timeout=max(0.1, float(deadline)))
+            thread.join(timeout=max(0.1, deadline - time.monotonic()))
+        self._commit.join(timeout=max(0.1, deadline - time.monotonic()))
+        with self._lock:
+            self._unflushed = self._inflight()
+            if self._commit.is_alive() or any(t.is_alive() for t in self._threads):
+                self._unflushed = max(1, self._unflushed)
         closer = getattr(self.writer, "close", None)
         if callable(closer):
             try:
                 closer()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 — reported, never swallowed silently
+                with self._lock:
+                    if not self.error:
+                        self.error = f"writer close {type(exc).__name__}: {exc}"
+                    self._close_failed = True
+                print(f"collect write failed: writer close {type(exc).__name__}: {exc}", flush=True)
+        return self.flush_report()
+
+    def flush_report(self) -> dict[str, Any]:
+        """``ok`` only when every enqueued tick was written and nothing failed."""
+        with self._lock:
+            unflushed = int(self._unflushed if self._closed else self._inflight())
+            ok = (
+                self.error is None
+                and int(self.failed) == 0
+                and unflushed == 0
+                and not self._close_failed
+                and int(self.written) == int(self.enqueued)
+            )
+            return {
+                "ok": bool(ok),
+                "closed": bool(self._closed),
+                "enqueued": int(self.enqueued),
+                "written": int(self.written),
+                "failed": int(self.failed),
+                "dropped": int(self.dropped),
+                "unflushed": unflushed,
+                "error": self.error,
+            }
 
     def _encode(self) -> None:
         while True:

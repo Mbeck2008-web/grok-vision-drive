@@ -391,6 +391,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clip mode: stop after this many seconds of driving (overrides --minutes and its 60 s floor). 0 is off.",
     )
     parser.add_argument(
+        "--cam-transport",
+        default="shmem",
+        choices=["shmem", "socket"],
+        help="shmem (default): cameras stream through BeamNG.tech shared memory. "
+        "socket: fallback, pictures come back in the PollCamera reply (slower, always serial).",
+    )
+    parser.add_argument(
+        "--cam-fetch",
+        default="parallel",
+        choices=["parallel", "serial"],
+        help="parallel (default): read + decode the shared-memory cameras on a thread pool, "
+        "one reading per camera per tick. serial: one after another.",
+    )
+    parser.add_argument(
         "--gt-thin",
         default="auto",
         choices=["auto", "off"],
@@ -1852,6 +1866,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     # Only a level load spawns the ego model (see ego_spawned below); a single-level
     # run drives the car already there and keeps the base rig.
     rig_for = ego["model"] if (map_names or args.reload_level) else None
+    _CAM_TRANSPORT["mode"] = str(getattr(args, "cam_transport", "shmem") or "shmem")
+    cam_parallel = str(getattr(args, "cam_fetch", "parallel")) == "parallel"
+    print(f"collect cameras transport={_CAM_TRANSPORT['mode']} fetch={'parallel' if cam_parallel else 'serial'}", flush=True)
     base_cam_cfg = load_camera_config()
     cam_cfg = rig_for_model(base_cam_cfg, rig_for)
     camera_rig = rig_model(base_cam_cfg, rig_for)
@@ -2135,6 +2152,20 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # loop runs behind the 10 Hz plan; colour frames are never thinned.
         gt_gate = TrainGtGate(1.0 / COLLECT_HZ, thin=str(getattr(args, "gt_thin", "auto")) != "off")
         gt_prev_mono: list[float | None] = [None]
+
+        def _flush_failed() -> bool:
+            """Flush the background writer on exit; a lost or failed tick stops the run loudly."""
+            report = writer.close() if writer is not None else {"ok": True}
+            if isinstance(report, dict) and not report.get("ok", True):
+                message = (
+                    f"flush on exit: written={report.get('written')}/{report.get('enqueued')} "
+                    f"failed={report.get('failed')} unflushed={report.get('unflushed')} error={report.get('error')}"
+                )
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                print(f"collect stop writer_failed {message}", flush=True)
+                run.stop("writer_failed", message)
+                return True
+            return False
 
         def _reset_gt_gate() -> None:
             # A level load, teleport or camera warm-up is a gap, not loop lag: the
@@ -2690,6 +2721,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
                 _say_repeats()
                 print("collect stop requested", flush=True)
+                if _flush_failed():
+                    return 2
                 run.stop("requested", f"stop file {stop_file(out)}")
                 return 0
             elapsed = done_s
@@ -2855,7 +2888,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tick_mark = time.monotonic()
             ticks.start(tick_mark)
             try:
-                frames, stamps, cam_reasons = _poll_cameras(cams)
+                frames, stamps, cam_reasons = _poll_cameras(cams, parallel=cam_parallel)
                 ticks.add("poll_s", time.monotonic() - tick_mark)
             except Exception as exc:
                 if not is_session_error(exc):
@@ -3774,14 +3807,30 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         if spawn_deck is not None:
             print(f"collect {spawn_deck.summary_line()}", flush=True)
         _say_repeats()
+        if _flush_failed():
+            return 2
         run.stop("target_reached")
         run.done_s = float(done_s)
         return 0
     finally:
         if writer is not None:
-            writer.close()
+            report = writer.close()
+            if isinstance(report, dict) and not report.get("ok", True):
+                print(f"collect WARNING writer flush report {json.dumps(report, sort_keys=True)}", flush=True)
         ticks.close()
         release_tech_beamngpy(bng)
+
+
+# --cam-transport (set by main): "shmem" streams every camera through BeamNG.tech
+# shared memory (stream_raw, no GE request); "socket" is the fallback that polls.
+_CAM_TRANSPORT: dict[str, str] = {"mode": "shmem"}
+
+
+def _camera_kwargs_for_transport(kwargs: dict[str, Any], transport: str) -> dict[str, Any]:
+    """Shared memory on (default) or the socket fallback: no shmem, no streaming, poll_raw."""
+    if transport == "socket":
+        return {**kwargs, "is_using_shared_memory": False, "is_streaming": False}
+    return {**kwargs, "is_using_shared_memory": True, "is_streaming": True}
 
 
 def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -3829,7 +3878,9 @@ def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, An
             cid=cid,
             train_gt=bool(spec.get("train_gt")),
         )
-        attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **kwargs)
+        transport = _CAM_TRANSPORT["mode"]
+        attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **_camera_kwargs_for_transport(kwargs, transport))
+        _mark_transport(attached[cid], transport)
         if spec.get("train_gt"):
             _attach_sem_palette(attached[cid], bng)
     chase = cfg.get("chase_camera")
@@ -3857,12 +3908,21 @@ def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, An
             cid=cid,
             train_gt=bool(chase.get("train_gt")),
         )
-        attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **kwargs)
+        transport = _CAM_TRANSPORT["mode"]
+        attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **_camera_kwargs_for_transport(kwargs, transport))
+        _mark_transport(attached[cid], transport)
         if chase.get("train_gt"):
             _attach_sem_palette(attached[cid], bng)
     if "main" not in attached:
         raise RuntimeError("main camera did not attach")
     return attached
+
+
+def _mark_transport(cam: Any, transport: str) -> None:
+    try:
+        cam.gvd_transport = transport
+    except Exception:  # noqa: BLE001 — a sensor object without attributes reads as shmem
+        pass
 
 
 def _camera_resolution(cam: Any) -> tuple[int, int] | None:
@@ -3899,7 +3959,21 @@ def _read_camera(cid: str, cam: Any, window: dict[str, Any] | None = None) -> tu
     # monotonic pair) only time the call: on Windows the monotonic pair can
     # read equal (15.6 ms clock).
     window = {} if window is None else window
-    if callable(getattr(cam, "stream_raw", None)):
+    if getattr(cam, "gvd_transport", "shmem") == "socket" and callable(getattr(cam, "poll_raw", None)):
+        # --cam-transport socket: the picture comes back in the PollCamera reply
+        # (no shared memory). One GE round trip per camera; never run in parallel.
+        how = "poll_raw"
+        window["mono_before"] = time.monotonic()
+        window["perf_before"] = time.perf_counter()
+        try:
+            raw = cam.poll_raw()
+        except Exception as exc:
+            return None, f"poll_raw {type(exc).__name__}: {exc}", None
+        finally:
+            window["perf_after"] = time.perf_counter()
+            window["mono_after"] = time.monotonic()
+            window["wall"] = time.time()
+    elif callable(getattr(cam, "stream_raw", None)):
         how = "stream_raw"
         window["mono_before"] = time.monotonic()
         window["perf_before"] = time.perf_counter()
@@ -3959,34 +4033,96 @@ def take_train_gt() -> dict[str, Any]:
     return out
 
 
-def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
-    """Pictures as the sensor returned them, plus why each camera was dropped."""
+def _fetch_camera(cid: str, cam: Any) -> dict[str, Any]:
+    """One camera's picture, capture window and training-only GT (safe on a worker thread).
+
+    Nothing global is touched here; ``_poll_cameras`` merges the results in
+    camera order on the calling thread.
+    """
+    window: dict[str, Any] = {}
+    image, reason, raw = _read_camera(cid, cam, window)
+    gt: dict[str, Any] = {}
+    gt_exc: BaseException | None = None
+    if image is not None and (
+        getattr(cam, "is_render_depth", False) is True or getattr(cam, "is_render_annotations", False) is True
+    ):
+        from python.data import raw_frames
+
+        try:
+            gt = dict(raw_frames.train_gt_from_raw(str(cid), cam, raw))
+        except Exception as exc:  # noqa: BLE001 — reported by _poll_cameras
+            gt_exc = exc
+    return {"image": image, "reason": reason, "raw": raw, "window": window, "gt": gt, "gt_exc": gt_exc}
+
+
+def parallel_safe(cams: dict[str, Any]) -> bool:
+    """True when every camera reads shared memory only (``stream_raw``, no GE request).
+
+    BeamNGpy's ``stream_raw`` copies the camera's own shared-memory buffers and
+    sends nothing; ``poll``/``poll_raw`` (socket transport) talk over the one
+    BeamNGpy socket, which is not thread-safe, so those stay serial.
+    """
+    for cam in cams.values():
+        if getattr(cam, "gvd_transport", "shmem") == "socket" or not callable(getattr(cam, "stream_raw", None)):
+            return False
+    return True
+
+
+_FETCH_POOL: dict[str, Any] = {"pool": None, "n": 0}
+
+
+def _fetch_pool(n: int) -> Any:
+    from concurrent.futures import ThreadPoolExecutor
+
+    if _FETCH_POOL["pool"] is None or _FETCH_POOL["n"] < n:
+        if _FETCH_POOL["pool"] is not None:
+            _FETCH_POOL["pool"].shutdown(wait=True)
+        _FETCH_POOL["pool"] = ThreadPoolExecutor(max_workers=max(1, n), thread_name_prefix="gvd-cam-fetch")
+        _FETCH_POOL["n"] = n
+    return _FETCH_POOL["pool"]
+
+
+def _poll_cameras(
+    cams: dict[str, Any], *, parallel: bool = False
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """Pictures as the sensor returned them, plus why each camera was dropped.
+
+    ``parallel`` (``--cam-fetch parallel``) reads and decodes every camera on a
+    thread pool when ``parallel_safe(cams)``; it returns only after all of them
+    are back, so the tick still holds one reading per camera, each with its own
+    capture window. Results merge in camera order: same frames, stamps and GT
+    as the serial path.
+    """
     frames: dict[str, Any] = {}
     stamps: dict[str, Any] = {}
     reasons: dict[str, str] = {}
     _TRAIN_GT.clear()
-    for cid, cam in cams.items():
-        window: dict[str, Any] = {}
-        image, reason, raw = _read_camera(cid, cam, window)
+    items = list(cams.items())
+    if parallel and len(items) > 1 and parallel_safe(cams):
+        pool = _fetch_pool(len(items))
+        futures = [pool.submit(_fetch_camera, str(cid), cam) for cid, cam in items]
+        results = [f.result() for f in futures]
+    else:
+        results = [_fetch_camera(str(cid), cam) for cid, cam in items]
+    for (cid, cam), got in zip(items, results):
+        image, reason, raw, window = got["image"], got["reason"], got["raw"], got["window"]
         if image is None:
             reasons[str(cid)] = reason or "missing"
             continue
         frames[cid] = image
-        if getattr(cam, "is_render_depth", False) is True or getattr(cam, "is_render_annotations", False) is True:
-            from python.data import raw_frames
-
-            try:
-                _TRAIN_GT.update(raw_frames.train_gt_from_raw(str(cid), cam, raw))
-            except Exception as exc:
-                # Training-only GT never stops collection; colour frames still go out.
-                _TRAIN_GT_FAIL["n"] += 1
-                if _TRAIN_GT_FAIL["n"] == 1:
-                    print(
-                        f"collect WARNING train_gt decode failed for {cid} "
-                        f"({type(exc).__name__}: {exc}); GT skipped, colour kept "
-                        "(count in train_gt_failures)",
-                        flush=True,
-                    )
+        if got["gt_exc"] is not None:
+            exc = got["gt_exc"]
+            # Training-only GT never stops collection; colour frames still go out.
+            _TRAIN_GT_FAIL["n"] += 1
+            if _TRAIN_GT_FAIL["n"] == 1:
+                print(
+                    f"collect WARNING train_gt decode failed for {cid} "
+                    f"({type(exc).__name__}: {exc}); GT skipped, colour kept "
+                    "(count in train_gt_failures)",
+                    flush=True,
+                )
+        else:
+            _TRAIN_GT.update(got["gt"])
         sensor_t = None
         if isinstance(raw, dict):
             for key in ("timestamp", "time", "t"):

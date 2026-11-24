@@ -474,10 +474,11 @@ def check_wall_behind_is_unknown_not_free() -> None:
     Walls on main (bins 12 and 24), pillarL (bin 16) and rear (bin 20), with the rest of the depth
     mass spread evenly (p_hit 0.6, 0.8, 0.94, 0.987, 0.999999). Cells in front of the wall stay learned.
     """
-    # near-ground centre + edge samples: 60 with the band over the local ground (the fixture's only surfaces
+    # near-ground centre + edge samples: 54 with two-scale ground (the fixture's only surfaces
     # are the wall's, so cells more than GROUND_WINDOW_CELLS // 2 from it have no ground and stay plain
-    # unknown); 908 with the v4 ego-frame band, 776 with centres only over the whole z band
-    expect_behind = {("main", 12): 60}
+    # unknown; the wide-scale window trims six fringe cells versus the v5 60); 908 with the v4
+    # ego-frame band, 776 with centres only over the whole z band
+    expect_behind = {("main", 12): 54}
     for cam, k in (("main", 12), ("main", 24), ("pillarL", 16), ("rear", 20)):
         for p_hit in (0.6, 0.8, 0.94, 0.987, 0.999999):
             out, rig, head = _run_fixed(cam, _peaked(k, p_hit))
@@ -1494,6 +1495,61 @@ def check_low_occluder_hides_ground() -> None:
     print("low_occluder_hides_ground")
 
 
+def _barrier_hidden(geoms, lo, hi, below_top: float = 0.1) -> list[tuple[int, int]]:
+    """Cells beyond the barrier whose sight line to the ground centre passes at least
+    ``below_top`` under the barrier top for every in-view camera (Skeptic wall_leak)."""
+    lo2 = (lo[0] + 0.3, lo[1], lo[2])
+    hi2 = (hi[0] - 0.3, hi[1], hi[2] - below_top)
+    cells: list[tuple[int, int]] = []
+    for r in range(bl.BEV_N):
+        for c in range(bl.BEV_N):
+            y, x = 32 - 0.5 * (r + 0.5), -32 + 0.5 * (c + 0.5)
+            if y <= hi[1] + 0.2:
+                continue
+            inview, hidden = 0, True
+            for g in geoms:
+                o = g.T[:3, 3].astype(np.float64)
+                tgt = np.array([x, y, 0.0])
+                cam = np.linalg.inv(g.T.astype(np.float64)) @ np.append(tgt, 1.0)
+                if cam[2] <= 0:
+                    continue
+                u = g.K[0, 0] * cam[0] / cam[2] + g.K[0, 2]
+                v = g.K[1, 1] * cam[1] / cam[2] + g.K[1, 2]
+                nw, nh, x0, y0 = g.content
+                if not (x0 <= u < x0 + nw and y0 <= v < y0 + nh):
+                    continue
+                inview += 1
+                t = _ray_box(o, tgt - o, np.array(lo2), np.array(hi2))
+                if t is None or t >= 1.0:
+                    hidden = False
+                    break
+            if hidden and inview > 0:
+                cells.append((r, c))
+    return cells
+
+
+def check_wide_low_barrier_hides_ground() -> None:
+    """G5: a barrier wider than the ±3 m window must not reopen hidden ground as free.
+
+    12 m-wide wall at y = 10 m, height 0.6 / 0.8 / 1.0 m, on main alone and on all 8 cameras.
+    A cell is hidden when the sight line to its ground centre passes ≥ 0.1 m under the wall top
+    (Skeptic wall_leak). Hidden cells are never free-eligible.
+    """
+    cams8 = [c["id"] for c in _cfg()["cameras"]]
+    assert len(cams8) == 8, cams8
+    for height in (0.6, 0.8, 1.0):
+        lo, hi = (-6.0, 10.0, 0.0), (6.0, 10.3, height)
+        for cams in (["main"], cams8):
+            out, geoms = _scene_run(cams, [(lo, hi)])
+            free_ok = out["logits"][0, bl.CH_FREE] != -bl.FORCE_LOGIT
+            hid = _barrier_hidden(geoms, lo, hi)
+            assert len(hid) >= 1, (height, cams, len(hid))
+            nf = sum(bool(free_ok[r, c]) for r, c in hid)
+            assert nf == 0, (
+                f"barrier {height} m cams={len(cams)}: hidden {len(hid)} free-eligible {nf}"
+            )
+
+
 def check_empty_road_on_grade_and_pitch() -> None:
     """G5: the band follows the road, not the ego frame. Empty road on main and on narrow + main + wide
     at +-1 deg ego pitch (ground z = tan(+-1 deg) y), a +3 % grade and the ground 0.23 m below the ego
@@ -1591,6 +1647,8 @@ def check_ground_band_pinned_and_plumbed() -> None:
     reaches the head through the config."""
     assert bl.GROUND_BAND_M == 0.5, bl.GROUND_BAND_M
     assert bl.GROUND_WINDOW_CELLS == 13 and bl.GROUND_SOFTMIN_K == 10.0
+    assert bl.GROUND_WIDE_WINDOW_CELLS == 21 and bl.GROUND_SLOPE_CAP == 0.15
+    assert bl.RAISED_OCC_M == 0.3 and bl.OCC_WINDOW_CELLS == 3 and bl.SIGHTLINE_STEPS == 12 and bl.SIGHTLINE_CLEARANCE_M == 0.05 and bl.SIGHTLINE_MARGIN_M == 1.5
     assert bl.BevLssHead().ground_band_m == 0.5
     span = bl.BEV_Z_MAX_M - bl.BEV_Z_MIN_M
     for bad in (0.0, -0.5, span + 0.1, float("nan")):
@@ -1632,6 +1690,7 @@ def main() -> None:
     check_ground_band_pinned_and_plumbed()
     check_sky_rays_never_free()
     check_low_occluder_hides_ground()
+    check_wide_low_barrier_hides_ground()
     check_pass_mass_is_survival()
     check_zero_valid_cameras_no_nan()
     check_gradients_reach_stem_and_depth()

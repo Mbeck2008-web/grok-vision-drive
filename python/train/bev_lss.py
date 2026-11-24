@@ -28,14 +28,24 @@ G5  Unknown is the default, decided per ray by depth transmittance.
     behind a wall: ``occluded`` is forced high as well. Cells no valid ray
     landed in are unknown, not occluded. A partial wall (p < 1) or a second
     depth guess beyond it does not open the cells in between unless the
-    ray more likely than not got there. Only ray points inside the ground
-    band (``z < GROUND_BAND_MAX_M``, ego frame, ground at z = 0 under the
-    ego) count for seen / free / occluded: a ray that skims over a car roof,
-    or rises into the sky, says nothing about the ground under it, so the
-    hidden ground behind a low occluder and the occluder's own cells stay
-    unknown. Objects lower than the band (curbs, debris under 0.5 m) can
-    still be passed over; flat-ground z = 0 is assumed (UNVERIFIED on
-    slopes). This is structural, not a loss weight.
+    ray more likely than not got there. Only ray points near the local
+    ground count for seen / free / occluded. Each ray's surface is its
+    median-depth point (the last bin it more likely than not reached); a
+    ray with no surface in range (median in the last bin: sky) counts
+    nowhere. The ground height of a cell is the lowest surface height seen
+    within ``GROUND_WINDOW_CELLS`` (a soft minimum over every surface point
+    in the window). A ray point counts if it is
+    less than ``GROUND_BAND_M`` above the ground height of its own cell;
+    a cell with no surface in its window has no ground height and no ray
+    point counts there. Heights are ego-frame differences, so ego pitch,
+    a grade and the (unverified) ego-origin height do not move the band.
+    A ray that skims a car roof passes far above the road seen beside the
+    car, so the hidden ground behind it and the car's own cells stay
+    unknown; a ray that lands on the roof is above that ground too.
+    Limits: objects lower than the band (curbs, debris under 0.5 m) can be
+    passed over; where no ground is visible within the window (a wide
+    shadow, a lot full of cars) the lowest visible surface stands in for
+    the ground. This is structural, not a loss weight.
 G6  The output is differentiable with respect to the stem taps and the
     depth head.
 G7  No NaN or Inf, including a batch where no camera is valid.
@@ -98,11 +108,20 @@ FORCE_LOGIT = 30.0
 # a wall it is less than half sure of does not.
 REACH_TAU = 0.5  # seen: T_i = sum_{j >= i} p_j >= REACH_TAU
 FREE_PASS_TAU = 0.5  # may be free: S_i = sum_{j > i} p_j >= FREE_PASS_TAU
-# Ground band (G5): only frustum points with z < GROUND_BAND_MAX_M (ego frame,
-# metres above the ground under the ego) count for seen / free / occluded.
-# 0.5 m sits below a car's sill and roof, so a ray passing over a vehicle
-# never opens the ground behind it; the ground itself (z ~ 0) is inside.
-GROUND_BAND_MAX_M = 0.5
+# Ground band (G5): a ray point counts for seen / free / occluded only if it is
+# less than GROUND_BAND_M above the local ground height (the lowest surface
+# seen within GROUND_WINDOW_CELLS of its cell). 0.5 m is below a car's sill
+# and roof, so a ray passing over (or landing on) a vehicle never opens it.
+GROUND_BAND_M = 0.5
+# Window for the local ground height: 13 cells = +-3 m, wider than the gap
+# between neighbouring ground hits along a ray column out to ~25 m and than a
+# car's half width, so road beside a vehicle is in every window over it.
+GROUND_WINDOW_CELLS = 13
+# Soft minimum of the surface heights in a window: -log(mean(exp(-k z))) / k,
+# with exp taken relative to BEV_Z_MIN_M. With k = 10 / m a surface 1.5 m
+# above the road (a roof) weighs exp(-15) as much as the road; the exponent
+# stays in [-60, 0] over the z band, well inside float32.
+GROUND_SOFTMIN_K = 10.0
 
 # Categorical depth (audit item 9: 40 log bins, 1-48 m).
 DEPTH_BINS = 40
@@ -328,15 +347,46 @@ def visibility_gates(reach: Any, passed: Any, reach_tau: float = REACH_TAU, free
     return (reach >= reach_tau).to(reach.dtype), (passed >= free_pass_tau).to(reach.dtype)
 
 
-def in_ground_band(z: Any, band_max_m: float = GROUND_BAND_MAX_M) -> Any:
-    """True where an ego-frame height is inside the ground band (``z < band_max_m``, exclusive like the z band)."""
-    return z < band_max_m
+def ray_surface(reached: Any, dim: int = 2) -> tuple[Any, Any]:
+    """Per ray: (one-hot of its surface bin along ``dim``, 1 if it has a surface in range else 0).
+
+    ``reached`` is the 0/1 reach gate (1 up to the last bin the ray more likely than not reached, then 0).
+    The surface is that last reached bin. A ray still reached at the last bin (sky, nothing within range)
+    or reached nowhere has none.
+    """
+    d = reached.shape[dim]
+    nxt = torch.cat([reached.narrow(dim, 1, d - 1), torch.zeros_like(reached.narrow(dim, 0, 1))], dim=dim)
+    has = reached.narrow(dim, 0, 1) * (1.0 - reached.narrow(dim, d - 1, 1))
+    return (reached - nxt) * has, has
+
+
+def ground_height(z_sum: Any, w_sum: Any, window: int = GROUND_WINDOW_CELLS, k: float = GROUND_SOFTMIN_K) -> tuple[Any, Any]:
+    """Local ground height per cell and a 0/1 "has ground" mask (both B x 1 x N x N).
+
+    ``z_sum`` = splatted ``w * exp(-k (z - BEV_Z_MIN_M))`` of the ray surface points, ``w_sum`` = splatted
+    ``w``. Both are summed over a ``window`` x ``window`` neighbourhood and the ground height is the soft
+    minimum ``BEV_Z_MIN_M - log(z_sum / w_sum) / k`` of every surface point in it: about the mean height on
+    an even grade, about the lowest height where raised surfaces (car faces) mix with the road. Cells with
+    no surface in the window have none.
+    """
+    pad = window // 2
+    zp = F.avg_pool2d(z_sum, window, stride=1, padding=pad, count_include_pad=True)
+    wp = F.avg_pool2d(w_sum, window, stride=1, padding=pad, count_include_pad=True)
+    has = (wp > 0) & (zp > 0)
+    ratio = torch.where(has, zp / torch.where(has, wp, torch.ones_like(wp)), torch.ones_like(zp))
+    ground = torch.where(has, BEV_Z_MIN_M - torch.log(ratio) / k, torch.zeros_like(zp))
+    return ground, has.to(z_sum.dtype)
+
+
+def near_ground(z: Any, ground: Any, band_m: float = GROUND_BAND_M) -> Any:
+    """True where a height is less than ``band_m`` above the local ground height (exclusive)."""
+    return (z - ground) < band_m
 
 
 def _check_band(value: float) -> float:
     value = float(value)
-    if not (BEV_Z_MIN_M < value <= BEV_Z_MAX_M):
-        raise ValueError(f"ground_band_max_m must be in ({BEV_Z_MIN_M}, {BEV_Z_MAX_M}], got {value}")
+    if not (0.0 < value <= BEV_Z_MAX_M - BEV_Z_MIN_M):
+        raise ValueError(f"ground_band_m must be in (0, {BEV_Z_MAX_M - BEV_Z_MIN_M}], got {value}")
     return value
 
 
@@ -438,14 +488,14 @@ class BevLssHead(nn.Module):
         depth_bins: int = DEPTH_BINS,
         reach_tau: float = REACH_TAU,
         free_pass_tau: float = FREE_PASS_TAU,
-        ground_band_max_m: float = GROUND_BAND_MAX_M,
+        ground_band_m: float = GROUND_BAND_M,
     ) -> None:
         super().__init__()
         self.spatial = SpatialPath(depth_bins=depth_bins)
         self.encoder = BevEncoder(CTX_CH + 2)
         self.reach_tau = _check_tau("reach_tau", reach_tau)
         self.free_pass_tau = _check_tau("free_pass_tau", free_pass_tau)
-        self.ground_band_max_m = _check_band(ground_band_max_m)
+        self.ground_band_m = _check_band(ground_band_m)
         self.register_buffer("depths", torch.from_numpy(depth_bin_centers(depth_bins)), persistent=False)
         self.register_buffer("edges", torch.from_numpy(depth_bin_inner_edges(depth_bins)), persistent=False)
 
@@ -476,7 +526,7 @@ class BevLssHead(nn.Module):
         cell), ``through_mass`` (sum of S over valid rays that passed through it),
         ``occluded_mass`` (sum of 1 - T over valid rays that landed there but did not reach it),
         all B x 1 x 128 x 128, and ``depth_prob``. The three visibility masses count only ray
-        points inside the ground band (``z < ground_band_max_m``).
+        points less than ``ground_band_m`` above the local ground height (G5).
         """
         b, n = f8.shape[:2]
         flat = lambda t: t.reshape(b * n, *t.shape[2:])  # noqa: E731
@@ -493,29 +543,43 @@ class BevLssHead(nn.Module):
         prob_w = prob * weight
         beyond_w = beyond * weight
         pts = frustum_ego_points(K, T, self.depths.to(K.dtype), (h, w), FEAT_STRIDE, time_offset_s, ego_speed_mps)
-        band_w = in_ground_band(pts[..., 2], self.ground_band_max_m).to(prob.dtype) * weight  # B N D h w
         reach = depth_transmittance(prob, dim=2)
         reached, through = visibility_gates(reach, beyond, self.reach_tau, self.free_pass_tau)
+        idx, ok = bev_flat_index(pts)  # B N D h w
+        z = pts[..., 2].to(prob.dtype)
+        surf, has_surf = ray_surface(reached, dim=2)  # B N D h w one-hot, B N 1 h w
+        ray_w = has_surf * weight
+        g_vals = torch.stack([surf * ray_w * torch.exp(-GROUND_SOFTMIN_K * (z - BEV_Z_MIN_M)), surf * ray_w], dim=-1)
+        g_sum = splat(g_vals.reshape(b, n * d * h * w, 2), idx.reshape(b, -1), ok.reshape(b, -1))
+        ground, has_ground = ground_height(g_sum[:, 0:1], g_sum[:, 1:2])
+        flat_g = (ground * has_ground).reshape(b, BEV_N * BEV_N)
+        flat_has = has_ground.reshape(b, BEV_N * BEV_N)
+
+        def _band(zs: Any, ids: Any) -> Any:
+            g = flat_g.gather(1, ids.reshape(b, -1)).view_as(zs)
+            ok_g = flat_has.gather(1, ids.reshape(b, -1)).view_as(zs)
+            return near_ground(zs, g, self.ground_band_m).to(prob.dtype) * ok_g * ray_w
+
+        band_w = _band(z, idx)  # B N D h w
         clear_w = reach * reached * band_w
         through_w = beyond * through * band_w
         occ_w = (1.0 - reach) * (1.0 - reached) * band_w
-        # Visibility is also sampled at the edge between bins j and j + 1. In the ground band only
-        # near-ground points count, and the bin centres alone leave whole cell rows unsampled at range
+        # Visibility is also sampled at the edge between bins j and j + 1. In the surface band only
+        # near-surface points count, and the bin centres alone leave whole cell rows unsampled at range
         # (bins ~1.4 m apart at 15 m, cells 0.5 m). An edge counts only the mass beyond bin j + 1
         # (S_{j+1}) for both reach and pass, so a surface anywhere in bin j + 1, or snapped into it
         # from just before the edge, never opens the edge point.
         pts_e = frustum_ego_points(K, T, self.edges.to(K.dtype), (h, w), FEAT_STRIDE, time_offset_s, ego_speed_mps)
-        band_e = in_ground_band(pts_e[..., 2], self.ground_band_max_m).to(prob.dtype) * weight
+        idx_e, ok_e = bev_flat_index(pts_e)
+        band_e = _band(pts_e[..., 2].to(prob.dtype), idx_e)
         s_e = beyond[:, :, 1:]
         reached_e, through_e = visibility_gates(s_e, s_e, self.reach_tau, self.free_pass_tau)
-        idx_e, ok_e = bev_flat_index(pts_e)
         vis_e = torch.stack(
             [(1.0 - s_e) * (1.0 - reached_e) * band_e, s_e * reached_e * band_e, s_e * through_e * band_e], dim=-1
         ).reshape(b, n * (d - 1) * h * w, 3)
         vis_e = splat(vis_e, idx_e.reshape(b, -1), ok_e.reshape(b, -1))
         ctx = ctx.view(b, n, 1, CTX_CH, h, w)
         lifted = prob_w.unsqueeze(3) * ctx  # B N D C h w
-        idx, ok = bev_flat_index(pts)  # B N D h w
         values = torch.cat(
             [
                 lifted.permute(0, 1, 2, 4, 5, 3),
@@ -545,6 +609,8 @@ class BevLssHead(nn.Module):
             "occluded_mass": occ,
             "clear_mass": clear,
             "through_mass": thru,
+            "ground_height": ground * has_ground,
+            "has_ground": has_ground,
             "depth_prob": prob,
             "bev_feat": feat,
         }
@@ -599,5 +665,5 @@ def build_bev_head(cfg: Mapping[str, Any] | None = None) -> Any:
         depth_bins=int(section.get("depth_bins", DEPTH_BINS)),
         reach_tau=float(section.get("reach_tau", REACH_TAU)),
         free_pass_tau=float(section.get("free_pass_tau", FREE_PASS_TAU)),
-        ground_band_max_m=float(section.get("ground_band_max_m", GROUND_BAND_MAX_M)),
+        ground_band_m=float(section.get("ground_band_m", GROUND_BAND_M)),
     )

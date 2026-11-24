@@ -235,7 +235,7 @@ def make_session(path: Path | str, ep: str = "cpu", **so_kwargs: Any) -> Any:
     import onnxruntime as ort
 
     if ep == "cuda" and hasattr(ort, "preload_dlls"):
-        # pip nvidia-* wheels (requirements-ort.txt) put the CUDA/cuDNN DLLs in site-packages.
+        # pip nvidia-* packages (requirements-ort.txt) put the CUDA/cuDNN DLLs in site-packages.
         try:
             ort.preload_dlls()
         except Exception:

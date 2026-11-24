@@ -576,8 +576,11 @@ def check_short_collect_v2() -> None:
             rgb = [c for c in row["cams"] if c in CAM_IDS]
             if len(rgb) >= 2:
                 assert row["cam_span_ms"] is not None and row["cam_span_ms"] >= 0.0
-            # item 6: wheel speed and yaw rate on every row
-            assert row["ego"].get("yaw_rate") is not None, row["ego"]
+            # item 6: wheel speed on every row; yaw rate on every row that has a
+            # previous heading (the fake State has no yaw_rate, so the first row
+            # falls back to yaw_rate_from_dirs with nothing to diff: null, not 0).
+            if row is not state[0]:
+                assert row["ego"].get("yaw_rate") is not None, row["ego"]
             assert row["veh"].get("wheelspeed") == 10.0, row.get("veh")
             assert row.get("gt_stride") == 1
         filled = [row for row in state if row.get("traffic")]
@@ -589,7 +592,9 @@ def check_short_collect_v2() -> None:
         cams_json = json.loads((out / "cameras.json").read_text(encoding="utf-8"))
         ids = [c["id"] for c in cams_json["cameras"]]
         assert ids.count("chase") == 1 and set(ids) == {*CAM_IDS, "chase"}
-        assert all(c["mount"]["rig_model"] == "sbr" for c in cams_json["cameras"] if c["id"] != "chase")
+        # No --map here: a single-level run drives the car already loaded on the base (etk800) rig.
+        # Clip mode always loads a map, which spawns the eSBR and its rig (check_sidecar_has_k_and_sbr_mounts).
+        assert all(c["mount"]["rig_model"] == "etk800" for c in cams_json["cameras"]), cams_json["cameras"][0]["mount"]
         from python.data.raw_frames import list_raw_images
 
         listed = {p.parent.parent.name for p in list_raw_images(out)}

@@ -409,7 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="On west_coast_usa, teleport to a new stratified spawn after this many minutes.",
     )
-    parser.add_argument("--time-of-day", default="", help="0-1 day fraction, or an hour 0-24. Empty leaves the sky.")
+    parser.add_argument("--time-of-day", default="", help="BeamNG 0-1 time (0 noon, 0.5 midnight), or a clock hour above 1. Empty leaves the sky.")
     parser.add_argument("--weather", default="", help="clear, rain, or fog. Empty leaves the weather.")
     parser.add_argument(
         "--out",
@@ -586,6 +586,26 @@ def build_parser() -> argparse.ArgumentParser:
             "Off by default. Every allowlist stem is still an unverified guess, so leave this "
             "off until a real scenetree dump has been checked."
         ),
+    )
+    parser.add_argument(
+        "--chase-cam",
+        action="store_true",
+        help=(
+            "Also record the recording-only chase camera (cameras.yaml chase_camera: behind and above the "
+            "ego, RGB + depth + sem at chase_hz) into raw/chase*. Never in the strip or the model."
+        ),
+    )
+    parser.add_argument(
+        "--spawn-seed",
+        type=int,
+        default=None,
+        help="West coast: seed for the spawn deck shuffle (clip mode passes one per clip). Unset: seed 0 as before.",
+    )
+    parser.add_argument(
+        "--spawn-kind",
+        default=None,
+        choices=["city", "highway", "ramp"],
+        help="West coast: draw spawns from this road kind only (clip mode: ramp for merges). Unset: the 40/35/25 mix.",
     )
     parser.add_argument(
         "--recheck-cov-min",
@@ -1707,10 +1727,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     )
     from python.data.raw_frames import (
         CAMERA_HZ,
+        COLLECT_HZ,
         PNG_RATIO_MAX,
         PNG_RATIO_MEAN,
         CameraSchedule,
         RawFrameWriter,
+        TrainGtGate,
         camera_sidecar,
         capture_plan,
         frame_nbytes,
@@ -1800,6 +1822,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     cam_cfg = rig_for_model(base_cam_cfg, rig_for)
     camera_rig = rig_model(base_cam_cfg, rig_for)
     camera_overrides = rig_overrides(base_cam_cfg, rig_for)
+    chase_spec = cam_cfg.pop("chase_camera", None)
+    if args.chase_cam:
+        if not isinstance(chase_spec, dict):
+            print("collect --chase-cam: config/cameras.yaml has no chase_camera block", file=sys.stderr)
+            return 2
+        # Recording-only: attached by _attach_cameras, written to raw/chase*, never in CAM_IDS.
+        cam_cfg["chase_camera"] = {**chase_spec, "enabled": True}
+        cam_rates["chase"] = float(chase_spec.get("chase_hz") or 2.0)
     plan = capture_plan(cam_cfg, PNG_RATIO_MAX)
     totals = plan_totals(plan)
     ceiling_gb = float(totals["png_gb_per_hour"])
@@ -1926,7 +1956,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if opened.spawn is not None:
                 spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
             spawn_seq += 1
-        writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
+        writer = RawWriteQueue(
+            RawFrameWriter(
+                out,
+                camera_sidecar(cam_cfg, rig_model=camera_rig, overrides=camera_overrides, chase=bool(args.chase_cam)),
+            )
+        )
         sem_classes_written = False
         ticks = TickLog(out / TICKS_FILE, 0.1)
         from python.data.strip_writer import STRIP_ORDER
@@ -2060,6 +2095,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # Phase-scheduled capture (raw_frames.CameraSchedule). Reset on
         # respawn and level load; the first tick after is the new anchor.
         cam_sched = CameraSchedule(cam_rates)
+        # Training-only depth/sem drop to every other frame per camera while the
+        # loop runs behind the 10 Hz plan; colour frames are never thinned.
+        gt_gate = TrainGtGate(1.0 / COLLECT_HZ)
+        gt_prev_mono: list[float | None] = [None]
         prev_dir: list[float] | None = None
         prev_dir_t: float | None = None
         last_error = ""
@@ -2306,8 +2345,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     return
                 load_t0 = time.perf_counter()
                 cov_min = max(0.0, float(args.min_paint_cov))
+                import random as _random
+
                 spawn_deck = SpawnDeck.load(
                     dump,
+                    None if args.spawn_seed is None else _random.Random(int(args.spawn_seed)),
+                    only_kind=args.spawn_kind,
                     painted=painted if cov_min > 0.0 and painted else None,
                     min_paint_cov=cov_min,
                     log=lambda text: print(f"collect {text}", flush=True),
@@ -2883,9 +2926,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if cid in stamps:
                     due_stamps[cid] = stamps[cid]
             train_gt = take_train_gt()
+            gt_dt = None if gt_prev_mono[0] is None else mono - gt_prev_mono[0]
+            gt_prev_mono[0] = mono
+            gt_bases = sorted({gid.rsplit("_", 1)[0] for gid in train_gt} & set(due))
+            gt_keep = gt_gate.select(gt_dt, gt_bases)
             for gid, garr in train_gt.items():
                 base = gid.rsplit("_", 1)[0]
-                if base in due:
+                if base in due and base in gt_keep:
                     due[gid] = garr
                     if base in due_stamps:
                         due_stamps[gid] = due_stamps[base]
@@ -3370,6 +3417,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tags["ai_cmd"] = dict(ai_cmd)
             tags["road"] = control_log.road_tag(hit, lanes_here)
             tags["traffic"] = traffic_now
+            tags["gt_stride"] = int(gt_gate.stride)
             if ctl_meta_for != spawn_seq:
                 meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))
                 # A spawned ego is the model the spawn asked for; the live object (maybe None)
@@ -3707,6 +3755,34 @@ def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, An
         )
         attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **kwargs)
         if spec.get("train_gt"):
+            _attach_sem_palette(attached[cid], bng)
+    chase = cfg.get("chase_camera")
+    if isinstance(chase, dict) and chase.get("enabled"):
+        # Recording-only chase camera (--chase-cam): behind and above the ego,
+        # follows its yaw. Same kwargs path as the rig; never in CAM_IDS.
+        cid = str(chase.get("id") or "chase")
+        pos = list(chase.get("pos_m") or [0.0, -8.0, 4.0])
+        direction, up = yaw_pitch_to_dir_up(float(chase.get("yaw_deg") or 0.0), float(chase.get("pitch_deg") or 0.0))
+        res = chase.get("live_res") or [640, 360]
+        near_m, far_m = camera_clip_planes(chase, cid=cid, defaults={"near_m": cfg.get("near_m", 0.05)})
+        kwargs = beamng_camera_sensor_kwargs(
+            pos=gvd_to_bng_vehicle(*[float(v) for v in pos]),
+            direction=gvd_to_bng_vehicle(*direction),
+            up=gvd_to_bng_vehicle(*up),
+            fov_v=float(chase.get("fov_v") or 60.0),
+            resolution=(int(res[0]), int(res[1])),
+            update_s=camera_update_s(chase, cid=cid),
+            near_m=near_m,
+            far_m=far_m,
+            shmem=True,
+            streaming=True,
+            rgb_only=True,
+            update_priority=camera_update_priority(chase, cid=cid),
+            cid=cid,
+            train_gt=bool(chase.get("train_gt")),
+        )
+        attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **kwargs)
+        if chase.get("train_gt"):
             _attach_sem_palette(attached[cid], bng)
     if "main" not in attached:
         raise RuntimeError("main camera did not attach")

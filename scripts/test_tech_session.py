@@ -829,8 +829,8 @@ def check_collector_train_gt_stays_on() -> None:
         else:
             assert "integer_depth" not in kw, cid
             assert not hasattr(attached[cid], "gvd_sem_palette"), cid
-    assert palette_calls["n"] == 2
-    print("collector train_gt stays on for main and wide")
+    assert palette_calls["n"] == len(CAM_IDS)  # one palette read per train_gt camera
+    print("collector train_gt stays on for all eight cameras")
 
 
 def check_beamngpy_side_grab_half_rate() -> None:

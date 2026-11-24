@@ -17,7 +17,10 @@
 #   wide:   300 @ -1     priority 0.5
 #   pillarL / pillarR / repeatL / repeatR / rear: 100 @ -1
 # Optional per-cam near_far_planes: [near_m, far_m] still clamped to the role band.
-# Depth OFF. Div/phase numbers are not the live skip schedule.
+# Live depth OFF. Div/phase numbers are not the live skip schedule.
+# train_gt: true = the collector (scripts/collect_scene_lanes.py) also renders that camera's
+# training-only depth (raw/<id>_depth, uint16 cm planar z) and semantic ids (raw/<id>_sem).
+# Recorder v2: all eight. The live attach forces train_gt off (python/sensors/cameras.py).
 origin_offset: [0.0, 0.0, 0.0]
 near_m: 0.05
 hitch:
@@ -55,6 +58,7 @@ cameras:
     far_m: 800
     requested_update_time: -1
     update_priority: 0.5
+    train_gt: true
   - id: main
     role: primary_forward
     note: "toy analogue of the primary forward windshield cam; alias cam_main"
@@ -68,7 +72,7 @@ cameras:
     requested_update_time: 0.067
     update_priority: 0.0
     aliases: [cam_main]
-    train_gt: true  # training-only depth (raw/main_depth, uint16 cm PNG) + semantic ids (raw/main_sem)
+    train_gt: true
   - id: wide
     role: urban_intersection
     note: "toy analogue of a wide forward windshield cam"
@@ -81,7 +85,7 @@ cameras:
     far_m: 300
     requested_update_time: -1
     update_priority: 0.5
-    train_gt: true  # urban-intersection camera; the other six stay RGB-only
+    train_gt: true
   - id: pillarL
     role: forward_side_left
     note: "toy analogue of a left B-pillar cam aimed across the corner, not down the lane"
@@ -94,6 +98,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 0.5
+    train_gt: true
   - id: pillarR
     role: forward_side_right
     note: "toy analogue of a right B-pillar cam aimed across the corner, not down the lane"
@@ -106,6 +111,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 0.5
+    train_gt: true
   - id: repeatL
     role: rear_side_left
     note: "toy analogue of a left fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
@@ -118,6 +124,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 1.0
+    train_gt: true
   - id: repeatR
     role: rear_side_right
     note: "toy analogue of a right fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
@@ -130,6 +137,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 1.0
+    train_gt: true
   - id: rear
     role: rear_traffic
     note: "toy analogue of a rear license-plate cam"
@@ -142,6 +150,25 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 1.0
+    train_gt: true
+# Recording-only chase ("drone") camera, collector --chase-cam only. Not in
+# `cameras:` on purpose: CAM_IDS, the strip, the live attach and the model never
+# see it. Attached to the ego (follows its yaw), 8 m behind and 4 m above, looking
+# down 20 deg. RGB + depth + sem at chase_hz. Refinement supervision at the
+# product's viewpoint; UNVERIFIED on Tech 0.39 until the IQU45 smoke run.
+chase_camera:
+  id: chase
+  role: recording_only_chase
+  pos_m: [0.00, -8.00, 4.00]
+  yaw_deg: 0
+  pitch_deg: -20
+  fov_v: 60.0
+  live_res: [640, 360]
+  far_m: 100            # side/rear band (cameras.clamp_far_m)
+  requested_update_time: 0.5   # renders at chase_hz; never ad-hoc
+  update_priority: 1.0
+  train_gt: true
+  chase_hz: 2.0
 # Per-ego-model mounts (python/sensors/rig_overrides.py). Keys here replace the
 # camera's keys above for that model only; a model without an entry (the
 # etk800 the rig was calibrated on) gets the cameras above unchanged.

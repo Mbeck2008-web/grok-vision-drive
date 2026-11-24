@@ -8,6 +8,7 @@ against a fake BeamNG session.
 """
 from __future__ import annotations
 
+import math
 import json
 import sys
 import tempfile
@@ -34,7 +35,12 @@ PROBE_REPLY = {
 }
 TRAFFIC_CAR = {"name": "gvd_traffic_0", "pos": [0.4, 40.0, 0.5], "vel": [0.0, 9.0, 0.0], "dir": [0.0, 1.0, 0.0]}
 # The fake session does not connect the scenetree car, so Electrics stays masked.
-TRAFFIC_ROW = {**TRAFFIC_CAR, "brake_lights": None}
+# Recorder v2 actor fields: heading from dir; no id/OOBB from the fake chunk, so null dims.
+TRAFFIC_ROW = {
+    "name": "gvd_traffic_0", "id": None, **{k: TRAFFIC_CAR[k] for k in ("pos", "vel", "dir")},
+    "heading_rad": math.pi / 2.0, "length_m": None, "width_m": None, "height_m": None,
+    "dims_source": None, "brake_lights": None,
+}
 # Old row keys, in their order before the control fields: these stay byte-identical.
 OLD_EGO = ["speed_mps", "yaw_rate", "damage", "pos", "dir", "up", "x", "y"]
 OLD_CAPTURE = ["t", "dt_s", "steer", "throttle", "brake", "speed_mps", "yaw_rate", "pos", "dir", "driver", "gt"]

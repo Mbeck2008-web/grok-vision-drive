@@ -136,6 +136,15 @@ def rates_table(rates: str, cameras: str) -> dict[str, float]:
     return table
 
 
+def hour_to_beamng_tod(hour: float) -> float:
+    """A clock hour (0-24) as BeamNG ``TimeOfDay.time``: 0 is local noon, 0.5 midnight.
+
+    documentation.beamng.com/modding/levels/level_classes/tod/: 0.00 12:00,
+    0.25 18:00, 0.50 00:00, 0.75 06:00. Plain hour/24 would put noon at midnight.
+    """
+    return ((float(hour) - 12.0) / 24.0) % 1.0
+
+
 def environment_commands(time_of_day: str, weather: str) -> list[str]:
     """Best-effort BeamNG environment lines. Empty when the option is blank."""
     commands: list[str] = []
@@ -147,7 +156,7 @@ def environment_commands(time_of_day: str, weather: str) -> list[str]:
             tod = None
         if tod is not None:
             if tod > 1.0:
-                tod = tod / 24.0
+                tod = hour_to_beamng_tod(tod)
             tod = min(1.0, max(0.0, tod))
             commands.append(f"core_environment.setTimeOfDay({{time={tod:.4f}}})")
     sky = str(weather or "").strip().replace("\\", "").replace('"', "")

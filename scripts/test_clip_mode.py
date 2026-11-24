@@ -77,6 +77,22 @@ def check_collector_argv() -> None:
     assert f"--minutes {p.duration_s / 60.0:.6f}" in joined, joined
     for banned in ("--strip", "jpeg", "jpg", "--maps"):
         assert banned not in joined, banned
+    # The clock reaches BeamNG as its own 0-1 time (0 noon, 0.5 midnight), so an
+    # early-morning night hour (00:30) is never misread as a 0-1 fraction.
+    from python.collect.auto_mode import environment_commands
+
+    night = [plan_clip(i, seed=5, maps=("italy",), max_traffic=0, edge_cases=("night",)) for i in range(40)]
+    assert any(n.time_of_day_h < 1.0 for n in night), [n.time_of_day_h for n in night]
+    for n in night:
+        a = clip_argv(n, Path("/tmp/x/clip"))
+        tod = a[a.index("--time-of-day") + 1]
+        line = environment_commands(tod, "")[0]
+        t = float(line.split("time=")[1].rstrip("})"))
+        assert 0.375 - 1e-4 <= t <= 0.6875 + 1e-4, (n.time_of_day_h, tod, line)
+    day = plan_clip(0, seed=5, maps=("italy",), max_traffic=0, edge_cases=("rain",))
+    a = clip_argv(day, Path("/tmp/x/clip"))
+    t = float(environment_commands(a[a.index("--time-of-day") + 1], "")[0].split("time=")[1].rstrip("})"))
+    assert t <= 0.2084 or t >= 0.8333 - 1e-4, (day.time_of_day_h, t)  # 08:00-17:00
     print("collector argv: one map, sbr, new --out, no lossy option")
 
 
@@ -230,6 +246,27 @@ def check_run_clips_with_fake_collector() -> None:
     print("run_clips: 3 clips, 3 new folders, tags + session manifest")
 
 
+def check_cli() -> None:
+    """scripts/collect_clips.py: 30-60 s bounds, one collector subprocess per clip."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("collect_clips", ROOT / "scripts" / "collect_clips.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)  # type: ignore[union-attr]
+    for bad in (["--min-s", "20"], ["--max-s", "90"], ["--min-s", "50", "--max-s", "40"], ["--clips", "0"]):
+        try:
+            cli.parse_args(["--out", "/tmp/x"] + bad)
+        except SystemExit:
+            continue
+        raise AssertionError(f"accepted {bad}")
+    args = cli.parse_args(["--out", "/tmp/x", "--clips", "5", "--maps", "west_coast_usa,italy"])
+    assert args.min_s == 30.0 and args.max_s == 60.0 and args.clips == 5
+    assert args.maps == ("west_coast_usa", "italy")
+    cmd = cli.collector_command(["--map", "italy"], python="py")
+    assert cmd[0] == "py" and cmd[1].endswith("collect_scene_lanes.py") and cmd[2:] == ["--map", "italy"]
+    print("collect_clips CLI: 30-60 s bounds, one collector process per clip")
+
+
 def main() -> None:
     check_edge_case_list()
     check_plans_are_seeded_and_bounded()
@@ -238,6 +275,7 @@ def main() -> None:
     check_edge_case_observation()
     check_session_never_overwrites()
     check_run_clips_with_fake_collector()
+    check_cli()
     print("test_clip_mode: OK")
 
 

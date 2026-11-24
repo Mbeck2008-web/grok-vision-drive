@@ -61,10 +61,47 @@ SIGN_FEAT = 4
 # Length and width are not labels. A missing size stays 0, and the loss
 # ignores those two columns (object_feature_keep). 4.5 m x 1.8 m was a filler.
 # Columns of signs[8, 4]: x, y, misses, seen fraction.
-OBJECT_CLASSES = ("vehicle", "car", "truck", "bus", "pedestrian", "bike")
+# Recorder/labels v2 (Michael, 2026-11-23): no people class. Five classes, so
+# object_class_head is N_OBJECTS * 5 = 80 outputs. A pre-v2 checkpoint or ONNX
+# has 96 (six classes); ``check_object_class_head`` refuses it by name.
+OBJECT_CLASSES = ("vehicle", "car", "truck", "bus", "bike")
+OBJECT_CLASSES_PRE_V2 = 6
 OBJECT_SIZE_COLS = (3, 4)
 SIGN_CLASSES = ("stop_sign", "yield", "traffic_light", "speed_limit")
 LAMP_STATES = ("unknown", "red", "yellow", "green")
+
+
+class ObjectClassCountError(ValueError):
+    """A checkpoint / output built for a different object class list."""
+
+
+def _object_class_message(got: int, where: str) -> str:
+    want = N_OBJECTS * len(OBJECT_CLASSES)
+    old = N_OBJECTS * OBJECT_CLASSES_PRE_V2
+    why = (
+        f" {got} = {N_OBJECTS} slots x {OBJECT_CLASSES_PRE_V2} classes is the pre-v2 list that still had "  # gvd-allow-pedestrian-word
+        "'pedestrian'; that class was removed, so these weights cannot be mapped onto the new head. Retrain."  # gvd-allow-pedestrian-word
+        if got == old
+        else ""
+    )
+    return (
+        f"{where}: object_class has {got} outputs, this build expects {want} "
+        f"({N_OBJECTS} x {len(OBJECT_CLASSES)} classes {OBJECT_CLASSES}).{why}"
+    )
+
+
+def check_object_class_head(weights: Mapping[str, Any], where: str = "checkpoint") -> None:
+    """Refuse weights whose object_class_head is not N_OBJECTS * len(OBJECT_CLASSES) wide."""
+    want = N_OBJECTS * len(OBJECT_CLASSES)
+    for key in ("object_class_head.weight", "object_class_head.bias"):
+        if key not in weights:
+            continue
+        shape = getattr(weights[key], "shape", None)
+        if shape is None:
+            shape = np.shape(np.asarray(weights[key]))
+        rows = int(shape[0]) if len(shape) else 0
+        if rows != want:
+            raise ObjectClassCountError(_object_class_message(rows, f"{where} {key}"))
 
 
 def object_feature_keep(n: int = OBJECT_FEAT) -> np.ndarray:
@@ -981,6 +1018,10 @@ def scene_to_predict_kwargs(scene: Any, *, ego_speed_mps: float = 0.0) -> dict[s
     curb_valid = _numpy(_field(scene, "curb_valid")).reshape(-1)
     objects = _numpy(_field(scene, "objects"))
     object_class = _numpy(_field(scene, "object_class"))
+    if object_class.ndim >= 2 and int(object_class.shape[-1]) != len(OBJECT_CLASSES):
+        raise ObjectClassCountError(
+            _object_class_message(int(object_class.shape[-1]) * N_OBJECTS, "scene output")
+        )
     object_valid = _numpy(_field(scene, "object_valid")).reshape(-1)
     signs = _numpy(_field(scene, "signs"))
     sign_class = _field(scene, "sign_class")

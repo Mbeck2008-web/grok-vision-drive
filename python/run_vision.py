@@ -126,6 +126,7 @@ from python.sensors.live_hold import (
 from python.data.cam_hold import CAM_AGE_ORDER
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
+from python.viz.view_select import ViewChoice, render_main_view, resolve_view
 
 
 
@@ -381,12 +382,41 @@ def detector_runtime(detector: Any) -> str:
     return name
 
 
-def start_cpp_viz(args: argparse.Namespace) -> Any:
+def cpp_viz_unlocked(args: argparse.Namespace, cameras: dict[str, Any] | None = None) -> bool:
+    """Whether the disabled C++ early-FSD-beta viewer may open.
+
+    Same pattern as classic view: ``--enable-viz-cpp`` or
+    ``viz.cpp_viz_enabled: true`` (literal True only). No env path.
+    Unknown or garbage config is a safe off and never raises.
+    """
+    if bool(getattr(args, "enable_viz_cpp", False)):
+        return True
+    if cameras is None:
+        try:
+            from python.viz.stage import _load_viz_files
+
+            cameras, _ = _load_viz_files()
+        except Exception:
+            return False
+    viz = cameras.get("viz") if isinstance(cameras, dict) else None
+    return isinstance(viz, dict) and viz.get("cpp_viz_enabled") is True
+
+
+def start_cpp_viz(args: argparse.Namespace, cameras: dict[str, Any] | None = None) -> Any:
     """``--viz-cpp``: a CppVizPublisher (and gvd_viz if built), else None.
 
-    Fail-safe: any error here leaves the C++ viz off and the supervisor running.
+    The C++ early-FSD-beta viewer stays off unless explicitly opted in
+    (``--enable-viz-cpp`` or ``viz.cpp_viz_enabled: true``). ``--viz-cpp``
+    alone does not open it. Fail-safe: any error here leaves the C++ viz off
+    and the supervisor running.
     """
     if not bool(getattr(args, "viz_cpp", False)):
+        return None
+    if not cpp_viz_unlocked(args, cameras):
+        print(
+            "[GVD] viz-cpp: disabled (pass --enable-viz-cpp or viz.cpp_viz_enabled: true)",
+            flush=True,
+        )
         return None
     try:
         from python.viz.cpp_publisher import CppVizPublisher
@@ -404,16 +434,72 @@ def start_cpp_viz(args: argparse.Namespace) -> Any:
         return None
 
 
+def resolve_main_view(args: argparse.Namespace) -> ViewChoice:
+    """Main view from config/cameras.yaml viz.* and --view / --enable-classic-view."""
+    from python.viz.stage import _load_viz_files
+
+    cams, _vram = _load_viz_files()
+    return resolve_view(
+        cams,
+        cli_view=getattr(args, "view", None),
+        cli_enable_classic=bool(getattr(args, "enable_classic_view", False)),
+    )
+
+
+def draw_vision_frame(
+    view_choice: ViewChoice,
+    paint: dict[str, Any],
+    ui: Any,
+    main: Any,
+    bundle: Any,
+    pout: Any,
+) -> Any:
+    """Live GVD VISION frame. Window width and hit-testing match classic.
+
+    Always uses STAGE_W x STAGE_H for the main pane and forwards main_frame,
+    cam_frames and dets so the PIP, PIP boxes and camera tiles stay intact.
+    """
+    return render_main_view(
+        view_choice,
+        paint,
+        render_stage,
+        width=STAGE_W,
+        height=STAGE_H,
+        ui=ui,
+        main_frame=main,
+        cam_frames=getattr(bundle, "frames", None),
+        dets=getattr(pout, "dets", None),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """CLI for ``python.run_vision``. Default ``--no-conf-gate`` is off."""
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
     ap.add_argument(
+        "--view",
+        default=None,
+        choices=["reality", "classic"],
+        help="Main view for --viz. Default: viz.main_view in config/cameras.yaml, else reality. "
+        "classic is the old stage view and needs --enable-classic-view (or viz.classic_view_enabled).",
+    )
+    ap.add_argument(
+        "--enable-classic-view",
+        action="store_true",
+        help="Allow the disabled classic stage view (off by default; Reality View is the main view).",
+    )
+    ap.add_argument(
         "--viz-cpp",
         action="store_true",
-        help="Also publish perception-only scene messages to the C++ visualizer (gvd_viz) over "
-        "localhost UDP, and start it if built. Off by default. Never blocks the loop; frames drop "
-        "when the renderer is slow or absent (docs/specs/viz_cpp.md).",
+        help="Request the C++ visualizer (gvd_viz) over localhost UDP. "
+        "Disabled unless also passed --enable-viz-cpp (or viz.cpp_viz_enabled: true). Never "
+        "blocks the loop; frames drop when the renderer is slow or absent (docs/specs/viz_cpp.md).",
+    )
+    ap.add_argument(
+        "--enable-viz-cpp",
+        action="store_true",
+        help="Allow the disabled C++ visualizer (gvd_viz). Off by default; "
+        "--viz-cpp does nothing unless this flag or viz.cpp_viz_enabled: true is set.",
     )
     ap.add_argument("--viz-cpp-port", type=int, default=47800, help="UDP port for --viz-cpp (127.0.0.1 only)")
     ap.add_argument("--viz-cpp-exe", default="", help="gvd_viz path for --viz-cpp (default: cpp/viz/build)")
@@ -937,6 +1023,9 @@ def main(clock=None) -> None:
 
     cpp_viz = start_cpp_viz(args)
     win = "GVD VISION" if args.viz else None
+    view_choice = resolve_main_view(args)
+    if win is not None:
+        print(f"[GVD] viz main view: {view_choice.view}" + (f" ({view_choice.note})" if view_choice.note else ""), flush=True)
     viz_screen_active = str(args.viz_screen)
     viz_note = ""
     if win:
@@ -2188,12 +2277,13 @@ def main(clock=None) -> None:
                 # Reuse this tick's bus check. A second bus_identity() would
                 # move the clock seam the retail tests count.
                 paint = st if ident.matched else load_paint_state()
-                stage_frame = render_stage(
+                stage_frame = draw_vision_frame(
+                    view_choice,
                     paint,
-                    ui=ui,
-                    main_frame=main,
-                    cam_frames=getattr(bundle, "frames", None),
-                    dets=getattr(pout, "dets", None),
+                    ui,
+                    main,
+                    bundle,
+                    pout,
                 )
                 st["viz_ms"] = float(paint.get("viz_ms") or 0.0)
             if cpp_viz is not None:

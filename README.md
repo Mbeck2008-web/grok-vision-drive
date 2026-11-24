@@ -37,7 +37,7 @@ Windows. You do not need an administrator account. The full agent procedure (Tec
 
 ### GVD VISION window (supervisor)
 
-`python/run_vision.py --viz` opens one OpenCV window named **GVD VISION**. The left part is the stage (the 3D view of what GVD sees). The right part is the nerd panel with tabs.
+`python/run_vision.py --viz` opens one OpenCV window named **GVD VISION**. The left part is Reality View, the default main view (a placeholder until the splat renderer exists). The old classic stage view is a disabled option, unlocked with `--view classic --enable-classic-view` (or `viz.classic_view_enabled: true`). The right part is the nerd panel with tabs.
 
 ![GVD VISION supervisor ribbon, offline render](docs/img/viz-ribbon.png)
 
@@ -183,7 +183,7 @@ Do not run Automatic Mode while the supervisor is also attaching cameras.
 
 Review capture (`R`) writes `Documents/GVD/review/<UTC stamp>/tick_NNNNNN.json` and one `tick_NNNNNN_<camera>.jpg` per camera. Clips go to `Documents/GVD/clips`.
 
-**C++ visualizer (M1, opt-in).** `--viz-cpp` also sends a perception-only scene message per tick over localhost UDP to `gvd_viz`, a separate C++/OpenGL app with the early-FSD-beta look, and starts it if it has been built under `cpp/viz/build`. Sending never blocks the loop: frames are dropped when the app is slow or missing. Build: `cmake --preset windows-msvc && cmake --build --preset windows-msvc` in `cpp/viz`. Live lanes draw white until perception reports paint colour. Spec: [docs/specs/viz_cpp.md](docs/specs/viz_cpp.md).
+**C++ visualizer (M1, disabled option).** `--viz-cpp` alone does not open it. With `--enable-viz-cpp` (or `viz.cpp_viz_enabled: true`, literal true only) it sends a perception-only scene message per tick over localhost UDP to `gvd_viz`, a separate C++/OpenGL app with the early-FSD-beta look, and starts it if it has been built under `cpp/viz/build`. Sending never blocks the loop: frames are dropped when the app is slow or missing. Build: `cmake --preset windows-msvc && cmake --build --preset windows-msvc` in `cpp/viz`. Live lanes draw white until perception reports paint colour. Spec: [docs/specs/viz_cpp.md](docs/specs/viz_cpp.md).
 
 ### In-game GVD app
 
@@ -257,7 +257,7 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 
 | Command | Key flags (default) | Status |
 | --- | --- | --- |
-| `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off), `--no-engage` / `GVD_NO_ENGAGE=1` (hard engage disable, off), `--cam-age-baseline` (cam-age capture baseline: cam-age model / hold off), `--run-seconds` (0 = until stopped) | Unproven |
+| `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--view` (reality|classic, default from config else reality), `--enable-classic-view` (off), `--viz-cpp` (off), `--enable-viz-cpp` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off), `--no-engage` / `GVD_NO_ENGAGE=1` (hard engage disable, off), `--cam-age-baseline` (cam-age capture baseline: cam-age model / hold off), `--run-seconds` (0 = until stopped) | Unproven |
 | `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (unset), `--speed-max` (unset; when set, each clamps every spawn type's range: city 8-14, highway 20-30, ramp 10-18 m/s; off the deck 8-17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--no-impact-respawn` (impact respawn is on by default), `--time-of-day`, `--weather`, `--no-excursions`, `--weave-guard` (on; `--no-weave-guard` turns it off), `--ego-model` (sbr, the Hirochi eSBR electric), `--ego-config` (`vehicles/sbr/electric_800.pc`, the stock eSBR 800), `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Proven live: recording only (`GVD_data\logs\rec3_20261019.txt`, `GVD_data\scene_lanes_rec3\collect.json`) |
 | `py -3 -m python.train.train_scene` (trainer) | see Technical details | Offline smoke only |
 | `py -3 scripts\gvd_status.py` | none | Offline smoke only |

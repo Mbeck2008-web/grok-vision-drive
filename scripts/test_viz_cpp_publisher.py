@@ -267,7 +267,7 @@ def check_flag_default_off() -> None:
     args = build_parser().parse_args([])
     assert args.viz_cpp is False and args.viz_cpp_port == 47800
     assert start_cpp_viz(args) is None
-    args = build_parser().parse_args(["--viz-cpp", "--viz-cpp-exe", "/nonexistent/gvd_viz", "--viz-cpp-port", "47999"])
+    args = build_parser().parse_args(["--viz-cpp", "--enable-viz-cpp", "--viz-cpp-exe", "/nonexistent/gvd_viz", "--viz-cpp-port", "47999"])
     pub = start_cpp_viz(args)
     assert pub is not None and pub.addr == ("127.0.0.1", 47999) and "not found" in pub.note
     assert pub.publish(rich_state()) in (True, False) and pub.errors == 0
@@ -459,6 +459,90 @@ def check_sendto_oserror() -> None:
     print("sendto OSError: counted as drop, no raise OK")
 
 
+
+def check_viz_cpp_gate() -> None:
+    """--viz-cpp alone must not open gvd_viz; the explicit opt-in must."""
+    import os
+
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    from python.run_vision import build_parser, start_cpp_viz
+
+    ap = build_parser()
+    # Flag exists and defaults off (same pattern as --enable-classic-view).
+    bare = ap.parse_args([])
+    assert getattr(bare, "enable_viz_cpp", None) is False
+    assert bare.viz_cpp is False
+    bare_buf = io.StringIO()
+    with redirect_stdout(bare_buf), redirect_stderr(bare_buf):
+        assert start_cpp_viz(bare) is None
+    assert "viz-cpp: disabled" not in bare_buf.getvalue(), bare_buf.getvalue()
+
+    alone = ap.parse_args(["--viz-cpp", "--viz-cpp-exe", "/nonexistent/gvd_viz", "--viz-cpp-port", "47999"])
+    assert alone.viz_cpp is True and alone.enable_viz_cpp is False
+    assert start_cpp_viz(alone) is None, "--viz-cpp alone must not open the C++ early-FSD-beta viewer"
+
+    buf = io.StringIO()
+    with redirect_stdout(buf), redirect_stderr(buf):
+        assert start_cpp_viz(alone) is None
+    note = buf.getvalue()
+    disabled = "[GVD] viz-cpp: disabled (pass --enable-viz-cpp or viz.cpp_viz_enabled: true)"
+    assert disabled in note, note
+    assert note.count("disabled") >= 1
+    assert "fsd" not in note.lower(), note
+
+    # Opt-in CLI + --viz-cpp opens the publisher (missing exe stays fail-safe).
+    on = ap.parse_args([
+        "--viz-cpp", "--enable-viz-cpp",
+        "--viz-cpp-exe", "/nonexistent/gvd_viz", "--viz-cpp-port", "47999",
+    ])
+    assert on.viz_cpp is True and on.enable_viz_cpp is True
+    on_buf = io.StringIO()
+    with redirect_stdout(on_buf), redirect_stderr(on_buf):
+        pub = start_cpp_viz(on)
+    assert pub is not None and pub.addr == ("127.0.0.1", 47999)
+    assert "viz-cpp: disabled" not in on_buf.getvalue(), on_buf.getvalue()
+    pub.close()
+
+    # Enable flag alone does not open it.
+    assert start_cpp_viz(ap.parse_args(["--enable-viz-cpp"])) is None
+
+    # Literal True in config unlocks --viz-cpp; "yes"/1 do not (literal true only).
+    req = ["--viz-cpp", "--viz-cpp-exe", "/nonexistent/gvd_viz", "--viz-cpp-port", "47998"]
+    args = ap.parse_args(req)
+    pub = start_cpp_viz(args, cameras={"viz": {"cpp_viz_enabled": True}})
+    assert pub is not None
+    pub.close()
+    assert start_cpp_viz(args, cameras={"viz": {"cpp_viz_enabled": "yes"}}) is None
+    assert start_cpp_viz(args, cameras={"viz": {"cpp_viz_enabled": 1}}) is None
+    assert start_cpp_viz(args, cameras={"viz": {"cpp_viz_enabled": False}}) is None
+    assert start_cpp_viz(args, cameras={}) is None
+    # Garbage config is a safe off, never a raise.
+    assert start_cpp_viz(args, cameras={"viz": "nope"}) is None
+    assert start_cpp_viz(args, cameras=[1]) is None
+    assert start_cpp_viz(args, cameras="x") is None
+    assert start_cpp_viz(args, cameras=None) is None  # shipped yaml is disabled
+
+    # No env-var path.
+    old = {k: os.environ.get(k) for k in ("GVD_VIZ_CPP", "GVD_ENABLE_VIZ_CPP", "ENABLE_VIZ_CPP")}
+    try:
+        os.environ["GVD_VIZ_CPP"] = "1"
+        os.environ["GVD_ENABLE_VIZ_CPP"] = "true"
+        os.environ["ENABLE_VIZ_CPP"] = "1"
+        assert start_cpp_viz(ap.parse_args(req)) is None
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    # Gate must not consult the environment.
+    gate = src[src.index("def cpp_viz_unlocked") : src.index("def resolve_main_view")]
+    assert "environ" not in gate and "getenv" not in gate
+
+
 def main() -> None:
     sys.path.insert(0, str(ROOT / "scripts"))
     check_schema()
@@ -475,6 +559,7 @@ def main() -> None:
     check_close_terminates_and_reaps()
     check_close_kill_fallback()
     check_flag_default_off()
+    check_viz_cpp_gate()
     print("test_viz_cpp_publisher: all OK")
 
 

@@ -213,6 +213,167 @@ def check_brake_lights_come_from_each_vehicle() -> None:
     print("brake_lights stay on the vehicle that reported them")
 
 
+
+def check_electrics_keyerror_zero_still_attaches() -> None:
+    """beamngpy Sensors often has __getitem__ but no __contains__.
+
+    Then ``"electrics" in sensors`` iterates via sensors[0] and raises
+    KeyError: 0, which the 30 min bughunt logged for gvd_traffic_0, and
+    attach never ran. A safe lookup must still attach and read the lamp.
+    """
+    import contextlib
+    import io
+
+    import python.collect.recorder_v4 as rec
+
+    rec._ELECTRICS_LOGGED.clear()
+
+    class _MapSensors:
+        def __init__(self) -> None:
+            self._data: dict = {}
+
+        def __getitem__(self, key: object):
+            return self._data[key]
+
+        def attach(self, name: str, sensor: object) -> None:
+            self._data[name] = sensor
+
+    class _Veh:
+        def __init__(self, name: str, lamp: int) -> None:
+            self.name = name
+            self.sensors = _MapSensors()
+            self.lamp = lamp
+            self.polls = 0
+
+        def poll_sensors(self) -> None:
+            self.polls += 1
+            el = self.sensors["electrics"]
+            el.data["brake_lights"] = self.lamp
+
+    class _Api:
+        def get_current(self, **_kwargs):
+            return {"ego": object(), "gvd_traffic_0": lead}
+
+        def get_player_vehicle_id(self):
+            return {"vid": "ego"}
+
+    class _Bng:
+        vehicles = _Api()
+
+    lead = _Veh("gvd_traffic_0", 1)
+    sensors = types.ModuleType("beamngpy.sensors")
+    _install_sensors(sensors)
+    beamngpy = types.ModuleType("beamngpy")
+    beamngpy.sensors = sensors
+    old = {key: sys.modules.get(key) for key in ("beamngpy", "beamngpy.sensors")}
+    sys.modules["beamngpy"] = beamngpy
+    sys.modules["beamngpy.sensors"] = sensors
+    try:
+        # The buggy membership test raises KeyError: 0 on this sensors object.
+        raised = None
+        try:
+            _ = "electrics" in lead.sensors
+        except Exception as exc:  # noqa: BLE001
+            raised = exc
+        assert isinstance(raised, KeyError) and raised.args == (0,), raised
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rows = rec.with_brake_lights(
+                [{"name": "gvd_traffic_0", "pos": [1.0, 2.0, 0.0], "vel": [0.0, 1.0, 0.0], "dir": [0.0, 1.0, 0.0]}],
+                _Bng(),
+            )
+    finally:
+        for key, value in old.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+    assert rows[0]["brake_lights"] == 1, rows
+    assert lead.polls == 1
+    assert "electrics lookup failed" not in buf.getvalue()
+    print("KeyError: 0 membership still attaches traffic Electrics")
+
+
+def check_electrics_contains_lie_still_attaches() -> None:
+    """Membership can lie; only a keyed lookup tells if Electrics is attached.
+
+    A weak fix that still uses ``"electrics" in sensors`` (even if it
+    catches KeyError: 0 and then attaches) treats a true membership test
+    as "already attached" and never calls attach. The IQU45 Sensors object
+    may later grow a ``__contains__`` that does not mean Electrics is
+    present. ``sensors["electrics"]`` must KeyError and attach anyway.
+    """
+    import contextlib
+    import io
+
+    import python.collect.recorder_v4 as rec
+
+    rec._ELECTRICS_LOGGED.clear()
+
+    class _LieSensors:
+        def __init__(self) -> None:
+            self._data: dict = {}
+
+        def __contains__(self, key: object) -> bool:
+            return True
+
+        def __getitem__(self, key: object):
+            return self._data[key]
+
+        def attach(self, name: str, sensor: object) -> None:
+            self._data[name] = sensor
+
+    class _Veh:
+        def __init__(self, name: str, lamp: int) -> None:
+            self.name = name
+            self.sensors = _LieSensors()
+            self.lamp = lamp
+            self.polls = 0
+
+        def poll_sensors(self) -> None:
+            self.polls += 1
+            el = self.sensors["electrics"]
+            el.data["brake_lights"] = self.lamp
+
+    class _Api:
+        def get_current(self, **_kwargs):
+            return {"ego": object(), "gvd_traffic_0": lead}
+
+        def get_player_vehicle_id(self):
+            return {"vid": "ego"}
+
+    class _Bng:
+        vehicles = _Api()
+
+    lead = _Veh("gvd_traffic_0", 1)
+    sensors = types.ModuleType("beamngpy.sensors")
+    _install_sensors(sensors)
+    beamngpy = types.ModuleType("beamngpy")
+    beamngpy.sensors = sensors
+    old = {key: sys.modules.get(key) for key in ("beamngpy", "beamngpy.sensors")}
+    sys.modules["beamngpy"] = beamngpy
+    sys.modules["beamngpy.sensors"] = sensors
+    try:
+        assert "electrics" in lead.sensors  # membership lies
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rows = rec.with_brake_lights(
+                [{"name": "gvd_traffic_0", "pos": [1.0, 2.0, 0.0], "vel": [0.0, 1.0, 0.0], "dir": [0.0, 1.0, 0.0]}],
+                _Bng(),
+            )
+    finally:
+        for key, value in old.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+    assert rows[0]["brake_lights"] == 1, rows
+    assert lead.polls == 1
+    assert "electrics" in lead.sensors._data
+    assert "electrics lookup failed" not in buf.getvalue()
+    print("lying __contains__ still attaches traffic Electrics")
+
+
 def check_electrics_attach_failure_is_masked() -> None:
     """A scenetree car with no beamngpy handle does not crash the collect."""
     import contextlib
@@ -663,6 +824,8 @@ def main() -> None:
     check_traffic_chunk_walks_non_player_objects()
     check_missing_signal_api_is_err_row()
     check_brake_lights_come_from_each_vehicle()
+    check_electrics_keyerror_zero_still_attaches()
+    check_electrics_contains_lie_still_attaches()
     check_electrics_attach_failure_is_masked()
     check_electrics_poll_failure_is_masked()
     check_iqu45_smoke_is_documented()

@@ -558,6 +558,24 @@ def check_cut_in_bend_uses_speed_not_ten() -> None:
     print("cut-in: abs(yr)/speed at 20 m/s, yaw 0.1, 15 m ahead is not a bend; /10.0 would be")
 
 
+def check_cut_in_seen_when_t_is_none() -> None:
+    """A cut-in is still observed when row t is missing: membership, not truthiness of t."""
+    from python.collect.clip_mode import _observe, plan_clip
+
+    plan = plan_clip(0, seed=1, maps=("west_coast_usa",), max_traffic=2, edge_cases=("cut_in",), min_s=4.0, max_s=4.0)
+
+    def row(lat: float, ahead: float = 15.0) -> dict:
+        return {
+            "t": None,
+            "ego": {"pos": [0.0, 0.0, 0.0], "dir": [0, 1, 0], "speed_mps": 10.0, "yaw_rate": 0.0},
+            "traffic": [{"name": "gvd_traffic_1", "pos": [lat, ahead, 0.0]}],
+        }
+
+    ok, msg = _observe(plan, Path("/tmp/unused"), [row(3.5), row(0.3)], [], 1)
+    assert ok is True, (ok, msg)
+    print("cut-in: a missing t still counts as a sighting (name in seen)")
+
+
 def main() -> None:
     check_edge_case_list()
     check_plans_are_seeded_and_bounded()
@@ -574,6 +592,7 @@ def main() -> None:
     check_cli()
     check_cut_in_bend_speed_floor()
     check_cut_in_bend_uses_speed_not_ten()
+    check_cut_in_seen_when_t_is_none()
     check_plan_clip_traffic_zero_off_west_coast()
     check_session_gfx_follows_flag()
     print("test_clip_mode: OK")

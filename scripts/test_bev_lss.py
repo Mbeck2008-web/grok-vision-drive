@@ -397,7 +397,8 @@ def check_transmittance_boundary() -> None:
 
 
 class _FixedDepth(torch.nn.Module):
-    """Spatial stand-in: depth distribution ``p`` at every pixel (or a list, one per camera), unit context."""
+    """Spatial stand-in: depth distribution ``p`` (D, or D x h x w) at every pixel, or a list of them, one per
+    camera; unit context."""
 
     def __init__(self, p) -> None:
         super().__init__()
@@ -405,7 +406,7 @@ class _FixedDepth(torch.nn.Module):
 
     def forward(self, f4, f8, f16, cam):
         n, _, h, w = f8.shape
-        per = [p.view(-1, 1, 1).expand(-1, h, w) for p in self.ps]
+        per = [p.view(-1, 1, 1).expand(-1, h, w) if p.dim() == 1 else p for p in self.ps]
         return torch.stack([per[i % len(per)] for i in range(n)]).contiguous(), torch.ones(n, bl.CTX_CH, h, w)
 
 
@@ -425,12 +426,19 @@ def _bimodal(kw: int, p_wall: float, kf: int, eps: float = 1e-6) -> torch.Tensor
 
 
 def _cells(rig: dict, head, lo: int, hi: int) -> torch.Tensor:
-    """Bool 128x128: cells some valid pixel's bins lo..hi-1 land in."""
-    pts = bl.frustum_ego_points(rig["K"], rig["T"], head.depths, (24, 32))[0, 0]
-    idx, ok = bl.bev_flat_index(pts)
-    ok = ok & rig["pixel_valid"][0].bool()[None]
+    """Bool 128x128: cells some valid in-band visibility sample governed by bins lo..hi-1 lands in.
+
+    Samples are the bin centres (centre i: reach T_i) and the edges between bins (edge j: reach S_{j+1}
+    = T_{j+2}, so edge j counts as bin j + 2). Only samples inside the ground band count.
+    """
     m = torch.zeros(128 * 128, dtype=torch.bool)
-    m[idx[lo:hi][ok[lo:hi]]] = True
+    pv = rig["pixel_valid"][0].bool()[None]
+    for depths, shift in ((head.depths, 0), (head.edges, 2)):
+        pts = bl.frustum_ego_points(rig["K"], rig["T"], depths, (24, 32))[0, 0]
+        idx, ok = bl.bev_flat_index(pts)
+        ok = ok & pv & bl.in_ground_band(pts[..., 2], head.ground_band_max_m)
+        a, b = max(lo - shift, 0), max(hi - shift, 0)
+        m[idx[a:b][ok[a:b]]] = True
     return m.view(128, 128)
 
 
@@ -459,7 +467,8 @@ def check_wall_behind_is_unknown_not_free() -> None:
     Walls on main (bins 12 and 24), pillarL (bin 16) and rear (bin 20), with the rest of the depth
     mass spread evenly (p_hit 0.6, 0.8, 0.94, 0.987, 0.999999). Cells in front of the wall stay learned.
     """
-    expect_behind = {("main", 12): 776}
+    # in-band centre + edge samples (ground band 0.5 m); was 776 with centres only over the whole z band
+    expect_behind = {("main", 12): 908}
     for cam, k in (("main", 12), ("main", 24), ("pillarL", 16), ("rear", 20)):
         for p_hit in (0.6, 0.8, 0.94, 0.987, 0.999999):
             out, rig, head = _run_fixed(cam, _peaked(k, p_hit))
@@ -505,32 +514,48 @@ def check_bimodal_depth_occludes_between_modes() -> None:
     print("bimodal_depth_occludes_between_modes")
 
 
-def check_visibility_masses_values() -> None:
-    """clear / through / occluded masses on one pixel equal a hand sum over its bins."""
-    K, T = _simple_cam(pos=(0.0, 0.0, 1.0), fx=100.0)
+def _hand_masses(head, band: float) -> None:
+    """One pixel's clear / through / occluded masses equal a hand sum over its in-band samples.
+
+    Level camera at 0.7 m, pixel row 12 (v = 100, cy = 96): height z = 0.7 - 0.04 d. Centre i counts reach
+    T_i / pass S_i; the edge between bins j and j + 1 counts S_{j+1} for both. Samples with z >= band skip.
+    """
+    K, T = _simple_cam(pos=(0.0, 0.0, 0.7), fx=100.0)
     p = torch.zeros(bl.DEPTH_BINS)
-    p[5], p[15], p[25] = 0.25, 0.375, 0.375  # exact in float32
-    head = bl.BevLssHead()
+    p[18], p[26], p[34] = 0.25, 0.375, 0.375  # exact in float32
     head.spatial = _FixedDepth(p)
     only = torch.zeros(1, 24, 32)
     only[0, 12, 16] = 1.0
     with torch.no_grad():
         out = head(*(t[:, :1] for t in _taps()), K, T, pixel_valid=only)
-    pts = bl.frustum_ego_points(K, T, head.depths, (24, 32))[0, 0, :, 12, 16]
-    _idx, ok = bl.bev_flat_index(pts)
+    centres = [float(c) for c in bl.depth_bin_centers()]
+    edges = list(np.geomspace(bl.DEPTH_MIN_M, bl.DEPTH_MAX_M, bl.DEPTH_BINS + 1)[1:-1])
+    samples = [(c, float(p[i:].sum()), float(p[i + 1 :].sum()), "c") for i, c in enumerate(centres)]
+    samples += [(e, float(p[j + 2 :].sum()), float(p[j + 2 :].sum()), "e") for j, e in enumerate(edges)]
     clear = through = occ = 0.0
-    for i in range(bl.DEPTH_BINS):
-        if not bool(ok[i]):
+    above = set()
+    for d, reach, passed, kind in samples:
+        z = 0.7 - 0.04 * d
+        if d > 32.0 or z < bl.BEV_Z_MIN_M:  # off the grid (y = d forward)
             continue
-        reach = float(p[i:].sum())
-        passed = float(p[i + 1 :].sum())
+        if z >= band:
+            above.add(kind)
+            continue
         clear += reach if reach >= 0.5 else 0.0
         through += passed if passed >= 0.5 else 0.0
         occ += (1.0 - reach) if reach < 0.5 else 0.0
     assert clear > 0 and through > 0 and occ > 0
-    assert abs(float(out["clear_mass"].sum()) - clear) < 1e-5, (float(out["clear_mass"].sum()), clear)
-    assert abs(float(out["through_mass"].sum()) - through) < 1e-5, (float(out["through_mass"].sum()), through)
-    assert abs(float(out["occluded_mass"].sum()) - occ) < 1e-5, (float(out["occluded_mass"].sum()), occ)
+    assert above == ({"c", "e"} if band <= 0.6 else set()), (band, above)
+    assert abs(float(out["clear_mass"].sum()) - clear) < 1e-5, (band, float(out["clear_mass"].sum()), clear)
+    assert abs(float(out["through_mass"].sum()) - through) < 1e-5, (band, float(out["through_mass"].sum()), through)
+    assert abs(float(out["occluded_mass"].sum()) - occ) < 1e-5, (band, float(out["occluded_mass"].sum()), occ)
+
+
+def check_visibility_masses_values() -> None:
+    """Hand-summed masses at the default 0.5 m band (near samples above it skip) and at a 1.0 m band
+    passed through the config (every sample counts, centres and edges alike)."""
+    _hand_masses(bl.BevLssHead(), 0.5)
+    _hand_masses(bl.build_bev_head({"bev_lss": {"enabled": True, "ground_band_max_m": 1.0}}), 1.0)
     print("visibility_masses_values")
 
 
@@ -1256,11 +1281,12 @@ def check_dtype_follows_model() -> None:
         assert got["logits"].dtype == torch.float32
         plain = head(f4, f8, f16, rig["K"], rig["T"])
         assert torch.equal(got["logits"], plain["logits"])
-    # the lift geometry runs in K's dtype: a float64 depth buffer must not upcast the float32 frustum
+    # the lift geometry runs in K's dtype: float64 depth / edge buffers must not upcast the float32 frustum
     K, T = _simple_cam(pos=(0.0, 0.0, 1.0), fx=100.0)
     headg = bl.BevLssHead()
     headg.spatial = _ConstSpatial(int(torch.argmin((headg.depths - 10.0).abs())), 1.0)
     headg.depths = headg.depths.double()
+    headg.edges = headg.edges.double()
     seen = []
     orig = bl.bev_flat_index
 
@@ -1273,9 +1299,189 @@ def check_dtype_follows_model() -> None:
         headg(*(t[:, :1] for t in _taps()), K, T)
     finally:
         bl.bev_flat_index = orig
-    assert seen == [torch.float32], seen
+    assert seen == [torch.float32, torch.float32], seen  # bin centres, then the visibility edges
     print("dtype_follows_model")
 
+
+# ---------------------------------------------------------------- G5 ground band: rays over low occluders
+def _ray_box(o, d, lo, hi):
+    t0, t1 = -np.inf, np.inf
+    for a in range(3):
+        if abs(d[a]) < 1e-12:
+            if o[a] < lo[a] or o[a] > hi[a]:
+                return None
+        else:
+            ta, tb = (lo[a] - o[a]) / d[a], (hi[a] - o[a]) / d[a]
+            t0, t1 = max(t0, min(ta, tb)), min(t1, max(ta, tb))
+    return t0 if (t1 >= t0 and t1 > 0) else None
+
+
+def _scene_depth(geoms, boxes, p_true: float = 0.95) -> torch.Tensor:
+    """Ray-cast flat ground (z = 0) plus boxes: p_true at the true z-depth bin, the rest uniform. Rays that
+    hit nothing within 48 m put p_true in the last bin (sky)."""
+    log_c = np.log(bl.depth_bin_centers())
+    P = torch.zeros(len(geoms), bl.DEPTH_BINS, 24, 32)
+    for n, g in enumerate(geoms):
+        K, T = g.K.astype(np.float64), g.T.astype(np.float64)
+        o = T[:3, 3]
+        for r in range(24):
+            for c in range(32):
+                rc = np.array([((c + 0.5) * 8 - K[0, 2]) / K[0, 0], ((r + 0.5) * 8 - K[1, 2]) / K[1, 1], 1.0])
+                d = T[:3, :3] @ rc  # ego displacement per metre of z-depth
+                ts = [-o[2] / d[2]] if d[2] < -1e-9 else []
+                for lo, hi in boxes:
+                    t = _ray_box(o, d, np.array(lo), np.array(hi))
+                    if t is not None:
+                        ts.append(t)
+                z = min(ts) if ts else 60.0
+                k = int(np.argmin(np.abs(log_c - np.log(max(z, 1.0))))) if z <= bl.DEPTH_MAX_M else bl.DEPTH_BINS - 1
+                P[n, :, r, c] = (1.0 - p_true) / (bl.DEPTH_BINS - 1)
+                P[n, k, r, c] = p_true
+    return P
+
+
+def _scene_run(cams, boxes, head=None):
+    geoms = bl.rig_geometry(cams, _cfg(), model=BASE_RIG_MODEL)
+    rig = bl.rig_tensors(geoms)
+    head = (head or bl.BevLssHead()).eval()
+    P = _scene_depth(geoms, boxes)
+    head.spatial = _FixedDepth([P[i] for i in range(len(cams))])
+    nc = len(cams)
+    taps = (torch.zeros(1, nc, 64, 48, 64), torch.zeros(1, nc, 128, 24, 32), torch.zeros(1, nc, 128, 12, 16))
+    with torch.no_grad():
+        out = head(*taps, rig["K"], rig["T"], pixel_valid=rig["pixel_valid"])
+    return out, geoms
+
+
+def _shadow_core(geoms, lo, hi, margin: float = 0.3) -> list[tuple[int, int]]:
+    """Cells beyond the box whose ground point's ray passes >= margin inside the box for every camera that
+    has it in view (Skeptic's shadow-core definition, pr241v3_logs/scene_probe.py)."""
+    lo2 = np.array(lo, dtype=np.float64) + margin
+    hi2 = np.array(hi, dtype=np.float64) - margin
+    lo2[2] = lo[2]
+    cells = []
+    for r in range(64):
+        for c in range(128):
+            y, x = 32 - 0.5 * (r + 0.5), -32 + 0.5 * (c + 0.5)
+            if y <= hi[1] + 0.5:
+                continue
+            inview, hidden = 0, True
+            for g in geoms:
+                o = g.T[:3, 3].astype(np.float64)
+                tgt = np.array([x, y, 0.0])
+                cam = np.linalg.inv(g.T.astype(np.float64)) @ np.append(tgt, 1.0)
+                if cam[2] <= 0:
+                    continue
+                u = g.K[0, 0] * cam[0] / cam[2] + g.K[0, 2]
+                v = g.K[1, 1] * cam[1] / cam[2] + g.K[1, 2]
+                nw, nh, x0, y0 = g.content
+                if not (x0 <= u < x0 + nw and y0 <= v < y0 + nh):
+                    continue
+                inview += 1
+                t = _ray_box(o, tgt - o, lo2, hi2)
+                if t is None or t >= 1.0:
+                    hidden = False
+                    break
+            if hidden and inview > 0:
+                cells.append((r, c))
+    return cells
+
+
+def _footprint(lo, hi, whole: bool = False) -> list[tuple[int, int]]:
+    """Cells whose centre is inside the box's ground footprint, or (``whole``) whose whole 0.5 m square is."""
+    m = 0.25 if whole else 0.0
+    return [
+        (r, c)
+        for r in range(64)
+        for c in range(128)
+        if lo[0] + m <= -32 + 0.5 * (c + 0.5) <= hi[0] - m and lo[1] + m <= 32 - 0.5 * (r + 0.5) <= hi[1] - m
+    ]
+
+
+CAR_BOX = ((-0.9, 8.0, 0.0), (0.9, 12.5, 1.5))  # 1.8 x 4.5 x 1.5 m car, 8-12.5 m ahead
+VAN_BOX = ((-1.0, 8.0, 0.0), (1.0, 13.0, 2.5))  # 2 x 5 x 2.5 m van
+
+
+def check_low_occluder_hides_ground() -> None:
+    """G5: rays that skim over a car roof do not open the hidden ground behind it or the car's own cells.
+
+    Ray-cast scene (flat ground, a 1.5 m car or a 2.5 m van at 8-12.5 m, depth head 95% sure of the true
+    surface) on main alone and on narrow + main + wide. Shadow-core cells and footprint cells: never free,
+    never seen. Open ground in front of the car stays free-eligible.
+    """
+    for name, (lo, hi) in (("car", CAR_BOX), ("van", VAN_BOX)):
+        for cams in (["main"], ["narrow", "main", "wide"]):
+            out, geoms = _scene_run(cams, [(lo, hi)])
+            lg = out["logits"][0]
+            free_ok = lg[bl.CH_FREE] != -bl.FORCE_LOGIT
+            seen = lg[bl.CH_UNKNOWN] != bl.FORCE_LOGIT
+            core = _shadow_core(geoms, lo, hi)
+            assert len(core) > 200, (name, cams, len(core))
+            nf = sum(bool(free_ok[r, c]) for r, c in core)
+            ns = sum(bool(seen[r, c]) for r, c in core)
+            assert nf == 0 and ns == 0, f"{name} {cams}: shadow core {len(core)}: free-eligible {nf}, seen {ns}"
+            # cells wholly under the vehicle: never free. (A centre-inside cell that sticks out past the side,
+            # e.g. x -1.0..-0.5 for the car's x >= -0.9, may be opened by a ray passing that 0.1 m strip.)
+            fp = _footprint(lo, hi, whole=True)
+            assert len(fp) >= 18, (name, len(fp))
+            nfp = sum(bool(free_ok[r, c]) for r, c in fp)
+            assert nfp == 0, f"{name} {cams}: footprint {len(fp)}: free-eligible {nfp}"
+            # ground in front of the car (3-7 m, centre columns) is seen and free-eligible
+            front = [(r, c) for r in range(50, 58) for c in (63, 64)]  # y 3.25-6.75 m
+            assert all(bool(free_ok[r, c]) and bool(seen[r, c]) for r, c in front), (name, cams)
+    # no occluder: the centre column at 5, 10 and 15 m is free-eligible on main (realistic head, 15 m floor)
+    out, _ = _scene_run(["main"], [])
+    free_ok = out["logits"][0, bl.CH_FREE] != -bl.FORCE_LOGIT
+    for ahead in (5.0, 10.0, 15.0):
+        assert bool(free_ok[int((32 - ahead) / 0.5), 64]), ahead
+    print("low_occluder_hides_ground")
+
+
+def check_sky_rays_never_free() -> None:
+    """A ray above the horizon with its depth mass in the last bin (sky) marks no cell free or seen."""
+    K, T = _simple_cam(pos=(0.0, 0.0, 1.3), fx=100.0)
+    only = torch.zeros(1, 24, 32)
+    only[0, 4, 16] = 1.0  # v = 36 < cy = 96: the ray rises
+    p = torch.full((bl.DEPTH_BINS,), 0.05 / (bl.DEPTH_BINS - 1))
+    p[-1] = 0.95
+    taps = (torch.zeros(1, 1, 64, 48, 64), torch.zeros(1, 1, 128, 24, 32), torch.zeros(1, 1, 128, 12, 16))
+    head = bl.BevLssHead().eval()
+    head.spatial = _FixedDepth(p)
+    with torch.no_grad():
+        out = head(*taps, K, T, pixel_valid=only)
+    assert float(out["pass_mass"].sum()) > 0  # the ray does land in the grid (inside the z band)
+    assert float(out["through_mass"].sum()) == 0.0 and float(out["clear_mass"].sum()) == 0.0
+    assert float(out["occluded_mass"].sum()) == 0.0
+    assert torch.all(out["logits"][0, bl.CH_FREE] == -bl.FORCE_LOGIT)
+    assert torch.all(out["logits"][0, bl.CH_UNKNOWN] == bl.FORCE_LOGIT)
+    # the same ray with the band opened to the whole z range does mark free (the check bites)
+    wide = bl.build_bev_head({"bev_lss": {"enabled": True, "ground_band_max_m": bl.BEV_Z_MAX_M}}).eval()
+    wide.spatial = _FixedDepth(p)
+    with torch.no_grad():
+        out_w = wide(*taps, K, T, pixel_valid=only)
+    assert float(out_w["through_mass"].sum()) > 0
+    assert not torch.all(out_w["logits"][0, bl.CH_FREE] == -bl.FORCE_LOGIT)
+    print("sky_rays_never_free")
+
+
+def check_ground_band_pinned_and_plumbed() -> None:
+    """GROUND_BAND_MAX_M is 0.5 m, validated, and a non-default value reaches the head through the config."""
+    assert bl.GROUND_BAND_MAX_M == 0.5, bl.GROUND_BAND_MAX_M
+    assert bl.BevLssHead().ground_band_max_m == 0.5
+    for bad in (bl.BEV_Z_MIN_M, bl.BEV_Z_MIN_M - 1.0, bl.BEV_Z_MAX_M + 0.1, float("nan")):
+        _raises(ValueError, lambda: bl.BevLssHead(ground_band_max_m=bad), match="ground_band_max_m")
+    bl.BevLssHead(ground_band_max_m=bl.BEV_Z_MAX_M)  # the top of the z band is legal
+    head = bl.build_bev_head({"bev_lss": {"enabled": True, "ground_band_max_m": 2.0}})
+    assert head.ground_band_max_m == 2.0 and head.reach_tau == bl.REACH_TAU
+    # 2.0 m band: rays over the 1.5 m car roof count again, so the car's footprint opens (default stays shut)
+    out, _ = _scene_run(["main"], [CAR_BOX], head=head)
+    free_ok = out["logits"][0, bl.CH_FREE] != -bl.FORCE_LOGIT
+    assert sum(bool(free_ok[r, c]) for r, c in _footprint(*CAR_BOX)) > 0
+    # boundary: a point exactly at the band top is outside the band (z < max), like the BEV z band
+    z = torch.tensor([0.25, 0.5 - 1e-6, 0.5, 0.5 + 1e-6, 3.0])
+    assert bl.in_ground_band(z, 0.5).tolist() == [True, True, False, False, False]
+    assert bl.in_ground_band(z, 2.0).tolist() == [True, True, True, True, False]
+    print("ground_band_pinned_and_plumbed")
 
 def main() -> None:
     check_intrinsics_from_fov()
@@ -1295,6 +1501,9 @@ def main() -> None:
     check_visibility_masses_values()
     check_occlusion_branches()
     check_visibility_taus_plumbed()
+    check_ground_band_pinned_and_plumbed()
+    check_sky_rays_never_free()
+    check_low_occluder_hides_ground()
     check_pass_mass_is_survival()
     check_zero_valid_cameras_no_nan()
     check_gradients_reach_stem_and_depth()

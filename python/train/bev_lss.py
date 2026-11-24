@@ -28,7 +28,14 @@ G5  Unknown is the default, decided per ray by depth transmittance.
     behind a wall: ``occluded`` is forced high as well. Cells no valid ray
     landed in are unknown, not occluded. A partial wall (p < 1) or a second
     depth guess beyond it does not open the cells in between unless the
-    ray more likely than not got there. This is structural, not a loss weight.
+    ray more likely than not got there. Only ray points inside the ground
+    band (``z < GROUND_BAND_MAX_M``, ego frame, ground at z = 0 under the
+    ego) count for seen / free / occluded: a ray that skims over a car roof,
+    or rises into the sky, says nothing about the ground under it, so the
+    hidden ground behind a low occluder and the occluder's own cells stay
+    unknown. Objects lower than the band (curbs, debris under 0.5 m) can
+    still be passed over; flat-ground z = 0 is assumed (UNVERIFIED on
+    slopes). This is structural, not a loss weight.
 G6  The output is differentiable with respect to the stem taps and the
     depth head.
 G7  No NaN or Inf, including a batch where no camera is valid.
@@ -91,6 +98,11 @@ FORCE_LOGIT = 30.0
 # a wall it is less than half sure of does not.
 REACH_TAU = 0.5  # seen: T_i = sum_{j >= i} p_j >= REACH_TAU
 FREE_PASS_TAU = 0.5  # may be free: S_i = sum_{j > i} p_j >= FREE_PASS_TAU
+# Ground band (G5): only frustum points with z < GROUND_BAND_MAX_M (ego frame,
+# metres above the ground under the ego) count for seen / free / occluded.
+# 0.5 m sits below a car's sill and roof, so a ray passing over a vehicle
+# never opens the ground behind it; the ground itself (z ~ 0) is inside.
+GROUND_BAND_MAX_M = 0.5
 
 # Categorical depth (audit item 9: 40 log bins, 1-48 m).
 DEPTH_BINS = 40
@@ -116,6 +128,12 @@ def depth_bin_centers(bins: int = DEPTH_BINS, lo: float = DEPTH_MIN_M, hi: float
         raise ValueError(f"bad depth bins: bins={bins} lo={lo} hi={hi}")
     edges = np.geomspace(lo, hi, bins + 1)
     return (0.5 * (edges[1:] + edges[:-1])).astype(np.float32)
+
+
+def depth_bin_inner_edges(bins: int = DEPTH_BINS, lo: float = DEPTH_MIN_M, hi: float = DEPTH_MAX_M) -> np.ndarray:
+    """The ``bins - 1`` log-spaced edges between neighbouring depth bins (edge j sits between bins j and j + 1)."""
+    depth_bin_centers(bins, lo, hi)  # same validation
+    return np.geomspace(lo, hi, bins + 1)[1:-1].astype(np.float32)
 
 
 def content_rect(res_w: int, res_h: int, crop_w: int = CROP_W, crop_h: int = CROP_H) -> tuple[int, int, int, int]:
@@ -310,6 +328,18 @@ def visibility_gates(reach: Any, passed: Any, reach_tau: float = REACH_TAU, free
     return (reach >= reach_tau).to(reach.dtype), (passed >= free_pass_tau).to(reach.dtype)
 
 
+def in_ground_band(z: Any, band_max_m: float = GROUND_BAND_MAX_M) -> Any:
+    """True where an ego-frame height is inside the ground band (``z < band_max_m``, exclusive like the z band)."""
+    return z < band_max_m
+
+
+def _check_band(value: float) -> float:
+    value = float(value)
+    if not (BEV_Z_MIN_M < value <= BEV_Z_MAX_M):
+        raise ValueError(f"ground_band_max_m must be in ({BEV_Z_MIN_M}, {BEV_Z_MAX_M}], got {value}")
+    return value
+
+
 def _check_tau(name: str, value: float) -> float:
     value = float(value)
     if not (0.0 < value <= 1.0):
@@ -408,13 +438,16 @@ class BevLssHead(nn.Module):
         depth_bins: int = DEPTH_BINS,
         reach_tau: float = REACH_TAU,
         free_pass_tau: float = FREE_PASS_TAU,
+        ground_band_max_m: float = GROUND_BAND_MAX_M,
     ) -> None:
         super().__init__()
         self.spatial = SpatialPath(depth_bins=depth_bins)
         self.encoder = BevEncoder(CTX_CH + 2)
         self.reach_tau = _check_tau("reach_tau", reach_tau)
         self.free_pass_tau = _check_tau("free_pass_tau", free_pass_tau)
+        self.ground_band_max_m = _check_band(ground_band_max_m)
         self.register_buffer("depths", torch.from_numpy(depth_bin_centers(depth_bins)), persistent=False)
+        self.register_buffer("edges", torch.from_numpy(depth_bin_inner_edges(depth_bins)), persistent=False)
 
     @staticmethod
     def camera_features(K: Any, T: Any) -> Any:
@@ -442,7 +475,8 @@ class BevLssHead(nn.Module):
         ``hit_mass``, ``pass_mass``, ``clear_mass`` (sum of T over valid rays that reached the
         cell), ``through_mass`` (sum of S over valid rays that passed through it),
         ``occluded_mass`` (sum of 1 - T over valid rays that landed there but did not reach it),
-        all B x 1 x 128 x 128, and ``depth_prob``.
+        all B x 1 x 128 x 128, and ``depth_prob``. The three visibility masses count only ray
+        points inside the ground band (``z < ground_band_max_m``).
         """
         b, n = f8.shape[:2]
         flat = lambda t: t.reshape(b * n, *t.shape[2:])  # noqa: E731
@@ -458,14 +492,29 @@ class BevLssHead(nn.Module):
         beyond = depth_survival(prob, dim=2)
         prob_w = prob * weight
         beyond_w = beyond * weight
+        pts = frustum_ego_points(K, T, self.depths.to(K.dtype), (h, w), FEAT_STRIDE, time_offset_s, ego_speed_mps)
+        band_w = in_ground_band(pts[..., 2], self.ground_band_max_m).to(prob.dtype) * weight  # B N D h w
         reach = depth_transmittance(prob, dim=2)
         reached, through = visibility_gates(reach, beyond, self.reach_tau, self.free_pass_tau)
-        clear_w = reach * reached * weight
-        through_w = beyond * through * weight
-        occ_w = (1.0 - reach) * (1.0 - reached) * weight
+        clear_w = reach * reached * band_w
+        through_w = beyond * through * band_w
+        occ_w = (1.0 - reach) * (1.0 - reached) * band_w
+        # Visibility is also sampled at the edge between bins j and j + 1. In the ground band only
+        # near-ground points count, and the bin centres alone leave whole cell rows unsampled at range
+        # (bins ~1.4 m apart at 15 m, cells 0.5 m). An edge counts only the mass beyond bin j + 1
+        # (S_{j+1}) for both reach and pass, so a surface anywhere in bin j + 1, or snapped into it
+        # from just before the edge, never opens the edge point.
+        pts_e = frustum_ego_points(K, T, self.edges.to(K.dtype), (h, w), FEAT_STRIDE, time_offset_s, ego_speed_mps)
+        band_e = in_ground_band(pts_e[..., 2], self.ground_band_max_m).to(prob.dtype) * weight
+        s_e = beyond[:, :, 1:]
+        reached_e, through_e = visibility_gates(s_e, s_e, self.reach_tau, self.free_pass_tau)
+        idx_e, ok_e = bev_flat_index(pts_e)
+        vis_e = torch.stack(
+            [(1.0 - s_e) * (1.0 - reached_e) * band_e, s_e * reached_e * band_e, s_e * through_e * band_e], dim=-1
+        ).reshape(b, n * (d - 1) * h * w, 3)
+        vis_e = splat(vis_e, idx_e.reshape(b, -1), ok_e.reshape(b, -1))
         ctx = ctx.view(b, n, 1, CTX_CH, h, w)
         lifted = prob_w.unsqueeze(3) * ctx  # B N D C h w
-        pts = frustum_ego_points(K, T, self.depths.to(K.dtype), (h, w), FEAT_STRIDE, time_offset_s, ego_speed_mps)
         idx, ok = bev_flat_index(pts)  # B N D h w
         values = torch.cat(
             [
@@ -484,7 +533,9 @@ class BevLssHead(nn.Module):
         passed = bev[:, CTX_CH + 1 : CTX_CH + 2]
         occ = bev[:, CTX_CH + 2 : CTX_CH + 3]
         clear = bev[:, CTX_CH + 3 : CTX_CH + 4]
-        thru = bev[:, CTX_CH + 4 : CTX_CH + 5]
+        thru = bev[:, CTX_CH + 4 : CTX_CH + 5] + vis_e[:, 2:3]
+        occ = occ + vis_e[:, 0:1]
+        clear = clear + vis_e[:, 1:2]
         logits = self.encoder(torch.cat([feat, torch.log1p(hit), torch.log1p(passed)], dim=1))
         logits = apply_visibility(logits, clear, thru, occluded_mass=occ)
         return {
@@ -548,4 +599,5 @@ def build_bev_head(cfg: Mapping[str, Any] | None = None) -> Any:
         depth_bins=int(section.get("depth_bins", DEPTH_BINS)),
         reach_tau=float(section.get("reach_tau", REACH_TAU)),
         free_pass_tau=float(section.get("free_pass_tau", FREE_PASS_TAU)),
+        ground_band_max_m=float(section.get("ground_band_max_m", GROUND_BAND_MAX_M)),
     )

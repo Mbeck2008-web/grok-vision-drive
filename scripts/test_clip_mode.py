@@ -464,6 +464,26 @@ def check_cli() -> None:
     print("collect_clips CLI: 30-60 s bounds, one collector process per clip")
 
 
+def check_default_clip_maps_have_a_dump() -> None:
+    """Every collect_clips DEFAULT_MAPS entry has a road dump; utah stays valid when passed."""
+    import importlib.util
+
+    from python.collect.spawn_mix import spawn_roads_path
+
+    spec = importlib.util.spec_from_file_location("collect_clips", ROOT / "scripts" / "collect_clips.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)  # type: ignore[union-attr]
+    maps = cli._maps(cli.DEFAULT_MAPS)
+    assert maps, cli.DEFAULT_MAPS
+    assert "utah" not in maps and "jungle_rock_island" not in maps, maps
+    for name in maps:
+        path = spawn_roads_path(name)
+        assert path is not None and path.is_file(), (name, path)
+    explicit = cli.parse_args(["--out", "/tmp/x", "--maps", "utah,jungle_rock_island"])
+    assert explicit.maps == ("utah", "jungle_rock_island")
+    print("collect_clips DEFAULT_MAPS: every default map has a dump; utah still accepted explicitly")
+
+
 def check_cut_in_bend_speed_floor() -> None:
     """A cut-in at 0.3 m/s is still a cut-in: yaw is not curvature below 0.5 m/s."""
     from python.collect.clip_mode import plan_clip, quality_check
@@ -608,6 +628,7 @@ def main() -> None:
     check_tags_never_overwritten()
     check_run_clips_with_fake_collector()
     check_cli()
+    check_default_clip_maps_have_a_dump()
     check_cut_in_bend_speed_floor()
     check_cut_in_bend_uses_speed_not_ten()
     check_cut_in_seen_when_t_is_none()

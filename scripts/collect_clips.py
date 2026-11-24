@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 from python.collect.clip_mode import EDGE_CASES, GFX, MAX_CLIP_S, MIN_CLIP_S, run_clips  # noqa: E402
 
 COLLECTOR = ROOT / "scripts" / "collect_scene_lanes.py"
-DEFAULT_MAPS = "west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island"
+DEFAULT_MAPS = "west_coast_usa,italy,east_coast_usa"
 
 
 def _maps(text: str) -> tuple[str, ...]:

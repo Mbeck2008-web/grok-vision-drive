@@ -30,8 +30,8 @@ is a smoke collect: if those PNGs do not decode, the process stops.
 ``--check-maps`` loads each level as a scenario and exits without recording.
 
     py -3 scripts\\collect_scene_lanes.py --check-maps --list-levels
-    py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island
-    py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60
+    py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa
+    py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa --segment-min 12 --smoke-s 60
 
 IQU45 smoke for brake lights and per-tick signals. Tech is already
 running and ``GVD_DATA_DIR`` is the data disk. One minute is the shortest

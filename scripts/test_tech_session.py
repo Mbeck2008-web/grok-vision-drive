@@ -820,7 +820,7 @@ def check_collector_train_gt_stays_on() -> None:
     assert set(attached) == set(CAM_IDS)
     for cid in CAM_IDS:
         kw = made[f"gvd_collect_{cid}"]
-        want = cid in ("main", "wide")
+        want = True  # recorder v2: depth + semantics on all eight collector cameras
         assert kw["is_render_depth"] is want, cid
         assert kw["is_render_annotations"] is want, cid
         if want:

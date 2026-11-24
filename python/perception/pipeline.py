@@ -10,6 +10,7 @@ import numpy as np
 
 from python.perception.cipv import select_cipv
 from python.perception.detect import STATIC_CLASSES
+from python.perception.lane_select import HOUGH_ONLY_TELEMETRY
 from python.perception.lanes import LaneResult, lanes_from_view
 from python.perception.track import IoUTracker
 from python.planning.path_predictor import (
@@ -77,6 +78,9 @@ class PerceptionOut:
     lane_source: str = "none"
     # Seconds since the windshield/pillar pixels last changed. 0 on a new frame.
     frame_age_s: float = 0.0
+    # Which lane source fed the planner this tick, and why (lane_select).
+    # Flag off: {"mode": "hough", ...}. Never empty, so a fallback is never silent.
+    lane_head: dict[str, Any] = field(default_factory=lambda: dict(HOUGH_ONLY_TELEMETRY))
 
 
 class ModularPerception:
@@ -94,6 +98,9 @@ class ModularPerception:
         self._last_plan: Any = None
         self._last_lanes: LaneResult | None = None
         self._clock = clock  # test-only (scripts/gvd_clock_child.py); None is time.monotonic
+        # --learned-lanes: a lane_select.LearnedLaneSelector. None keeps Hough only.
+        self.lane_selector: Any = None
+        self._lane_head: dict[str, Any] = dict(HOUGH_ONLY_TELEMETRY)
 
     def arm_lane_seed(self) -> None:
         """Drop any center fit before engage. The next pair may seed it.
@@ -134,6 +141,7 @@ class ModularPerception:
         steer_deg: float = 0.0,
         yaw_rate: float = 0.0,
         dt_s: float | None = None,
+        lane_strip: np.ndarray | None = None,
     ) -> PerceptionOut:
         # The wheel is for the override residual and the ego display. The route
         # is predicted from lanes, vehicles, and signs, then followed.
@@ -176,7 +184,14 @@ class ModularPerception:
         pixel_age = 0.0 if fresh else max(0.0, now - self._lane_mono)
         dt = 0.05 if dt_s is None or dt_s <= 0.0 else float(dt_s)
         if fresh or self._last_plan is None:
-            lanes = lanes_from_view(main_bgr, stitch_bgr)
+            if self.lane_selector is not None:
+                # Learned lane head first; Hough only as the reported fallback.
+                selection = self.lane_selector.select(main_bgr, stitch_bgr, strip=lane_strip, dt_s=dt_s)
+                lanes = selection.result
+                self._lane_head = selection.telemetry()
+            else:
+                lanes = lanes_from_view(main_bgr, stitch_bgr)
+                self._lane_head = dict(HOUGH_ONLY_TELEMETRY)
             self._last_lanes = lanes
         else:
             # Same windshield and pillar pixels. Do not treat the old fit as a
@@ -291,6 +306,7 @@ class ModularPerception:
             detector_name=self.detector.name,
             lane_source=plan.lane_source,
             frame_age_s=frame_age_s,
+            lane_head=dict(self._lane_head),
         )
 
 

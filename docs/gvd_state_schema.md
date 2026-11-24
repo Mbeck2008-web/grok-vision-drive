@@ -41,6 +41,7 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 | `electrics_ms` | float | Wall-ms of the grab-loop `read_electrics` (snapshot reuse, or a miss-path poll). |
 | `infer_ms` | float | perception tick ms |
 | `viz_ms` | float | OpenCV stage ms |
+| `viz_view` | string | `reality` (default main view) or `classic` (disabled option). Set when the OpenCV GVD VISION window paints this state. |
 
 Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Poll-free `grab_ms` is the main `stream_raw` cost. The gap versus a hitch-phase `grab_ms` is the companion `stream_raw`. `companion_inflight` stays 0. `grab_read_blocked=1` means the tick moved on instead of waiting out a blocked read. `heartbeat_ms - grab_ms - infer_ms` is the rest of the tick before the heartbeat stamp, including the ego-poll tail (`sensors_poll_ms`, `poll_gps_ms`, `electrics_ms`). `camera_hz` stays the unique GPU-frame EMA. `rss_mb` is the supervisor RSS sample for a long-run sag check.
 

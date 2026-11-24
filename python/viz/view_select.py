@@ -99,6 +99,10 @@ def render_reality_placeholder(
             text, fg = word, tuple(int(c) for c in color)
         org = (x, y if y >= 0 else h + y)
         cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, fg, thick, cv2.LINE_AA)
+    # Cabin top bar: docs/SPEC_no_conf_gate.md requires CONF GATE OFF when the flag is on.
+    from python.viz.stage import _draw_conf_gate_tag
+
+    _draw_conf_gate_tag(img, dict(state or {}), x=max(260, w - 280))
     return img
 
 

@@ -396,24 +396,38 @@ def _local_plane(h: np.ndarray, w: int) -> np.ndarray:
 
     Returns the intercept ``a`` (the fitted height at the window centre).
     Degenerate windows fall back to the inlier mean.
-    """
-    from numpy.lib.stride_tricks import sliding_window_view
 
-    pad = np.pad(h, w, constant_values=np.nan)
-    win = sliding_window_view(pad, (2 * w + 1, 2 * w + 1))
-    mask = np.isfinite(win)
-    dx = np.arange(-w, w + 1, dtype=np.float64)[:, None]
-    dy = np.arange(-w, w + 1, dtype=np.float64)[None, :]
-    zv = np.where(mask, win, 0.0)
-    n = mask.sum(axis=(-1, -2)).astype(np.float64)
-    sx = (mask * dx).sum(axis=(-1, -2))
-    sy = (mask * dy).sum(axis=(-1, -2))
-    sx2 = (mask * (dx * dx)).sum(axis=(-1, -2))
-    sy2 = (mask * (dy * dy)).sum(axis=(-1, -2))
-    sxy = (mask * (dx * dy)).sum(axis=(-1, -2))
-    sz = zv.sum(axis=(-1, -2))
-    szx = (zv * dx).sum(axis=(-1, -2))
-    szy = (zv * dy).sum(axis=(-1, -2))
+    The window sums come from 2-D prefix sums (integral images), so memory
+    is O(nx * ny), not O(nx * ny * (2w+1)^2): a materialised sliding
+    window ran the 64x grid-growth test out of memory.
+    """
+    nx, ny = h.shape
+    mask = np.isfinite(h)
+    m = mask.astype(np.float64)
+    z = np.where(mask, h, 0.0)
+    X = np.arange(nx, dtype=np.float64)[:, None]
+    Y = np.arange(ny, dtype=np.float64)[None, :]
+    k = 2 * w + 1
+
+    def box(v: np.ndarray) -> np.ndarray:
+        c = np.zeros((nx + 2 * w + 1, ny + 2 * w + 1))
+        c[1:, 1:] = np.pad(v, w).cumsum(0).cumsum(1)
+        return c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+
+    n = box(m)
+    Sx, Sy = box(m * X), box(m * Y)
+    Sxx, Syy, Sxy = box(m * X * X), box(m * Y * Y), box(m * X * Y)
+    Sz, Szx, Szy = box(z), box(z * X), box(z * Y)
+    # Shift absolute index moments to window-centre offsets dx = X - i.
+    i, j = X, Y
+    sx = Sx - i * n
+    sy = Sy - j * n
+    sx2 = Sxx - 2.0 * i * Sx + i * i * n
+    sy2 = Syy - 2.0 * j * Sy + j * j * n
+    sxy = Sxy - j * Sx - i * Sy + i * j * n
+    sz = Sz
+    szx = Szx - i * Sz
+    szy = Szy - j * Sz
     det = (
         n * (sx2 * sy2 - sxy * sxy)
         - sx * (sx * sy2 - sxy * sy)
@@ -424,6 +438,7 @@ def _local_plane(h: np.ndarray, w: int) -> np.ndarray:
         - sx * (szx * sy2 - sxy * szy)
         + sy * (szx * sxy - sx2 * szy)
     )
+    n = np.rint(n)
     with np.errstate(invalid="ignore", divide="ignore"):
         a = det_a / det
         mean = sz / np.maximum(n, 1.0)
@@ -433,7 +448,24 @@ def _local_plane(h: np.ndarray, w: int) -> np.ndarray:
 
 def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
                        ix0: np.ndarray, iy0: np.ndarray, cell_m: float) -> np.ndarray:
+    """Ground layer index per xy column id (see ``_column_ground_lvl_compact``).
+
+    Works on the occupied columns only, so the per-column arrays scale
+    with the hot set, not with the grid's xy extent; the result is
+    indexed by the caller's ``col`` ids (unused ids hold int64 min).
+    """
+    uniq, inv = np.unique(col, return_inverse=True)
+    t = _column_ground_lvl_compact(inv.reshape(col.shape), lvl, p_hot, ix0, iy0, cell_m)
+    out = np.full(int(col.max()) + 1, np.iinfo(np.int64).min)
+    out[uniq] = t
+    return out
+
+
+def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
+                               ix0: np.ndarray, iy0: np.ndarray, cell_m: float) -> np.ndarray:
     """Ground layer index per xy column, chosen from the bottom up.
+
+    ``col`` holds dense ids 0..n-1 (every id occupied).
 
     The seed is the highest near-max layer (within ``BAND_MARGIN`` of the
     column max) in a three-layer window starting at the lowest near-max
@@ -483,34 +515,44 @@ def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
     valid = raw > np.iinfo(np.int64).min // 2
     cs = np.flatnonzero(valid)
     radius_m = 12.0
-    w = max(1, int(np.ceil(radius_m / float(cell_m))))
+    # The 2-D envelope / plane rasters use tiles of at least TILE_M, so
+    # their size depends on the metric extent, not the grid resolution
+    # (test_occ_cams grid growth). At the production cells (0.8 / 1.6 m)
+    # a tile is one column and this is exact.
+    TILE_M = 0.8
+    s_t = max(1, int(np.floor(TILE_M / float(cell_m) + 1e-6)))
+    tix = col_ix // s_t
+    tiy = col_iy // s_t
+    ntx = (nx - 1) // s_t + 1
+    nty = (ny - 1) // s_t + 1
+    w = max(1, int(np.ceil(radius_m / (float(cell_m) * s_t))))
     # Only strong-p columns vote, so a weak fill in a hole cannot pull
     # the lower envelope a layer down and reject the true ground.
-    pmax2d = np.full((nx, ny), -np.inf)
+    pmax2d = np.full((ntx, nty), -np.inf)
     if cs.size:
-        pmax2d[col_ix[cs], col_iy[cs]] = pmax[cs]
+        np.maximum.at(pmax2d, (tix[cs], tiy[cs]), pmax[cs])
     local_pmax = sliding_window_view(
         np.pad(pmax2d, w, constant_values=-np.inf), (2 * w + 1, 2 * w + 1)
     ).max(axis=(-1, -2))
     vote = np.zeros(n_col, dtype=bool)
     if cs.size:
-        vote[cs] = pmax[cs] >= (local_pmax[col_ix[cs], col_iy[cs]] - BAND_MARGIN)
-    seed_h = np.full((nx, ny), np.inf)
+        vote[cs] = pmax[cs] >= (local_pmax[tix[cs], tiy[cs]] - BAND_MARGIN)
+    seed_h = np.full((ntx, nty), np.inf)
     vs = np.flatnonzero(vote)
     if vs.size:
-        seed_h[col_ix[vs], col_iy[vs]] = raw[vs].astype(np.float64)
+        np.minimum.at(seed_h, (tix[vs], tiy[vs]), raw[vs].astype(np.float64))
     env2d = sliding_window_view(
         np.pad(seed_h, w, constant_values=np.inf), (2 * w + 1, 2 * w + 1)
     ).min(axis=(-1, -2))
     env = np.full(n_col, np.inf)
-    env[used] = env2d[col_ix[used], col_iy[used]]
+    env[used] = env2d[tix[used], tiy[used]]
     # Inliers follow the lower envelope up to a 15% grade over the
     # window (far ground on a hill). A column that already has a cell
     # at the envelope (a car or guardrail on real ground) votes at the
     # envelope, not at the object. Roofs of a 3-layer building sit
     # higher than that and stay out of the plane fit.
     GRADE = 0.15
-    max_rise = GRADE * radius_m / float(cell_m)
+    max_rise = GRADE * radius_m / float(cell_m)  # in layers
     has_env_layer = np.zeros(n_col, dtype=bool)
     env_lvl = np.full(n_col, np.iinfo(np.int64).min)
     finite_env = np.isfinite(env)
@@ -531,10 +573,14 @@ def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
     expected = np.full(n_col, np.nan)
     ins = np.flatnonzero(inlier)
     if ins.size:
-        h = np.full((nx, ny), np.nan)
-        h[col_ix[ins], col_iy[ins]] = fit_z[ins]
+        hs = np.zeros((ntx, nty))
+        hn = np.zeros((ntx, nty))
+        np.add.at(hs, (tix[ins], tiy[ins]), fit_z[ins])
+        np.add.at(hn, (tix[ins], tiy[ins]), 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            h = np.where(hn > 0, hs / hn, np.nan)
         plane2d = _local_plane(h, w)
-        expected[used] = plane2d[col_ix[used], col_iy[used]]
+        expected[used] = plane2d[tix[used], tiy[used]]
     # No inliers in the window: fall back to the lower envelope.
     expected = np.where(np.isfinite(expected), expected, env)
     target = np.full(n_col, np.iinfo(np.int64).min)

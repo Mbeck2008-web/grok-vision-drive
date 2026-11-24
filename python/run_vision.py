@@ -487,14 +487,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--viz-cpp",
         action="store_true",
-        help="Request the C++ visualizer (gvd_viz, early-FSD-beta look) over localhost UDP. "
+        help="Request the C++ visualizer (gvd_viz) over localhost UDP. "
         "Disabled unless also passed --enable-viz-cpp (or viz.cpp_viz_enabled: true). Never "
         "blocks the loop; frames drop when the renderer is slow or absent (docs/specs/viz_cpp.md).",
     )
     ap.add_argument(
         "--enable-viz-cpp",
         action="store_true",
-        help="Allow the disabled C++ early-FSD-beta viewer (gvd_viz). Off by default; "
+        help="Allow the disabled C++ visualizer (gvd_viz). Off by default; "
         "--viz-cpp does nothing unless this flag or viz.cpp_viz_enabled: true is set.",
     )
     ap.add_argument("--viz-cpp-port", type=int, default=47800, help="UDP port for --viz-cpp (127.0.0.1 only)")

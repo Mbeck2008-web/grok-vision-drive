@@ -121,6 +121,7 @@ from python.sensors.live_hold import (
 from python.data.cam_hold import CAM_AGE_ORDER
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
+from python.viz.view_select import ViewChoice, render_main_view, resolve_view
 
 
 
@@ -399,10 +400,34 @@ def start_cpp_viz(args: argparse.Namespace) -> Any:
         return None
 
 
+def resolve_main_view(args: argparse.Namespace) -> ViewChoice:
+    """Main view from config/cameras.yaml viz.* and --view / --enable-classic-view."""
+    from python.viz.stage import _load_viz_files
+
+    cams, _vram = _load_viz_files()
+    return resolve_view(
+        cams,
+        cli_view=getattr(args, "view", None),
+        cli_enable_classic=bool(getattr(args, "enable_classic_view", False)),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """CLI for ``python.run_vision``. Default ``--no-conf-gate`` is off."""
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
+    ap.add_argument(
+        "--view",
+        default=None,
+        choices=["reality", "classic"],
+        help="Main view for --viz. Default: viz.main_view in config/cameras.yaml, else reality. "
+        "classic is the old stage view and needs --enable-classic-view (or viz.classic_view_enabled).",
+    )
+    ap.add_argument(
+        "--enable-classic-view",
+        action="store_true",
+        help="Allow the disabled classic stage view (off by default; Reality View is the main view).",
+    )
     ap.add_argument(
         "--viz-cpp",
         action="store_true",
@@ -921,6 +946,9 @@ def main(clock=None) -> None:
 
     cpp_viz = start_cpp_viz(args)
     win = "GVD VISION" if args.viz else None
+    view_choice = resolve_main_view(args)
+    if win is not None:
+        print(f"[GVD] viz main view: {view_choice.view}" + (f" ({view_choice.note})" if view_choice.note else ""), flush=True)
     viz_screen_active = str(args.viz_screen)
     viz_note = ""
     if win:
@@ -2167,8 +2195,12 @@ def main(clock=None) -> None:
                 # Reuse this tick's bus check. A second bus_identity() would
                 # move the clock seam the retail tests count.
                 paint = st if ident.matched else load_paint_state()
-                stage_frame = render_stage(
+                stage_frame = render_main_view(
+                    view_choice,
                     paint,
+                    render_stage,
+                    width=STAGE_W,
+                    height=STAGE_H,
                     ui=ui,
                     main_frame=main,
                     cam_frames=getattr(bundle, "frames", None),

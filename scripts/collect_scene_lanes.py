@@ -968,12 +968,28 @@ def segment_boundary(
 
 
 def segment_changed(loaded_map: str, loaded_index: int, map_name: str, seg_index: int) -> bool:
-    """True when this piece needs a fresh level load.
+    """True when this piece is a new segment.
 
     Two west-coast chunks are different segments even though the level name
     matches. An empty name is the single-level collect and does not reload.
+    Same-map chunks still change segments, but they must respawn rather than
+    reload (see ``needs_level_reload``).
     """
     return bool(map_name) and (map_name != loaded_map or seg_index != loaded_index)
+
+
+# How many times enter_map is tried for a new map before a respawn fallback.
+LEVEL_LOAD_ATTEMPTS = 3
+
+
+def needs_level_reload(loaded_map: str, map_name: str) -> bool:
+    """True when this segment is a different map, or the first named map.
+
+    A new chunk on the same map must not call ``enter_map``: that reloads the
+    level, and a second load can time out and kill the run (IQU45 30 min
+    bughunt, ``west_coast_usa#2``, ``level_load_failed`` / ``TimeoutError``).
+    """
+    return bool(map_name) and map_name != loaded_map
 
 
 def continue_after_segment_end(
@@ -2405,7 +2421,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                 return
             from python.collect.level_session import place_vehicle
-            from python.collect.spawn_mix import traffic_lua
+            from python.collect.spawn_mix import queue_companion_traffic
 
             shift = place_vehicle(bng, vehicle, picked.pos, picked.rot)
             if shift:
@@ -2430,7 +2446,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             segment_open = False
             count = traffic_count(args.traffic, map_name)
             ge = getattr(bng, "queue_lua_command", None)
-            if count and callable(ge):
+            slots, notes = [], []
+            if count and spawn_deck is not None:
                 slots, notes = spawn_deck.traffic_slots(
                     picked, count, float(args.traffic_ahead_m), float(args.traffic_behind_m)
                 )
@@ -2442,8 +2459,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     f"(want ahead={float(args.traffic_ahead_m):.0f}m behind={float(args.traffic_behind_m):.0f}m along the road)",
                     flush=True,
                 )
-                for command in traffic_lua(picked, len(slots), slots):
-                    ge(command)
+            queue_companion_traffic(ge, picked, count, slots)
             print(
                 f"collect spawn {segment_id} {picked.kind} "
                 f"({picked.pos[0]:.1f},{picked.pos[1]:.1f},{picked.pos[2]:.1f}) "
@@ -2716,18 +2732,38 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         respawn_released_for = spawn_mark
             if segment_changed(loaded_map, loaded_index, map_name, seg_index):
                 print(f"collect segment {segment_id}", flush=True)
-                opened = enter_map(bng, map_name, cam_cfg, cams)
-                vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
-                painted = painted_for(map_name)
-                _log_road_heights(map_name, roads, heights_logged)
-                if err or vehicle is None or not roads or not cams:
-                    last_error = err or "no vehicle after load"
-                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
-                    _publish(None, speed, waypoint)
-                    _write_collect_crash(status_root, last_error, {})
-                    print(f"collect stop {last_error}", flush=True)
-                    run.stop("level_load_failed", last_error)
-                    return 2
+                opened = None
+                reloaded = False
+                if needs_level_reload(loaded_map, map_name):
+                    # enter_map drops the live cameras before begin_level.
+                    # A failed new-map load must not restore those already-dropped
+                    # cams or keep collecting on the previous level.
+                    last_load_error = ""
+                    for attempt in range(1, LEVEL_LOAD_ATTEMPTS + 1):
+                        opened = enter_map(bng, map_name, cam_cfg, cams)
+                        vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
+                        painted = painted_for(map_name)
+                        _log_road_heights(map_name, roads, heights_logged)
+                        if not (err or vehicle is None or not roads or not cams):
+                            reloaded = True
+                            break
+                        last_load_error = err or "no vehicle after load"
+                        if attempt < LEVEL_LOAD_ATTEMPTS:
+                            print(
+                                f"collect level load retry {attempt}/{LEVEL_LOAD_ATTEMPTS} "
+                                f"{map_name}: {last_load_error}",
+                                flush=True,
+                            )
+                    if not reloaded:
+                        last_error = last_load_error
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                        _publish(None, speed, waypoint)
+                        _write_collect_crash(status_root, last_error, {})
+                        print(f"collect stop {last_error}", flush=True)
+                        run.stop("level_load_failed", last_error)
+                        return 2
+                else:
+                    print(f"collect segment {segment_id} same map; respawn without reload", flush=True)
                 loaded_map = map_name
                 loaded_index = seg_index
                 if args.static_signs:
@@ -2738,14 +2774,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 clock = place_excursion_clock(clock, persist=gap_persist, fresh=new_clock)
                 live.reset()
                 segment_aborts = 0
-                cams_ready = False
+                if reloaded:
+                    cams_ready = False
                 segment_open = False
                 follow = RoadFollow()
                 lane_track.reset()
                 label_hit = None
                 gate_note = ""
                 warmup_since = None
-                if opened.spawn is not None:
+                if opened is not None and opened.spawn is not None:
                     spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
                 spawn_seq += 1
                 prev_dir = None
@@ -3432,7 +3469,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
             q_before = writer.stats()
             submit_mark = time.monotonic()
-            queued = writer.submit(
+            queued = False
+            if due:
+                queued = writer.submit(
                 due,
                 t=now,
                 timestamps=due_stamps,
@@ -3470,6 +3509,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 tags=tags,
             )
             ticks.add("submit_s", time.monotonic() - submit_mark)
+            write_err = (writer.stats() or {}).get("error")
+            if write_err:
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                print(f"collect stop writer_failed {write_err}", flush=True)
+                run.stop("writer_failed", str(write_err))
+                return 2
             ticks.note(
                 row=bool(queued),
                 cams=len(due),
@@ -3503,8 +3548,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     flush=True,
                 )
                 damage_warned = True
-            if not queued:
+            if due and not queued:
                 # A tick that is not written puts its phases back.
+                # An empty due list is not a drop: no cameras were due.
                 cam_sched.undo()
                 print(
                     f"collect drop writer queue full cams={sorted(due)} "

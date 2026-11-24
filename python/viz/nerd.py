@@ -328,13 +328,18 @@ def render_panel(
     return img
 
 
-def _draw_tabs(
-    img: np.ndarray, tab: str, w: int, y: int, hits: list[dict[str, Any]]
-) -> int:
-    labels = NERD_TABS
-    x = 12
-    row_y = y
-    last_bottom = y + TAB_H
+def tab_layout(w: int, y: int = 0, labels: Any = None) -> list[tuple[str, str, tuple[int, int, int, int]]]:
+    """Nerd tab boxes, wrapped so every rect stays inside ``w``.
+
+    OpenCV Hershey ``getTextSize`` can differ by a couple of pixels across
+    builds of the same version, so a single-row sum is not portable. The
+    drawer already wraps when a tab would pass the right edge; this helper
+    is that layout, shared with the test.
+    """
+    labels = tuple(labels) if labels is not None else NERD_TABS
+    x, row_y = 12, int(y)
+    last_bottom = int(y) + TAB_H
+    out: list[tuple[str, str, tuple[int, int, int, int]]] = []
     for tid, label in labels:
         tw, _th = _text_size(label, FS_TAB)
         box_w = tw + 18
@@ -342,14 +347,24 @@ def _draw_tabs(
             x = 12
             row_y = last_bottom + 6
         rect = (x, row_y, x + box_w, row_y + TAB_H)
+        out.append((str(tid), str(label), rect))
+        x += tw + 26
+        last_bottom = row_y + TAB_H
+    return out
+
+
+def _draw_tabs(
+    img: np.ndarray, tab: str, w: int, y: int, hits: list[dict[str, Any]]
+) -> int:
+    last_bottom = y + TAB_H
+    for tid, label, rect in tab_layout(w, y):
         on = tid == tab
         bg = ICE if on else (40, 36, 34)
         fg = (16, 13, 12) if on else FG
         cv2.rectangle(img, (rect[0], rect[1]), (rect[2], rect[3]), bg, -1)
-        _put(img, label, (x + 8, row_y + TAB_H - 10), FS_TAB, fg)
+        _put(img, label, (rect[0] + 8, rect[3] - 10), FS_TAB, fg)
         hits.append({"kind": "tab", "id": tid, "rect": rect})
-        x += tw + 26
-        last_bottom = row_y + TAB_H
+        last_bottom = rect[3]
     return last_bottom + 8
 
 

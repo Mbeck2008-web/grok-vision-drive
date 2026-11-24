@@ -460,7 +460,19 @@ def _collect(root: Path, out: Path, bng: "_Bng", extra: list[str]) -> int:
         del session, veh, cfg
         return {"main": _Cam()}
 
-    collect.time.sleep = lambda _seconds: None
+    # Advance the collector clock by the requested sleep so 10 Hz cameras
+    # stay due each tick. A no-op sleep left only the first row with
+    # cameras, and later ticks were correctly skipped as empty.
+    _mono = [collect.time.monotonic()]
+
+    def _sleep(seconds: object) -> None:
+        _mono[0] += max(0.0, float(seconds or 0.0))
+
+    def _monotonic() -> float:
+        return _mono[0]
+
+    collect.time.sleep = _sleep
+    collect.time.monotonic = _monotonic
     import python.debug.gt_logger as gt_logger
     import python.sensors.tech as tech
 
@@ -538,6 +550,65 @@ def check_all_cameras_dead() -> None:
     print(f"outage={message}")
 
 
+
+def check_empty_due_is_not_a_drop() -> None:
+    """A tick with nothing due is not a queue-full drop (c8664f9).
+
+    It must not log ``writer queue full``, must not call ``cam_sched.undo()``,
+    and must report ``row=False`` in ticks.jsonl. Always submitting an empty
+    due list would set row=True because empty submit returns True.
+    """
+    import io
+    from python.data.raw_frames import CameraSchedule
+    from python.collect.tick_log import TICKS_FILE
+
+    undo_on_empty = [0]
+    last_empty = [False]
+    real_tick = CameraSchedule.tick
+    real_undo = CameraSchedule.undo
+    ticks_n = [0]
+
+    def tick(self, now_s, cams):
+        ticks_n[0] += 1
+        # After the first due tick, force one empty due list.
+        if ticks_n[0] == 3:
+            last_empty[0] = True
+            return []
+        last_empty[0] = False
+        return real_tick(self, now_s, cams)
+
+    def undo(self, cams=None):
+        if last_empty[0]:
+            undo_on_empty[0] += 1
+        return real_undo(self, cams)
+
+    CameraSchedule.tick = tick
+    CameraSchedule.undo = undo
+    try:
+        with collect_root() as root:
+            out = root / "scene"
+            vehicle = _Vehicle(stop_file(out), stop_after=6)
+            bng = _Bng(vehicle)
+            # Capture stdout for the drop line
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = _collect(root, out, bng, ["--no-excursions", "--smoke-s", "0"])
+            text = buf.getvalue()
+            assert code == 0, (code, text[-2000:])
+            assert "writer queue full" not in text, text[-2000:]
+            assert undo_on_empty[0] == 0, undo_on_empty
+            tick_path = out / TICKS_FILE
+            rows = [json.loads(ln) for ln in tick_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            empty = [r for r in rows if int(r.get("cams") or 0) == 0]
+            assert empty, rows
+            assert all(r.get("row") is False for r in empty), empty
+    finally:
+        CameraSchedule.tick = real_tick
+        CameraSchedule.undo = real_undo
+    print(f"empty due is not a drop ok: empty_ticks={len(empty)} undo_on_empty={undo_on_empty[0]}")
+
+
 def main() -> None:
     check_read_vehicle()
     check_stream_raw_not_poll()
@@ -545,6 +616,7 @@ def main() -> None:
     check_all_cameras_dead()
     check_one_tick()
     check_probe_every_2_and_traffic_rate()
+    check_empty_due_is_not_a_drop()
     check_probe_round_trips()
     check_pipeline_version_gate()
     check_ctl_null_counts()

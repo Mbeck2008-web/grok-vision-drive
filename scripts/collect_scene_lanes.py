@@ -2719,7 +2719,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         print(f"collect stop {last_error}", flush=True)
                         run.stop("level_load_failed", last_error)
                         return 2
-                elif not needs_level_reload(loaded_map, map_name):
+                else:
                     print(f"collect segment {segment_id} same map; respawn without reload", flush=True)
                 loaded_map = map_name
                 loaded_index = seg_index

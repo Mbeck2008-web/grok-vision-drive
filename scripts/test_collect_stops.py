@@ -219,6 +219,43 @@ def check_level_load_retries_then_stops() -> None:
     print(f"level load retry/stop ok: italy_tries={italy_tries} dropped={len(calls['dropped'])}")
 
 
+def check_new_map_load_resets_camera_warmup() -> None:
+    """A successful load of a new map must go through camera warmup again.
+
+    Deleting ``if reloaded: cams_ready = False`` would skip attached_frames_ready
+    on the fresh cameras and never print a second ``collect cameras live``.
+    """
+    calls = {"n": 0}
+
+    def enter(bng, level, cfg, cams):
+        del cfg
+        collect.drop_cameras(cams)
+        calls["n"] += 1
+        calls.setdefault("levels", []).append(level)
+        from python.collect.level_session import OpenedLevel
+        from python.debug.gt_geom import RoadPoly
+        return OpenedLevel(
+            vehicle=bng.vehicles.vehicle,
+            roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)],
+            spawn=(0.4, 12.0, 0.5),
+            cameras={"main": sf._Cam()},
+        )
+
+    code, text, out = _with_west_deck(
+        enter,
+        lambda: sf._run_collector(
+            {"speed_at": lambda n: 10.0, "stop_at": 99999},
+            ["--maps", "west_coast_usa,italy", "--no-vary-env", "--no-excursions",
+             "--segment-min", "1", "--minutes", "3"],
+        ),
+    )
+    assert "italy" in calls.get("levels", []), (calls, text[-3000:])
+    live = [ln for ln in text.splitlines() if ln.startswith("collect cameras live")]
+    assert len(live) >= 2, (live, text[-3000:])
+    assert code == 0, (code, text[-2000:])
+    print(f"new-map camera warmup ok: live={len(live)} levels={calls.get('levels')}")
+
+
 def check_level_load_failed() -> None:
     """The first map load still stops the run when every attempt fails (no session to keep)."""
     calls = {"n": 0}
@@ -609,6 +646,7 @@ def main() -> None:
     check_needs_level_reload()
     check_same_map_segment_respawns_not_reloads()
     check_level_load_retries_then_stops()
+    check_new_map_load_resets_camera_warmup()
     check_level_load_failed()
     check_writer_failed_stops_collector()
     check_empty_traffic_slots_still_queued_from_collector()

@@ -390,6 +390,47 @@ if nn is not None:
 
 
 
+
+def _local_plane(h: np.ndarray, w: int) -> np.ndarray:
+    """Least-squares plane ``z = a + b dx + c dy`` in each ``(2w+1)`` window.
+
+    Returns the intercept ``a`` (the fitted height at the window centre).
+    Degenerate windows fall back to the inlier mean.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    pad = np.pad(h, w, constant_values=np.nan)
+    win = sliding_window_view(pad, (2 * w + 1, 2 * w + 1))
+    mask = np.isfinite(win)
+    dx = np.arange(-w, w + 1, dtype=np.float64)[:, None]
+    dy = np.arange(-w, w + 1, dtype=np.float64)[None, :]
+    zv = np.where(mask, win, 0.0)
+    n = mask.sum(axis=(-1, -2)).astype(np.float64)
+    sx = (mask * dx).sum(axis=(-1, -2))
+    sy = (mask * dy).sum(axis=(-1, -2))
+    sx2 = (mask * (dx * dx)).sum(axis=(-1, -2))
+    sy2 = (mask * (dy * dy)).sum(axis=(-1, -2))
+    sxy = (mask * (dx * dy)).sum(axis=(-1, -2))
+    sz = zv.sum(axis=(-1, -2))
+    szx = (zv * dx).sum(axis=(-1, -2))
+    szy = (zv * dy).sum(axis=(-1, -2))
+    det = (
+        n * (sx2 * sy2 - sxy * sxy)
+        - sx * (sx * sy2 - sxy * sy)
+        + sy * (sx * sxy - sx2 * sy)
+    )
+    det_a = (
+        sz * (sx2 * sy2 - sxy * sxy)
+        - sx * (szx * sy2 - sxy * szy)
+        + sy * (szx * sxy - sx2 * szy)
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        a = det_a / det
+        mean = sz / np.maximum(n, 1.0)
+    a = np.where((n >= 3) & (np.abs(det) > 1e-9), a, np.nan)
+    return np.where(np.isfinite(a), a, np.where(n > 0, mean, np.nan))
+
+
 def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
                        ix0: np.ndarray, iy0: np.ndarray, cell_m: float) -> np.ndarray:
     """Ground layer index per xy column, chosen from the bottom up.
@@ -397,11 +438,13 @@ def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
     The seed is the highest near-max layer (within ``BAND_MARGIN`` of the
     column max) in a three-layer window starting at the lowest near-max
     layer: the surface of a fill+ground stack, including when a cold
-    fill leaves a gap. A seed that is a full layer above or below the
-    12 m neighbourhood lower envelope (a wall or car roof, or a building with
-    no ground) is rejected; that column inherits the nearest accepted
-    ground seed. A column with no cell at that height has no band, so
-    every structure layer stays in the above-ground pool.
+    fill leaves a gap. Strong-p seeds vote. A 12 m lower envelope
+    rejects roofs; remaining inliers (up to a 15% grade over that
+    radius) fit a local ground plane. The band is the plane's height,
+    so far ground on a hill stays the band, a one-layer car or
+    guardrail on real ground goes to the above-ground pool, and a
+    column with no cell at the plane (a building with no ground) has
+    no band, so every structure layer stays in the above-ground pool.
     """
     from numpy.lib.stride_tricks import sliding_window_view
 
@@ -461,17 +504,62 @@ def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
     ).min(axis=(-1, -2))
     env = np.full(n_col, np.inf)
     env[used] = env2d[col_ix[used], col_iy[used]]
-    # Accept the local lower envelope and one layer above it (ground
-    # next to a rare fill seed). Roofs sit two or more layers up.
-    is_g = valid & np.isfinite(env) & (raw.astype(np.float64) >= env) & (
-        raw.astype(np.float64) <= env + 1.0
+    # Inliers follow the lower envelope up to a 15% grade over the
+    # window (far ground on a hill). A column that already has a cell
+    # at the envelope (a car or guardrail on real ground) votes at the
+    # envelope, not at the object. Roofs of a 3-layer building sit
+    # higher than that and stay out of the plane fit.
+    GRADE = 0.15
+    max_rise = GRADE * radius_m / float(cell_m)
+    has_env_layer = np.zeros(n_col, dtype=bool)
+    env_lvl = np.full(n_col, np.iinfo(np.int64).min)
+    finite_env = np.isfinite(env)
+    env_lvl[finite_env] = np.rint(env[finite_env]).astype(np.int64)
+    at = finite_env[col] & (lvl == env_lvl[col]) & (p_hot >= pmax[col] - 1e-12)
+    if at.any():
+        has_env_layer[col[at]] = True
+    fit_z = raw.astype(np.float64).copy()
+    fit_z[has_env_layer] = env[has_env_layer]
+    inlier = vote & finite_env & (
+        (has_env_layer & (raw.astype(np.float64) >= env))
+        | (
+            ~has_env_layer
+            & (raw.astype(np.float64) >= env)
+            & (raw.astype(np.float64) <= env + max_rise + 1e-6)
+        )
     )
+    expected = np.full(n_col, np.nan)
+    ins = np.flatnonzero(inlier)
+    if ins.size:
+        h = np.full((nx, ny), np.nan)
+        h[col_ix[ins], col_iy[ins]] = fit_z[ins]
+        plane2d = _local_plane(h, w)
+        expected[used] = plane2d[col_ix[used], col_iy[used]]
+    # No inliers in the window: fall back to the lower envelope.
+    expected = np.where(np.isfinite(expected), expected, env)
     target = np.full(n_col, np.iinfo(np.int64).min)
-    target[is_g] = raw[is_g]
-    gcs = np.flatnonzero(is_g)
-    q = np.flatnonzero(used & ~is_g)
+    ok = used & np.isfinite(expected)
+    # Bias a slightly high plane down so a 0.6-layer error cannot put
+    # a wall in the band. Prefer the column's own seed when it sits on
+    # the plane (true ground, including a hill). A one-layer car at
+    # expected+1 is a full layer off the plane and stays in the above-ground pool.
+    target[ok] = np.floor(expected[ok] + 0.25).astype(np.int64)
+    # Inlier columns use the fit height (envelope if they have real ground,
+    # otherwise the seed). This keeps a 1-layer quantization step on the
+    # band when the plane undershoots, without promoting a one-layer object.
+    ins = np.flatnonzero(inlier & ok)
+    if ins.size:
+        target[ins] = np.rint(fit_z[ins]).astype(np.int64)
+    # A seed below the envelope must not become the band (P8). With the
+    # lower bound removed, a weak hole fill at env-1 would snap here.
+    snap_low = valid & ok & (raw.astype(np.float64) >= env) & (
+        raw.astype(np.float64) <= env + 1.0
+    ) & (raw.astype(np.float64) < expected - 0.5)
+    target[snap_low] = raw[snap_low]
+    gcs = np.flatnonzero(ok)
+    q = np.flatnonzero(used & ~ok)
     if q.size and gcs.size:
-        gx, gy, glv = col_ix[gcs], col_iy[gcs], raw[gcs]
+        gx, gy, glv = col_ix[gcs], col_iy[gcs], target[gcs]
         qx, qy = col_ix[q], col_iy[q]
         d2 = (qx[:, None] - gx[None, :]).astype(np.int64) ** 2 + (
             qy[:, None] - gy[None, :]).astype(np.int64) ** 2
@@ -485,22 +573,22 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
     """Indices of the ``cap`` hot cells to refine.
 
     The ground band is chosen from the bottom of each xy column, not the
-    top. The seed is the top of the bottom contiguous near-max run
-    (occupancy within BAND_MARGIN of the column max): that is the
-    surface of a fill+ground stack. Seeds that sit above the
-    neighbourhood lower envelope (a wall or car roof in a saturated
-    column, or a building with no ground under it) are discarded and
-    those columns inherit the nearest ground seed, so structure stays
-    in the above-ground pool and the below-ground pool stays empty.
-    Below and above are relative to that column's ground, so a
-    downhill or height-offset road stays the band instead of a fixed z=0
-    slab. A thinner or holed ground layer still wins its columns when it
-    is within the margin of the strongest layer there, even if a
-    below-ground fill has more cells globally. At most half the cap goes
-    to the band. Above-ground
-    structure is filled next, then below-ground leftovers, so a hot
-    below-ground fill cannot starve posts / buildings that VO and
-    occluders need. Unused budget returns to the ground, then to structure.
+    top. The seed is the highest near-max layer in a three-layer window
+    starting at the lowest near-max layer (the surface of a fill+ground
+    stack). Strong-p seeds vote on a 12 m lower envelope; inliers up to
+    a 15% grade over that radius fit a local ground plane, which is the
+    band. Far ground on a hill stays the band; a one-layer car or
+    guardrail on real ground, and a wall or roof (or a building with no
+    ground under it), stay in the above-ground pool; the below-ground
+    pool stays empty. Below and above are relative to that column's
+    ground, so a downhill or height-offset road stays the band instead
+    of a fixed z=0 slab. A thinner or holed ground layer still wins its
+    columns when it is within the margin of the strongest layer there,
+    even if a below-ground fill has more cells globally. At most half
+    the cap goes to the band. Above-ground structure is filled next,
+    then below-ground leftovers, so a hot below-ground fill cannot
+    starve posts / buildings that VO and occluders need. Unused budget
+    returns to the ground, then to structure.
 
     Within each of those three pools, slots are spread in xy rather than a
     global top-k by probability, so a high-p off-road region cannot take the
@@ -513,7 +601,6 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
     lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
     # Per-column ground: bottom-up surface, not the highest near-max
     # layer (a wall or car roof at the same p would steal the band).
-    BAND_MARGIN = 0.05
     ix = np.floor(hot[:, 0] / cell_m + 1e-6).astype(np.int64)
     iy = np.floor(hot[:, 1] / cell_m + 1e-6).astype(np.int64)
     ix0 = ix - int(ix.min())

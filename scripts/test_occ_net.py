@@ -33,7 +33,7 @@ import yaml  # noqa: E402
 
 from python.data.occ_shards import ShardWriter  # noqa: E402
 from python.perception.occ_geometry import DEFAULT_GRID, project, rig_cams  # noqa: E402
-from python.perception.occ_sparse import LEVELS, SparseOccNet, _capped_hot, visible_mask  # noqa: E402
+from python.perception.occ_sparse import LEVELS, SparseOccNet, _capped_hot, _column_ground_lvl, visible_mask  # noqa: E402
 from python.train.occ_labels import build_occ_labels  # noqa: E402
 from python.train.occ_train import _class_balance, _unoccupied_points, prep_image, sample_queries, train  # noqa: E402
 from synthetic_occ import SEM_CLASSES, render  # noqa: E402
@@ -492,6 +492,151 @@ def check_capped_hot_structure_surface() -> None:
         + [(layer(0.2 + k * cm, cars), 0.97, "car") for k in (1, 2)], 1024)
 
 
+def check_capped_hot_grade_and_onelayer() -> None:
+    """Steep uphill, one-layer objects, a wide no-ground building, and a weak hole fill.
+
+    The band follows a local ground plane (up to a 15% grade over the 12 m
+    window) so far ground on a hill stays the band and structure keeps the
+    cfb2a42 / 6a530c5 share. A one-layer car or guardrail that sits on
+    real ground goes to the above-ground pool, not the band. A >=20 m
+    building with no ground under it stays structure (kills P4, radius
+    4 m). A hole whose only seed is a weak below-ground fill inherits
+    the surrounding ground (kills P8, dropping raw >= env).
+    """
+    def zc(z, cm):
+        return G.z_min + cm * (np.floor((z - G.z_min) / cm) + 0.5)
+
+    def grid_xy(cm):
+        xs = G.x_min + cm * (np.arange(int(51.2 / cm)) + 0.5)
+        ys = G.y_min + cm * (np.arange(int(64 / cm)) + 0.5)
+        return [a.ravel() for a in np.meshgrid(xs, ys, indexing="ij")]
+
+    def lay(X, Y, zfun, m, cm):
+        z = zfun(X[m], Y[m])
+        return np.stack([X[m], Y[m], zc(z, cm)], 1)
+
+    def run_parts(name, parts, cap, cm, min_counts, max_below=0):
+        hot = np.concatenate([p[0] for p in parts])
+        ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float32)
+        lab = np.concatenate([np.full(len(p[0]), p[2]) for p in parts])
+        keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
+        hot, ph, lab = hot[keep], ph[keep], lab[keep]
+        idx = _capped_hot(hot, ph, cap, G.z_min, cm)
+        kept = {str(k): int(v) for k, v in zip(*np.unique(lab[idx], return_counts=True))}
+        for k, nmin in min_counts.items():
+            assert int(kept.get(k, 0)) >= nmin, (name, k, kept, nmin)
+        n_bel = int(kept.get("below", 0))
+        assert n_bel <= max_below, (name, n_bel, max_below, kept)
+        print(f"capped_hot {name}: {kept} OK")
+        return kept
+
+    # --- uphill + one-layer (Skeptic attack6 / attack6_base) ---
+    for f, cap, want in (
+        (2, 2048, {"up10_wall": 900, "up15_wall": 650, "car": 150, "rail": 64,
+                    "up10_below": 128, "up15_below": 140}),
+        (4, 512, {"up10_wall": 176, "up15_wall": 120, "car": 40, "rail": 32,
+                    "up10_below": 88, "up15_below": 138}),
+    ):
+        cm = G.voxel_m * f
+        X, Y = grid_xy(cm)
+        ALL = np.ones_like(X, bool)
+        road = np.abs(X) < 4
+        bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
+        rail = np.abs(np.abs(X) - 5) < cm * 0.6
+        cars = road & (np.floor(Y / 6) % 2 == 0) & (Y > 5)
+        flat = lambda x, y: np.full(x.shape, 0.2)
+        # 1-layer cars on saturated road + 3-layer buildings (cfb2a42 / 6a530c5).
+        run_parts(
+            f"f={f} 1-layer cars 1.0",
+            [(lay(X, Y, flat, ALL, cm), 1.0, "ground")]
+            + [(lay(X, Y, lambda x, y, k=k: 0.2 + k * cm + 0 * x, bld, cm), 1.0, "wall") for k in (1, 2, 3)]
+            + [(lay(X, Y, lambda x, y: 0.2 + cm + 0 * x, cars, cm), 1.0, "car")],
+            cap, cm, {"car": want["car"]},
+        )
+        # 1-layer guardrails + fill (cfb2a42 kept 64 / 32 rails).
+        run_parts(
+            f"f={f} 1-layer guardrails 1.0",
+            [(lay(X, Y, flat, ALL, cm), 1.0, "ground"),
+             (lay(X, Y, lambda x, y: 0.2 - cm + 0 * x, ALL, cm), 1.0, "below")]
+            + [(lay(X, Y, lambda x, y, k=k: 0.2 + k * cm + 0 * x, bld, cm), 1.0, "wall") for k in (1, 2, 3)]
+            + [(lay(X, Y, lambda x, y: 0.2 + cm + 0 * x, rail, cm), 1.0, "rail")],
+            cap, cm, {"rail": want["rail"]},
+        )
+        for g, wkey, bkey in ((0.10, "up10_wall", "up10_below"), (0.15, "up15_wall", "up15_below")):
+            gz = lambda x, y, g=g: 0.2 + g * np.maximum(y, 0)
+            run_parts(
+                f"f={f} uphill {g * 100:+.0f}%",
+                [(lay(X, Y, gz, ALL, cm), 0.95, "ground"),
+                 (lay(X, Y, lambda x, y, g=g: gz(x, y) - cm, ALL, cm), 0.9, "below")]
+                + [(lay(X, Y, lambda x, y, k=k, g=g: gz(x, y) + k * cm, bld, cm), 0.95, "wall") for k in (1, 2, 3)],
+                cap, cm, {"wall": want[wkey]},
+                max_below=want[bkey],
+            )
+
+    # --- P4: >=20 m-wide building, no ground under it ---
+    f, cap = 2, 2048
+    cm = G.voxel_m * f
+    X, Y = grid_xy(cm)
+    # 20 m+ wide in x (fits in the 51.2 m grid); the centre is ~10 m
+    # from the side, so a 12 m window still sees ground and a 4 m
+    # window does not.
+    bld = (X >= 5.0) & (X < G.x_max) & (Y >= 5.0) & (Y < 45.0)
+    width = float(X[bld].max() - X[bld].min()) + cm
+    assert width >= 20.0, (width, cm, X[bld].min(), X[bld].max())
+    nob = ~bld
+    run_parts(
+        "P4 20 m+ building, no ground under it",
+        [(lay(X, Y, lambda x, y: np.full(x.shape, 0.2), nob, cm), 0.95, "ground"),
+         (lay(X, Y, lambda x, y: np.full(x.shape, 0.2 - cm), nob, cm), 0.9, "below")]
+        + [(lay(X, Y, lambda x, y, k=k: np.full(x.shape, 0.2 + k * cm), bld, cm), 0.8, "wall") for k in (1, 2, 3)],
+        cap, cm, {"wall": 1024},
+        max_below=0,
+    )
+
+    # --- P8: hole whose only seed is a weak below-ground fill ---
+    f, cap = 2, 2048
+    cm = G.voxel_m * f
+    X, Y = grid_xy(cm)
+    ALL = np.ones_like(X, bool)
+    hole = (np.abs(X) < 3.0) & (Y > 10.0) & (Y < 22.0)
+    ground = ALL & ~hole
+    bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
+    parts = (
+        [(lay(X, Y, lambda x, y: np.full(x.shape, 0.2), ground, cm), 0.95, "ground"),
+         (lay(X, Y, lambda x, y: np.full(x.shape, 0.2 - cm), hole, cm), 0.60, "holefill"),
+         (lay(X, Y, lambda x, y: np.full(x.shape, 0.2 - cm), ground, cm), 0.90, "below")]
+        + [(lay(X, Y, lambda x, y, k=k: np.full(x.shape, 0.2 + k * cm), bld, cm), 0.95, "wall") for k in (1, 2, 3)]
+    )
+    hot = np.concatenate([p[0] for p in parts])
+    ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float32)
+    lab = np.concatenate([np.full(len(p[0]), p[2]) for p in parts])
+    keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
+    hot, ph, lab = hot[keep], ph[keep], lab[keep]
+    lvl = np.floor((hot[:, 2] - G.z_min) / cm + 1e-6).astype(np.int64)
+    ix = np.floor(hot[:, 0] / cm + 1e-6).astype(np.int64)
+    iy = np.floor(hot[:, 1] / cm + 1e-6).astype(np.int64)
+    ix0 = ix - int(ix.min())
+    iy0 = iy - int(iy.min())
+    col = ix0 * (int(iy0.max()) + 1) + iy0
+    gl = _column_ground_lvl(col, lvl, ph, ix0, iy0, cm)
+    hole_cols = np.unique(col[lab == "holefill"])
+    ground_lvl = int(np.median(lvl[lab == "ground"]))
+    fill_lvl = int(np.median(lvl[lab == "holefill"]))
+    assert fill_lvl < ground_lvl, (fill_lvl, ground_lvl)
+    assert hole_cols.size >= 8, hole_cols.size
+    # The hole inherits the surrounding ground; a weak fill must not become
+    # the band (P8 would set gl to the fill layer).
+    assert np.all(gl[hole_cols] == ground_lvl), (
+        "P8 hole fill became the band",
+        int((gl[hole_cols] == fill_lvl).sum()),
+        int(hole_cols.size),
+        fill_lvl,
+        ground_lvl,
+    )
+    print(f"capped_hot P8 weak hole fill: {hole_cols.size} hole cols inherit ground {ground_lvl}, not fill {fill_lvl} OK")
+
+
+
 def check_class_balance() -> None:
     """_class_balance splits evenly across classes; a 99:1 pool must not stay 99:1."""
     rng = np.random.default_rng(0)
@@ -556,6 +701,7 @@ def main() -> int:
     check_capped_hot_follows_ground()
     check_capped_hot_surface_fill()
     check_capped_hot_structure_surface()
+    check_capped_hot_grade_and_onelayer()
     check_class_balance()
     check_unoccupied_not_occluded_structure()
     check_queries()

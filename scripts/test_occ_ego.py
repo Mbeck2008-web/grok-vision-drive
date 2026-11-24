@@ -28,11 +28,7 @@ import numpy as np  # noqa: E402
 from python.perception.occ_ego import (  # noqa: E402
     EgoMotion, VO_MIN_CELLS, VO_MIN_SCORE, _static_bev, _warp, occ_odometry,
 )
-from python.perception.occ_geometry import DEFAULT_GRID, PinholeCam  # noqa: E402
-try:
-    from python.perception.occ_geometry import observed_mask  # noqa: E402
-except ImportError:
-    from python.perception.occ_out import observed_mask  # noqa: E402
+from python.perception.occ_geometry import DEFAULT_GRID, PinholeCam, observed_mask  # noqa: E402
 from python.perception.occ_outputs import OccTracker, objects  # noqa: E402
 
 G = DEFAULT_GRID
@@ -546,24 +542,97 @@ def check_vo_observed_region_cost() -> None:
 
     ego_mod._observed_bev_keys = wrap
     try:
-        t0 = time.perf_counter()
         occ_odometry(k0, c0, k1, c1, grid=G, cams=[cam], occl=occl)
-        ms_cams = (time.perf_counter() - t0) * 1e3
+        assert calls["n"] == 1, (calls["n"], "observed region must be built once per tick")
+        calls["n"] = 0
+        cam_times = []
+        for _ in range(3):
+            t1 = time.perf_counter()
+            occ_odometry(k0, c0, k1, c1, grid=G, cams=[cam], occl=occl)
+            cam_times.append((time.perf_counter() - t1) * 1e3)
+        ms_cams = float(np.median(cam_times))
+        assert calls["n"] == 3, (calls["n"], "one observed-region build per tick")
     finally:
         ego_mod._observed_bev_keys = orig
-    assert calls["n"] == 1, (calls["n"], "observed region must be built once per tick")
-    t0 = time.perf_counter()
     times = []
     for _ in range(3):
         t1 = time.perf_counter()
         occ_odometry(k0, c0, k1, c1, grid=G)
         times.append((time.perf_counter() - t1) * 1e3)
     ms_nocams = float(np.median(times))
-    # Generous wall-clock bound: the old per-hypothesis path was ~80x
-    # (~1.9 s vs ~24 ms). Stay within 15x of the no-cams path, and under 200 ms.
-    assert ms_cams <= max(200.0, 15.0 * ms_nocams), (ms_cams, ms_nocams)
-    print(f"VO cost: observed-region builds={calls['n']}, "
+    # The v4 baseline is ~23 ms with no observed-region work. Stay within
+    # 6x of the no-cams path so an 8x regression cannot pass.
+    assert ms_cams <= 6.0 * ms_nocams, (ms_cams, ms_nocams)
+    print(f"VO cost: observed-region builds=1, "
           f"with cams {ms_cams:.0f} ms, no cams {ms_nocams:.0f} ms OK")
+
+
+def check_vo_prev_obs_update() -> None:
+    """Unobserved previous cells must not vote (kills O4 prev_obs=None).
+
+    Goes through EgoMotion.update so a drop of prev_obs is visible.
+    Observed posts support 2.5 m of true motion; a dense unobserved
+    ego-fixed sheet would lock the estimate at 0 if it were allowed to vote.
+    """
+    rng = np.random.default_rng(0)
+    posts = np.stack([rng.uniform(-20, -6, 80), rng.uniform(5, 40, 80)], 1)
+    clutter = np.stack([rng.uniform(-24, 24, 3000), rng.uniform(-12, 50, 3000)], 1)
+    fwd, dt = 2.5, 0.2
+
+    def cells(shift):
+        post_xy = posts - np.array([0.0, shift])
+        xy = np.concatenate([post_xy, clutter])
+        obs = np.concatenate([np.ones(len(post_xy), bool), np.zeros(len(clutter), bool)])
+        pts = np.column_stack([xy, np.full(len(xy), 1.2)])
+        keys = G.keys_of(pts)
+        ok = keys >= 0
+        return keys[ok], np.zeros(ok.sum(), np.uint8), obs[ok]
+
+    k0, c0, o0 = cells(0.0)
+    k1, c1, o1 = cells(fwd)
+    em = EgoMotion()
+    em.update(k0, c0, 0.0, obs=o0)
+    est = em.update(k1, c1, dt, obs=o1)
+    err = abs(est.speed_mps * dt - fwd)
+    assert est.ok, (est, "observed posts must register")
+    assert err < 0.3, (est, err, "unobserved prev cells must not vote (O4)")
+    print(f"VO prev_obs update: fwd {est.speed_mps * dt:.3f} m (true {fwd}) ok={est.ok} OK")
+
+
+def check_vo_empty_observed_region() -> None:
+    """An empty live observed region must hold (kills V3 score=1.0).
+
+    A rear-facing camera sees none of the posts ahead, so the observed
+    region is empty. Returning 1.0 would certify the first hypothesis
+    (fwd -1 m, yaw -0.15) as a perfect match.
+    """
+    rng = np.random.default_rng(4)
+    posts = np.stack([rng.uniform(-12, 12, 80), rng.uniform(8, 40, 80)], 1)
+
+    def keys_at(shift):
+        xy = posts - np.array([0.0, shift])
+        pts = np.column_stack([xy, np.full(len(xy), 1.2)])
+        k = G.keys_of(pts)
+        k = np.unique(k[k >= 0])
+        return k, np.zeros(k.size, np.uint8)
+
+    cam = PinholeCam(
+        "rear", (0.0, -1.20, 1.26),
+        (-1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0),
+        640, 400, 50.0, 0.3, 80.0,
+    )
+    k0, c0 = keys_at(0.0)
+    k1, c1 = keys_at(1.5)
+    # The live camera sees none of the posts; the region is empty.
+    import python.perception.occ_ego as E
+    obs = E._observed_bev_keys(G, [cam], k1, prev_xy=E._static_bev(k0, c0, G))
+    assert len(obs) == 0, (len(obs), "rear camera must see an empty region")
+    em = EgoMotion()
+    em.update(k0, c0, 0.0, obs=np.ones(k0.size, bool), cams=[cam], occl=k1)
+    est = em.update(k1, c1, 0.1, obs=np.ones(k1.size, bool), cams=[cam], occl=k1)
+    assert not est.ok, (est, "empty observed region must hold (V3)")
+    print(f"VO empty observed region: ok={est.ok}, speed {est.speed_mps:.3f} m/s (held) OK")
+
 
 
 def main() -> int:
@@ -579,6 +648,8 @@ def main() -> int:
     check_vo_min_cells_visible()
     check_vo_visibility_z()
     check_vo_observed_region_cost()
+    check_vo_prev_obs_update()
+    check_vo_empty_observed_region()
     print("test_occ_ego: all OK")
     return 0
 

@@ -141,25 +141,6 @@ def _observed_bev_keys(grid: OccGrid, cams: Sequence[Any], occl: np.ndarray | No
 
 
 
-def _visible_xy(xy: np.ndarray, cams: Sequence[Any] | None, z=0.6,
-                occl: np.ndarray | None = None, grid: OccGrid | None = None) -> np.ndarray:
-    """Which BEV points the current live cameras can see (at height ``z``).
-
-    Frustum only when no occluders are given; otherwise the same observed
-    test the runtime uses (frustum and no occluder on the ray).
-    """
-    if not cams or len(xy) == 0:
-        return np.ones(len(xy), dtype=bool)
-    pts = np.column_stack([xy, np.full(len(xy), z)])
-    if occl is None or grid is None:
-        vis = np.zeros(len(xy), dtype=bool)
-        for cam in cams:
-            _, _, ok = project(cam, pts)
-            vis |= ok
-        return vis
-    return observed_mask(pts, cams, occl, grid)
-
-
 def _score(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid, fwd: float, dyaw: float,
            obs_keys: np.ndarray | None = None) -> float:
     """Share of warped previous cells that hit a current cell. Sparse: sorted key lookup, no raster.

@@ -259,8 +259,11 @@ observed cells that, after the hypothesis warp, fall in the current
 observed region (this tick's live/fresh cameras, with this tick's
 occluders), so a side or rear camera going stale does not collapse the
 overlap and trigger a hold. If fewer than `VO_MIN_CELLS` of those are
-visible, or the score is below `VO_MIN_SCORE` (0.4), the last estimate is
-held, `ok` is False, and `OccMemory` is cleared (no blind carry).
+visible, or the score is below `VO_MIN_SCORE` (0.4), or the current
+observed region is empty, the last estimate is held, `ok` is False, and
+`OccMemory` is cleared (no blind carry). The observed region is built
+once per tick and each hypothesis is a sorted-key lookup; `test_occ_ego`
+caps per-tick VO time at 6× the no-camera (lookup-only) path.
 `check_ego` requires 11/11 ticks `ok` at the recorder's camera rates, with
 all cameras fresh, and with only the front three fresh. A parked ego with
 1-3 voxel smears, whole-wall depth jumps, moving objects, or lateral smear
@@ -465,7 +468,8 @@ memory, causality), `test_occ_memory_gap` (hidden-leg proof through
 `OccRuntime`: predict + cap + vehicle-signal ego + observed + memory; lift retrain,
 loss ablation, zero-warp, memory-off mutants; camera VO is not in this proof), `test_occ_net` (xy-spread
 cap, below-ground-hot cap, per-column ground band at 0.8/1.6 m including
-3% downhill, -0.7 m offset, flat, and exact band contents, class-balanced ground positives, below-ground
+3% downhill, -0.7 m offset, flat, holed 12.5%, 10% and 15% uphill, one-layer
+cars and guardrails, a >=20 m building with no ground, a weak hole fill, and exact band contents, class-balanced ground positives, below-ground
 free samples, deterministic overfit/predict), `test_occ_out` (v2 fields, version gate),
 `test_occ_runtime_imports` (safety isolation), `test_eval_occ_unseen` (eval
 smoke). Metrics: `scripts/eval_occ_unseen.py` (results below).
@@ -474,11 +478,13 @@ Later-stage `predict` caps (`_capped_hot`, at production `LEVELS` (4, 2):
 cell 1.6 m and 0.8 m): the ground band is chosen from the bottom of each
 xy column, not the top. The seed is the highest near-max layer (within a
 small margin of the column max) in a three-layer window starting at the
-lowest near-max layer — the surface of a fill+ground stack. Seeds that
-sit above the neighbourhood lower envelope (a wall or car roof, or a
-building with no ground under it) inherit the nearest ground seed, so
-structure stays in the above-ground pool. A below-ground fill that ties
-or is slightly hotter does not win. Below and above are relative to that column's ground, so a downhill
+lowest near-max layer — the surface of a fill+ground stack. Strong-p
+seeds vote on a 12 m lower envelope; inliers up to a 15% grade over that
+radius fit a local ground plane, which is the band. Far ground on a hill
+stays the band. A one-layer car or guardrail that sits on real ground,
+and a wall or roof (or a building with no ground under it), stay in the
+above-ground pool. A below-ground fill that ties or is slightly hotter
+does not win. Below and above are relative to that column's ground, so a downhill
 or height-offset road stays the band instead of a fixed z=0 slab. At most
 half the cap goes to the band; above-ground structure is filled next, then
 below-ground, each pool spread in xy so a high-p off-road region cannot take

@@ -510,6 +510,14 @@ def check_paint_gate_stripe_shape_rules() -> None:
     six = dict(h=240, w=640, x0=100, width=6, r0=100, r1=230)
     assert paint_both(stripe_frame(WHITE, GRAY, shift=2, **six)) >= ls.PAINT_MIN_PX
     assert paint_both(stripe_frame(WHITE, GRAY, shift=3, **six)) == 0
+    # Integer boundary of s <= (W_ridge+8)/5: 12 px allows 4 px/row, 7 px allows 3.
+    # w=800 so W=12 at 5 px/row stays in-frame (last_end=757); measured 12/4=504,
+    # 12/5=0, 7/3=378, 7/4=0. These pin connectivity=8 against connectivity=4.
+    wide = dict(h=240, w=800, x0=100, r0=100, r1=230)
+    assert paint_both(stripe_frame(WHITE, GRAY, width=12, shift=4, **wide)) >= ls.PAINT_MIN_PX
+    assert paint_both(stripe_frame(WHITE, GRAY, width=12, shift=5, **wide)) == 0
+    assert paint_both(stripe_frame(WHITE, GRAY, width=7, shift=3, **wide)) >= ls.PAINT_MIN_PX
+    assert paint_both(stripe_frame(WHITE, GRAY, width=7, shift=4, **wide)) == 0
     # Component bounding box: (W + 8) wide after the join, R - 4 rows tall.
     # W=4, R=12 -> 12 x 8 box: exactly PAINT_MIN_RUN_PX long, counts.
     assert ls.PAINT_MIN_RUN_PX == 12

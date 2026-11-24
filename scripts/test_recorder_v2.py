@@ -1130,6 +1130,109 @@ def check_gt_gate_reset_on_recover_and_segment_load() -> None:
         root_cm.__exit__(None, None, None)
     print(f"recover + same-map load: GT full rate after recover row {rec_at} and load row {later}")
 
+def check_non_west_coast_gets_seeded_spawn_and_traffic() -> None:
+    """italy gets a seeded legal spawn and companion traffic, not the level's fixed spawn."""
+    import random
+
+    import python.collect.level_session as level_session
+    import python.collect.spawn_mix as spawn_mix
+    from python.debug.gt_geom import RoadPoly
+
+    real_begin, real_place, real_load = level_session.begin_level, level_session.place_vehicle, spawn_mix.SpawnDeck.load
+    loads: list[dict] = []
+    places: list[int] = []
+
+    def begin(bng, level):
+        del level
+        return level_session.OpenedLevel(
+            vehicle=bng.ego, roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], spawn=(0.0, 10.0, 0.5),
+        )
+
+    def place(*args, **kwargs):
+        places.append(1)
+        return real_place(*args, **kwargs)
+
+    def load(cls, path, rng=None, **kwargs):
+        loads.append({
+            "path": str(path),
+            "rng_state": None if rng is None else rng.getstate(),
+            "only_kind": kwargs.get("only_kind"),
+        })
+        return real_load.__func__(cls, path, rng, **kwargs)
+
+    level_session.begin_level = begin
+    level_session.place_vehicle = place
+    spawn_mix.SpawnDeck.load = classmethod(load)  # type: ignore[assignment]
+    try:
+        code, text, out, _made, root_cm = _run_fake_collect(
+            [
+                "--maps", "italy",
+                "--spawn-seed", "7",
+                "--spawn-kind", "highway",
+                "--traffic", "3",
+                "--no-vary-env",
+                "--min-paint-cov", "0",
+            ],
+            tick_s=0.2,
+            stop_at=20,
+        )
+    finally:
+        level_session.begin_level, level_session.place_vehicle = real_begin, real_place
+        spawn_mix.SpawnDeck.load = real_load  # type: ignore[assignment]
+    try:
+        assert code == 0, text[-2000:]
+        assert len(loads) == 1, loads
+        assert loads[0]["path"].endswith("italy.json.gz"), loads
+        assert loads[0]["rng_state"] == random.Random(7).getstate(), loads
+        assert loads[0]["only_kind"] == "highway", loads
+        assert places, text[-1500:]
+        assert re.search(r"collect spawn italy#0 highway \(.*traffic=3 ", text), text[-2500:]
+        assert "collect traffic italy#0 placed " in text, text[-2500:]
+        state = _rows(out)
+        assert state and {r.get("spawn_type") for r in state} == {"highway"}, {r.get("spawn_type") for r in state}
+    finally:
+        root_cm.__exit__(None, None, None)
+    print("italy: seeded highway spawn and traffic=3 from italy.json.gz")
+
+
+def check_missing_spawn_dump_fails_loudly() -> None:
+    """A map with no road dump stops; it must not keep the level spawn or drop traffic silently."""
+    import python.collect.level_session as level_session
+    from python.debug.gt_geom import RoadPoly
+
+    real_begin = level_session.begin_level
+
+    def begin(bng, level):
+        del level
+        return level_session.OpenedLevel(
+            vehicle=bng.ego, roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], spawn=(0.0, 10.0, 0.5),
+        )
+
+    level_session.begin_level = begin
+    try:
+        code, text, _out, _made, root_cm = _run_fake_collect(
+            [
+                "--maps", "utah",
+                "--spawn-seed", "1",
+                "--traffic", "2",
+                "--no-vary-env",
+                "--min-paint-cov", "0",
+            ],
+            tick_s=0.2,
+            stop_at=20,
+        )
+    finally:
+        level_session.begin_level = real_begin
+    try:
+        assert code == 2, (code, text[-2000:])
+        assert "utah: no road dump for a legal seeded spawn" in text, text[-2500:]
+        assert "spawn_failed" in text, text[-2500:]
+        assert "collect stop utah: no road dump" in text, text[-2500:]
+    finally:
+        root_cm.__exit__(None, None, None)
+    print("utah: missing road dump fails loudly (spawn_failed)")
+
+
 def main() -> None:
     check_train_gt_on_all_eight()
     check_live_attach_forces_gt_off()
@@ -1164,6 +1267,8 @@ def main() -> None:
     check_capture_plan_chase_uses_chase_hz()
     check_clip_s_overrides_until_disk()
     check_gt_gate_reset_on_recover_and_segment_load()
+    check_non_west_coast_gets_seeded_spawn_and_traffic()
+    check_missing_spawn_dump_fails_loudly()
     print("test_recorder_v2: OK")
 
 

@@ -1,4 +1,4 @@
-"""Stratified west-coast spawns from a dumped navgraph.
+"""Stratified on-road spawns from a dumped navgraph.
 
 Highway is a wide or one-way multi-lane road. A ramp is a short one-way
 road that touches both a highway and a local road. Everything else that
@@ -46,6 +46,27 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from python.data.data_root import roads_dir
+
+
+def spawn_roads_path(map_name: str) -> Path | None:
+    """Gzip road dump for ``map_name``, or None if no dump exists.
+
+    A live file under ``roads_dir()`` wins; otherwise a bundled fixture
+    at ``tests/fixtures/roads/{map}.json.gz``. Callers must fail loudly
+    when this returns None rather than silently using the level's fixed
+    spawn or skipping traffic.
+    """
+    name = f"{map_name}.json.gz"
+    live = roads_dir() / name
+    if live.is_file():
+        return live
+    bundled = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "roads" / name
+    if bundled.is_file():
+        return bundled
+    return None
+
 
 CITY = "city"
 HIGHWAY = "highway"

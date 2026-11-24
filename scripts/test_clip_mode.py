@@ -49,20 +49,20 @@ def check_plans_are_seeded_and_bounded() -> None:
         assert 0 <= p.traffic <= 8, p
         assert p.map in MAPS
         assert p.ego_model == "sbr"
-        if p.map != "west_coast_usa":
-            assert p.traffic == 0 and p.spawn_kind is None, p
         if p.edge_case == "heavy_traffic":
             assert p.traffic == 8
         if p.edge_case == "cut_in":
             assert p.traffic >= 2
         if p.edge_case in ("heavy_traffic", "cut_in", "merge"):
-            assert p.map == "west_coast_usa", p  # the spawn deck and companions only run there today
+            assert p.map == "west_coast_usa", p  # those cases need a highway/ramp pool
         if p.edge_case == "night":
             assert p.time_of_day_h >= 21.0 or p.time_of_day_h < 4.5, p
         else:
             assert 8.0 <= p.time_of_day_h <= 17.0, p
         assert p.weather == {"rain": "rain", "fog": "fog"}.get(p.edge_case, "clear"), p
     assert len({p.spawn_seed for p in plans}) == len(plans)
+    off = [p for p in plans if p.map != "west_coast_usa"]
+    assert off and any(p.traffic > 0 for p in off), [p.traffic for p in off]
     print("plans: seeded, 30-60 s, traffic <= max, edge-case recipes hold")
 
 
@@ -509,25 +509,39 @@ def check_session_gfx_follows_flag() -> None:
     print("session.json gfx follows the run_clips gfx argument")
 
 
-def check_plan_clip_traffic_zero_off_west_coast() -> None:
-    """Off west_coast_usa, the plan is traffic=0 and no spawn_kind (Michael 2026-11-24)."""
-    from python.collect.clip_mode import DECK_MAP, DECK_ONLY, clip_argv, plan_clip
+def check_plan_clip_traffic_and_spawn_on_every_map() -> None:
+    """Non-west_coast maps get planned traffic and a seeded spawn (Michael 2026-11-24 15:14 CST)."""
+    from python.collect.clip_mode import DECK_MAP, DECK_ONLY, SPAWN_KIND, clip_argv, plan_clip
 
     off = ("italy", "east_coast_usa")
     plans = [plan_clip(i, seed=11, maps=off, max_traffic=8) for i in range(80)]
     assert plans and all(p.map in off for p in plans)
-    assert all(p.traffic == 0 and p.spawn_kind is None for p in plans), [(p.map, p.traffic, p.spawn_kind, p.edge_case) for p in plans]
-    # Deck-only cases still land on west_coast even when it is listed with others.
+    assert all(p.spawn_seed > 0 for p in plans)
+    assert any(p.traffic > 0 for p in plans), [p.traffic for p in plans]
+    for p in plans:
+        if p.edge_case in DECK_ONLY:
+            assert p.spawn_kind is None, p  # highway/ramp not guaranteed off west_coast
+        else:
+            assert p.spawn_kind == SPAWN_KIND.get(p.edge_case), p
+        argv = clip_argv(p, Path("/tmp/x/clip"))
+        assert argv[argv.index("--traffic") + 1] == str(p.traffic), argv
+        assert argv[argv.index("--spawn-seed") + 1] == str(p.spawn_seed), argv
+        if p.spawn_kind is not None:
+            assert argv[argv.index("--spawn-kind") + 1] == p.spawn_kind, argv
+        else:
+            assert "--spawn-kind" not in argv, argv
+    # Deck-only cases still land on west_coast when it is listed with others.
     mixed = [plan_clip(i, seed=3, maps=(DECK_MAP,) + off, max_traffic=8) for i in range(120)]
     for p in mixed:
         if p.map != DECK_MAP:
-            assert p.traffic == 0 and p.spawn_kind is None, p
             assert p.edge_case not in DECK_ONLY, p
+            assert p.spawn_seed > 0, p
         argv = clip_argv(p, Path("/tmp/x/clip"))
         assert argv[argv.index("--traffic") + 1] == str(p.traffic), argv
-    on_deck = [p for p in mixed if p.map == DECK_MAP]
-    assert any(p.traffic > 0 for p in on_deck), [p.traffic for p in on_deck]
-    print("plan_clip: traffic=0 and no spawn_kind off west_coast_usa")
+        assert "--spawn-seed" in argv, argv
+    off_mixed = [p for p in mixed if p.map != DECK_MAP]
+    assert off_mixed and any(p.traffic > 0 for p in off_mixed), [p.traffic for p in off_mixed]
+    print("plan_clip: traffic and a seeded spawn on every map")
 
 
 def check_cut_in_bend_uses_speed_not_ten() -> None:
@@ -564,14 +578,18 @@ def check_cut_in_seen_when_t_is_none() -> None:
 
     plan = plan_clip(0, seed=1, maps=("west_coast_usa",), max_traffic=2, edge_cases=("cut_in",), min_s=4.0, max_s=4.0)
 
-    def row(lat: float, ahead: float = 15.0) -> dict:
+    def row(lat: float, ahead: float = 15.0, t=None) -> dict:
         return {
-            "t": None,
+            "t": t,
             "ego": {"pos": [0.0, 0.0, 0.0], "dir": [0, 1, 0], "speed_mps": 10.0, "yaw_rate": 0.0},
             "traffic": [{"name": "gvd_traffic_1", "pos": [lat, ahead, 0.0]}],
         }
 
     ok, msg = _observe(plan, Path("/tmp/unused"), [row(3.5), row(0.3)], [], 1)
+    assert ok is True, (ok, msg)
+    # A later in-lane row with a real t must still observe the cut-in. Storing
+    # (t,) would make t_out a 1-tuple and t - t_out raise TypeError.
+    ok, msg = _observe(plan, Path("/tmp/unused"), [row(3.5), row(0.3, t=1.0)], [], 1)
     assert ok is True, (ok, msg)
     print("cut-in: a missing t still counts as a sighting (name in seen)")
 
@@ -593,7 +611,7 @@ def main() -> None:
     check_cut_in_bend_speed_floor()
     check_cut_in_bend_uses_speed_not_ten()
     check_cut_in_seen_when_t_is_none()
-    check_plan_clip_traffic_zero_off_west_coast()
+    check_plan_clip_traffic_and_spawn_on_every_map()
     check_session_gfx_follows_flag()
     print("test_clip_mode: OK")
 

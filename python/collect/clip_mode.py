@@ -6,14 +6,16 @@ with arguments drawn from a seeded plan:
 
 * one random edge case from ``EDGE_CASES`` and its recipe (weather, time of
   day, spawn kind, paint filter, traffic floor),
-* a random companion-traffic count up to ``max_traffic`` on
-  ``west_coast_usa`` (Michael, 2026-11-24 14:28 CST: west-coast-only traffic
-  for now); every other map is planned as ``traffic=0``,
-* a map from the pool (edge cases that need the west-coast spawn deck and
-  companion cars stay on ``west_coast_usa``; that is the only map the
-  collector places traffic or deck spawns on today),
-* a random spawn: a per-clip ``--spawn-seed`` for the deck shuffle (the
-  collector only applies it on ``west_coast_usa``).
+* a random companion-traffic count up to ``max_traffic`` on every map
+  (Michael, 2026-11-24 15:14 CST: "Add traffic and random spawns on every
+  map"),
+* a map from the pool (edge cases that need a highway or ramp spawn stay
+  on ``west_coast_usa`` when it is in the pool; other maps still get a
+  seeded legal spawn and planned traffic),
+* a random spawn: a per-clip ``--spawn-seed`` for the deck shuffle on
+  every map. The collector loads that map's road dump, places a legal
+  on-road spawn (correct side of the road) and companions, and stops
+  with a visible error if the map has no dump or no legal pose.
 
 After each clip, ``quality_check`` reads the recording back (never writes
 into ``raw/``) and ``write_tags`` stores ``clip_tags.json`` beside it. A bad
@@ -52,7 +54,7 @@ EDGE_CASES: tuple[str, ...] = (
     "heavy_traffic",
 )
 DECK_MAP = "west_coast_usa"
-# Needs companion cars or the stratified spawn deck: west coast only today.
+# Needs a highway or ramp spawn pool; those are not on every map.
 DECK_ONLY = ("merge", "cut_in", "heavy_traffic")
 # Maps with unpaved roads, from the map descriptions (UNVERIFIED per map: the
 # clip's own quality check reads the semantic planes for dirt).
@@ -145,9 +147,7 @@ def plan_clip(
             notes.append("no dirt map in the pool")
     else:
         map_name = rng.choice(pool)
-    if map_name != DECK_MAP:
-        traffic = 0
-    elif case == "heavy_traffic":
+    if case == "heavy_traffic":
         traffic = max_traffic
     elif case == "cut_in":
         traffic = rng.randint(min(2, max_traffic), max_traffic) if max_traffic else 0
@@ -170,7 +170,11 @@ def plan_clip(
         time_of_day_h=round(tod, 3),
         duration_s=duration,
         spawn_seed=int(spawn_seed),
-        spawn_kind=SPAWN_KIND.get(case) if map_name == DECK_MAP else None,
+        spawn_kind=(
+            None
+            if case in DECK_ONLY and map_name != DECK_MAP
+            else SPAWN_KIND.get(case)
+        ),
         min_paint_cov=0.0 if case in ("faded_paint", "dirt_road") else None,
         traffic_ahead_m=CUT_IN_AHEAD_M if case == "cut_in" else None,
         notes=notes,

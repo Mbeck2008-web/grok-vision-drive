@@ -214,7 +214,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import controls_from_state
-from python.collect.spawn_mix import clamp_speed_range, traffic_count
+from python.collect.spawn_mix import clamp_speed_range, spawn_roads_path, traffic_count
 from python.collect import control_log
 from python.collect.boundary import BoundaryDefer, CarryOver, boundary_wait_reason
 from python.collect.level_session import EGO_CONFIG_DEFAULT, EGO_MODEL_DEFAULT
@@ -2133,6 +2133,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # against the planned ramp (None between lane changes).
         lane_change_run: dict[str, float] | None = None
         spawn_deck = None
+        spawn_deck_map = ""
         spawn_kind = ""
         spawn_mark = -1.0e9
         respawn_s = max(0.0, float(args.respawn_min)) * 60.0
@@ -2393,44 +2394,47 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 rows.append(entry)
             return speeds_for(lo, hi)
 
-        def _apply_spawn(force: bool, source: str = "spawn") -> None:
-            """Teleport west coast to the next unused stratified spawn."""
-            nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, spawn_seq, last_ai, segment_open, speed, spawn_cov
+        def _apply_spawn(force: bool, source: str = "spawn") -> str | None:
+            """Teleport to the next unused legal, on-road stratified spawn.
+
+            Works on every map that has a road dump. Returns an error string
+            when the map has no dump, the deck cannot load, or a forced first
+            spawn finds no legal pose on the correct side of the road. Never
+            silently keeps the level's fixed spawn or skips traffic.
+            """
+            nonlocal spawn_deck, spawn_deck_map, spawn_kind, spawn_mark, spawn_pos, spawn_seq, last_ai, segment_open, speed, spawn_cov
             nonlocal spawn_road, recheck_mark
-            if map_name != "west_coast_usa" or vehicle is None:
-                return
+            if vehicle is None:
+                return None
             if not force and (respawn_s <= 0.0 or done_s - spawn_mark < respawn_s):
-                return
+                return None
+            if spawn_deck is not None and spawn_deck_map != map_name:
+                spawn_deck = None
+                spawn_deck_map = ""
             if spawn_deck is None:
                 from python.collect.spawn_mix import SpawnDeck
 
-                dump = None
-                try:
-                    from python.data.data_root import roads_dir
-
-                    candidate = roads_dir() / "west_coast_usa.json.gz"
-                    if candidate.is_file():
-                        dump = candidate
-                except Exception:
-                    dump = None
+                dump = spawn_roads_path(map_name)
                 if dump is None:
-                    bundled = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "roads" / "west_coast_usa.json.gz"
-                    if bundled.is_file():
-                        dump = bundled
-                if dump is None:
-                    return
+                    return f"{map_name}: no road dump for a legal seeded spawn"
                 load_t0 = time.perf_counter()
                 cov_min = max(0.0, float(args.min_paint_cov))
                 import random as _random
 
-                spawn_deck = SpawnDeck.load(
-                    dump,
-                    None if args.spawn_seed is None else _random.Random(int(args.spawn_seed)),
-                    only_kind=args.spawn_kind,
-                    painted=painted if cov_min > 0.0 and painted else None,
-                    min_paint_cov=cov_min,
-                    log=lambda text: print(f"collect {text}", flush=True),
-                )
+                try:
+                    spawn_deck = SpawnDeck.load(
+                        dump,
+                        None if args.spawn_seed is None else _random.Random(int(args.spawn_seed)),
+                        only_kind=args.spawn_kind,
+                        painted=painted if cov_min > 0.0 and painted else None,
+                        min_paint_cov=cov_min,
+                        log=lambda text: print(f"collect {text}", flush=True),
+                    )
+                except Exception as exc:
+                    spawn_deck = None
+                    spawn_deck_map = ""
+                    return f"{map_name}: spawn deck failed to load: {type(exc).__name__}: {exc}"
+                spawn_deck_map = map_name
                 print(
                     f"collect spawn deck paint filter "
                     f"{'min_cov=' + format(cov_min, '.2f') if spawn_deck.filtering() else 'off'} "
@@ -2456,7 +2460,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         flush=True,
                     )
             if spawn_deck.exhausted:
-                return
+                if spawn_deck.summary()["picks"] == 0:
+                    return f"{map_name}: no legal on-road spawn (correct side of the road)"
+                return None
             picked = spawn_deck.take(source)
             if picked is None:
                 mix = spawn_deck.summary()
@@ -2479,14 +2485,18 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     flush=True,
                 )
                 _save_progress(done_s, done_s if target_s == float("inf") else target_s)
-                return
+                if mix["picks"] == 0:
+                    return f"{map_name}: no legal on-road spawn (correct side of the road)"
+                return None
             from python.collect.level_session import place_vehicle
             from python.collect.spawn_mix import queue_companion_traffic
 
             shift = place_vehicle(bng, vehicle, picked.pos, picked.rot)
             if shift:
                 print(f"collect spawn {segment_id} {picked.kind} failed {shift}", flush=True)
-                return
+                if source == "spawn":
+                    return f"{map_name}: legal spawn pose could not be placed: {shift}"
+                return None
             spawn_kind = picked.kind
             spawn_cov = picked.paint_cov
             spawn_road = str(picked.road_id)
@@ -2534,7 +2544,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             return (
                 stall_respawn_s > 0.0
                 and not (stall_streak[0] >= STALL_RESPAWN_STREAK and done_s <= stall_streak[1] + 1e-3)
-                and map_name == "west_coast_usa"
                 and vehicle is not None
                 and spawn_deck is not None
                 and not spawn_deck.exhausted
@@ -2865,7 +2874,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 # A new level starts on the off-deck range; a deck spawn below replaces it.
                 speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
                 speed = speed_at(done_s, tuple(speed_span[0]))
-                _apply_spawn(True)
+                spawn_err = _apply_spawn(True)
+                if spawn_err:
+                    last_error = spawn_err
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _publish(None, speed, waypoint)
+                    _write_collect_crash(status_root, last_error, {})
+                    print(f"collect stop {last_error}", flush=True)
+                    run.stop("spawn_failed", last_error)
+                    return 2
                 for command in sky_commands:
                     try:
                         _queue(vehicle, command)
@@ -3635,7 +3652,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 here = None if pos is None else [round(float(v), 2) for v in list(pos)[:3]]
                 road_here = None if hit is None else (str(getattr(hit, "road_id", "") or "") or None)
                 kind_was, road_was = spawn_kind or None, spawn_road
-                can_respawn = map_name == "west_coast_usa" and vehicle is not None and spawn_deck is not None
+                can_respawn = vehicle is not None and spawn_deck is not None
                 boundary = None if can_respawn else segment_boundary(
                     done_s + schedule_cut,
                     map_names,
@@ -3692,7 +3709,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 and recheck_due(recheck_s, done_s, recheck_mark)
                 and spawn_deck is not None
                 and spawn_deck.filtering()
-                and map_name == "west_coast_usa"
                 and vehicle is not None
                 and not settle.active(done_s)
             ):

@@ -1868,6 +1868,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     rig_for = ego["model"] if (map_names or args.reload_level) else None
     _CAM_TRANSPORT["mode"] = str(getattr(args, "cam_transport", "shmem") or "shmem")
     cam_parallel = str(getattr(args, "cam_fetch", "parallel")) == "parallel"
+    _CAM_FETCH["parallel"] = cam_parallel
     print(f"collect cameras transport={_CAM_TRANSPORT['mode']} fetch={'parallel' if cam_parallel else 'serial'}", flush=True)
     base_cam_cfg = load_camera_config()
     cam_cfg = rig_for_model(base_cam_cfg, rig_for)
@@ -2888,7 +2889,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tick_mark = time.monotonic()
             ticks.start(tick_mark)
             try:
-                frames, stamps, cam_reasons = _poll_cameras(cams, parallel=cam_parallel)
+                frames, stamps, cam_reasons = _poll_cameras(cams)
                 ticks.add("poll_s", time.monotonic() - tick_mark)
             except Exception as exc:
                 if not is_session_error(exc):
@@ -4082,8 +4083,13 @@ def _fetch_pool(n: int) -> Any:
     return _FETCH_POOL["pool"]
 
 
+# --cam-fetch (set by main). Module state, so a test that swaps in its own
+# ``_poll_cameras(cams)`` keeps working.
+_CAM_FETCH: dict[str, bool] = {"parallel": False}
+
+
 def _poll_cameras(
-    cams: dict[str, Any], *, parallel: bool = False
+    cams: dict[str, Any], *, parallel: bool | None = None
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     """Pictures as the sensor returned them, plus why each camera was dropped.
 
@@ -4097,6 +4103,8 @@ def _poll_cameras(
     stamps: dict[str, Any] = {}
     reasons: dict[str, str] = {}
     _TRAIN_GT.clear()
+    if parallel is None:
+        parallel = bool(_CAM_FETCH["parallel"])
     items = list(cams.items())
     if parallel and len(items) > 1 and parallel_safe(cams):
         pool = _fetch_pool(len(items))

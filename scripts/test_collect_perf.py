@@ -416,10 +416,15 @@ def check_collector_fails_loudly_when_exit_flush_fails() -> None:
         assert "collect stop writer_failed flush on exit" in text and "final fsync failed" in text, text[-1500:]
     finally:
         root_cm.__exit__(None, None, None)
+    import scripts.collect_scene_lanes as collect
+
+    collect._FETCH_POOL.update({"pool": None, "n": 0})
     code, text, out, _made, root_cm = rv2._run_fake_collect([], stop_at=12)
     try:
         assert code == 0 and "writer_failed" not in text, text[-1500:]
         assert "collect cameras transport=shmem fetch=parallel" in text, text[:1500]
+        # the run's own ticks went through the fetch pool (8 shared-memory cameras)
+        assert collect._FETCH_POOL["pool"] is not None and collect._FETCH_POOL["n"] >= 8, collect._FETCH_POOL
     finally:
         root_cm.__exit__(None, None, None)
     print("collector: an exit flush failure stops the run with writer_failed (exit 2); a clean run exits 0")

@@ -471,9 +471,14 @@ free samples, deterministic overfit/predict), `test_occ_out` (v2 fields, version
 smoke). Metrics: `scripts/eval_occ_unseen.py` (results below).
 
 Later-stage `predict` caps (`_capped_hot`, at production `LEVELS` (4, 2):
-cell 1.6 m and 0.8 m): the ground band follows the ground per xy column,
-the highest layer whose occupancy is within a small margin of that
-column's maximum (the surface; a below-ground fill that ties or is slightly hotter does not win). Below and above are relative to that column's ground, so a downhill
+cell 1.6 m and 0.8 m): the ground band is chosen from the bottom of each
+xy column, not the top. The seed is the highest near-max layer (within a
+small margin of the column max) in a three-layer window starting at the
+lowest near-max layer — the surface of a fill+ground stack. Seeds that
+sit above the neighbourhood lower envelope (a wall or car roof, or a
+building with no ground under it) inherit the nearest ground seed, so
+structure stays in the above-ground pool. A below-ground fill that ties
+or is slightly hotter does not win. Below and above are relative to that column's ground, so a downhill
 or height-offset road stays the band instead of a fixed z=0 slab. At most
 half the cap goes to the band; above-ground structure is filled next, then
 below-ground, each pool spread in xy so a high-p off-road region cannot take

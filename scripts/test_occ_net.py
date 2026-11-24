@@ -365,57 +365,11 @@ def check_capped_hot_follows_ground() -> None:
         # Holed ground, n_ground < cap//2, structure fills the rest: picked
         # below must be 0. A widened band (N6) would pull the adjacent below
         # layer into the band and spend those slots on below.
+        # Structure stays on the building footprint (not only on ground
+        # columns): a roof must not become the band in a hole.
         if cap <= 1024 or f == 2:
-            # 12.5% of columns have ground; structure sits on those same
-            # columns only (enough cells to fill the non-band budget) so a
-            # hole cannot promote a roof to the band. Picked below must be 0.
-            # A widened band (N6b) would pull the adjacent below into the
-            # band and spend those slots on below.
-            # Stride so n_ground < cap//2 but n_ground + in-grid struct >= cap
-            # (at 1.6 m the third struct layer can clip z_max).
-            step = 6 if cap <= 1024 else 8
-            gm = (np.arange(X.size) % step) == 0
-            gz = np.broadcast_to(np.asarray(0.2, dtype=np.float64), X.shape)
-            parts = [(np.stack([X[gm], Y[gm], zc(gz[gm])], 1), 0.95,
-                      np.where(Y[gm] > 20.0, "groundFAR", "groundNEAR")),
-                     (np.stack([X[gm], Y[gm], zc(gz[gm] - cm)], 1), 0.9,
-                      np.full(int(gm.sum()), "below"))]
-            for k in (1, 2, 3):
-                parts.append((np.stack([X[gm], Y[gm], zc(gz[gm] + k * cm)], 1),
-                              0.7, np.full(int(gm.sum()), "struct")))
-            # reuse run() by passing through a temporary ground_mask path:
-            # build via a one-off that uses the same exact-count asserts
-            def run_parts(name, parts):
-                hot = np.concatenate([p[0] for p in parts])
-                ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts])
-                lab = np.concatenate([p[2] for p in parts])
-                keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
-                hot, ph, lab = hot[keep], ph[keep], lab[keep]
-                idx = _capped_hot(hot, ph, cap, G.z_min, cm)
-                picked = lab[idx]
-                n_g = int(np.isin(picked, ("groundFAR", "groundNEAR")).sum())
-                n_st = int((picked == "struct").sum())
-                n_bel = int((picked == "below").sum())
-                n_g_tot = int(np.isin(lab, ("groundFAR", "groundNEAR")).sum())
-                n_st_tot = int((lab == "struct").sum())
-                n_bel_tot = int((lab == "below").sum())
-                n_low = min(n_g_tot, cap // 2) if n_g_tot else 0
-                n_up = min(n_st_tot, cap - n_low)
-                n_dn = min(n_bel_tot, cap - n_low - n_up)
-                leftover = cap - (n_low + n_up + n_dn)
-                n_low = min(n_g_tot, n_low + leftover)
-                leftover = cap - (n_low + n_up + n_dn)
-                n_up = min(n_st_tot, n_up + leftover)
-                leftover = cap - (n_low + n_up + n_dn)
-                n_dn = min(n_bel_tot, n_dn + leftover)
-                kept = dict(zip(*np.unique(picked, return_counts=True)))
-                assert n_g == n_low, (name, f, n_g, n_low, kept)
-                assert n_st == n_up, (name, f, n_st, n_up, kept)
-                assert n_bel == n_dn == 0, (name, f, n_bel, n_dn, kept)
-                assert n_g == n_g_tot, (name, f, "ground dropped", kept)
-                print(f"capped_hot f={f} cell={cm}m cap={cap} {name}: "
-                      f"ground {n_g} struct {n_st} below {n_bel} OK")
-            run_parts("holed (N6)", parts)
+            gm = (np.arange(X.size) % 8) == 0  # 12.5% of columns
+            run("holed 12.5% (N6)", 0.2, ground_mask=gm)
 
 
 
@@ -471,6 +425,71 @@ def check_capped_hot_surface_fill() -> None:
     run("cold ground, hot fill p=0.9",
         [(layer(0.2 - cm), 0.9, "below"), (layer(0.2 - 2 * cm), 0.9, "below")] + struct,
         expect_ground=False)
+
+
+def check_capped_hot_structure_surface() -> None:
+    """Saturated structure and buildings with no ground under them.
+
+    The band is chosen from the bottom of the column, so a wall or car
+    roof at the same p as the ground cannot take the band (Skeptic
+    pr237v5 roof_probe A/C/E). Structure must keep at least the cfb2a42
+    share; the below-ground pool must be empty.
+    """
+    f, cap = 2, 2048
+    cm = G.voxel_m * f
+    xs = G.x_min + cm * (np.arange(int(51.2 / cm)) + 0.5)
+    ys = G.y_min + cm * (np.arange(int(64 / cm)) + 0.5)
+    X, Y = [a.ravel() for a in np.meshgrid(xs, ys, indexing="ij")]
+
+    def zc(z):
+        return G.z_min + cm * (np.floor((z - G.z_min) / cm) + 0.5)
+
+    def layer(z, m):
+        return np.stack([X[m], Y[m], np.full(int(m.sum()), zc(z))], 1)
+
+    all_xy = np.ones_like(X, bool)
+    road = np.abs(X) < 4
+    bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
+    cars = road & (np.floor(Y / 6) % 2 == 0) & (Y > 5)
+    nob = ~bld
+
+    def run(name, parts, min_struct, allow_below=False):
+        hot = np.concatenate([p[0] for p in parts])
+        ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float32)
+        lab = np.concatenate([np.full(len(p[0]), p[2]) for p in parts])
+        idx = _capped_hot(hot, ph, cap, G.z_min, cm)
+        kept = {str(k): int(v) for k, v in zip(*np.unique(lab[idx], return_counts=True))}
+        n_st = int(kept.get("wall", 0) + kept.get("car", 0))
+        n_bel = int(kept.get("below", 0))
+        assert n_st >= min_struct, (name, n_st, min_struct, kept)
+        if not allow_below:
+            assert n_bel == 0, (name, n_bel, kept)
+        print(f"capped_hot structure {name}: {kept} OK")
+
+    walls = [(layer(0.2 + k * cm, bld), 1.0, "wall") for k in (1, 2, 3)]
+    car_l = [(layer(0.2 + k * cm, cars), 1.0, "car") for k in (1, 2)]
+    # A: all saturated, no fill. cfb2a42: wall 874 + car 150 = 1024, below 0.
+    run("A all saturated 1.0, no fill",
+        [(layer(0.2, all_xy), 1.0, "ground")] + walls + car_l, 1024)
+    # B: saturated + fill 1.0. cfb2a42 kept structure and below=0.
+    run("B all saturated 1.0 + below fill 1.0",
+        [(layer(0.2, all_xy), 1.0, "ground"), (layer(0.2 - cm, all_xy), 1.0, "below")]
+        + walls + car_l, 1024)
+    # C: ground .95, walls .92, cars .93, fill .9 (all inside a 0.05 margin
+    # of some neighbour). cfb2a42: car 520 + wall 504 = 1024, below 0.
+    run("C ground .95, walls .92, cars .93, fill .9",
+        [(layer(0.2, all_xy), 0.95, "ground"), (layer(0.2 - cm, all_xy), 0.9, "below")]
+        + [(layer(0.2 + k * cm, bld), 0.92, "wall") for k in (1, 2, 3)]
+        + [(layer(0.2 + k * cm, cars), 0.93, "car") for k in (1, 2)], 1024)
+    # E: no ground under buildings. cfb2a42: wall 1024, below 0.
+    run("E no ground under buildings, walls .8, fill .9",
+        [(layer(0.2, nob), 0.95, "ground"), (layer(0.2 - cm, nob), 0.9, "below")]
+        + [(layer(0.2 + k * cm, bld), 0.8, "wall") for k in (1, 2, 3)], 1024)
+    # F: E + cars .97 on the road. cfb2a42: car 520 + wall 504 = 1024, below 0.
+    run("F no ground under buildings + cars .97",
+        [(layer(0.2, nob), 0.95, "ground"), (layer(0.2 - cm, nob), 0.9, "below")]
+        + [(layer(0.2 + k * cm, bld), 0.8, "wall") for k in (1, 2, 3)]
+        + [(layer(0.2 + k * cm, cars), 0.97, "car") for k in (1, 2)], 1024)
 
 
 def check_class_balance() -> None:
@@ -536,6 +555,7 @@ def main() -> int:
     check_capped_hot_below_ground()
     check_capped_hot_follows_ground()
     check_capped_hot_surface_fill()
+    check_capped_hot_structure_surface()
     check_class_balance()
     check_unoccupied_not_occluded_structure()
     check_queries()

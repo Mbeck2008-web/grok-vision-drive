@@ -389,13 +389,110 @@ if nn is not None:
                                  tuple(stages) + (int(pts.shape[0]),))
 
 
+
+def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
+                       ix0: np.ndarray, iy0: np.ndarray, cell_m: float) -> np.ndarray:
+    """Ground layer index per xy column, chosen from the bottom up.
+
+    The seed is the highest near-max layer (within ``BAND_MARGIN`` of the
+    column max) in a three-layer window starting at the lowest near-max
+    layer: the surface of a fill+ground stack, including when a cold
+    fill leaves a gap. A seed that is a full layer above or below the
+    12 m neighbourhood lower envelope (a wall or car roof, or a building with
+    no ground) is rejected; that column inherits the nearest accepted
+    ground seed. A column with no cell at that height has no band, so
+    every structure layer stays in the above-ground pool.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    BAND_MARGIN = 0.05
+    SEED_SPAN = 2  # window is lo_near .. lo_near + SEED_SPAN (3 layers)
+    n_col = int(col.max()) + 1
+    order = np.lexsort((-p_hot, col))
+    _, first = np.unique(col[order], return_index=True)
+    pmax = np.full(n_col, -np.inf)
+    pmax[col[order][first]] = p_hot[order][first]
+    near = p_hot >= (pmax[col] - BAND_MARGIN)
+
+    raw = np.full(n_col, np.iinfo(np.int64).min)
+    near_idx = np.flatnonzero(near)
+    if near_idx.size:
+        c_n, l_n = col[near_idx], lvl[near_idx]
+        order = np.lexsort((l_n, c_n))
+        c_s, l_s = c_n[order], l_n[order]
+        _, first = np.unique(c_s, return_index=True)
+        lo = np.full(n_col, np.iinfo(np.int64).max)
+        lo[c_s[first]] = l_s[first]
+        in_win = l_s <= (lo[c_s] + SEED_SPAN)
+        if in_win.any():
+            np.maximum.at(raw, c_s, np.where(in_win, l_s, np.iinfo(np.int64).min))
+
+    nx = int(ix0.max()) + 1
+    ny = int(iy0.max()) + 1
+    _, first = np.unique(col, return_index=True)
+    col_ix = np.full(n_col, -1, np.int64)
+    col_iy = np.full(n_col, -1, np.int64)
+    col_ix[col[first]] = ix0[first]
+    col_iy[col[first]] = iy0[first]
+    used = np.zeros(n_col, dtype=bool)
+    used[col[first]] = True
+
+    valid = raw > np.iinfo(np.int64).min // 2
+    cs = np.flatnonzero(valid)
+    radius_m = 12.0
+    w = max(1, int(np.ceil(radius_m / float(cell_m))))
+    # Only strong-p columns vote, so a weak fill in a hole cannot pull
+    # the lower envelope a layer down and reject the true ground.
+    pmax2d = np.full((nx, ny), -np.inf)
+    if cs.size:
+        pmax2d[col_ix[cs], col_iy[cs]] = pmax[cs]
+    local_pmax = sliding_window_view(
+        np.pad(pmax2d, w, constant_values=-np.inf), (2 * w + 1, 2 * w + 1)
+    ).max(axis=(-1, -2))
+    vote = np.zeros(n_col, dtype=bool)
+    if cs.size:
+        vote[cs] = pmax[cs] >= (local_pmax[col_ix[cs], col_iy[cs]] - BAND_MARGIN)
+    seed_h = np.full((nx, ny), np.inf)
+    vs = np.flatnonzero(vote)
+    if vs.size:
+        seed_h[col_ix[vs], col_iy[vs]] = raw[vs].astype(np.float64)
+    env2d = sliding_window_view(
+        np.pad(seed_h, w, constant_values=np.inf), (2 * w + 1, 2 * w + 1)
+    ).min(axis=(-1, -2))
+    env = np.full(n_col, np.inf)
+    env[used] = env2d[col_ix[used], col_iy[used]]
+    # Accept the local lower envelope and one layer above it (ground
+    # next to a rare fill seed). Roofs sit two or more layers up.
+    is_g = valid & np.isfinite(env) & (raw.astype(np.float64) >= env) & (
+        raw.astype(np.float64) <= env + 1.0
+    )
+    target = np.full(n_col, np.iinfo(np.int64).min)
+    target[is_g] = raw[is_g]
+    gcs = np.flatnonzero(is_g)
+    q = np.flatnonzero(used & ~is_g)
+    if q.size and gcs.size:
+        gx, gy, glv = col_ix[gcs], col_iy[gcs], raw[gcs]
+        qx, qy = col_ix[q], col_iy[q]
+        d2 = (qx[:, None] - gx[None, :]).astype(np.int64) ** 2 + (
+            qy[:, None] - gy[None, :]).astype(np.int64) ** 2
+        target[q] = glv[d2.argmin(axis=1)]
+    elif q.size and not gcs.size:
+        target[q] = raw[q]
+    return target
+
+
 def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell_m: float) -> np.ndarray:
     """Indices of the ``cap`` hot cells to refine.
 
-    The ground band follows the ground per xy column: the highest layer
-    whose occupancy is within a small margin of that column's maximum
-    (the surface, not a below-ground fill that ties or is slightly
-    hotter). Below and above are relative to that column's ground, so a
+    The ground band is chosen from the bottom of each xy column, not the
+    top. The seed is the top of the bottom contiguous near-max run
+    (occupancy within BAND_MARGIN of the column max): that is the
+    surface of a fill+ground stack. Seeds that sit above the
+    neighbourhood lower envelope (a wall or car roof in a saturated
+    column, or a building with no ground under it) are discarded and
+    those columns inherit the nearest ground seed, so structure stays
+    in the above-ground pool and the below-ground pool stays empty.
+    Below and above are relative to that column's ground, so a
     downhill or height-offset road stays the band instead of a fixed z=0
     slab. A thinner or holed ground layer still wins its columns when it
     is within the margin of the strongest layer there, even if a
@@ -414,26 +511,15 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
     cell_m = float(cell_m)
     z_min = float(z_min)
     lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
-    # Per-column ground: highest layer within BAND_MARGIN of the
-    # column's max occupancy (the surface). A below-ground fill that
-    # ties or is slightly hotter cannot take the band. Not a z=0 slab.
+    # Per-column ground: bottom-up surface, not the highest near-max
+    # layer (a wall or car roof at the same p would steal the band).
     BAND_MARGIN = 0.05
     ix = np.floor(hot[:, 0] / cell_m + 1e-6).astype(np.int64)
     iy = np.floor(hot[:, 1] / cell_m + 1e-6).astype(np.int64)
     ix0 = ix - int(ix.min())
     iy0 = iy - int(iy.min())
     col = ix0 * (int(iy0.max()) + 1) + iy0
-    order = np.lexsort((-p_hot, col))
-    _, first = np.unique(col[order], return_index=True)
-    pmax = np.empty(int(col.max()) + 1, dtype=np.float64)
-    pmax[col[order][first]] = p_hot[order][first]
-    near = p_hot >= (pmax[col] - BAND_MARGIN)
-    # candidates first, then highest layer
-    order = np.lexsort((-lvl, ~near, col))
-    _, first = np.unique(col[order], return_index=True)
-    g_lvl = np.empty(int(col.max()) + 1, dtype=np.int64)
-    g_lvl[col[order][first]] = lvl[order][first]
-    gl = g_lvl[col]
+    gl = _column_ground_lvl(col, lvl, p_hot, ix0, iy0, cell_m)[col]
     band = lvl == gl
     below = lvl < gl
     above = lvl > gl

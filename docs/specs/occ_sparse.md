@@ -484,7 +484,13 @@ radius fit a local ground plane, which is the band. Far ground on a hill
 stays the band. A one-layer car or guardrail that sits on real ground,
 and a wall or roof (or a building with no ground under it), stay in the
 above-ground pool. A below-ground fill that ties or is slightly hotter
-does not win. Below and above are relative to that column's ground, so a downhill
+does not win. Limit: where flat road turns into a +10% / +15% uphill inside
+the 12 m window, the plane fit lags the kink and some below-ground fill
+still reaches the cap (0.8 m: walls 924 / 662, below 128 / 140 of 2048;
+1.6 m: walls 176 / 120, below 88 / 138 of 512). `test_occ_net` pins these
+as floors on walls and ceilings on below; a kinked -10% / -15% downhill
+keeps 18 / 12 below at 0.8 m (2 / 2 at 1.6 m), unpinned. Grades above 15%
+are not covered. Below and above are relative to that column's ground, so a downhill
 or height-offset road stays the band instead of a fixed z=0 slab. At most
 half the cap goes to the band; above-ground structure is filled next, then
 below-ground, each pool spread in xy so a high-p off-road region cannot take

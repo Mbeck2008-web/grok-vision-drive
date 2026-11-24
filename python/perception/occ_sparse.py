@@ -579,8 +579,11 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
     a 15% grade over that radius fit a local ground plane, which is the
     band. Far ground on a hill stays the band; a one-layer car or
     guardrail on real ground, and a wall or roof (or a building with no
-    ground under it), stay in the above-ground pool; the below-ground
-    pool stays empty. Below and above are relative to that column's
+    ground under it), stay in the above-ground pool. On flat, offset and
+    3% downhill roads the below-ground pool is empty; where a grade
+    starts inside the 12 m window some below-ground fill still reaches
+    the cap (0.8 m: 128 / 140 at +10% / +15%, 18 / 12 at -10% / -15%;
+    the uphill maxima are pinned in test_occ_net). Below and above are relative to that column's
     ground, so a downhill or height-offset road stays the band instead
     of a fixed z=0 slab. A thinner or holed ground layer still wins its
     columns when it is within the margin of the strongest layer there,

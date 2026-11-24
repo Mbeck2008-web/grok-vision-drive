@@ -224,6 +224,53 @@ def check_quality_check_failed_clip_paths() -> None:
     print("failed-clip QC: signal kill, half-span floor, undecodable frame, impact")
 
 
+def check_quality_check_main_hz_inclusive_floor() -> None:
+    """Exactly MIN_MAIN_HZ (5.0) is train; the comparison is strictly less, not <=."""
+    from python.collect.clip_mode import MIN_MAIN_HZ, plan_clip, quality_check
+    from scripts.gvd_test_env import collect_root
+
+    p = plan_clip(0, seed=1, maps=MAPS, max_traffic=2, edge_cases=("rain",), min_s=4.0, max_s=4.0)
+    assert MIN_MAIN_HZ == 5.0
+    with collect_root() as root:
+        d = root / "hz_eq"
+        n = 20
+        _fake_recording(d, rows=n)
+        path = d / "state.jsonl"
+        rewritten = []
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+            rec = json.loads(line)
+            rec["t"] = 1000.0 + i * (4.0 / (n - 1))
+            rewritten.append(rec)
+        path.write_text("".join(json.dumps(r) + "\n" for r in rewritten), encoding="utf-8")
+        q = quality_check(d, p, exit_code=0)
+        assert q["main_hz"] == MIN_MAIN_HZ, q
+        assert q["quality"] == "train" and q["reasons"] == [], q
+    print("quality check: main camera at exactly 5.0 Hz is still train")
+
+
+def check_run_clips_marks_collector_crash() -> None:
+    """If the collector raises, the clip is kept as pretrain_only with exit 99, not a clean 0."""
+    from python.collect.clip_mode import run_clips
+    from scripts.gvd_test_env import collect_root
+
+    def runner(argv: list[str]) -> int:
+        out = Path(argv[argv.index("--out") + 1])
+        _fake_recording(out, rows=50)
+        raise RuntimeError("collector crashed")
+
+    with collect_root() as root:
+        session = run_clips(root, clips=1, seed=5, maps=MAPS, max_traffic=4, runner=runner, min_s=4.0, max_s=5.0)
+        dirs = [p for p in session.iterdir() if p.is_dir()]
+        assert len(dirs) == 1
+        tags = json.loads((dirs[0] / "clip_tags.json").read_text(encoding="utf-8"))
+        assert tags["quality"] == "pretrain_only", tags
+        assert tags.get("collector_exit") == 99, tags
+        assert any("exit 99" in r for r in tags["reasons"]), tags
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["results"][0]["exit"] == 99, manifest["results"]
+    print("run_clips: a raised collector is exit 99 and pretrain_only")
+
+
 def check_edge_case_false_positives() -> None:
     """A False observation must not read as True: each case here is a plain clip."""
     from python.collect.clip_mode import plan_clip, quality_check
@@ -421,6 +468,8 @@ def main() -> None:
     check_collector_argv()
     check_quality_check_marks_not_deletes()
     check_quality_check_failed_clip_paths()
+    check_quality_check_main_hz_inclusive_floor()
+    check_run_clips_marks_collector_crash()
     check_edge_case_observation()
     check_edge_case_false_positives()
     check_session_never_overwrites()

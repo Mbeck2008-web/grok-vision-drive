@@ -202,6 +202,15 @@ def check_old_checkpoint_class_count_is_refused() -> None:
         assert "96" in text and "80" in text and "pedestrian" in text, text
     else:
         raise AssertionError("a 6-class (pedestrian) checkpoint loaded")
+    # A too-narrow head must also be refused. `if rows > want` would let it through.
+    narrow = {"object_class_head.weight": np.zeros((N_OBJECTS * (len(OBJECT_CLASSES) - 1), 4))}
+    try:
+        check_object_class_head(narrow)
+    except ObjectClassCountError as exc:
+        text = str(exc)
+        assert "64" in text and "80" in text, text
+    else:
+        raise AssertionError("a too-narrow object_class head loaded")
     # Decoding a pre-v2 6-wide class output never maps slot 5 onto slot 4 silently.
     scene = {
         "lanes": np.zeros((6, 16, 2)), "lane_valid": np.zeros(6), "curbs": np.zeros((2, 16, 2)),
@@ -215,7 +224,7 @@ def check_old_checkpoint_class_count_is_refused() -> None:
         pass
     else:
         raise AssertionError("a 6-wide object_class output decoded")
-    print("old 96-wide object_class head refused with a clear error")
+    print("old 96-wide and too-narrow object_class heads refused with a clear error")
 
 
 def check_old_checkpoint_refused_by_loaders() -> None:

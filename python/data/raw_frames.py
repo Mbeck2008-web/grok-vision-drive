@@ -703,6 +703,10 @@ class TrainGtGate:
     every due camera keeps its GT. Behind it, each camera keeps every other
     one of its own GT frames (``stride`` 2), so a 1 Hz camera is not starved
     by a 10 Hz one. Back under ``recover_ratio`` the full rate returns.
+
+    ``thin=False`` keeps every due GT frame whatever the tick rate (clip mode:
+    a clip that runs at a steady 4-5 Hz would otherwise thin for its whole
+    length, IQU45 smoke at d3cfb7d). The EMA is still tracked.
     """
 
     def __init__(
@@ -712,8 +716,10 @@ class TrainGtGate:
         behind_ratio: float = 1.2,
         recover_ratio: float = 1.05,
         alpha: float = 0.2,
+        thin: bool = True,
     ) -> None:
         self.period_s = float(period_s)
+        self.thin = bool(thin)
         self.behind_ratio = float(behind_ratio)
         self.recover_ratio = float(recover_ratio)
         self.alpha = float(alpha)
@@ -736,7 +742,7 @@ class TrainGtGate:
         if dt_s is not None and float(dt_s) > 0.0:
             dt = float(dt_s)
             self.ema_s = dt if self.ema_s is None else self.ema_s + self.alpha * (dt - self.ema_s)
-        if self.ema_s is not None:
+        if self.ema_s is not None and self.thin:
             if self.stride == 1 and self.ema_s > self.period_s * self.behind_ratio:
                 self.stride = 2
             elif self.stride == 2 and self.ema_s < self.period_s * self.recover_ratio:

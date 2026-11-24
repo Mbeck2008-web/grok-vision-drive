@@ -864,6 +864,93 @@ def check_respawn_keeps_full_gt_and_cli_reaches_collector() -> None:
           f"chase {chase}/{len(mains)} rows; ceiling {full:.1f} GB/h incl. GT + chase")
 
 
+def check_gt_gate_off_keeps_full_rate() -> None:
+    """Smoke C: thin=False never halves GT, even at a steady 4 Hz (2.5x the period)."""
+    from python.data.raw_frames import TrainGtGate
+
+    gate = TrainGtGate(period_s=0.1, thin=False)
+    kept = [gate.select(0.25, ["main", "rear"]) for _ in range(200)]
+    assert gate.stride == 1 and all(k == {"main", "rear"} for k in kept), gate.stride
+    assert gate.ema_s is not None and abs(gate.ema_s - 0.25) < 1e-9, gate.ema_s
+    print("GT gate thin=False: full-rate depth/sem at a steady 4 Hz")
+
+
+def check_clip_argv_spawns_traffic_full_gt_and_length() -> None:
+    """IQU45 smoke at d3cfb7d, fixes A-C, on clip_mode's own argv.
+
+    * A: the clip runs a seeded deck spawn (SpawnDeck.load gets Random(spawn_seed), the
+      car is placed before the first row) and queues the planned companion traffic.
+    * B: it stops at the planned clip length, not the collector's 60 s floor.
+    * C: a steady 5 Hz loop (2x behind the 10 Hz plan) still writes depth/sem every row.
+    """
+    import random
+
+    import python.collect.level_session as level_session
+    import python.collect.spawn_mix as spawn_mix
+    from python.collect.clip_mode import clip_argv, plan_clip
+    from python.debug.gt_geom import RoadPoly
+
+    plan = plan_clip(0, seed=3, maps=("west_coast_usa",), max_traffic=3, edge_cases=("heavy_traffic",))
+    assert plan.traffic == 3 and 30.0 <= plan.duration_s <= 60.0, plan
+    argv = clip_argv(plan, Path("/unused"))
+    i = argv.index("--out")
+    argv = argv[:i] + argv[i + 2:]
+    i = argv.index("--ego-model")  # the fake session has no eSBR rig to spawn
+    argv = argv[:i] + argv[i + 2:]
+
+    real_begin, real_place, real_load = level_session.begin_level, level_session.place_vehicle, spawn_mix.SpawnDeck.load
+    loads: list[dict] = []
+    places: list[int] = []
+
+    def begin(bng, level):
+        del level
+        return level_session.OpenedLevel(
+            vehicle=bng.ego, roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], spawn=(0.0, 10.0, 0.5),
+        )
+
+    def place(*args, **kwargs):
+        places.append(1)
+        return real_place(*args, **kwargs)
+
+    def load(cls, path, rng=None, **kwargs):
+        loads.append({"rng_state": None if rng is None else rng.getstate(), "only_kind": kwargs.get("only_kind")})
+        return real_load.__func__(cls, path, rng, **kwargs)
+
+    level_session.begin_level = begin
+    level_session.place_vehicle = place
+    spawn_mix.SpawnDeck.load = classmethod(load)  # type: ignore[assignment]
+    try:
+        code, text, out, _made, root_cm = _run_fake_collect(argv + ["--min-paint-cov", "0"], tick_s=0.2, stop_at=10**6)
+    finally:
+        level_session.begin_level, level_session.place_vehicle = real_begin, real_place
+        spawn_mix.SpawnDeck.load = real_load  # type: ignore[assignment]
+    try:
+        assert code == 0, text[-2000:]
+        # A: seeded deck spawn + companions
+        assert len(loads) == 1 and loads[0]["rng_state"] == random.Random(plan.spawn_seed).getstate(), loads
+        assert loads[0]["only_kind"] == plan.spawn_kind, loads
+        assert places, text[-1500:]
+        assert re.search(r"collect spawn \S+ highway \(.*traffic=3 ", text), text[-2500:]
+        # The deck asked for slots (the fixture roads may have no legal lane for them;
+        # real placement on west_coast_usa is an IQU45 check).
+        assert "collect traffic west_coast_usa#0 placed " in text, text[-2500:]
+        state = _rows(out)
+        assert state and {r.get("spawn_type") for r in state} == {"highway"}, {r.get("spawn_type") for r in state}
+        # B: planned length, not 60 s
+        m = re.search(r"collect stop reason=\S+ code=\d+ done_s=([0-9.]+) target_s=([0-9.]+)", text)
+        assert m and abs(float(m.group(2)) - plan.duration_s) < 0.05, (m and m.groups(), plan.duration_s)
+        assert float(m.group(1)) <= plan.duration_s + 1.0, m.groups()
+        # C: full-rate GT at a steady 5 Hz
+        mains = [r for r in state if "main" in r["cams"]]
+        assert len(mains) >= 50, len(mains)
+        thinned = [r["i"] for r in mains if "main_depth" not in r["cams"] or r.get("gt_stride") != 1]
+        assert not thinned, f"clip GT thinned at rows {thinned[:12]}"
+    finally:
+        root_cm.__exit__(None, None, None)
+    print(f"clip argv: seeded deck spawn, traffic={plan.traffic} sent to the deck, {float(m.group(1)):.1f}/{plan.duration_s:.1f} s, "
+          f"full-rate GT on {len(mains)} rows at 5 Hz")
+
+
 def main() -> None:
     check_train_gt_on_all_eight()
     check_live_attach_forces_gt_off()
@@ -893,6 +980,8 @@ def main() -> None:
     check_short_collect_v2()
     check_short_collect_behind_halves_gt()
     check_respawn_keeps_full_gt_and_cli_reaches_collector()
+    check_gt_gate_off_keeps_full_rate()
+    check_clip_argv_spawns_traffic_full_gt_and_length()
     print("test_recorder_v2: OK")
 
 

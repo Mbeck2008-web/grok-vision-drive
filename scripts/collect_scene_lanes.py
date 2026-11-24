@@ -384,6 +384,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minutes", type=float, default=45.0, help="Stop after this much driving. 0 with --until-disk runs to the 20 GB floor.")
     parser.add_argument("--until-disk", action="store_true", help="Ignore the clock. Stop only under 20 GB free.")
     parser.add_argument("--map", default="", help="Level to load. Empty keeps the current level.")
+    parser.add_argument(
+        "--clip-s",
+        type=float,
+        default=0.0,
+        help="Clip mode: stop after this many seconds of driving (overrides --minutes and its 60 s floor). 0 is off.",
+    )
+    parser.add_argument(
+        "--gt-thin",
+        default="auto",
+        choices=["auto", "off"],
+        help="auto: depth/sem drop to every other frame while the loop runs behind 10 Hz. off: always full rate.",
+    )
     parser.add_argument("--route", default="span", choices=["span", "waypoints", "random"])
     parser.add_argument(
         "--speed-min", type=float, default=None,
@@ -1820,7 +1832,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         return 2
     progress_path = out / "collect.json"
     done_s = load_progress(progress_path)
-    target_s = float("inf") if until_disk else max(60.0, float(args.minutes) * 60.0)
+    clip_s = float(getattr(args, "clip_s", 0.0) or 0.0)
+    if clip_s > 0.0:
+        # Clip mode (collect_clips): the planned 30-60 s length, not the 60 s floor.
+        until_disk = False
+        target_s = clip_s
+    else:
+        target_s = float("inf") if until_disk else max(60.0, float(args.minutes) * 60.0)
     flag = stop_file(out)
     if flag.is_file():
         flag.unlink()
@@ -2115,7 +2133,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         cam_sched = CameraSchedule(cam_rates)
         # Training-only depth/sem drop to every other frame per camera while the
         # loop runs behind the 10 Hz plan; colour frames are never thinned.
-        gt_gate = TrainGtGate(1.0 / COLLECT_HZ)
+        gt_gate = TrainGtGate(1.0 / COLLECT_HZ, thin=str(getattr(args, "gt_thin", "auto")) != "off")
         gt_prev_mono: list[float | None] = [None]
 
         def _reset_gt_gate() -> None:

@@ -178,7 +178,13 @@ def clip_argv(plan: ClipPlan, out_dir: Path, *, chase: bool = False, extra: Iter
     """``collect_scene_lanes.py`` arguments for one clip (lossless raw writer, one map, the eSBR)."""
     argv = [
         "--minutes", f"{plan.duration_s / 60.0:.6f}",
-        "--map", plan.map,
+        # The collector's --minutes has a 60 s floor; --clip-s is the planned length.
+        "--clip-s", repr(float(plan.duration_s)),
+        # A one-map rotation, not --map: only a segment load runs the seeded deck
+        # spawn and queues companion traffic (--map kept the loaded pose, 0 cars).
+        "--maps", plan.map,
+        # Full-rate depth/sem: at a steady 4-5 Hz the gate would thin the whole clip.
+        "--gt-thin", "off",
         "--out", str(out_dir),
         "--ego-model", plan.ego_model,
         "--traffic", str(int(plan.traffic)),

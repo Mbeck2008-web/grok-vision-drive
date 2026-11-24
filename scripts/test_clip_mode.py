@@ -70,12 +70,19 @@ def check_collector_argv() -> None:
     p = plan_clip(3, seed=1, maps=("west_coast_usa",), max_traffic=4, edge_cases=("merge",))
     argv = clip_argv(p, Path("/tmp/x/clip"), chase=True)
     joined = " ".join(argv)
-    for want in ("--out /tmp/x/clip", "--map west_coast_usa", "--ego-model sbr", "--no-vary-env",
+    # Smoke A: "--maps <one map>" (the rotation path), never "--map": only a segment
+    # load runs the seeded deck spawn and queues companion traffic.
+    assert "--map" not in argv and argv[argv.index("--maps") + 1] == "west_coast_usa", argv
+    # Smoke B: the planned length reaches the collector (its --minutes floor is 60 s).
+    assert float(argv[argv.index("--clip-s") + 1]) == p.duration_s, argv
+    # Smoke C: clips keep full-rate depth/sem; the thinning gate is off.
+    assert argv[argv.index("--gt-thin") + 1] == "off", argv
+    for want in ("--out /tmp/x/clip", "--ego-model sbr", "--no-vary-env",
                  f"--traffic {p.traffic}", "--weather clear", "--spawn-kind ramp",
                  f"--spawn-seed {p.spawn_seed}", "--chase-cam", "--smoke-s 0"):
         assert want in joined, (want, joined)
     assert f"--minutes {p.duration_s / 60.0:.6f}" in joined, joined
-    for banned in ("--strip", "jpeg", "jpg", "--maps"):
+    for banned in ("--strip", "jpeg", "jpg"):
         assert banned not in joined, banned
     # The clock reaches BeamNG as its own 0-1 time (0 noon, 0.5 midnight), so an
     # early-morning night hour (00:30) is never misread as a 0-1 fraction.

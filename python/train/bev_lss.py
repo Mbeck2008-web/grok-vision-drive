@@ -19,8 +19,12 @@ G4  Per-camera intrinsics K and cam-to-ego extrinsics are explicit inputs.
     principal point, no distortion; UNVERIFIED against a recorded K).
 G5  Unknown is the default. A cell no valid ray reaches is ``unknown``
     (logit forced high) and never ``observed_free`` (logit forced low).
-    ``observed_free`` is allowed only where depth mass passed beyond the
-    cell (``pass_mass > 0``). This is structural, not a loss weight.
+    ``observed_free`` is allowed only where a minimum share of the cell's
+    depth mass passed through it (``pass_mass / (hit_mass + pass_mass)
+    >= PASS_FRAC_TAU``). Softmax residual mass is not enough: cells that
+    only lie behind a confident depth hit (prior cumulative probability
+    already ``OCCLUDE_HIT_TAU``) have free forced low and ``unknown``
+    plus ``occluded`` forced high. This is structural, not a loss weight.
 G6  The output is differentiable with respect to the stem taps and the
     depth head.
 G7  No NaN or Inf, including a batch where no camera is valid.
@@ -73,8 +77,17 @@ BEV_CHANNELS: tuple[str, ...] = (
 )
 CH_FREE = BEV_CHANNELS.index("observed_free")
 CH_UNKNOWN = BEV_CHANNELS.index("unknown")
+CH_OCCLUDED = BEV_CHANNELS.index("occluded")
 # Finite, so a forced logit never produces NaN in a loss.
 FORCE_LOGIT = 30.0
+# Free is allowed only when this share of a cell's depth mass passed through
+# it: pass_mass / (hit_mass + pass_mass) >= PASS_FRAC_TAU. A raw `passed > 0`
+# test cannot tell "seen through" from softmax residual behind a wall.
+PASS_FRAC_TAU = 0.5
+# A ray has a confident hit once cumulative depth probability reaches this.
+# Bins past that hit are occluded. 0.95 is below the weakest wall case the
+# tests pin (p_hit = 0.987 at softmax margin 8).
+OCCLUDE_HIT_TAU = 0.95
 
 # Categorical depth (audit item 9: 40 log bins, 1-48 m).
 DEPTH_BINS = 40
@@ -155,8 +168,27 @@ class CamGeom:
     yaw_deg: float
 
 
-def rig_geometry(cam_ids: Sequence[str], cameras_cfg: Mapping[str, Any]) -> list[CamGeom]:
-    """Per-camera geometry from a parsed ``cameras.yaml``. A missing field raises."""
+def rig_geometry(
+    cam_ids: Sequence[str], cameras_cfg: Mapping[str, Any], model: str | None = None
+) -> list[CamGeom]:
+    """Per-camera geometry from a parsed ``cameras.yaml``. A missing field raises.
+
+    When ``cameras_cfg`` contains ``vehicle_overrides``, ``model`` is required
+    and the rig is resolved through ``python.sensors.rig_overrides.rig_for_model``
+    (the default collection ego is the eSBR, whose repeater mounts differ).
+    """
+    from python.sensors.rig_overrides import OVERRIDES_KEY, rig_for_model
+
+    by_id = {str(c["id"]): c for c in cameras_cfg.get("cameras") or [] if isinstance(c, Mapping) and c.get("id")}
+    for cid in cam_ids:
+        if str(cid) not in by_id:
+            raise KeyError(f"camera {cid!r} is not in cameras.yaml")
+    if cameras_cfg.get(OVERRIDES_KEY) is not None and model is None:
+        raise ValueError(
+            "cameras.yaml has vehicle_overrides; pass model= (e.g. 'sbr' or 'etk800') "
+            "so rig_geometry can apply them via rig_for_model"
+        )
+    cameras_cfg = rig_for_model(cameras_cfg, model)
     by_id = {str(c["id"]): c for c in cameras_cfg.get("cameras") or [] if isinstance(c, Mapping) and c.get("id")}
     out: list[CamGeom] = []
     for cid in cam_ids:
@@ -265,6 +297,12 @@ def depth_survival(prob: Any, dim: int = 1) -> Any:
     return (prob.flip(dim).cumsum(dim).flip(dim) - prob).clamp(min=0.0)
 
 
+def depth_already_hit(prob: Any, tau: float = OCCLUDE_HIT_TAU, dim: int = 2) -> Any:
+    """True at bins already behind a confident hit: prior cumulative mass >= ``tau``."""
+    prior = prob.cumsum(dim) - prob
+    return prior >= tau
+
+
 def bev_flat_index(points: Any) -> tuple[Any, Any]:
     """Flat cell index (row * N + col) and a validity mask for ego xyz points (G2, G3)."""
     x, y, z = points[..., 0], points[..., 1], points[..., 2]
@@ -351,10 +389,17 @@ class BevEncoder(nn.Module):
 class BevLssHead(nn.Module):
     """Lift (depth x context), splat (scatter_add), BEV encoder. Taps in, ``B x 14 x 128 x 128`` out."""
 
-    def __init__(self, depth_bins: int = DEPTH_BINS) -> None:
+    def __init__(
+        self,
+        depth_bins: int = DEPTH_BINS,
+        pass_frac_tau: float = PASS_FRAC_TAU,
+        occlude_hit_tau: float = OCCLUDE_HIT_TAU,
+    ) -> None:
         super().__init__()
         self.spatial = SpatialPath(depth_bins=depth_bins)
         self.encoder = BevEncoder(CTX_CH + 2)
+        self.pass_frac_tau = float(pass_frac_tau)
+        self.occlude_hit_tau = float(occlude_hit_tau)
         self.register_buffer("depths", torch.from_numpy(depth_bin_centers(depth_bins)), persistent=False)
 
     @staticmethod
@@ -396,29 +441,87 @@ class BevLssHead(nn.Module):
         beyond = depth_survival(prob, dim=2)
         prob_w = prob * weight
         beyond_w = beyond * weight
+        blocked = depth_already_hit(prob, self.occlude_hit_tau, dim=2).to(dtype=prob.dtype)
+        unblocked = 1.0 - blocked
+        occ_w = blocked * weight
+        clear_w = (prob_w + beyond_w) * unblocked
         ctx = ctx.view(b, n, 1, CTX_CH, h, w)
         lifted = prob_w.unsqueeze(3) * ctx  # B N D C h w
         pts = frustum_ego_points(K, T, self.depths.to(K.dtype), (h, w), FEAT_STRIDE, time_offset_s, ego_speed_mps)
         idx, ok = bev_flat_index(pts)  # B N D h w
         values = torch.cat(
-            [lifted.permute(0, 1, 2, 4, 5, 3), prob_w.unsqueeze(-1), beyond_w.unsqueeze(-1)], dim=-1
-        ).reshape(b, n * d * h * w, CTX_CH + 2)
+            [
+                lifted.permute(0, 1, 2, 4, 5, 3),
+                prob_w.unsqueeze(-1),
+                beyond_w.unsqueeze(-1),
+                occ_w.unsqueeze(-1),
+                clear_w.unsqueeze(-1),
+            ],
+            dim=-1,
+        ).reshape(b, n * d * h * w, CTX_CH + 4)
         bev = splat(values, idx.reshape(b, -1), ok.reshape(b, -1))
         feat = bev[:, :CTX_CH]
         hit = bev[:, CTX_CH : CTX_CH + 1]
         passed = bev[:, CTX_CH + 1 : CTX_CH + 2]
+        occ = bev[:, CTX_CH + 2 : CTX_CH + 3]
+        clear = bev[:, CTX_CH + 3 : CTX_CH + 4]
         logits = self.encoder(torch.cat([feat, torch.log1p(hit), torch.log1p(passed)], dim=1))
-        logits = apply_visibility(logits, hit, passed)
-        return {"logits": logits, "hit_mass": hit, "pass_mass": passed, "depth_prob": prob, "bev_feat": feat}
+        logits = apply_visibility(
+            logits, hit, passed, occluded_mass=occ, clear_mass=clear, pass_frac_tau=self.pass_frac_tau
+        )
+        return {
+            "logits": logits,
+            "hit_mass": hit,
+            "pass_mass": passed,
+            "occluded_mass": occ,
+            "clear_mass": clear,
+            "depth_prob": prob,
+            "bev_feat": feat,
+        }
 
-def apply_visibility(logits: Any, hit: Any, passed: Any) -> Any:
-    """G5: unobserved -> unknown, never free; free only where depth mass passed through."""
-    seen = (hit + passed) > 0
-    free_ok = passed > 0
+def apply_visibility(
+    logits: Any,
+    hit: Any,
+    passed: Any,
+    occluded_mass: Any = None,
+    clear_mass: Any = None,
+    pass_frac_tau: float = PASS_FRAC_TAU,
+) -> Any:
+    """G5: unobserved -> unknown, never free; free only where pass share >= ``pass_frac_tau``.
+
+    Cells with ``occluded_mass > 0`` and no unblocked (``clear_mass``) observation
+    are behind a confident hit: free is forced low, unknown and occluded high.
+    """
+    total = hit + passed
+    pass_frac = passed / (total + 1e-12)
+    free_ok = (total > 0) & (pass_frac >= pass_frac_tau)
+    seen = total > 0
+    behind = None
+    if occluded_mass is not None:
+        behind = occluded_mass > 0
+        if clear_mass is not None:
+            behind = behind & (clear_mass <= 0)
+            seen = clear_mass > 0
+        else:
+            seen = seen & ~behind
+        free_ok = free_ok & ~behind
     free = torch.where(free_ok, logits[:, CH_FREE : CH_FREE + 1], torch.full_like(hit, -FORCE_LOGIT))
     unknown = torch.where(seen, logits[:, CH_UNKNOWN : CH_UNKNOWN + 1], torch.full_like(hit, FORCE_LOGIT))
+    if behind is None:
+        return torch.cat(
+            [logits[:, :CH_FREE], free, logits[:, CH_FREE + 1 : CH_UNKNOWN], unknown, logits[:, CH_UNKNOWN + 1 :]],
+            dim=1,
+        )
+    occ = torch.where(behind, torch.full_like(hit, FORCE_LOGIT), logits[:, CH_OCCLUDED : CH_OCCLUDED + 1])
     return torch.cat(
-        [logits[:, :CH_FREE], free, logits[:, CH_FREE + 1 : CH_UNKNOWN], unknown, logits[:, CH_UNKNOWN + 1 :]],
+        [
+            logits[:, :CH_FREE],
+            free,
+            logits[:, CH_FREE + 1 : CH_UNKNOWN],
+            unknown,
+            occ,
+            logits[:, CH_OCCLUDED + 1 :],
+        ],
         dim=1,
     )
 
@@ -434,4 +537,8 @@ def build_bev_head(cfg: Mapping[str, Any] | None = None) -> Any:
     section = (cfg or {}).get("bev_lss") or {}
     if not bool(section.get("enabled", DEFAULT_ENABLED)):
         return None
-    return BevLssHead(depth_bins=int(section.get("depth_bins", DEPTH_BINS)))
+    return BevLssHead(
+        depth_bins=int(section.get("depth_bins", DEPTH_BINS)),
+        pass_frac_tau=float(section.get("pass_frac_tau", PASS_FRAC_TAU)),
+        occlude_hit_tau=float(section.get("occlude_hit_tau", OCCLUDE_HIT_TAU)),
+    )

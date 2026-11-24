@@ -23,6 +23,7 @@ import torch
 import yaml
 
 from python.train import bev_lss as bl
+from python.sensors.rig_overrides import BASE_RIG_MODEL
 
 torch.manual_seed(0)
 N_CAMS = 8
@@ -47,7 +48,7 @@ def _cam_ids() -> list[str]:
 
 
 def _rig(batch: int = 1) -> dict:
-    return bl.rig_tensors(bl.rig_geometry(_cam_ids(), _cfg()), batch=batch)
+    return bl.rig_tensors(bl.rig_geometry(_cam_ids(), _cfg(), model=BASE_RIG_MODEL), batch=batch)
 
 
 def _taps(batch: int = 1, requires_grad: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -75,7 +76,7 @@ def check_intrinsics_from_fov() -> None:
     wide = bl.camera_intrinsics(88.7, 640, 360)  # 16:9 letterboxed to 256x144 at row 24
     assert abs(wide[1, 1] - 72.0 / math.tan(math.radians(44.35))) < 1e-3, wide
     assert wide[1, 2] == 96.0 and bl.content_rect(640, 360) == (256, 144, 0, 24)
-    geoms = {g.cam_id: g for g in bl.rig_geometry(_cam_ids(), _cfg())}
+    geoms = {g.cam_id: g for g in bl.rig_geometry(_cam_ids(), _cfg(), model=BASE_RIG_MODEL)}
     fx = {k: round(float(g.K[0, 0]), 1) for k, g in geoms.items()}
     # audit table (redesigner.md item 9), by hand: fy = (content_h / 2) / tan(fov_v / 2) with content_h = 192
     # for 640x480 and 144 for 640x360, e.g. main 96 / tan(17 deg) = 314.0, rear 72 / tan(40 deg) = 85.8
@@ -91,7 +92,7 @@ def check_intrinsics_from_fov() -> None:
             continue
         raise AssertionError(f"fov {bad} accepted")
     try:
-        bl.rig_geometry(["nope"], _cfg())
+        bl.rig_geometry(["nope"], _cfg(), model=BASE_RIG_MODEL)
     except KeyError:
         pass
     else:
@@ -183,7 +184,7 @@ def check_frustum_point_lands_in_expected_cell() -> None:
         assert torch.allclose(pts[0, 0, di, 11, 20], want, atol=1e-5), (pts[0, 0, di, 11, 20], want)
     # main camera from cameras.yaml: centre-ish pixel at a known depth (uses the module K; the fully
     # hand-derived version with literal numbers is check_geometry_hand_points)
-    geoms = {g.cam_id: g for g in bl.rig_geometry(_cam_ids(), _cfg())}
+    geoms = {g.cam_id: g for g in bl.rig_geometry(_cam_ids(), _cfg(), model=BASE_RIG_MODEL)}
     g = geoms["main"]
     Km = torch.from_numpy(g.K).view(1, 1, 3, 3)
     Tm = torch.from_numpy(g.T).view(1, 1, 4, 4)
@@ -324,11 +325,14 @@ def check_visibility_by_construction() -> None:
     with torch.no_grad():
         out = head(*_taps(), rig["K"], rig["T"], pixel_valid=rig["pixel_valid"])
     logits, hit, passed = out["logits"][0], out["hit_mass"][0, 0], out["pass_mass"][0, 0]
-    seen = (hit + passed) > 0
+    clear = out["clear_mass"][0, 0]
+    seen = clear > 0  # unblocked observation; residual mass behind a hit is not "seen"
     assert 0.2 < float(seen.float().mean()) < 1.0  # some cells seen, some not (near-ego blind ring, gaps)
     assert torch.all(logits[bl.CH_UNKNOWN][~seen] == bl.FORCE_LOGIT)
     assert torch.all(logits[bl.CH_FREE][~seen] == -bl.FORCE_LOGIT)
     assert torch.all(logits[bl.CH_FREE][passed <= 0] == -bl.FORCE_LOGIT)
+    frac = passed / (hit + passed + 1e-12)
+    assert torch.all(logits[bl.CH_FREE][frac < bl.PASS_FRAC_TAU] == -bl.FORCE_LOGIT)
     assert torch.all(logits[bl.CH_UNKNOWN][seen].abs() < bl.FORCE_LOGIT)  # learned where seen
     assert bool(seen[64 - 30, 64])  # 15 m ahead is seen
     # apply_visibility in isolation: other channels untouched
@@ -345,6 +349,98 @@ def check_visibility_by_construction() -> None:
     assert got[0, bl.CH_FREE, 0, 0] == -bl.FORCE_LOGIT  # hit only, nothing passed: not free
     assert got[0, bl.CH_FREE, 1, 1] == raw[0, bl.CH_FREE, 1, 1]
     print("visibility_by_construction")
+
+
+
+def check_pass_fraction_gate() -> None:
+    """observed_free is allowed only when pass / (hit + pass) >= PASS_FRAC_TAU (default 0.5)."""
+    raw = torch.randn(1, 14, 2, 2)
+    h = torch.zeros(1, 1, 2, 2)
+    p = torch.zeros(1, 1, 2, 2)
+    # below 0.5: hit=0.9, pass=0.1 (frac=0.1), still > 0 so a `passed > 0` gate would allow free
+    h[..., 0, 0] = 0.9
+    p[..., 0, 0] = 0.1
+    # above 0.5: hit=0.4, pass=0.6 (frac=0.6)
+    h[..., 0, 1] = 0.4
+    p[..., 0, 1] = 0.6
+    got = bl.apply_visibility(raw, h, p)
+    assert got[0, bl.CH_FREE, 0, 0] == -bl.FORCE_LOGIT, "sub-threshold pass share must force free low"
+    assert got[0, bl.CH_FREE, 0, 1] == raw[0, bl.CH_FREE, 0, 1], "at-or-above-threshold pass share may be free"
+    assert bl.PASS_FRAC_TAU == 0.5, bl.PASS_FRAC_TAU
+    print("pass_fraction_gate")
+
+
+def check_wall_behind_is_unknown_not_free() -> None:
+    """G5: a confident wall makes every cell behind it unknown (and occluded), never free.
+
+    Wall at bin 12 (3.4 m) of the main camera, softmax margins 8, 15 and 25
+    (p_hit 0.987, ~1, 1). All 776 cells only reached beyond the wall must have
+    free forced low and unknown (and occluded) forced high.
+    """
+    class Peaked(torch.nn.Module):
+        def __init__(self, k, m):
+            super().__init__()
+            self.k, self.m = k, m
+
+        def forward(self, f4, f8, f16, cam):
+            n, _, h, w = f8.shape
+            lg = torch.zeros(n, bl.DEPTH_BINS, h, w)
+            lg[:, self.k] = self.m
+            return lg.softmax(1), torch.ones(n, bl.CTX_CH, h, w)
+
+    cfg = _cfg()
+    geoms = bl.rig_geometry(["main"], cfg, model=BASE_RIG_MODEL)
+    rig = bl.rig_tensors(geoms)
+    head = bl.BevLssHead().eval()
+    k = 12
+    centre = float(head.depths[k])
+    assert 3.3 < centre < 3.5, centre  # 3.4 m ahead
+    ch_occ = bl.BEV_CHANNELS.index("occluded")
+    f4 = torch.randn(1, 1, 64, 48, 64)
+    f8 = torch.randn(1, 1, 128, 24, 32)
+    f16 = torch.randn(1, 1, 128, 12, 16)
+    behind_n = None
+    for m in (8.0, 15.0, 25.0):
+        head.spatial = Peaked(k, m)
+        with torch.no_grad():
+            out = head(f4, f8, f16, rig["K"], rig["T"], pixel_valid=rig["pixel_valid"])
+        lg = out["logits"][0]
+        pts = bl.frustum_ego_points(rig["K"], rig["T"], head.depths, (24, 32))[0, 0]
+        idx, ok = bl.bev_flat_index(pts)
+        behind = torch.zeros(128 * 128, dtype=torch.bool)
+        front = torch.zeros(128 * 128, dtype=torch.bool)
+        in_front = torch.zeros(128 * 128, dtype=torch.bool)
+        behind[idx[k + 1 :][ok[k + 1 :]]] = True
+        front[idx[: k + 1][ok[: k + 1]]] = True
+        in_front[idx[:k][ok[:k]]] = True
+        behind = (behind & ~front).view(128, 128)
+        in_front = (in_front & ~behind.view(-1)).view(128, 128)
+        n_behind = int(behind.sum())
+        if behind_n is None:
+            behind_n = n_behind
+        assert n_behind == 776, n_behind
+        p_hit = float(torch.softmax(torch.tensor([m] + [0.0] * (bl.DEPTH_BINS - 1)), 0)[0])
+        free_open = behind & (lg[bl.CH_FREE] != -bl.FORCE_LOGIT)
+        unk_learned = behind & (lg[bl.CH_UNKNOWN] != bl.FORCE_LOGIT)
+        occ_open = behind & (lg[ch_occ] != bl.FORCE_LOGIT)
+        assert int(free_open.sum()) == 0, (
+            f"margin {m}: p_hit={p_hit:.8f} free NOT forced low={int(free_open.sum())} of {n_behind}"
+        )
+        assert int(unk_learned.sum()) == 0, (
+            f"margin {m}: p_hit={p_hit:.8f} unknown NOT forced high={int(unk_learned.sum())} of {n_behind}"
+        )
+        assert int(occ_open.sum()) == 0, (
+            f"margin {m}: p_hit={p_hit:.8f} occluded NOT forced high={int(occ_open.sum())} of {n_behind}"
+        )
+        # rays that have not yet hit the wall stay learned, not forced unknown / not-free
+        assert int(in_front.sum()) > 0
+        assert torch.all(lg[bl.CH_UNKNOWN][in_front].abs() < bl.FORCE_LOGIT), m
+        assert not torch.all(lg[bl.CH_FREE][in_front] == -bl.FORCE_LOGIT), m
+    assert 0.0 < bl.OCCLUDE_HIT_TAU <= 0.987, bl.OCCLUDE_HIT_TAU
+    src = Path(bl.__file__).read_text(encoding="utf-8")
+    assert "PASS_FRAC_TAU" in src and "OCCLUDE_HIT_TAU" in src
+    assert "pass_mass / (hit_mass + pass_mass)" in src or "pass_mass/(hit_mass+pass_mass)" in src
+    print("wall_behind_is_unknown_not_free")
 
 
 def check_pass_mass_is_survival() -> None:
@@ -534,12 +630,77 @@ def check_default_off() -> None:
     assert isinstance(head, bl.BevLssHead) and head.depths.numel() == bl.DEPTH_BINS
     small = bl.build_bev_head({"bev_lss": {"enabled": True, "depth_bins": 20}})
     assert small.depths.numel() == 20 and small.spatial.depth.out_channels == 20
-    assert bl.rig_tensors(bl.rig_geometry(["main"], _cfg()))["K"].shape == (1, 1, 3, 3)  # default batch 1
+    assert bl.rig_tensors(bl.rig_geometry(["main"], _cfg(), model=BASE_RIG_MODEL))["K"].shape == (1, 1, 3, 3)  # default batch 1
     import python.train.scene_net as sn
 
     assert "bev_lss" not in Path(sn.__file__).read_text(encoding="utf-8")
     assert not any(n.startswith("bev") for n, _ in sn.SceneNet().named_modules() if n)
+    import subprocess
+
+    probe = (
+        "import sys\n"
+        "import python.run_vision  # noqa: F401\n"
+        "import python.perception.pipeline  # noqa: F401\n"
+        "assert 'python.train.bev_lss' not in sys.modules, "
+        "sorted(m for m in sys.modules if 'bev' in m)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(ROOT),
+        env={**os.environ, "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+             "CUDA_VISIBLE_DEVICES": "-1"},
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
     print("default_off")
+
+
+
+def check_rig_geometry_applies_vehicle_overrides() -> None:
+    """rig_geometry applies cameras.yaml vehicle_overrides via rig_for_model, or raises."""
+    from python.collect.level_session import EGO_MODEL_DEFAULT
+    from python.sensors.rig_overrides import BASE_RIG_MODEL
+
+    cfg = _cfg()
+    assert EGO_MODEL_DEFAULT == "sbr"
+    assert "vehicle_overrides" in cfg and "sbr" in cfg["vehicle_overrides"]
+    sbr_pos = {cid: list(map(float, p["pos_m"])) for cid, p in cfg["vehicle_overrides"]["sbr"].items()}
+    assert sbr_pos["repeatL"] == [-1.10, 0.00, 0.90] and sbr_pos["repeatR"] == [1.10, 0.00, 0.90]
+    try:
+        sbr = {g.cam_id: g for g in bl.rig_geometry(["repeatL", "repeatR"], cfg, model="sbr")}
+        base = {g.cam_id: g for g in bl.rig_geometry(["repeatL", "repeatR"], cfg, model=BASE_RIG_MODEL)}
+    except TypeError as err:
+        raise AssertionError("rig_geometry must take model and apply rig_for_model") from err
+    assert np.allclose(sbr["repeatL"].T[:3, 3], [-1.10, 0.00, 0.90], atol=1e-5), sbr["repeatL"].T[:3, 3]
+    assert np.allclose(sbr["repeatR"].T[:3, 3], [1.10, 0.00, 0.90], atol=1e-5), sbr["repeatR"].T[:3, 3]
+    assert np.allclose(base["repeatL"].T[:3, 3], [-0.81, 1.25, 0.67], atol=1e-5), base["repeatL"].T[:3, 3]
+    assert np.allclose(base["repeatR"].T[:3, 3], [0.81, 1.25, 0.67], atol=1e-5), base["repeatR"].T[:3, 3]
+    # 1.25 m / 0.29 m mount error on the default eSBR is about 2 cells at 0.5 m
+    for cid, depth, base_cell, sbr_cell in (
+        ("repeatL", 7.5, (74, 54), (76, 54)),
+        ("repeatL", 20.0, (95, 41), (97, 41)),
+        ("repeatR", 7.5, (74, 72), (76, 73)),
+        ("repeatR", 20.0, (96, 84), (98, 85)),
+    ):
+        def _cell(geom, d):
+            K = torch.from_numpy(geom.K).view(1, 1, 3, 3)
+            T = torch.from_numpy(geom.T).view(1, 1, 4, 4)
+            pts = bl.frustum_ego_points(K, T, torch.tensor([d], dtype=torch.float32), (24, 32))
+            mid = pts[0, 0, 0, 12, 16]
+            return bl.bev_cell(float(mid[0]), float(mid[1]))
+
+        assert _cell(base[cid], depth) == base_cell, (cid, depth, _cell(base[cid], depth))
+        assert _cell(sbr[cid], depth) == sbr_cell, (cid, depth, _cell(sbr[cid], depth))
+    try:
+        bl.rig_geometry(["repeatL"], cfg)
+    except ValueError as err:
+        msg = str(err).lower()
+        assert "model" in msg or "override" in msg, err
+    else:
+        raise AssertionError("rig_geometry must raise when vehicle_overrides is present and no model is given")
+    print("rig_geometry_applies_vehicle_overrides")
 
 
 # ---------------------------------------------------------------- mutation-guided edge checks
@@ -605,6 +766,27 @@ def check_flat_index_edges() -> None:
     assert ok.tolist() == [True, True, False, False, False, False], ok
     assert idx[0].item() == 0 and idx[1].item() == 128 * 128 - 1
     print("flat_index_edges")
+
+
+
+def check_depth_already_hit_boundary() -> None:
+    """A bin whose prior cumulative mass is exactly OCCLUDE_HIT_TAU is already occluded."""
+    tau = bl.OCCLUDE_HIT_TAU
+    d = 4
+    p = torch.zeros(1, 1, d, 1, 1)
+    p[0, 0, 0] = tau
+    p[0, 0, 1] = 1.0 - tau
+    blocked = bl.depth_already_hit(p, tau, dim=2)
+    assert not bool(blocked[0, 0, 0]), "hit bin itself is not yet behind"
+    assert bool(blocked[0, 0, 1]), "prior == tau must count as a confident hit (>=, not >)"
+    assert bool(blocked[0, 0, 2]) and bool(blocked[0, 0, 3])
+    q = torch.zeros(1, 1, d, 1, 1)
+    just = min(tau - 1e-6, tau * 0.999)
+    q[0, 0, 0] = just
+    q[0, 0, 1] = 1.0 - just
+    below = bl.depth_already_hit(q, tau, dim=2)
+    assert not bool(below[0, 0, 0]) and not bool(below[0, 0, 1]), (float(just), tau)
+    print("depth_already_hit_boundary")
 
 
 def check_depth_survival_reference() -> None:
@@ -950,6 +1132,8 @@ def main() -> None:
     check_ego_compensation_optional()
     check_shapes_every_stage()
     check_visibility_by_construction()
+    check_pass_fraction_gate()
+    check_wall_behind_is_unknown_not_free()
     check_pass_mass_is_survival()
     check_zero_valid_cameras_no_nan()
     check_gradients_reach_stem_and_depth()
@@ -958,9 +1142,11 @@ def main() -> None:
     check_activation_memory_estimate()
     check_onnx_export_parity()
     check_default_off()
+    check_rig_geometry_applies_vehicle_overrides()
     check_geometry_helper_edges()
     check_flat_index_edges()
     check_depth_survival_reference()
+    check_depth_already_hit_boundary()
     check_lift_and_head_compensation()
     check_camera_features_values()
     check_architecture_pinned()

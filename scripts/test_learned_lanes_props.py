@@ -348,6 +348,373 @@ def check_pipeline_wiring() -> None:
     print("pipeline: flag off is Hough as before; learned / fallback reach lane_head OK")
 
 
+def _fixture_frames() -> list[tuple[str, np.ndarray]]:
+    """The repo's committed BeamNG captures (tests/fixtures, 87 frames: 85 full stitches)."""
+    import cv2
+
+    root = ROOT / "tests" / "fixtures"
+    paths = sorted(list(root.rglob("*.jpg")) + list(root.rglob("*.png")))
+    frames = []
+    for path in paths:
+        img = cv2.imread(str(path))
+        if img is not None:
+            frames.append((str(path.relative_to(root)), img))
+    return frames
+
+
+def check_flag_off_pipeline_pin_real_frames() -> None:
+    """Flag OFF: ModularPerception lanes are exactly lanes_from_view, and the gate never runs.
+
+    Skeptic's question on eccf5c4: does the default Hough path go through the
+    new paint gate? It must not. On every committed real frame, with
+    lane_selector None (what run_vision builds without --learned-lanes):
+    PerceptionOut lanes / conf and the stored LaneResult equal a direct
+    lanes_from_view(main, stitch) call bit for bit, lane_head is
+    HOUGH_ONLY_TELEMETRY, and lane_select's gate / selector are never called.
+    """
+    from python.perception import pipeline
+    from python.perception.lanes import _full_stitch, lanes_from_view
+    from python.perception.pipeline import ModularPerception
+    from python.run_vision import build_parser
+
+    import python.run_vision as rv
+
+    # run_vision wiring: no flag (env unset or "0") and --no-learned-lanes build no selector.
+    saved_env = os.environ.pop(ls.LEARNED_LANES_ENV, None)
+    try:
+        assert rv.build_lane_selector is ls.build_lane_selector
+        quiet = lambda *a, **k: None  # noqa: E731
+        for argv, env in (([], None), ([], "0"), (["--no-learned-lanes"], "1")):
+            if env is not None:
+                os.environ[ls.LEARNED_LANES_ENV] = env
+            assert ls.build_lane_selector(build_parser().parse_args(argv), print_fn=quiet) is None, (argv, env)
+            os.environ.pop(ls.LEARNED_LANES_ENV, None)
+    finally:
+        os.environ.pop(ls.LEARNED_LANES_ENV, None)
+        if saved_env is not None:
+            os.environ[ls.LEARNED_LANES_ENV] = saved_env
+    import inspect
+
+    main_src = inspect.getsource(rv.main)
+    built = main_src.index("perc = ModularPerception(")
+    wired = main_src.index("perc.lane_selector = build_lane_selector(args)")
+    assert built < wired and main_src.count("lane_selector =") == 1 and main_src.count("ModularPerception(") == 1
+
+    frames = _fixture_frames()
+    assert len(frames) >= 80, f"expected the committed real frames, found {len(frames)}"
+
+    calls = {"hough": 0}
+
+    def tripwire(*_a, **_k):
+        raise AssertionError("flag OFF reached lane_select (paint gate / learned selector)")
+
+    def counting_hough(main_bgr, stitch_bgr=None):
+        calls["hough"] += 1
+        return lanes_from_view(main_bgr, stitch_bgr)
+
+    saved = (ls.paint_evidence_px, ls.LearnedLaneSelector.select, ls.forward_image, pipeline.lanes_from_view)
+    ls.paint_evidence_px = tripwire
+    ls.LearnedLaneSelector.select = tripwire
+    ls.forward_image = tripwire
+    pipeline.lanes_from_view = counting_hough
+    with_lanes = 0
+    try:
+        perc = ModularPerception(allow_synthetic=False, detector_id="empty")
+        assert perc.lane_selector is None
+        for i, (name, img) in enumerate(frames):
+            stitch = img if _full_stitch(img) else None
+            main = img.copy()
+            pout = perc.tick(main, stitch_bgr=None if stitch is None else stitch.copy(), ego_speed_mps=8.0)
+            ref = lanes_from_view(img.copy(), None if stitch is None else img.copy())
+            assert calls["hough"] == i + 1, (name, calls)
+            assert perc._last_lanes == ref, name
+            assert pout.lanes_bev == ref.lanes_bev and pout.lane_conf == ref.conf, name
+            assert pout.lane_head == ls.HOUGH_ONLY_TELEMETRY, (name, pout.lane_head)
+            with_lanes += bool(ref.lanes_bev)
+    finally:
+        ls.paint_evidence_px, ls.LearnedLaneSelector.select, ls.forward_image, pipeline.lanes_from_view = saved
+    assert with_lanes > 0, "no fixture frame has Hough lanes: the pin would be vacuous"
+    print(
+        f"flag OFF pin: {len(frames)} real fixture frames ({with_lanes} with Hough lanes), "
+        "pipeline lanes == lanes_from_view exactly, lane_head flag_off, paint gate never called OK"
+    )
+
+
+# ---------------------------------------------------------------- paint gate contract (mutation-driven)
+#
+# Each check below pins a documented rule of paint_evidence_px / forward_image
+# at its exact boundary, on both sides. They were written to kill surviving
+# mutants (evidence/mutant_table.md), but each one is a behaviour the I1 gate
+# depends on: a rule that can move by one unit without a test failing is not a
+# rule.
+
+ROI_TOP_100 = int(ls.PAINT_ROI_TOP * 100)  # 35 on a 100-row frame
+
+
+def stripe_frame(color, bg, *, h=100, w=160, x0=70, width=6, r0=45, r1=85, shift=0, dtype=np.uint8) -> np.ndarray:
+    """A single stripe (BGR ``color``) on a uniform ``bg``, rows r0..r1-1, moving ``shift`` px per row."""
+    img = np.empty((h, w, 3), dtype=dtype)
+    img[:] = bg
+    for r in range(r0, r1):
+        x = x0 + shift * (r - r0)
+        img[r, x:x + width] = color
+    return img
+
+
+def hsv_of(bgr) -> tuple:
+    import cv2
+
+    return tuple(int(v) for v in cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0, 0])
+
+
+def paint_both(img: np.ndarray) -> int:
+    """paint_evidence_px, asserting a float64 copy of the same frame gives the same count."""
+    n = ls.paint_evidence_px(img)
+    nf = ls.paint_evidence_px(img.astype(np.float64))
+    assert n == nf, ("float input must equal uint8 input", n, nf)
+    return n
+
+
+WHITE = (230, 230, 230)
+GRAY = (100, 100, 100)
+YELLOW = (0, 200, 200)
+GRAY200 = (200, 200, 200)
+
+
+def check_paint_gate_count_definition() -> None:
+    """The count is the stripe area after the +-4 px join and the PAINT_MIN_ROWS
+    vertical check: a W px stripe over R rows inside the ROI gives (W + 8) * (R - 4)."""
+    rows = 85 - 45
+    for color, bg in ((WHITE, GRAY), (YELLOW, GRAY200)):
+        for width in (3, 6, 10):
+            got = paint_both(stripe_frame(color, bg, width=width))
+            assert got == (width + 8) * (rows - (ls.PAINT_MIN_ROWS - 1)), (color, width, got)
+    # Two separate stripes add up (one lane line does not hide the other).
+    a = stripe_frame(WHITE, GRAY, x0=30)
+    b = stripe_frame(WHITE, GRAY, x0=110)
+    both = a.copy()
+    both[:, 100:] = b[:, 100:]
+    assert paint_both(both) == paint_both(a) + paint_both(b) == 2 * 14 * 36
+    print("paint count = (W + 8) * (R - 4) per stripe, additive over stripes OK")
+
+
+def check_paint_gate_stripe_shape_rules() -> None:
+    """Run >= 3 px counts, 2 px does not; slanted stripes count (the open is 1x3,
+    horizontal only); component length PAINT_MIN_RUN_PX counts, one less does not."""
+    assert paint_both(stripe_frame(WHITE, GRAY, width=3)) > 0
+    assert paint_both(stripe_frame(WHITE, GRAY, width=2)) == 0
+    for color, bg in ((WHITE, GRAY), (YELLOW, GRAY200)):
+        # 4 px wide, 2 px sideways per row: a side lane in perspective.
+        slanted = stripe_frame(color, bg, width=4, shift=2, x0=40)
+        assert paint_both(slanted) > 0, color
+    # Component bounding box: (W + 8) wide after the join, R - 4 rows tall.
+    # W=4, R=12 -> 12 x 8 box: exactly PAINT_MIN_RUN_PX long, counts.
+    assert ls.PAINT_MIN_RUN_PX == 12
+    assert paint_both(stripe_frame(WHITE, GRAY, width=4, r0=50, r1=62)) == 12 * 8
+    # W=3, R=12 -> 11 x 8 box: one short, does not count.
+    assert paint_both(stripe_frame(WHITE, GRAY, width=3, r0=50, r1=62)) == 0
+    print("paint stripe rules: 3 px run, slanted stripes, PAINT_MIN_RUN_PX boundary OK")
+
+
+def check_paint_gate_colour_boundaries() -> None:
+    """White: S <= 18, V >= 185, value ridge >= 18. Yellow: H 8..42, S >= 28,
+    V >= 80, saturation ridge >= 12. Each edge, inside and one unit outside."""
+    # White V and value ridge (grey stripe on darker grey, S = 0).
+    assert paint_both(stripe_frame((185,) * 3, (167,) * 3)) > 0       # V 185, ridge 18
+    assert paint_both(stripe_frame((184,) * 3, (166,) * 3)) == 0      # V 184
+    assert paint_both(stripe_frame((185,) * 3, (168,) * 3)) == 0      # ridge 17
+    # White S (V 255 on grey 230: ridge 25).
+    assert hsv_of((237, 255, 255))[1] == 18 and hsv_of((236, 255, 255))[1] == 19
+    assert paint_both(stripe_frame((237, 255, 255), (230,) * 3)) > 0  # S 18
+    assert paint_both(stripe_frame((236, 255, 255), (230,) * 3)) == 0  # S 19 (and not yellow: S < 28)
+    # Yellow on grey of the SAME value: only the saturation ridge can see it.
+    cases = [
+        ((178, 200, 200), (30, 28, 200), True), ((179, 200, 200), (30, 27, 200), False),   # S 28 / 27
+        ((0, 80, 80), (30, 255, 80), True), ((0, 79, 79), (30, 255, 79), False),           # V 80 / 79
+        ((0, 51, 200), (8, 255, 200), True), ((0, 44, 200), (7, 255, 200), False),         # H 8 / 7
+        ((0, 200, 117), (42, 255, 200), True), ((0, 200, 110), (43, 255, 200), False),     # H 42 / 43
+    ]
+    for bgr, want_hsv, counts in cases:
+        assert hsv_of(bgr) == want_hsv, (bgr, hsv_of(bgr))
+        v = want_hsv[2]
+        got = paint_both(stripe_frame(bgr, (v, v, v)))
+        assert (got > 0) == counts, (bgr, want_hsv, got)
+    # Saturation ridge exactly 12 / 11, inside a yellow field (bg S 243 at V 255).
+    assert hsv_of((12, 255, 255)) == (30, 243, 255) and hsv_of((0, 255, 255)) == (30, 255, 255)
+    assert hsv_of((1, 255, 255)) == (30, 254, 255)
+    assert paint_both(stripe_frame((0, 255, 255), (12, 255, 255))) > 0    # ridge 12
+    assert paint_both(stripe_frame((1, 255, 255), (12, 255, 255))) == 0   # ridge 11
+    print("paint colour thresholds hold at each edge (white S/V/ridge, yellow H/S/V/ridge) OK")
+
+
+def check_paint_gate_input_forms() -> None:
+    """No frame / degenerate shapes give 0; BGRA = BGR; float input is clipped to
+    0..255 like a camera (overexposed paint still counts, negative is black)."""
+    assert ls.paint_evidence_px(None) == 0
+    ref = stripe_frame(WHITE, GRAY)
+    n = ls.paint_evidence_px(ref)
+    assert n > 0
+    bgra = np.concatenate([ref, np.full(ref.shape[:2] + (1,), 7, np.uint8)], axis=2)
+    assert ls.paint_evidence_px(bgra) == n
+    assert ls.paint_evidence_px(np.ascontiguousarray(ref[:, :, :2])) == 0   # 2 channels: not an image
+    # Overexposed float paint (300) on 200 counts exactly like 255 on 200.
+    hot = stripe_frame((300.0,) * 3, (200.0,) * 3, dtype=np.float64)
+    assert ls.paint_evidence_px(hot) == ls.paint_evidence_px(stripe_frame((255,) * 3, (200,) * 3)) > 0
+    # Negative float "paint" is black, not wrapped to bright.
+    assert ls.paint_evidence_px(stripe_frame((-20.0,) * 3, (0.0,) * 3, dtype=np.float64)) == 0
+    # ROI height: under 4 rows below PAINT_ROI_TOP gives 0; exactly 4 rows is read.
+    assert ls.paint_evidence_px(stripe_frame(WHITE, GRAY, h=4, w=64, x0=20, r0=0, r1=4)) == 0
+    four = stripe_frame(WHITE, GRAY, h=6, w=64, x0=20, r0=0, r1=6)
+    assert 6 - int(ls.PAINT_ROI_TOP * 6) == 4 and ls.paint_evidence_px(four) == 14 * 4
+    print("paint gate input forms: None/2ch -> 0, BGRA = BGR, float clipped, ROI 4-row floor OK")
+
+
+def check_forward_image_contract() -> None:
+    """forward_image: None under 2x2 or < 3 channels; uint8 HxWx3 otherwise; the
+    stitch crop only for stitch_bgr; float clipped to 0..255 exactly like uint8."""
+    from python.perception.lanes import _full_stitch
+
+    for shape in ((2, 2, 3), (2, 7, 3), (7, 2, 3), (5, 5, 4)):
+        out = ls.forward_image(np.full(shape, 9, np.uint8))
+        assert out is not None and out.shape == shape[:2] + (3,) and out.dtype == np.uint8, shape
+    for shape in ((1, 7, 3), (7, 1, 3), (5, 5, 2)):
+        assert ls.forward_image(np.full(shape, 9, np.uint8)) is None, shape
+    assert ls.forward_image(None) is None
+    # A stitch-shaped main with no stitch is returned whole (the crop is for stitch_bgr).
+    stitch = next(img for _n, img in _fixture_frames() if _full_stitch(img))
+    assert np.array_equal(ls.forward_image(stitch), stitch)
+    assert ls.forward_image(None, stitch).shape != stitch.shape
+    # Float: in-range integers equal the uint8 frame; negatives are 0; > 255 is 255.
+    u8 = stripe_frame((0, 255, 255), (12, 255, 255))
+    assert np.array_equal(ls.forward_image(u8.astype(np.float64)), u8)
+    f = np.full((4, 4, 3), -50.0)
+    f[0, 0] = 400.0
+    got = ls.forward_image(f)
+    assert got[1, 1, 0] == 0 and got[0, 0, 0] == 255, got[:, :, 0]
+    print("forward_image contract (sizes, channels, stitch-only crop, float clip) OK")
+
+
+def check_learned_parse_contract() -> None:
+    """Batched ONNX shapes parse like flat ones; non-numeric outputs are bad_shape,
+    never an exception; learned points have Hough's {x, y, z=0.0} schema;
+    curvature reads every lane spanning >= 1 m."""
+    flat = ls.parse_learned_lanes(head_outputs(curb_xs=(3.0,)), 0.9)
+    batched = {k: np.asarray(v)[None, ...] for k, v in head_outputs(curb_xs=(3.0,)).items()}
+    got = ls.parse_learned_lanes(batched, 0.9)
+    assert got.reason == "" and got.result == flat.result and got.curbs_bev == flat.curbs_bev, got
+    for key in ls.LEARNED_OUTPUTS:
+        outs = head_outputs()
+        outs[key] = np.full(np.asarray(outs[key]).shape, "x")
+        bad = ls.parse_learned_lanes(outs, 0.9)
+        assert bad.result is None and bad.reason == ls.REASON_BAD_SHAPE, (key, bad)
+    from python.perception.lanes import lanes_from_view
+
+    hough_pts = [p for poly in lanes_from_view(painted_frame()).lanes_bev for p in poly]
+    assert hough_pts and all(set(p) == {"x", "y", "z"} and p["z"] == 0.0 for p in hough_pts)
+    for poly in flat.result.lanes_bev + flat.curbs_bev:
+        for p in poly:
+            assert set(p) == {"x", "y", "z"} and p["z"] == 0.0, p
+    # Curvature: x = a y^2 gives 2a; a lane spanning exactly 1 m counts; a short
+    # (< 1 m) lane first in the list does not stop the others from counting.
+    ys = np.linspace(10.0, 11.0, ls.LANE_POINTS)
+    curved = np.stack([0.01 * ys ** 2, ys], axis=-1)
+    assert abs(ls._curvature([curved]) - 0.02) < 1e-6, ls._curvature([curved])
+    short = np.stack([np.zeros(ls.LANE_POINTS), np.linspace(5.0, 5.5, ls.LANE_POINTS)], axis=-1)
+    assert abs(ls._curvature([short, curved]) - 0.02) < 1e-6
+    assert ls._curvature([short]) == 0.0
+    print("learned parse contract (batched shapes, non-numeric, point schema, curvature span) OK")
+
+
+def check_wiring_contract() -> None:
+    """build_lane_selector / lane_strip_for / describe / telemetry: defaults, the
+    --scene-onnx path reaching the runtime, and robustness to missing attributes."""
+    calls: list = []
+
+    def rec(*a, **k):
+        calls.append((" ".join(str(x) for x in a), k))
+
+    paths: list = []
+
+    def factory(p):
+        paths.append(p)
+        return FakeRuntime()
+
+    saved_env = os.environ.pop(ls.LEARNED_LANES_ENV, None)
+    try:
+        assert ls.build_lane_selector(SimpleNamespace(learned_lanes=False, lane_source="hough"), print_fn=rec) is None
+        assert calls[-1][0].startswith("[GVD] lane head: hough (learned lanes OFF") and calls[-1][1] == {"flush": True}, calls
+        assert ls.build_lane_selector(SimpleNamespace(learned_lanes=True, lane_source="scene"), print_fn=rec) is None
+        assert calls[-1] == ("[GVD] lane head: --learned-lanes ignored, --lane-source scene drives lanes", {"flush": True})
+        on = ls.build_lane_selector(
+            SimpleNamespace(learned_lanes=True, lane_source="hough", scene_onnx="/x/custom.onnx"), factory=factory, print_fn=rec
+        )
+        assert on is not None and on.ready and paths == ["/x/custom.onnx"], paths
+        assert calls[-1] == ("[GVD] lane head: learned lanes ON, model ready (fake.onnx)", {"flush": True}), calls[-1]
+        # Defaults: no lane_source / empty lane_source mean hough; no scene_onnx means None.
+        for args in (SimpleNamespace(learned_lanes=True), SimpleNamespace(learned_lanes=True, lane_source=None),
+                     SimpleNamespace(learned_lanes=True, lane_source="", scene_onnx="")):
+            paths.clear()
+            assert ls.build_lane_selector(args, factory=factory, print_fn=rec) is not None, args
+            assert paths == [None], (args, paths)
+        # No learned_lanes attribute and no env: OFF.
+        assert ls.build_lane_selector(SimpleNamespace(lane_source="hough"), factory=factory, print_fn=rec) is None
+    finally:
+        os.environ.pop(ls.LEARNED_LANES_ENV, None)
+        if saved_env is not None:
+            os.environ[ls.LEARNED_LANES_ENV] = saved_env
+    # The default factory gets the --scene-onnx path (the start line names it).
+    missing = ls.LearnedLaneSelector("/nonexistent/gvd_custom_scene.onnx")
+    assert "/nonexistent/gvd_custom_scene.onnx" in missing.load_reason, missing.load_reason
+    no_path = ls.LearnedLaneSelector(None, runtime_factory=lambda _p: SimpleNamespace(ready=True))
+    assert no_path.describe() == "learned lanes ON, model ready (?)", no_path.describe()
+    # lane_strip_for: only a ready selector and a non-empty frames dict compose, and it
+    # is exactly compose_strip(frames).
+    from python.data.strip_writer import compose_strip
+
+    ok = SimpleNamespace(lane_selector=selector_with())
+    frames = {"main": painted_frame()}
+    assert np.array_equal(ls.lane_strip_for(ok, SimpleNamespace(frames=frames)), compose_strip(frames))
+    for perc, bundle in (
+        (SimpleNamespace(), SimpleNamespace(frames=frames)),
+        (SimpleNamespace(lane_selector=SimpleNamespace()), SimpleNamespace(frames=frames)),
+        (ok, SimpleNamespace()), (ok, SimpleNamespace(frames={})), (ok, SimpleNamespace(frames=[painted_frame()])),
+    ):
+        assert ls.lane_strip_for(perc, bundle) is None, (perc, bundle)
+    # Telemetry: 3-decimal conf, the gate flag as set.
+    sel = ls.LaneSelection(result=ls._empty(), source=ls.SOURCE_NONE, learned_conf=0.123456, paint_gated=True)
+    t = sel.telemetry()
+    assert t["learned_conf"] == 0.123 and t["paint_gated"] is True, t
+    print("wiring contract (start lines flushed, --scene-onnx reaches runtime, defaults, strip, telemetry) OK")
+
+
+def check_lane_head_log_contract() -> None:
+    """One flushed line per change of source, reason or paint_gated, naming each,
+    with learned_conf or 'na'."""
+    lines: list = []
+
+    def rec(*a, **k):
+        lines.append((" ".join(str(x) for x in a), k))
+
+    seen = ls.log_lane_head_change(None, dict(ls.HOUGH_ONLY_TELEMETRY), print_fn=rec)
+    assert lines[-1] == ("[GVD] lane head: source=hough reason=flag_off paint_gated=0 learned_conf=na", {"flush": True}), lines
+    heads = [
+        {"source": "learned", "reason": "none", "paint_gated": False, "learned_conf": 0.731},
+        {"source": "learned", "reason": "none", "paint_gated": True, "learned_conf": 0.731},     # gate only
+        {"source": "hough_fallback", "reason": "none", "paint_gated": True, "learned_conf": 0.731},  # source only
+        {"source": "hough_fallback", "reason": "none", "paint_gated": True, "learned_conf": 0.2},   # conf only: no line
+    ]
+    for h in heads:
+        seen = ls.log_lane_head_change(seen, h, print_fn=rec)
+    assert [x[0] for x in lines[1:]] == [
+        "[GVD] lane head: source=learned reason=none paint_gated=0 learned_conf=0.731",
+        "[GVD] lane head: source=learned reason=none paint_gated=1 learned_conf=0.731",
+        "[GVD] lane head: source=hough_fallback reason=none paint_gated=1 learned_conf=0.731",
+    ], lines
+    assert all(k == {"flush": True} for _l, k in lines)
+    assert ls.log_lane_head_change(seen, None, print_fn=rec) == seen and len(lines) == 4
+    print("lane head change log contract OK")
+
+
 def check_eval_harness() -> None:
     from python.debug.lane_head_eval import MIN_BOUNDARIES, MIN_NO_PAINT, ego_boundaries, score, verdict, x_at
     from python.debug.lane_targets import LANE_GT_DIM, LOOKAHEADS_M, SLOT_LEFT, SLOT_RIGHT, lookahead_slot
@@ -774,6 +1141,15 @@ def main() -> None:
     check_env_and_load_details()
     check_hallucinating_head_gated()
     check_pipeline_wiring()
+    check_flag_off_pipeline_pin_real_frames()
+    check_paint_gate_count_definition()
+    check_paint_gate_stripe_shape_rules()
+    check_paint_gate_colour_boundaries()
+    check_paint_gate_input_forms()
+    check_forward_image_contract()
+    check_learned_parse_contract()
+    check_wiring_contract()
+    check_lane_head_log_contract()
     check_eval_harness()
     if given is None:
         skip_check("hypothesis_properties", "hypothesis not installed (dev-only dep; CI installs it)")

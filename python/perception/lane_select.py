@@ -103,7 +103,8 @@ def _empty() -> LaneResult:
 
 def forward_image(main_bgr: Any, stitch_bgr: Any = None) -> np.ndarray | None:
     """The image the forward lane fit reads: the windshield band of a full
-    stitch, else the stitch, else ``main``."""
+    stitch, else the stitch, else ``main``. None for no frame, a frame under
+    2x2, or under 3 channels. Float input is clipped to 0..255 (NaN is 0)."""
     from python.perception.lanes import _full_stitch
 
     img = stitch_bgr if stitch_bgr is not None else main_bgr
@@ -154,6 +155,11 @@ def paint_evidence_px(bgr: Any) -> int:
     bounding box is at least ``PAINT_MIN_RUN_PX`` long count, so per-pixel
     noise does not. Limit: a bright band thinner than ``PAINT_MAX_WIDTH_PX``
     in the image looks exactly like paint in pixels and does count.
+
+    The count is the stripe area after the +-4 px join: a W px stripe over R
+    rows clear of the ROI edges gives (W + 8) * (R - PAINT_MIN_ROWS + 1). No frame,
+    under 3 channels, or under 4 rows below ``PAINT_ROI_TOP`` gives 0. Float
+    input is clipped to 0..255 first, like a camera.
     """
     if bgr is None:
         return 0
@@ -179,7 +185,9 @@ def paint_evidence_px(bgr: Any) -> int:
     mask[(yellow & (_ridge(sat) >= 12)) | (white & (_ridge(val) >= 18))] = 255
     # A lane stripe is continuous down the image: keep ridge pixels that have
     # ridge neighbours within +-4 px on each of PAINT_MIN_ROWS consecutive rows.
-    # Noise is not continuous; a lane stripe moves about 1-4 px per row.
+    # Noise is not continuous. Limit: a W px stripe survives only while it moves
+    # at most (W + 7) / 4 px per row (4 px wide: 2 px/row; 12 px wide: 4 px/row).
+    # A flatter (more sideways) thin stripe gives 0 here: a stop, not a guess.
     joined = cv2.dilate(mask, np.ones((1, 9), np.uint8))
     mask = cv2.erode(joined, np.ones((PAINT_MIN_ROWS, 1), np.uint8))
     n, _labels, stats, _cent = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -218,6 +226,7 @@ def _poly_dicts(points: np.ndarray) -> list[dict[str, float]]:
 
 
 def _curvature(polys: list[np.ndarray]) -> float:
+    """Mean 2a of x = a*y^2 + b*y + c over lanes spanning at least 1 m in y, clipped."""
     curvs = []
     for pts in polys:
         ys = pts[:, 1]

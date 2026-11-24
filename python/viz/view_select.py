@@ -29,6 +29,13 @@ DEFAULT_VIEW = VIEW_REALITY
 PLACEHOLDER_BG = (24, 20, 18)
 PLACEHOLDER_FG = (235, 220, 200)
 PLACEHOLDER_DIM = (150, 140, 130)
+# (text, x, y, scale, color, thickness). y < 0 counts up from the bottom edge;
+# text None is the drive word in its own color.
+PLACEHOLDER_LINES: tuple[tuple[str | None, int, int, float, tuple[int, int, int] | None, int], ...] = (
+    ("GVD VISION - REALITY VIEW", 24, 44, 0.9, PLACEHOLDER_FG, 2),
+    ("placeholder: renderer not built yet", 24, 80, 0.6, PLACEHOLDER_DIM, 1),
+    (None, 24, -28, 1.0, None, 2),
+)
 
 
 @dataclass(frozen=True)
@@ -46,7 +53,7 @@ def _viz_cfg(cameras: dict[str, Any] | None) -> dict[str, Any]:
 def _norm(name: Any) -> str | None:
     if name is None:
         return None
-    s = str(name).strip().lower().replace("-", "_")
+    s = str(name).strip().lower()
     return s or None
 
 
@@ -87,10 +94,11 @@ def render_reality_placeholder(
     w, h = max(int(width), 1), max(int(height), 1)
     img = np.full((h, w, 3), PLACEHOLDER_BG, dtype=np.uint8)
     word, color = cabin_drive_word(dict(state or {}))
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(img, "GVD VISION - REALITY VIEW", (24, 44), font, 0.9, PLACEHOLDER_FG, 2, cv2.LINE_AA)
-    cv2.putText(img, "placeholder: renderer not built yet", (24, 80), font, 0.6, PLACEHOLDER_DIM, 1, cv2.LINE_AA)
-    cv2.putText(img, word, (24, h - 28), font, 1.0, tuple(int(c) for c in color), 2, cv2.LINE_AA)
+    for text, x, y, scale, fg, thick in PLACEHOLDER_LINES:
+        if text is None:
+            text, fg = word, tuple(int(c) for c in color)
+        org = (x, y if y >= 0 else h + y)
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, fg, thick, cv2.LINE_AA)
     return img
 
 

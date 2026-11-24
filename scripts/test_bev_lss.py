@@ -77,7 +77,8 @@ def check_intrinsics_from_fov() -> None:
     assert wide[1, 2] == 96.0 and bl.content_rect(640, 360) == (256, 144, 0, 24)
     geoms = {g.cam_id: g for g in bl.rig_geometry(_cam_ids(), _cfg())}
     fx = {k: round(float(g.K[0, 0]), 1) for k, g in geoms.items()}
-    # audit table (redesigner.md item 9)
+    # audit table (redesigner.md item 9), by hand: fy = (content_h / 2) / tan(fov_v / 2) with content_h = 192
+    # for 640x480 and 144 for 640x360, e.g. main 96 / tan(17 deg) = 314.0, rear 72 / tan(40 deg) = 85.8
     assert fx == {"repeatL": 182.9, "pillarL": 149.8, "wide": 73.7, "main": 314.0, "narrow": 508.1,
                   "pillarR": 149.8, "repeatR": 182.9, "rear": 85.8}, fx
     mask = bl.pixel_valid_mask([geoms["wide"], geoms["main"]])
@@ -180,7 +181,8 @@ def check_frustum_point_lands_in_expected_cell() -> None:
     for di, d in enumerate((5.0, 20.0)):
         want = torch.tensor([(u - 128.0) / 100.0 * d, d, 1.0 - (v - 96.0) / 100.0 * d])
         assert torch.allclose(pts[0, 0, di, 11, 20], want, atol=1e-5), (pts[0, 0, di, 11, 20], want)
-    # main camera from cameras.yaml: centre-ish pixel at a known depth
+    # main camera from cameras.yaml: centre-ish pixel at a known depth (uses the module K; the fully
+    # hand-derived version with literal numbers is check_geometry_hand_points)
     geoms = {g.cam_id: g for g in bl.rig_geometry(_cam_ids(), _cfg())}
     g = geoms["main"]
     Km = torch.from_numpy(g.K).view(1, 1, 3, 3)
@@ -701,7 +703,12 @@ def check_architecture_pinned() -> None:
 
 
 def check_forward_reference() -> None:
-    """SpatialPath, BevEncoder and _Res against an explicit composition of their own submodules."""
+    """SpatialPath, BevEncoder and _Res against an explicit composition of their own submodules.
+
+    REGRESSION-ONLY: the reference is rebuilt from the modules' own layers (no captured numbers), so it pins
+    the wiring, not any guarantee. No G1..G10 claim rests on this check alone; geometry is pinned to
+    hand-computed points in check_geometry_hand_points.
+    """
     import torch.nn.functional as F
 
     torch.manual_seed(4)
@@ -734,6 +741,204 @@ def check_forward_reference() -> None:
     print("forward_reference")
 
 
+# ---------------------------------------------------------------- hand-computed geometry (independent of the module)
+def check_geometry_hand_points() -> None:
+    """G2/G3/G4/G9 pinned to numbers written out by hand from pinhole math and the cameras.yaml mounts.
+
+    None of the expected numbers below is read back from bev_lss; each comes from the derivation beside it.
+    """
+    cfg = {c["id"]: c for c in _cfg()["cameras"]}
+    # the mounts the literals were derived from; if cameras.yaml changes, re-derive by hand
+    assert cfg["main"]["pos_m"] == [0.00, 1.20, 1.26] and cfg["main"]["pitch_deg"] == -6 and cfg["main"]["fov_v"] == 34.0
+    assert cfg["pillarL"]["pos_m"] == [-0.88, 0.40, 1.18] and cfg["pillarL"]["yaw_deg"] == -78
+    assert cfg["pillarL"]["pitch_deg"] == -6 and cfg["pillarL"]["fov_v"] == 65.3
+    assert cfg["rear"]["pos_m"] == [0.00, -2.25, 0.78] and cfg["rear"]["yaw_deg"] == 180 and cfg["rear"]["pitch_deg"] == -10
+    assert cfg["rear"]["fov_v"] == 80.0 and cfg["rear"]["live_res"] == [640, 360]
+
+    # --- intrinsics. 640x480 -> scale min(256/640, 192/480) = 0.4 -> 256x192 at (0, 0): cx = 128, cy = 96.
+    # 640x360 -> scale 0.4 -> 256x144, y0 = (192 - 144) / 2 = 24: cx = 128, cy = 24 + 72 = 96.
+    # fy = (content_h / 2) / tan(fov_v / 2), fx = fy.
+    hand_f = {
+        ("main", 34.0, 640, 480): 314.00185,  # 96 / tan(17.00 deg) = 96 / 0.3057307
+        ("narrow", 21.4, 640, 480): 508.06564,  # 96 / tan(10.70 deg) = 96 / 0.1889522
+        ("pillarL", 65.3, 640, 480): 149.82280,  # 96 / tan(32.65 deg) = 96 / 0.6407568
+        ("repeatL", 55.4, 640, 480): 182.85305,  # 96 / tan(27.70 deg) = 96 / 0.5250052
+        ("wide", 88.7, 640, 360): 73.65245,  # 72 / tan(44.35 deg) = 72 / 0.9775548
+        ("rear", 80.0, 640, 360): 85.80626,  # 72 / tan(40.00 deg) = 72 / 0.8390996
+    }
+    for (cid, fov, w, h), f in hand_f.items():
+        K = bl.camera_intrinsics(fov, w, h)
+        assert np.allclose(K, [[f, 0.0, 128.0], [0.0, f, 96.0], [0.0, 0.0, 1.0]], atol=1e-3), (cid, K, f)
+
+    # --- extrinsics. Columns are the camera axes (right, down, forward) in ego coords:
+    # fwd = (sin y cos p, cos y cos p, sin p), right = (cos y, -sin y, 0), down = fwd x right.
+    # main, yaw 0, pitch -6: sin 6 = 0.1045285, cos 6 = 0.9945219
+    #   right = (1, 0, 0); fwd = (0, 0.9945219, -0.1045285); down = (0, -0.1045285, -0.9945219)
+    Tm = bl.cam_to_ego([0.00, 1.20, 1.26], 0.0, -6.0)
+    assert np.allclose(Tm, [[1.0, 0.0, 0.0, 0.0],
+                            [0.0, -0.1045285, 0.9945219, 1.20],
+                            [0.0, -0.9945219, -0.1045285, 1.26],
+                            [0.0, 0.0, 0.0, 1.0]], atol=1e-6), Tm
+    # pillarL, yaw -78, pitch -6: sin 78 = 0.9781476, cos 78 = 0.2079117
+    #   right = (0.2079117, 0.9781476, 0)
+    #   fwd = (-0.9781476 * 0.9945219, 0.2079117 * 0.9945219, -0.1045285) = (-0.9727892, 0.2067727, -0.1045285)
+    #   down = fwd x right = (0.1045285 * 0.9781476, -0.1045285 * 0.2079117, -0.9727892 * 0.9781476 - 0.2067727 * 0.2079117)
+    #        = (0.1022443, -0.0217327, -0.9945219)
+    Tp = bl.cam_to_ego([-0.88, 0.40, 1.18], -78.0, -6.0)
+    assert Tp.dtype == np.float32 and Tp.shape == (4, 4)
+    assert np.allclose(Tp, [[0.2079117, 0.1022443, -0.9727892, -0.88],
+                            [0.9781476, -0.0217327, 0.2067727, 0.40],
+                            [0.0, -0.9945219, -0.1045285, 1.18],
+                            [0.0, 0.0, 0.0, 1.0]], atol=1e-6), Tp
+    # rear, yaw 180, pitch -10: sin 10 = 0.1736482, cos 10 = 0.9848078
+    #   right = (-1, 0, 0); fwd = (0, -0.9848078, -0.1736482); down = (0, 0.1736482, -0.9848078)
+    Tr = bl.cam_to_ego([0.00, -2.25, 0.78], 180.0, -10.0)
+    assert np.allclose(Tr, [[-1.0, 0.0, 0.0, 0.0],
+                            [0.0, 0.1736482, -0.9848078, -2.25],
+                            [0.0, -0.9848078, -0.1736482, 0.78],
+                            [0.0, 0.0, 0.0, 1.0]], atol=1e-6), Tr
+
+    # --- frustum points. Feature pixel (row 12, col 16) at stride 8: u = 16*8 + 4 = 132, v = 12*8 + 4 = 100.
+    # Camera point at depth 10: (xc, yc, zc) = ((132 - 128) / f * 10, (100 - 96) / f * 10, 10). Ego = R p + t.
+    # main, f = 314.00185: xc = yc = 0.1273878
+    #   x = 0.1273878; y = 1.20 - 0.1045285 * 0.1273878 + 0.9945219 * 10 = 11.1319033
+    #   z = 1.26 - 0.9945219 * 0.1273878 - 0.1045285 * 10 = 0.0880254
+    #   cell: row = floor((32 - 11.1319) / 0.5) = 41, col = floor((0.1274 + 32) / 0.5) = 64
+    # pillarL, f = 149.82280: xc = yc = 0.2669821
+    #   x = -0.88 + 0.2079117 * 0.2669821 + 0.1022443 * 0.2669821 - 0.9727892 * 10 = -10.5250860
+    #   y = 0.40 + 0.9781476 * 0.2669821 - 0.0217327 * 0.2669821 + 0.2067727 * 10 = 2.7230729
+    #   z = 1.18 - 0.9945219 * 0.2669821 - 0.1045285 * 10 = -0.1308041
+    #   cell: row = floor((32 - 2.7231) / 0.5) = 58, col = floor((-10.5251 + 32) / 0.5) = 42
+    # rear, f = 85.80626: xc = yc = 0.4661665
+    #   x = -0.4661665; y = -2.25 + 0.1736482 * 0.4661665 - 0.9848078 * 10 = -12.0171286
+    #   z = 0.78 - 0.9848078 * 0.4661665 - 0.1736482 * 10 = -1.4155661
+    #   cell: row = floor((32 + 12.0171) / 0.5) = 88, col = floor((32 - 0.4662) / 0.5) = 63
+    hand_pts = {
+        "main": ((314.00185, 96.0), Tm, (0.1273878, 11.1319033, 0.0880254), (41, 64)),
+        "pillarL": ((149.82280, 96.0), Tp, (-10.5250860, 2.7230729, -0.1308041), (58, 42)),
+        "rear": ((85.80626, 96.0), Tr, (-0.4661665, -12.0171286, -1.4155661), (88, 63)),
+    }
+    for cid, ((f, cy), T_np, want, cell) in hand_pts.items():
+        K = torch.tensor([[f, 0.0, 128.0], [0.0, f, cy], [0.0, 0.0, 1.0]]).view(1, 1, 3, 3)
+        T = torch.from_numpy(T_np).view(1, 1, 4, 4)
+        p = bl.frustum_ego_points(K, T, torch.tensor([10.0]), (24, 32))
+        assert p.shape == (1, 1, 1, 24, 32, 3)
+        assert torch.allclose(p[0, 0, 0, 12, 16], torch.tensor(want), atol=1e-4), (cid, p[0, 0, 0, 12, 16], want)
+        assert bl.bev_cell(want[0], want[1]) == cell, cid
+        idx, ok = bl.bev_flat_index(p[0, 0, 0, 12, 16])
+        assert bool(ok) and int(idx) == cell[0] * 128 + cell[1], (cid, int(idx))
+    # the image corner pixel (row 0, col 0): u = v = 4, simple camera f = 100 at (0, 0, 1), yaw 0, pitch 0,
+    # depth 2: cam = ((4 - 128) / 100 * 2, (4 - 96) / 100 * 2, 2) = (-2.48, -1.84, 2) -> ego (-2.48, 2, 1 + 1.84)
+    # and the last pixel (row 23, col 31): u = 252, v = 188 -> cam (2.48, 1.84, 2) -> ego (2.48, 2, 1 - 1.84)
+    K1 = torch.tensor([[100.0, 0.0, 128.0], [0.0, 100.0, 96.0], [0.0, 0.0, 1.0]]).view(1, 1, 3, 3)
+    T1 = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, -1.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]).view(1, 1, 4, 4)
+    p1 = bl.frustum_ego_points(K1, T1, torch.tensor([2.0]), (24, 32))[0, 0, 0]
+    assert torch.allclose(p1[0, 0], torch.tensor([-2.48, 2.0, 2.84]), atol=1e-5), p1[0, 0]
+    assert torch.allclose(p1[23, 31], torch.tensor([2.48, 2.0, -0.84]), atol=1e-5), p1[23, 31]
+    assert torch.allclose(p1[0, 31], torch.tensor([2.48, 2.0, 2.84]), atol=1e-5), p1[0, 31]  # u varies along columns
+    assert torch.allclose(p1[23, 0], torch.tensor([-2.48, 2.0, -0.84]), atol=1e-5), p1[23, 0]  # v varies along rows
+
+    # --- splat into hand-picked cells. row = floor((32 - y) / 0.5), col = floor((x + 32) / 0.5).
+    #   (0.25, 0.25, 0): row floor(63.5) = 63, col floor(64.5) = 64, twice (1 + 2 = 3)
+    #   (-31.75, 31.75, 0): row 0, col 0 (5); (31.75, -31.75, 3.9): row 127, col 127 (7)
+    #   (0, 0, 4.0): z = 4 is outside [-2, 4), dropped; (32.0, 0, 0): col 128, dropped
+    pts = torch.tensor([[[0.25, 0.25, 0.0], [0.25, 0.25, 0.0], [-31.75, 31.75, 0.0], [31.75, -31.75, 3.9],
+                         [0.0, 0.0, 4.0], [32.0, 0.0, 0.0]]])
+    vals = torch.tensor([[[1.0], [2.0], [5.0], [7.0], [100.0], [1000.0]]])
+    idx, ok = bl.bev_flat_index(pts)
+    assert ok.tolist() == [[True, True, True, True, False, False]]
+    assert idx[0, :4].tolist() == [63 * 128 + 64, 63 * 128 + 64, 0, 127 * 128 + 127]
+    grid = bl.splat(vals, idx, ok)[0, 0]
+    assert float(grid[63, 64]) == 3.0 and float(grid[0, 0]) == 5.0 and float(grid[127, 127]) == 7.0
+    assert float(grid.sum()) == 15.0  # 100 and 1000 went nowhere
+
+    # --- ego compensation (G9): v = 12.5 m/s, dt = +0.04 s -> +0.5 m along +y (one cell forward = row - 1)
+    moved = bl.ego_compensate(torch.tensor([[[1.0, 2.0, 0.5]]]), torch.tensor([[0.04]]), torch.tensor([12.5]))
+    assert torch.allclose(moved, torch.tensor([[[1.0, 2.5, 0.5]]]), atol=1e-6), moved
+    assert bl.bev_cell(1.0, 2.5) == (59, 66) and bl.bev_cell(1.0, 2.0) == (60, 66)
+    print("geometry_hand_points")
+
+
+def check_device_follows_inputs() -> None:
+    """Every tensor the head creates lives on the inputs' device (no hidden CPU tensors in the graph).
+
+    Run on PyTorch's ``meta`` device (shapes only, no data, no GPU): a CPU tensor mixed into a meta
+    computation raises, so this pins device propagation on a CPU-only host.
+    """
+    meta = torch.device("meta")
+    K, T = _simple_cam()
+    p = bl.frustum_ego_points(K.to(meta), T.to(meta), torch.tensor([5.0, 20.0], device=meta), (24, 32))
+    assert p.device.type == "meta" and tuple(p.shape) == (1, 1, 2, 24, 32, 3)
+    vals = torch.empty(2, 10, 3, device=meta)
+    grid = bl.splat(vals, torch.zeros(2, 10, dtype=torch.long, device=meta), torch.ones(2, 10, dtype=torch.bool, device=meta))
+    assert grid.device.type == "meta" and tuple(grid.shape) == (2, 3, 128, 128)
+    head = bl.BevLssHead().to(meta)
+    rig = _rig()
+    taps = (torch.empty(1, N_CAMS, 64, 48, 64, device=meta), torch.empty(1, N_CAMS, 128, 24, 32, device=meta),
+            torch.empty(1, N_CAMS, 128, 12, 16, device=meta))
+    for kw in ({}, {"cam_valid": torch.ones(1, N_CAMS, device=meta), "pixel_valid": rig["pixel_valid"].to(meta)}):
+        out = head(*taps, rig["K"].to(meta), rig["T"].to(meta), **kw)
+        assert all(v.device.type == "meta" for v in out.values())
+        assert tuple(out["logits"].shape) == (1, len(bl.BEV_CHANNELS), 128, 128)
+    print("device_follows_inputs")
+
+
+def check_dtype_follows_model() -> None:
+    """Output dtype is the model's dtype, whatever dtype the masks, speeds or torch's global default have."""
+    # ego_compensate: float32 points, float64 speed / offset -> float32 points, same numbers
+    # (0, 10, 0) with v = 10 m/s, dt = 0.1 s -> (0, 11, 0)
+    pts = torch.tensor([[[[0.0, 10.0, 0.0]]]])
+    out = bl.ego_compensate(pts, torch.tensor([[0.1]], dtype=torch.float64), torch.tensor([10.0], dtype=torch.float64))
+    assert out.dtype == torch.float32, out.dtype
+    assert torch.allclose(out, torch.tensor([[[[0.0, 11.0, 0.0]]]]), atol=1e-6)
+    out = bl.ego_compensate(pts, torch.tensor([[0.1]]), torch.tensor([10.0], dtype=torch.float64))
+    assert out.dtype == torch.float32, out.dtype
+    out = bl.ego_compensate(pts, torch.tensor([[0.1]], dtype=torch.float64), torch.tensor([10.0]))
+    assert out.dtype == torch.float32, out.dtype
+    # head: float32 model, masks in float64 / bool (numpy default and boolean masks are common)
+    torch.manual_seed(7)
+    head = bl.BevLssHead().eval()
+    rig = _rig()
+    f4, f8, f16 = _taps()
+    with torch.no_grad():
+        ref = head(f4, f8, f16, rig["K"], rig["T"], cam_valid=torch.ones(1, N_CAMS), pixel_valid=rig["pixel_valid"])
+        for cv, pv in ((torch.ones(1, N_CAMS, dtype=torch.float64), rig["pixel_valid"]),
+                       (torch.ones(1, N_CAMS), rig["pixel_valid"].double()),
+                       (torch.ones(1, N_CAMS, dtype=torch.bool), rig["pixel_valid"].bool())):
+            got = head(f4, f8, f16, rig["K"], rig["T"], cam_valid=cv, pixel_valid=pv)
+            assert got["logits"].dtype == torch.float32 and got["hit_mass"].dtype == torch.float32
+            assert torch.equal(got["logits"], ref["logits"]) and torch.equal(got["hit_mass"], ref["hit_mass"])
+        # global default dtype float64 (some training scripts set it): the float32 head still runs in float32
+        old = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float64)
+        try:
+            got = head(f4, f8, f16, rig["K"], rig["T"])
+        finally:
+            torch.set_default_dtype(old)
+        assert got["logits"].dtype == torch.float32
+        plain = head(f4, f8, f16, rig["K"], rig["T"])
+        assert torch.equal(got["logits"], plain["logits"])
+    # the lift geometry runs in K's dtype: a float64 depth buffer must not upcast the float32 frustum
+    K, T = _simple_cam(pos=(0.0, 0.0, 1.0), fx=100.0)
+    headg = bl.BevLssHead()
+    headg.spatial = _ConstSpatial(int(torch.argmin((headg.depths - 10.0).abs())), 1.0)
+    headg.depths = headg.depths.double()
+    seen = []
+    orig = bl.bev_flat_index
+
+    def _spy(points):
+        seen.append(points.dtype)
+        return orig(points)
+
+    bl.bev_flat_index = _spy
+    try:
+        headg(*(t[:, :1] for t in _taps()), K, T)
+    finally:
+        bl.bev_flat_index = orig
+    assert seen == [torch.float32], seen
+    print("dtype_follows_model")
+
+
 def main() -> None:
     check_intrinsics_from_fov()
     check_extrinsics_axes()
@@ -760,6 +965,9 @@ def main() -> None:
     check_camera_features_values()
     check_architecture_pinned()
     check_forward_reference()
+    check_geometry_hand_points()
+    check_device_follows_inputs()
+    check_dtype_follows_model()
     print("test_bev_lss: OK")
 
 

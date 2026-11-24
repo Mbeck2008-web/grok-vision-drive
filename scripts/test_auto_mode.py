@@ -118,9 +118,23 @@ def check_stop_and_panel() -> None:
         assert ui.auto.options.traffic is True
 
 
+def check_default_maps_have_a_dump() -> None:
+    """AUTO rotation only uses maps with a road dump; utah stays selectable."""
+    from python.collect.auto_mode import DEFAULT_MAPS, MAPS
+    from python.collect.spawn_mix import spawn_roads_path
+
+    assert DEFAULT_MAPS, DEFAULT_MAPS
+    assert "utah" not in DEFAULT_MAPS and "jungle_rock_island" not in DEFAULT_MAPS, DEFAULT_MAPS
+    for name in DEFAULT_MAPS:
+        path = spawn_roads_path(name)
+        assert path is not None and path.is_file(), (name, path)
+    assert "utah" in MAPS and "jungle_rock_island" in MAPS, MAPS
+
+
 def main() -> None:
     check_options_and_status()
     check_stop_and_panel()
+    check_default_maps_have_a_dump()
     print("automatic mode ok")
 
 

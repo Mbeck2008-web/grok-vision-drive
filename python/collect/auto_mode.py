@@ -16,8 +16,10 @@ from python.data.raw_frames import CAMERA_HZ
 from python.debug.remote_status import COLLECT_NAME, read_json, status_dir
 
 MAPS = ("", "west_coast_usa", "italy", "east_coast_usa", "utah", "jungle_rock_island")
-# Levels that ship with BeamNG.tech 0.39. A multi-map run rotates these.
-DEFAULT_MAPS = ("west_coast_usa", "italy", "east_coast_usa", "utah", "jungle_rock_island")
+# Levels a multi-map run rotates: only those with a bundled road dump, so
+# every segment gets a legal seeded spawn. utah and jungle_rock_island stay
+# selectable (MAPS, --maps) but stop with spawn_failed until dumps exist.
+DEFAULT_MAPS = ("west_coast_usa", "italy", "east_coast_usa")
 ROUTES = ("span", "waypoints", "random")
 LANE_CAMERAS = "main,narrow,wide"
 CAMERA_PRESETS = ("", LANE_CAMERAS)

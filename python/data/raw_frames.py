@@ -161,6 +161,14 @@ class CameraSchedule:
             self._undo.pop(cid, None)
 
 
+DEFAULT_CHASE_HZ = 2.0
+
+
+def chase_hz(spec: Mapping[str, Any] | None = None) -> float:
+    """Configured chase-camera rate in Hz. Missing or zero falls back to 2."""
+    return float((spec or {}).get("chase_hz") or DEFAULT_CHASE_HZ)
+
+
 def capture_plan(
     cfg: Mapping[str, Any] | None, ratio: float = PNG_RATIO_MAX, *, gt: bool = False
 ) -> list[dict[str, Any]]:
@@ -200,7 +208,7 @@ def capture_plan(
         cid = str(cam["id"])
         width, height = cam["resolution"]
         if cam.get("recording_only"):
-            hz = float((chase_spec or {}).get("chase_hz") or 2.0)
+            hz = chase_hz(chase_spec)
         else:
             hz = float(CAMERA_HZ.get(cid, 0.0))
         _row(cid, width, height, 3, 1, hz, float(ratio))

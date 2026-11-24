@@ -1770,6 +1770,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     from python.data.raw_frames import (
         CAMERA_HZ,
         COLLECT_HZ,
+        chase_hz,
         PNG_RATIO_MAX,
         PNG_RATIO_MEAN,
         CameraSchedule,
@@ -1881,7 +1882,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             return 2
         # Recording-only: attached by _attach_cameras, written to raw/chase*, never in CAM_IDS.
         cam_cfg["chase_camera"] = {**chase_spec, "enabled": True}
-        cam_rates["chase"] = float(chase_spec.get("chase_hz") or 2.0)
+        cam_rates["chase"] = chase_hz(chase_spec)
     # Disk ceiling: colour, every train_gt depth/sem plane (raw size; PNG ratio
     # unmeasured) and the chase camera when --chase-cam is on.
     plan = capture_plan(cam_cfg, PNG_RATIO_MAX, gt=True)

@@ -6,11 +6,14 @@ with arguments drawn from a seeded plan:
 
 * one random edge case from ``EDGE_CASES`` and its recipe (weather, time of
   day, spawn kind, paint filter, traffic floor),
-* a random companion-traffic count up to ``max_traffic``,
+* a random companion-traffic count up to ``max_traffic`` on
+  ``west_coast_usa`` (Michael, 2026-11-24 14:28 CST: west-coast-only traffic
+  for now); every other map is planned as ``traffic=0``,
 * a map from the pool (edge cases that need the west-coast spawn deck and
   companion cars stay on ``west_coast_usa``; that is the only map the
   collector places traffic or deck spawns on today),
-* a random spawn: a per-clip ``--spawn-seed`` for the deck shuffle.
+* a random spawn: a per-clip ``--spawn-seed`` for the deck shuffle (the
+  collector only applies it on ``west_coast_usa``).
 
 After each clip, ``quality_check`` reads the recording back (never writes
 into ``raw/``) and ``write_tags`` stores ``clip_tags.json`` beside it. A bad
@@ -142,14 +145,14 @@ def plan_clip(
             notes.append("no dirt map in the pool")
     else:
         map_name = rng.choice(pool)
-    if case == "heavy_traffic":
+    if map_name != DECK_MAP:
+        traffic = 0
+    elif case == "heavy_traffic":
         traffic = max_traffic
     elif case == "cut_in":
         traffic = rng.randint(min(2, max_traffic), max_traffic) if max_traffic else 0
     else:
         traffic = rng.randint(0, max_traffic)
-    if map_name != DECK_MAP and traffic:
-        notes.append(f"companion traffic is only placed on {DECK_MAP}; {map_name} records traffic_placed=0")
     if case == "night":
         tod = (21.0 + rng.uniform(0.0, 7.5)) % 24.0
     else:
@@ -177,8 +180,8 @@ def plan_clip(
 def clip_argv(plan: ClipPlan, out_dir: Path, *, chase: bool = False, extra: Iterable[str] = ()) -> list[str]:
     """``collect_scene_lanes.py`` arguments for one clip (lossless raw writer, one map, the eSBR)."""
     argv = [
-        "--minutes", f"{plan.duration_s / 60.0:.6f}",
-        # The collector's --minutes has a 60 s floor; --clip-s is the planned length.
+        # --clip-s is the planned length; --minutes is not passed (it has a 60 s
+        # floor and would be overridden anyway once --clip-s is set).
         "--clip-s", repr(float(plan.duration_s)),
         # A one-map rotation, not --map: only a segment load runs the seeded deck
         # spawn and queues companion traffic (--map kept the loaded pose, 0 cars).
@@ -339,7 +342,7 @@ def _observe(plan: ClipPlan, clip: Path, rows: list[dict[str, Any]], gt: list[di
         # "out". Rows where the road bends enough to fake that offset at the
         # car's range (a lead car on a curve) are not read, and an old "out"
         # sighting expires, so tailing a car long after it merged is not one.
-        seen: dict[str, tuple[float | None]] = {}
+        seen: dict[str, float | None] = {}
         for row in rows:
             ego = row.get("ego") or {}
             pos, d = ego.get("pos"), ego.get("dir")
@@ -350,7 +353,7 @@ def _observe(plan: ClipPlan, clip: Path, rows: list[dict[str, Any]], gt: list[di
             t = _num(row.get("t"))
             yr, sp = _num(ego.get("yaw_rate")), _num(ego.get("speed_mps"))
             bend_k = abs(yr) / sp if yr is not None and sp is not None and sp > 0.5 else 0.0
-            for name, (t_out,) in list(seen.items()):
+            for name, t_out in list(seen.items()):
                 if t is not None and t_out is not None and t - t_out > CUT_IN_WINDOW_S:
                     del seen[name]
             for car in row.get("traffic") or []:
@@ -365,8 +368,8 @@ def _observe(plan: ClipPlan, clip: Path, rows: list[dict[str, Any]], gt: list[di
                     continue
                 if 0.0 < ahead < CUT_IN_AHEAD_MAX_M:
                     if lat >= CUT_IN_FROM_M:
-                        seen[name] = (t,)
-                    elif lat <= CUT_IN_TO_M and seen.get(name):
+                        seen[name] = t
+                    elif lat <= CUT_IN_TO_M and name in seen:
                         return True, f"cut_in: {name} moved into the ego lane {ahead:.0f} m ahead"
         return False, "cut_in: no car crossed into the ego lane ahead"
     return None, f"{case}: no offline observation rule"

@@ -963,7 +963,7 @@ def check_clip_argv_spawns_traffic_full_gt_and_length() -> None:
 
 def check_capture_plan_chase_uses_chase_hz() -> None:
     """The disk ceiling counts the chase plane at chase_hz, not CAMERA_HZ (10)."""
-    from python.data.raw_frames import CAMERA_HZ, capture_plan
+    from python.data.raw_frames import CAMERA_HZ, capture_plan, chase_hz
 
     cfg = dict(load_camera_config())
     spec = dict(cfg.get("chase_camera") or {})
@@ -974,6 +974,8 @@ def check_capture_plan_chase_uses_chase_hz() -> None:
                 or str(row["id"]).startswith("chase_")]
         assert rows, rate
         assert all(abs(float(row["hz"]) - rate) < 1e-12 for row in rows), (rate, rows)
+        assert all(abs(float(row["hz"]) - chase_hz({"chase_hz": rate})) < 1e-12 for row in rows), rate
+    assert chase_hz(None) == 2.0 and chase_hz({}) == 2.0
     assert float(CAMERA_HZ.get("chase", 10.0)) != 2.0
     print("capture_plan: chase colour/depth/sem use chase_hz (2 and 3), not CAMERA_HZ")
 

@@ -137,6 +137,7 @@ Offline labelers (`intent`, `stoplines`, `signs`, `obstacles`, `road_edge`) run 
 ## Recorder v2 decisions
 
 - **No pedestrians (Michael's decision, 2026-11-23 23:19 CST).** There are no pedestrians in the game: BeamNG spawns none, so the live detector drops COCO person (id 0) on purpose (`coco_class_name` in `python/perception/detect.py` returns None for it) and `OBJECT_CLASSES` has no pedestrian slot. His words: "But there's no people in the game so it's not necessary anyways". This was not proven safe: with person dropped, the tracker, CIPV/AEB and the path predictor never see a person the camera does. `scripts/test_recorder_v2.py::check_person_dropped_by_decision` pins it; revisit before anything that can put a person in front of the car.
+- **West-coast-only traffic and random spawn (Michael's decision, 2026-11-24 14:28 CST).** Companion traffic and the seeded deck spawn stay on `west_coast_usa` for now. His words: "Finish #239; I OK west_coast_usa-only traffic for now, then record". `plan_clip` plans `traffic=0` and no `spawn_kind` on every other map. Revisit when those maps can place companions and shuffle spawns.
 - **`pretrain_only` is advisory.** Clip QC writes `quality` and `reasons` into each clip's `clip_tags.json`. No loader or trainer reads that file yet, so a `pretrain_only` clip trains like any other clip unless it is left out by hand.
 
 ## Implementation PRs (smallest first)

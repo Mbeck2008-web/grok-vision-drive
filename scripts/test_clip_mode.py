@@ -49,6 +49,8 @@ def check_plans_are_seeded_and_bounded() -> None:
         assert 0 <= p.traffic <= 8, p
         assert p.map in MAPS
         assert p.ego_model == "sbr"
+        if p.map != "west_coast_usa":
+            assert p.traffic == 0 and p.spawn_kind is None, p
         if p.edge_case == "heavy_traffic":
             assert p.traffic == 8
         if p.edge_case == "cut_in":
@@ -75,13 +77,13 @@ def check_collector_argv() -> None:
     assert "--map" not in argv and argv[argv.index("--maps") + 1] == "west_coast_usa", argv
     # Smoke B: the planned length reaches the collector (its --minutes floor is 60 s).
     assert float(argv[argv.index("--clip-s") + 1]) == p.duration_s, argv
+    assert "--minutes" not in argv, argv
     # Smoke C: clips keep full-rate depth/sem; the thinning gate is off.
     assert argv[argv.index("--gt-thin") + 1] == "off", argv
     for want in ("--out /tmp/x/clip", "--ego-model sbr", "--no-vary-env",
                  f"--traffic {p.traffic}", "--weather clear", "--spawn-kind ramp",
                  f"--spawn-seed {p.spawn_seed}", "--chase-cam", "--smoke-s 0"):
         assert want in joined, (want, joined)
-    assert f"--minutes {p.duration_s / 60.0:.6f}" in joined, joined
     for banned in ("--strip", "jpeg", "jpg"):
         assert banned not in joined, banned
     # The clock reaches BeamNG as its own 0-1 time (0 noon, 0.5 midnight), so an
@@ -507,6 +509,55 @@ def check_session_gfx_follows_flag() -> None:
     print("session.json gfx follows the run_clips gfx argument")
 
 
+def check_plan_clip_traffic_zero_off_west_coast() -> None:
+    """Off west_coast_usa, the plan is traffic=0 and no spawn_kind (Michael 2026-11-24)."""
+    from python.collect.clip_mode import DECK_MAP, DECK_ONLY, clip_argv, plan_clip
+
+    off = ("italy", "east_coast_usa")
+    plans = [plan_clip(i, seed=11, maps=off, max_traffic=8) for i in range(80)]
+    assert plans and all(p.map in off for p in plans)
+    assert all(p.traffic == 0 and p.spawn_kind is None for p in plans), [(p.map, p.traffic, p.spawn_kind, p.edge_case) for p in plans]
+    # Deck-only cases still land on west_coast even when it is listed with others.
+    mixed = [plan_clip(i, seed=3, maps=(DECK_MAP,) + off, max_traffic=8) for i in range(120)]
+    for p in mixed:
+        if p.map != DECK_MAP:
+            assert p.traffic == 0 and p.spawn_kind is None, p
+            assert p.edge_case not in DECK_ONLY, p
+        argv = clip_argv(p, Path("/tmp/x/clip"))
+        assert argv[argv.index("--traffic") + 1] == str(p.traffic), argv
+    on_deck = [p for p in mixed if p.map == DECK_MAP]
+    assert any(p.traffic > 0 for p in on_deck), [p.traffic for p in on_deck]
+    print("plan_clip: traffic=0 and no spawn_kind off west_coast_usa")
+
+
+def check_cut_in_bend_uses_speed_not_ten() -> None:
+    """A cut-in at 20 m/s, yaw 0.1, ~15 m ahead is observed; abs(yr)/10 would hide it."""
+    from python.collect.clip_mode import CUT_IN_BEND_MAX_M, plan_clip, quality_check
+    from scripts.gvd_test_env import collect_root
+
+    plan = plan_clip(0, seed=1, maps=("west_coast_usa",), max_traffic=2, edge_cases=("cut_in",), min_s=4.0, max_s=4.0)
+
+    def car(name: str, x: float, y: float) -> dict:
+        return {"name": name, "pos": [x, y, 0.0], "dir": [0, 1, 0]}
+
+    speed, yaw, ahead = 20.0, 0.1, 15.0
+    true_k = abs(yaw) / speed
+    fake_k = abs(yaw) / 10.0
+    assert 0.5 * true_k * ahead * ahead <= CUT_IN_BEND_MAX_M < 0.5 * fake_k * ahead * ahead, (
+        0.5 * true_k * ahead * ahead, 0.5 * fake_k * ahead * ahead, CUT_IN_BEND_MAX_M,
+    )
+    with collect_root() as root:
+        d = root / "fast_cut"
+        # ego y is i; car y is i+15 so ahead stays 15 m. Lateral 3.5 then 0.3 is a cut-in.
+        _fake_recording(
+            d, speed=speed, yaw_rate=yaw,
+            traffic_at=lambda i: [car("gvd_traffic_1", 3.5 if i < 15 else 0.3, i + ahead)],
+        )
+        q = quality_check(d, plan, exit_code=0)
+        assert q["edge_case_observed"] is True, q
+    print("cut-in: abs(yr)/speed at 20 m/s, yaw 0.1, 15 m ahead is not a bend; /10.0 would be")
+
+
 def main() -> None:
     check_edge_case_list()
     check_plans_are_seeded_and_bounded()
@@ -522,6 +573,8 @@ def main() -> None:
     check_run_clips_with_fake_collector()
     check_cli()
     check_cut_in_bend_speed_floor()
+    check_cut_in_bend_uses_speed_not_ten()
+    check_plan_clip_traffic_zero_off_west_coast()
     check_session_gfx_follows_flag()
     print("test_clip_mode: OK")
 

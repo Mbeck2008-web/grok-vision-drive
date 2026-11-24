@@ -161,7 +161,7 @@ def check_person_dropped_by_decision() -> None:
     """Pins Michael's call (2026-11-23 23:19 CST): BeamNG spawns no people, so the
     live detector drops COCO person on purpose and the labels have no such class.
     This is a decision, not a safety proof: if people ever appear in the sim, this
-    test is the line to revisit (labels_v4.md, "Recorder v2: no pedestrians")."""
+    test is the line to revisit (labels_v4.md, "Recorder v2 decisions")."""
     import test_yolo_nms as nms
     from python.perception.detect import COCO_VEHICLE, coco_class_name
     from python.train.scene_net import OBJECT_CLASSES, labels_from_tech
@@ -179,6 +179,7 @@ def check_person_dropped_by_decision() -> None:
     assert int(labels["object_class"][0]) == OBJECT_CLASSES.index("car")
     spec = (ROOT / "docs" / "specs" / "labels_v4.md").read_text(encoding="utf-8")
     assert "no pedestrians in the game" in spec.lower() and "not proven safe" in spec.lower(), "spec line missing"
+    assert "\"But there's no people in the game so it's not necessary anyways\"" in spec, "Michael's words missing"
     print("COCO person dropped live and in labels, by Michael's decision (spec line present)")
 
 

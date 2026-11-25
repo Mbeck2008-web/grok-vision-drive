@@ -442,8 +442,17 @@ def _local_plane(h: np.ndarray, w: int) -> np.ndarray:
     with np.errstate(invalid="ignore", divide="ignore"):
         a = det_a / det
         mean = sz / np.maximum(n, 1.0)
+        # Inliers on one line (a single row or column of the window, e.g.
+        # the edge of the voter support): fit that line instead of the
+        # mean, so the grade along it is kept.
+        vx = n * sx2 - sx * sx
+        vy = n * sy2 - sy * sy
+        line_y = (sz - (n * szy - sy * sz) / vy * sy) / n
+        line_x = (sz - (n * szx - sx * sz) / vx * sx) / n
     a = np.where((n >= 3) & (np.abs(det) > 1e-9), a, np.nan)
-    return np.where(np.isfinite(a), a, np.where(n > 0, mean, np.nan))
+    line = np.where(vy > vx, line_y, line_x)
+    line = np.where((n >= 2) & (np.maximum(vx, vy) > 1e-9), line, np.nan)
+    return np.where(np.isfinite(a), a, np.where(np.isfinite(line), line, np.where(n > 0, mean, np.nan)))
 
 
 
@@ -606,9 +615,24 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     # a layer, and the envelope stays the downhill min on a grade.
     # The sliding min is a view, so memory stays flat as the grid
     # grows (check_grid_growth / check_ground_band_growth).
+    pmax2d = np.full((ntx, nty), -np.inf)
+    if cs.size:
+        np.maximum.at(pmax2d, (tix[cs], tiy[cs]), pmax[cs])
+    local_pmax = sliding_window_view(
+        np.pad(pmax2d, w, constant_values=-np.inf), (2 * w + 1, 2 * w + 1)
+    ).max(axis=(-1, -2))
     vote = np.zeros(n_col, dtype=bool)
     if cs.size:
-        vote[cs] = pmax[cs] >= VOTE_P_MIN
+        # Absolute floor, or within BAND_MARGIN of the strongest seed in
+        # 12 m when that seed itself is trusted: a weak road next to
+        # slightly hotter one-layer cars votes, so the cars are not the only
+        # voters. A weak hole fill next to strong ground (local max .95)
+        # still does not, and a region with no trusted seed in 12 m has no
+        # voters at all (leftover, below).
+        lp = local_pmax[tix[cs], tiy[cs]]
+        vote[cs] = (pmax[cs] >= VOTE_P_MIN) | (
+            (lp >= VOTE_P_MIN) & (pmax[cs] >= lp - BAND_MARGIN)
+        )
     vs = np.flatnonzero(vote)
     env2d = np.full((ntx, nty), np.inf)
     filt = np.full((ntx, nty), np.nan)
@@ -639,23 +663,51 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
         env2d = sliding_window_view(
             np.pad(tmp, w, constant_values=np.inf), (2 * w + 1, 2 * w + 1)
         ).min(axis=(-1, -2))
+        # Buried-ground floor that follows the grade: a plane of the same
+        # envelope seeds (refit without seeds more than half a layer above
+        # it, i.e. roofs and walls), shifted down by the lowest residual in
+        # the 12 m window. On a grade the 12 m min lags downhill by several
+        # layers, so a fill under the road sat above it; the shifted plane
+        # does not lag, and a dense car lot only lowers the shift (its road
+        # seeds are the low residuals). Never below the envelope. Tile
+        # mean, not min (the min drops a layer at every grade step on
+        # grids finer than a tile). A column whose whole strong stack sits
+        # on the top level may be the grid ceiling (ground above z_max
+        # leaves only its fill): it does not shape the plane.
+        ts = np.zeros((ntx, nty))
+        tn = np.zeros((ntx, nty))
+        vp = vs[lo_all[vs] < int(lvl.max())]
+        np.add.at(ts, (tix[vp], tiy[vp]), raw[vp].astype(np.float64))
+        np.add.at(tn, (tix[vp], tiy[vp]), 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            hu = np.where(use & (tn > 0), ts / tn, np.nan)
+        pl = _local_plane(hu, w)
+        for _ in range(3):  # walls first, then one-layer objects
+            hu = np.where(np.isfinite(hu) & (hu - pl <= 0.5), hu, np.nan)
+            pl = _local_plane(hu, w)
+        res = np.where(np.isfinite(hu) & np.isfinite(pl), hu - pl, np.inf)
+        minres = sliding_window_view(
+            np.pad(res, w, constant_values=np.inf), (2 * w + 1, 2 * w + 1)
+        ).min(axis=(-1, -2))
+        with np.errstate(invalid="ignore"):
+            lb = pl + minres
+        floor2d = np.where(np.isfinite(lb), np.maximum(env2d, lb), env2d)
     local_med = np.full(n_col, np.nan)
     if vs.size and np.isfinite(filt).any():
         local_med[used] = filt[tix[used], tiy[used]]
     env = np.full(n_col, np.inf)
     env[used] = env2d[tix[used], tiy[used]]
+    gfloor = env.copy()
+    gplane = np.full(n_col, np.nan)
+    if vs.size:
+        gfloor[used] = floor2d[tix[used], tiy[used]]
+        gplane[used] = pl[tix[used], tiy[used]]
     # Envelope votes are absolute so a hotter car cannot silence the
     # road. Plane inliers still use a relative p vote, so far-uphill
     # columns whose ground was clipped (only a 0.05-weaker below cell
     # left) do not pull the plane off the 6cdfb8d +15% floor. If no
     # relative inlier remains (hot cars only), the plane falls back
     # to the envelope.
-    pmax2d = np.full((ntx, nty), -np.inf)
-    if cs.size:
-        np.maximum.at(pmax2d, (tix[cs], tiy[cs]), pmax[cs])
-    local_pmax = sliding_window_view(
-        np.pad(pmax2d, w, constant_values=-np.inf), (2 * w + 1, 2 * w + 1)
-    ).max(axis=(-1, -2))
     vote_inlier = np.zeros(n_col, dtype=bool)
     if cs.size:
         vote_inlier[cs] = pmax[cs] >= (local_pmax[tix[cs], tiy[cs]] - BAND_MARGIN)
@@ -683,7 +735,12 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     # level that passes is the column's ground.
     has_env_layer = np.zeros(n_col, dtype=bool)
     gnd_lvl = np.full(n_col, np.iinfo(np.int64).max)
-    cand = finite_env[col] & (lvl < raw[col]) & (lvl >= env_lvl[col])
+    # Buried ground lies between the grade-following floor and half a
+    # layer above the structure-free plane: a first wall layer that matches
+    # the uphill ground at its level is not ground.
+    gceil = np.where(np.isfinite(gplane), gplane + 0.5, np.inf)
+    cand = (finite_env[col] & (lvl < raw[col]) & (lvl >= env_lvl[col])
+            & (lvl >= gfloor[col] - 1e-6) & (lvl <= gceil[col] + 1e-6))
     if cand.any() and vs.size:
         ci = np.flatnonzero(cand)
         seed_cell = (lvl == raw[col]) & vote[col]
@@ -771,16 +828,40 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
         raw.astype(np.float64) <= env + 1.0
     ) & (raw.astype(np.float64) < expected - 0.5)
     target[snap_low] = raw[snap_low]
+    # A non-inlier column whose own surface (fit height) sits on the plane
+    # keeps it, including the upper level when the plane undershoots by
+    # under half a layer (a grade step the plane smooths over, a column
+    # next to a building). An object a full layer above stays off.
+    own = np.where(valid, np.rint(fit_z), np.nan)
+    # Unless the plane level already holds a strong cell and the own level
+    # is only the raw seed (a wall or car on that cell, not buried ground
+    # found by the exposed-ground test).
+    strong_at = np.zeros(n_col, dtype=bool)
+    hit = near & ok[col] & (lvl == target[col])
+    strong_at[col[hit]] = True
+    snap_own = valid & ok & ~inlier & ~snap_low & (own >= target) & (own <= expected + 0.5) & (
+        has_env_layer | ~strong_at
+    )
+    target[snap_own] = own[snap_own].astype(np.int64)
     leftover = used & ~ok
     if leftover.any():
         # Inherit the nearest finite expected height (tile grid, O(tiles)),
         # never a q×g distance matrix.
+        # Columns that kept their own surface hand on that level, not the
+        # smoothed plane.
         exp2d = np.full((ntx, nty), np.nan)
         if ok.any():
-            exp2d[tix[ok], tiy[ok]] = expected[ok]
+            mine_ok = (snap_own | snap_low)[ok]
+            exp2d[tix[ok], tiy[ok]] = np.where(mine_ok, target[ok], expected[ok])
         exp2d = _nearest_finite(exp2d)
         fill = leftover & np.isfinite(exp2d[tix, tiy])
         target[fill] = np.floor(exp2d[tix[fill], tiy[fill]] + 0.25).astype(np.int64)
+        # No trusted voter within 12 m: the inherited height is only a lower
+        # bound. A column whose own lowest strong layer is higher keeps it
+        # (ground rising away from a far corner); a lone weaker fill below
+        # the inherited ground does not pull the band down.
+        mine = fill & valid & (lo_all < np.iinfo(np.int64).max)
+        target[mine] = np.maximum(target[mine], lo_all[mine])
         still = leftover & ~fill
         if still.any():
             target[still] = raw[still]

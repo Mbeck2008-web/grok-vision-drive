@@ -277,7 +277,13 @@ def _walk_ahead(
                     if rid in seen:
                         continue
                     other = roads_by_id.get(rid)
-                    if other is None or (other["oneway"] and (at_start if reverse else not at_start)):
+                    if other is None:
+                        continue
+                    is_oneway = bool(other.get("oneway")) or (
+                        int(other.get("lanes_left") or 0) == 0 and int(other.get("lanes_right") or 0) >= 1
+                    )
+                    entered_legal_start = (not at_start) if other.get("flip") else at_start
+                    if is_oneway and (entered_legal_start if reverse else not entered_legal_start):
                         continue
                     seq = list(other["pts"]) if at_start else list(other["pts"])[::-1]
                     if math.hypot(seq[0][0] - tail[0], seq[0][1] - tail[1]) > PAINT_JOIN_M:
@@ -1626,19 +1632,22 @@ class SpawnDeck:
             fx, fy = (-tx, -ty) if back else (tx, ty)
             shift = 0.0 if pick.offset_m is None else float(pick.offset_m)
             rx, ry = fy, -fx
-            x += rx * shift
-            y += ry * shift
-            if shift and not self._slot_is_legal(x, y, z + 0.5, fx, fy):
-                notes.append(f"traffic {where} skipped: not in a legal lane")
-                continue
-            if any(math.dist((x, y, z + 0.5), placed[1]) < TRAFFIC_MIN_M for placed in slots):
+            cx, cy, cz = x + rx * shift, y + ry * shift, z + 0.5
+            slot_pos, slot_rot = (cx, cy, cz), _yaw_quat(fx, fy)
+            if not self._slot_is_legal(cx, cy, cz, fx, fy):
+                resolved = self._legal_traffic_pose(x, y, z, fx, fy)
+                if resolved is None:
+                    notes.append(f"traffic {where} skipped: not in a legal lane")
+                    continue
+                slot_pos, slot_rot = resolved
+            if any(math.dist(slot_pos, placed[1]) < TRAFFIC_MIN_M for placed in slots):
                 notes.append(f"traffic {where} skipped: within {TRAFFIC_MIN_M:.0f} m of a car already placed")
                 continue
-            slots.append((where, (x, y, z + 0.5), _yaw_quat(fx, fy), along))
+            slots.append((where, slot_pos, slot_rot, along))
         return slots, notes
 
     def _slot_is_legal(self, x: float, y: float, z: float, fx: float, fy: float) -> bool:
-        """Companion cars use the ego's lane shift, and are dropped when that is rejected."""
+        """Validate a companion car pose against measured road lanes."""
         from python.train.frame_quality import classify_wrong_way, spawn_pose_rejected
 
         quality, grid = self._ensure_quality()
@@ -1648,6 +1657,39 @@ class SpawnDeck:
         if spawn_pose_rejected(got):
             return False
         return str(got.get("verdict") or "") == "ok"
+
+    def _legal_traffic_pose(
+        self, x: float, y: float, z: float, fx: float, fy: float
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """Snap a traffic slot onto a legal right-hand lane aligned with ``(fx, fy)``."""
+        from python.train.frame_quality import classify_wrong_way
+
+        quality, grid = self._ensure_quality()
+        if not quality:
+            return None
+        found = self.nearest_road((x, y, z), (fx, fy), near_m=12.0)
+        if found is None:
+            return None
+        road, _dist = found
+        if not road.get("width"):
+            return None
+        hit = _project_station(road.get("pts") or [], x, y, road.get("widths"))
+        if hit is None:
+            return None
+        _d, center, tangent, local = hit
+        flip = bool(road.get("flip"))
+        station = _station_width(local, road)
+        road_id = str(road.get("id"))
+        for offset in _offset_candidates(road, station):
+            if not body_inside(offset, station):
+                continue
+            pos, rot, heading = _pose_shifted(center, tangent, flip, offset, 0.5)
+            if heading[0] * fx + heading[1] * fy <= 0.5:
+                continue
+            got = classify_wrong_way(pos[0], pos[1], math.atan2(heading[1], heading[0]), quality, grid, z=pos[2])
+            if _pose_accepted(got, road_id):
+                return pos, rot
+        return None
 
     # ------------------------------------------------------------ recheck
     def nearest_road(
@@ -1787,6 +1829,12 @@ def traffic_count(requested: int | None, map_name: str) -> int:
     return max(0, int(requested))
 
 
+def _traffic_spawn_rot(qx: float, qy: float, qz: float, qw: float) -> tuple[float, float, float, float]:
+    """Convert world-heading quat (atan2(dy, dx)) to BeamNG spawnNewVehicle quat (pi/2 - yaw)."""
+    yaw = math.atan2(2.0 * (float(qw) * float(qz) + float(qx) * float(qy)), 1.0 - 2.0 * (float(qy) * float(qy) + float(qz) * float(qz)))
+    return _yaw_quat(math.sin(yaw), math.cos(yaw))
+
+
 def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> list[str]:
     """GE Lua that replaces the companion cars ahead of and behind the ego.
 
@@ -1827,17 +1875,19 @@ def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> 
             dist = offsets[slot]
             poses.append(((x0 + dx * dist, y0 + dy * dist, z0), tuple(pick.rot)))
     for slot, ((x, y, z), (qx, qy, qz, qw)) in enumerate(poses):
+        sqx, sqy, sqz, sqw = _traffic_spawn_rot(qx, qy, qz, qw)
         name = f"gvd_traffic_{slot}"
         lines.append(
             "local veh = core_vehicles.spawnNewVehicle(\"etk800\", "
             f"{{pos=vec3({x:.2f},{y:.2f},{z:.2f}), "
-            f"rot=quat({qx:.5f},{qy:.5f},{qz:.5f},{qw:.5f}), "
+            f"rot=quat({sqx:.5f},{sqy:.5f},{sqz:.5f},{sqw:.5f}), "
             "autoEnterVehicle=false})"
         )
         lines.append("if veh then")
         lines.append(f"  pcall(function() veh:setField('name', 0, '{name}') end)")
-        lines.append("  veh:queueLuaCommand('ai.setMode(\"span\")')")
+        lines.append("  veh:queueLuaCommand('ai.setMode(\"traffic\")')")
         lines.append("  veh:queueLuaCommand('ai.driveInLane(\"on\")')")
+        lines.append("  veh:queueLuaCommand('ai.setAvoidCars(\"on\")')")
         lines.append("  veh:queueLuaCommand('ai.setSpeedMode(\"limit\")')")
         lines.append(f"  veh:queueLuaCommand('ai.setSpeed({speed:.1f})')")
         lines.append("end")

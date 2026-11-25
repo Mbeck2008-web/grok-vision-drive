@@ -1336,6 +1336,9 @@ def check_dtype_follows_model() -> None:
 
 
 # ---------------------------------------------------------------- G5 ground band: rays over low occluders
+CROP_ROWS, CROP_COLS = bl.CROP_H // bl.FEAT_STRIDE, bl.CROP_W // bl.FEAT_STRIDE
+
+
 def _ray_box(o, d, lo, hi):
     t0, t1 = -np.inf, np.inf
     for a in range(3):
@@ -1692,6 +1695,34 @@ def check_barrier_anywhere_hides_ground() -> None:
     print("barrier_anywhere_hides_ground")
 
 
+def check_unobservable_leak_pinned() -> None:
+    """Named limitation (G5, room ruling): a barrier no valid feature ray of any camera touches is
+    invisible to the rig, so the ground behind it can read as seen. The probe's only such row is a 0.3 m
+    wall 15 m ahead on main alone (it sits between two rows). Pin that it is unobservable by ray geometry
+    (no valid main ray's first hit is on the box) and that its leak cannot grow past 102 cells."""
+    box = ((-6.0, 15.0, 0.0), (6.0, 15.3, 0.3))
+    g = bl.rig_geometry(["main"], _cfg(), model=BASE_RIG_MODEL)[0]
+    pv = bl.rig_tensors([g])["pixel_valid"].reshape(CROP_ROWS, CROP_COLS).numpy() > 0
+    K, T = g.K.astype(np.float64), g.T.astype(np.float64)
+    o = T[:3, 3]
+    lo, hi = np.array(box[0]), np.array(box[1])
+    on_box = 0
+    for r in range(CROP_ROWS):
+        for c in range(CROP_COLS):
+            if not pv[r, c]:
+                continue
+            d = T[:3, :3] @ np.array([((c + 0.5) * 8 - K[0, 2]) / K[0, 0], ((r + 0.5) * 8 - K[1, 2]) / K[1, 1], 1.0])
+            t_box = _ray_box(o, d, lo, hi)
+            t_gnd = -o[2] / d[2] if d[2] < 0 else np.inf
+            on_box += int(t_box is not None and t_box < t_gnd)
+    assert on_box == 0, on_box  # unobservable: a leak here is the named limitation, not a gate bug
+    hidden, _, free_ok, seen = _leaks(["main"], [box])
+    leak = int((hidden & (free_ok | seen)).sum())
+    print(f"  0.3 m @15 main (unobservable): hidden {int(hidden.sum())} leak {leak}")
+    assert hidden.sum() >= 1 and leak <= 102, leak
+    print("unobservable_leak_pinned")
+
+
 def check_thin_occluders_keep_visible_road() -> None:
     """Over-hide check: a thin pole or a sign in one cell must not shadow the visible road around and
     behind it. On main and on narrow + main + wide, of the road cells observed with no occluder that are
@@ -1931,6 +1962,7 @@ def main() -> None:
     check_wide_low_barrier_hides_ground()
     check_barrier_anywhere_hides_ground()
     check_thin_occluders_keep_visible_road()
+    check_unobservable_leak_pinned()
     check_pass_mass_is_survival()
     check_zero_valid_cameras_no_nan()
     check_gradients_reach_stem_and_depth()

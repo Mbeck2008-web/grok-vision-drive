@@ -55,6 +55,19 @@ G5  Unknown is the default, decided per ray by depth transmittance.
     ground is behind a surface at least ``RAISED_OCC_M`` above the local
     ground on that camera's sight line, so a 0.6 m barrier that is too
     low to be "raised" for the band still hides the ground in its umbra.
+    A hit that climbs from the hit of the row below it in the same column
+    faster than ``GROUND_SLOPE_CAP`` (least steep reading of the two depth
+    bins) is a face, an occluder too. Virtual rays half way between
+    neighbouring pixel columns add seen / free only in bins both real rays
+    passed through. A point "within SEEN_TIGHT_M of the ground" keeps its
+    cell seen behind a bounded top only if it is also that close to its own
+    ray's landing.
+    Named limitation (observable vs unobservable): a barrier that no valid
+    feature ray of any camera touches (it falls between two rows, e.g. a
+    0.3 m wall 15 m ahead on main alone) is invisible to the rig, and the
+    ground behind it can read as seen. That count is pinned by
+    ``check_unobservable_leak_pinned``; every barrier some ray touches is
+    held to zero leaks by the probe battery.
     This is structural, not a loss weight.
 G6  The output is differentiable with respect to the stem taps and the
     depth head.
@@ -180,6 +193,10 @@ VIEWSHED_AZ_BINS = 720
 # at 32 m (the viewshed's 3 x 3 sampling bridges a one-cell gap).
 TOP_RADIAL_SAMPLES = 13
 TOP_LATERAL_SAMPLES = 13
+# Virtual rays between neighbouring pixel columns (G5 over-hide): at these fractions of the way from
+# column c to column c + 1. Columns are 8 px apart, up to ~1 m at 12 m on the side cameras, wider than
+# a 0.5 m cell, so a single midpoint still skips cells; quarter points keep virtual samples < 0.5 m apart.
+LATERAL_FRACS = (0.25, 0.5, 0.75)
 # Occluder tops live on their own finer grid (OCC_N x OCC_N over the same
 # 64 m square, 0.25 m cells): a 0.2 m pole fills 1-2 cells, not a 0.5 m BEV
 # cell (or two when it straddles a cell edge).
@@ -1121,7 +1138,7 @@ class BevLssHead(nn.Module):
 
     def _lateral_midpoints(
         self, pts: Any, T: Any, K: Any, idx: Any, pass_r: Any, crossed: Any, through: Any, ray_w: Any, z_land: Any,
-        raised: Any, flat_g: Any, flat_has: Any, blocked: Any, occ_m: float, ground: Any, unc: Any,
+        raised: Any, flat_g: Any, flat_has: Any, blocked: Any, occ_m: float, ground: Any, unc: Any, frac: float = 0.5,
     ) -> Any:
         """Seen / free masses (B x 2 x N x N) from virtual rays half way between neighbouring pixel columns (G5).
 
@@ -1140,7 +1157,7 @@ class BevLssHead(nn.Module):
         def mid(t: Any) -> Any:
             return torch.minimum(t[..., :-1], t[..., 1:])
 
-        pts_m = 0.5 * (pts[..., :-1, :] + pts[..., 1:, :])
+        pts_m = (1.0 - frac) * pts[..., :-1, :] + frac * pts[..., 1:, :]
         idx_m, ok_m = bev_flat_index(pts_m)
         ids = idx_m.reshape(b, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
         z_m = pts_m[..., 2].to(pass_r.dtype)
@@ -1267,8 +1284,11 @@ class BevLssHead(nn.Module):
             dim=-1,
         ).reshape(b, n * (d - 1) * h * w, 3)
         vis_e = splat(vis_e, idx_e.reshape(b, -1), ok_e.reshape(b, -1))
-        vis_m = self._lateral_midpoints(pts, T, K, idx, beyond * through, crossed, through, ray_w, z_land, raised, flat_g, flat_has, blocked, occ_m, ground * has_ground, unc)
-        vis_m = vis_m + self._lateral_midpoints(pts_e, T, K, idx_e, s_e * through_e, crossed_e, through_e, ray_w, z_land, raised, flat_g, flat_has, blocked, occ_m, ground * has_ground, unc)
+        vis_m = torch.zeros_like(vis_e[:, :2])
+        for frac in LATERAL_FRACS:
+            for p_v, i_v, pass_v, cr_v, th_v in ((pts, idx, beyond * through, crossed, through), (pts_e, idx_e, s_e * through_e, crossed_e, through_e)):
+                v = self._lateral_midpoints(p_v, T, K, i_v, pass_v, cr_v, th_v, ray_w, z_land, raised, flat_g, flat_has, blocked, occ_m, ground * has_ground, unc, frac)
+                vis_m = vis_m + v
         ctx = ctx.view(b, n, 1, CTX_CH, h, w)
         lifted = prob_w.unsqueeze(3) * ctx  # B N D C h w
         values = torch.cat(
@@ -1288,9 +1308,12 @@ class BevLssHead(nn.Module):
         passed = bev[:, CTX_CH + 1 : CTX_CH + 2]
         occ = bev[:, CTX_CH + 2 : CTX_CH + 3]
         clear = bev[:, CTX_CH + 3 : CTX_CH + 4]
-        thru = bev[:, CTX_CH + 4 : CTX_CH + 5] + vis_e[:, 2:3] + vis_m[:, 1:2]
         occ = occ + vis_e[:, 0:1]
-        clear = clear + vis_e[:, 1:2] + vis_m[:, 0:1]
+        # virtual rays fill gaps between real ones; they never overrule a real ray that landed in the
+        # cell without reaching it (behind a surface it is more likely than not to have hit)
+        fill = (occ <= 0).to(occ.dtype)
+        thru = bev[:, CTX_CH + 4 : CTX_CH + 5] + vis_e[:, 2:3] + vis_m[:, 1:2] * fill
+        clear = clear + vis_e[:, 1:2] + vis_m[:, 0:1] * fill
         logits = self.encoder(torch.cat([feat, torch.log1p(hit), torch.log1p(passed)], dim=1))
         logits = apply_visibility(logits, clear, thru, occluded_mass=occ)
         return {

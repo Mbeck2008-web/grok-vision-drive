@@ -456,6 +456,79 @@ def check_traffic_heading_lanes_and_ego_unchanged() -> None:
     print("traffic heading (all quadrants), legal lanes, flip oneway, AI mode, and ego unchanged OK")
 
 
+def check_legal_traffic_slot_keeps_unsnapped_pose() -> None:
+    """A slot already in a legal lane keeps its chosen pose; _legal_traffic_pose is not called.
+
+    Kills mutant S3, which always takes the _legal_traffic_pose branch and
+    re-snaps to the first _offset_candidates lane, discarding pick.offset_m.
+    """
+    # 4-lane two-way, 14 m wide (LANE_W_M=3.5 so the tag is kept). Legal
+    # right-hand centers are 1.75 m (inner) and 5.25 m (rightmost first).
+    road = {
+        "id": "tw4",
+        "pts": [(0.0, 0.0, 0.0), (0.0, 300.0, 0.0)],
+        "widths": [14.0, 14.0],
+        "lanes": 4,
+        "lanes_left": 2,
+        "lanes_right": 2,
+        "length": 300.0,
+        "oneway": False,
+        "flip": False,
+        "auto_lanes": False,
+        "width": 14.0,
+    }
+    deck = spawn_mix.SpawnDeck({spawn_mix.CITY: [road], spawn_mix.HIGHWAY: [], spawn_mix.RAMP: []})
+    offset = 1.75
+    pick = spawn_mix.SpawnPick(
+        "city",
+        "tw4",
+        (0.0, 100.0, 0.5),
+        spawn_mix._yaw_quat(0.0, 1.0),
+        (8.0, 14.0),
+        offset_m=offset,
+    )
+    assert deck._slot_is_legal(offset, 160.0, 0.5, 0.0, 1.0), "inner right-hand lane must already be legal"
+    assert deck._slot_is_legal(-offset, 60.0, 0.5, 0.0, -1.0), "oncoming inner lane must already be legal"
+
+    calls: list[tuple[float, float, float, float, float]] = []
+    real = spawn_mix.SpawnDeck._legal_traffic_pose
+
+    def wrapped(self, x, y, z, fx, fy):
+        calls.append((x, y, z, fx, fy))
+        return real(self, x, y, z, fx, fy)
+
+    spawn_mix.SpawnDeck._legal_traffic_pose = wrapped  # type: ignore[method-assign]
+    try:
+        slots, notes = deck.traffic_slots(pick, 2)
+    finally:
+        spawn_mix.SpawnDeck._legal_traffic_pose = real  # type: ignore[method-assign]
+
+    assert calls == [], f"_legal_traffic_pose must not be called for an already-legal slot: {calls} notes={notes}"
+    assert len(slots) == 2, (slots, notes)
+
+    hx, hy = 0.0, 1.0
+    expected: dict[str, tuple[tuple[float, float, float], tuple[float, float, float, float]]] = {}
+    for where, want, back in (("ahead", spawn_mix.TRAFFIC_AHEAD_M, False), ("behind", spawn_mix.TRAFFIC_BEHIND_M, True)):
+        heading = (-hx, -hy) if back else (hx, hy)
+        chain = spawn_mix.chain_from_pose(
+            deck._by_id["tw4"], pick.pos, heading, deck._by_id, deck._ends, want + 1.0, reverse=back
+        )
+        got = spawn_mix.point_along(chain, want)
+        assert got is not None, (where, want)
+        (x, y, z), (tx, ty), _along = got
+        fx, fy = (-tx, -ty) if back else (tx, ty)
+        rx, ry = fy, -fx
+        cx, cy, cz = x + rx * offset, y + ry * offset, z + 0.5
+        expected[where] = ((cx, cy, cz), spawn_mix._yaw_quat(fx, fy))
+
+    got_slots = {where: (pos, rot) for where, pos, rot, _along in slots}
+    assert set(got_slots) == set(expected), got_slots
+    for where, (pos, rot) in expected.items():
+        gpos, grot = got_slots[where]
+        assert gpos == pos, f"{where} pos changed: got {gpos} want unsnapped {pos}"
+        assert grot == rot, f"{where} rot changed: got {grot} want _yaw_quat {rot}"
+    print("legal traffic slot keeps unsnapped pose; _legal_traffic_pose not called OK")
+
 
 def check_begin_level_step_settle_and_timeout() -> None:
     """begin_level waits for vehicle step rate to settle before snap_to_road/place_vehicle, and fails loudly on timeout."""
@@ -572,6 +645,7 @@ def check_stale_impact_respawn_due_cleared_on_spawn() -> None:
 
 def main() -> int:
     check_traffic_heading_lanes_and_ego_unchanged()
+    check_legal_traffic_slot_keeps_unsnapped_pose()
     check_level_load_settle_waits_for_steady_fps()
     check_level_load_settle_timeout_fails_loudly()
     check_post_teleport_settle_and_no_double_teleport()

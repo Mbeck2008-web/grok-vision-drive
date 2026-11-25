@@ -944,7 +944,7 @@ def check_capped_hot_exposed_ground() -> None:
     for f, cap, want in (
         (2, 2048, {"fill_wall": 988, "fill_below": 128,
                    ("up10", 0.005): 1014, ("up10", 0.01): 963, ("crest", 0.01): 927, ("terrace", 0.01): 981}),
-        (4, 512, {"fill_wall": 176, "fill_below": 100,
+        (4, 512, {"fill_wall": 176,
                   ("up10", 0.005): 168, ("up10", 0.01): 170, ("kink15", 0.01): 215}),
     ):
         cm = G.voxel_m * f
@@ -952,9 +952,14 @@ def check_capped_hot_exposed_ground() -> None:
         bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
         terr = lambda x, y, cm=cm: 0.2 + cm * (x >= 0)
         for pf in (0.92, 0.93):
-            k = kept_of(scene(X, Y, up10, cm, bld, pf), cap, cm)
+            hot_p, ph_p, lab_p = noisy(scene(X, Y, up10, cm, bld, pf), 0.0, 1)
+            idx_p = _capped_hot(hot_p, ph_p, cap, G.z_min, cm)
+            k = {str(kk): int(vv) for kk, vv in zip(*np.unique(lab_p[idx_p], return_counts=True))}
             assert k.get("wall", 0) >= want["fill_wall"], (f, pf, k)
-            assert k.get("below", 0) <= want["fill_below"], (f, pf, k)
+            if f == 4:
+                _assert_f4_uphill_truth(f"f=4 fill {pf}", hot_p, ph_p, lab_p, idx_p, cap, cm, F4_UPHILL_TRUTH[(0.10, 0.0)])
+            else:
+                assert k.get("below", 0) <= want["fill_below"], (f, pf, k)
             print(f"exposed-ground f={f} uphill +10% fill {pf}: {k} OK")
         for (name, sig), wmin in [(k, v) for k, v in want.items() if isinstance(k, tuple)]:
             gz = {"up10": up10, "crest": crest, "kink15": kink15, "terrace": terr}[name]

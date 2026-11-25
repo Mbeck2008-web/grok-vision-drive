@@ -9,8 +9,11 @@ and this script must not touch a recording host.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -184,7 +187,7 @@ def check_off_never_relaunches() -> None:
 
 
 def check_missing_exe_halts() -> None:
-    from python.collect.tech_watchdog import STOP_RELAUNCH_UNAVAILABLE, TechWatchdog
+    from python.collect.tech_watchdog import TechWatchdog
     from scripts.gvd_test_env import collect_root
 
     calls = []
@@ -194,13 +197,13 @@ def check_missing_exe_halts() -> None:
         _write_stop(a, "session_open_failed")
         _write_stop(b, "session_open_failed")
         assert dog.after_clip(a) is None
-        assert dog.after_clip(b) == STOP_RELAUNCH_UNAVAILABLE
+        assert dog.after_clip(b) == "tech_relaunch_unavailable"
         assert calls == [] and dog.relaunches == 0
     print("watchdog: no BNG_HOME exe halts with tech_relaunch_unavailable (no attach retry)")
 
 
 def check_hello_failure_halts() -> None:
-    from python.collect.tech_watchdog import STOP_RELAUNCH_HELLO_FAILED, TechWatchdog
+    from python.collect.tech_watchdog import TechWatchdog
     from scripts.gvd_test_env import collect_root
 
     with collect_root() as root:
@@ -211,13 +214,13 @@ def check_hello_failure_halts() -> None:
         _write_stop(a, "level_load_failed")
         _write_stop(b, "level_load_failed")
         assert dog.after_clip(a) is None
-        assert dog.after_clip(b) == STOP_RELAUNCH_HELLO_FAILED
+        assert dog.after_clip(b) == "tech_relaunch_hello_failed"
         assert dog.relaunches == 1
     print("watchdog: a relaunch that does not get Hello halts with tech_relaunch_hello_failed")
 
 
 def check_relaunch_cap_halts() -> None:
-    from python.collect.tech_watchdog import STOP_RELAUNCH_LIMIT, TechWatchdog
+    from python.collect.tech_watchdog import TechWatchdog
     from scripts.gvd_test_env import collect_root
 
     calls = []
@@ -240,7 +243,7 @@ def check_relaunch_cap_halts() -> None:
             if i == 0:
                 assert halt is None
             else:
-                assert halt == STOP_RELAUNCH_LIMIT
+                assert halt == "tech_relaunch_limit"
         assert calls == ["r", "r", "r"]
     print("watchdog: a 4th needed relaunch halts with tech_relaunch_limit")
 
@@ -316,19 +319,20 @@ def check_relaunch_kills_then_starts_human_argv() -> None:
             exe=exe,
             kill_fn=kill,
             launch_fn=launch,
+            wait_port_fn=lambda: events.append(("port_clear",)) or True,
             wait_fn=lambda: events.append(("hello",)) or True,
         )
-        assert ok is True
-        assert [e[0] for e in events] == ["kill", "launch", "hello"], events
-        assert events[1][1].endswith("BeamNG.tech.exe")
-        assert events[1][2] == TECH_RELAUNCH_ARGV
+        assert ok is None
+        assert [e[0] for e in events] == ["kill", "port_clear", "launch", "hello"], events
+        assert events[2][1].endswith("BeamNG.tech.exe")
+        assert events[2][2] == TECH_RELAUNCH_ARGV
         assert TECH_RELAUNCH_ARGV == ("-tcom", "-console", "-gfx", "vk")
     print("relaunch_tech: kill process tree, then BeamNG.tech.exe -tcom -console -gfx vk, then Hello")
 
 
 def check_run_clips_halt_records_stop_reason() -> None:
     from python.collect.clip_mode import run_clips
-    from python.collect.tech_watchdog import STOP_RELAUNCH_LIMIT, TechWatchdog
+    from python.collect.tech_watchdog import TechWatchdog
     from scripts.gvd_test_env import collect_root
     from scripts.test_clip_mode import MAPS, _fake_recording
 
@@ -355,7 +359,7 @@ def check_run_clips_halt_records_stop_reason() -> None:
             after_clip=lambda clip, plan, code, qc: dog.after_clip(clip),
         )
         manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
-        assert manifest.get("stop_reason") == STOP_RELAUNCH_LIMIT, manifest
+        assert manifest.get("stop_reason") == "tech_relaunch_limit", manifest
         # 2 fails -> relaunch #1 (cap 1), 2 more fails -> halt. 4 clips, not 8.
         assert len(manifest["results"]) == 4, manifest["results"]
         dirs = sorted(p for p in session.iterdir() if p.is_dir())
@@ -391,6 +395,384 @@ def check_dirt_road_has_no_unpaved_spawn_kind() -> None:
     print("dirt_road: no unpaved spawn kind; pavement spawns can yield dirt share 0.00")
 
 
+
+def check_wait_hello_retries_exception_then_succeeds() -> None:
+    from python.collect.tech_watchdog import wait_tech_hello
+    from python.sensors.tech import TechHelloTimeout
+
+    hellos: list[str] = []
+    closed: list[object] = []
+
+    def listening() -> bool:
+        return True
+
+    def hello() -> object:
+        hellos.append("hello")
+        if len(hellos) == 1:
+            raise TechHelloTimeout("Hello timeout after 10s on localhost:25252")
+        return {"session": True}
+
+    logs: list[str] = []
+    ok = wait_tech_hello(
+        listening_fn=listening,
+        hello_fn=hello,
+        close_fn=lambda bng: closed.append(bng),
+        timeout_s=1.0,
+        poll_s=0.05,
+        log=logs.append,
+    )
+    assert ok is True, (ok, hellos, logs)
+    assert hellos == ["hello", "hello"], hellos
+    assert closed == [{"session": True}]
+    assert any("TechHelloTimeout" in line for line in logs), logs
+    print("wait_tech_hello: retries hello_fn exceptions until Hello succeeds")
+
+
+def check_relaunch_does_not_launch_while_port_listening() -> None:
+    from python.collect.tech_watchdog import relaunch_tech
+    from scripts.gvd_test_env import collect_root
+
+    events: list[tuple] = []
+    with collect_root() as root:
+        exe = root / "BeamNG.tech.exe"
+        exe.write_text("x", encoding="utf-8")
+
+        def kill() -> list[int]:
+            events.append(("kill",))
+            return [44888]
+
+        def launch(path: Path, argv: tuple[str, ...]) -> int:
+            events.append(("launch", str(path), argv))
+            return 99
+
+        ok = relaunch_tech(
+            exe=exe,
+            kill_fn=kill,
+            launch_fn=launch,
+            listening_fn=lambda: True,
+            port_clear_timeout_s=0.15,
+            wait_fn=lambda: events.append(("hello",)) or True,
+            log=lambda s: events.append(("log", s)),
+        )
+        assert ok == "tech_relaunch_port_stuck", ok
+        assert "launch" not in [e[0] for e in events], events
+        assert "hello" not in [e[0] for e in events], events
+        assert events[0] == ("kill",)
+    print("relaunch_tech: does not launch while the research port stays LISTENING after kill")
+
+
+def check_wait_live_hello_sets_quit_on_close_false_before_close() -> None:
+    from python.collect.tech_watchdog import wait_live_hello
+    import python.sensors.tech as tech_mod
+
+    class FakeBng:
+        def __init__(self) -> None:
+            self.quit_on_close = True
+            self.quit_on_close_at_close: bool | None = None
+
+        def close(self) -> None:
+            self.quit_on_close_at_close = self.quit_on_close
+
+    bng = FakeBng()
+    orig_listen = tech_mod.research_port_listening
+    orig_open = tech_mod.open_tech_beamngpy
+    orig_load = tech_mod.load_tech_config
+    try:
+        tech_mod.research_port_listening = lambda *a, **k: True
+        tech_mod.open_tech_beamngpy = lambda *a, **k: bng
+        tech_mod.load_tech_config = lambda: {"host": "127.0.0.1", "port": 25252, "home": "", "user": ""}
+        ok = wait_live_hello(timeout_s=0.5, log=lambda s: None)
+        assert ok is True
+        assert bng.quit_on_close_at_close is False, bng.quit_on_close_at_close
+        assert bng.quit_on_close is False
+    finally:
+        tech_mod.research_port_listening = orig_listen
+        tech_mod.open_tech_beamngpy = orig_open
+        tech_mod.load_tech_config = orig_load
+    print("wait_live_hello: hold_tech_process sets quit_on_close False before close()")
+
+
+def check_collect_clips_main_exits_2_on_halt() -> None:
+    cli = _cli()
+    from scripts.gvd_test_env import collect_root
+
+    with collect_root() as root:
+        orig_run = cli.run_clips
+        orig_resolve = cli.resolve_tech_exe
+        try:
+            def fake_halt(out, **kwargs):
+                after = kwargs["after_clip"]
+                session = out / "clips_halt"
+                session.mkdir()
+                stops = []
+                for name in ("a", "b"):
+                    clip = session / name
+                    _write_stop(clip, "session_open_failed")
+                    stops.append(after(clip, None, 2, None))
+                assert stops == [None, "tech_relaunch_unavailable"], stops
+                return session
+
+            cli.run_clips = fake_halt
+            cli.resolve_tech_exe = lambda: None
+            assert cli.main(["--out", str(root), "--clips", "2"]) == 2
+
+            def fake_ok(out, **kwargs):
+                return out / "clips_ok"
+
+            cli.run_clips = fake_ok
+            assert cli.main(["--out", str(root), "--clips", "1"]) == 0
+        finally:
+            cli.run_clips = orig_run
+            cli.resolve_tech_exe = orig_resolve
+    print("collect_clips.main: exits 2 on halt, 0 otherwise")
+
+
+def check_resolve_tech_exe() -> None:
+    from python.collect.tech_watchdog import resolve_tech_exe
+    from scripts.gvd_test_env import collect_root
+    import python.sensors.tech as tech_mod
+
+    with collect_root() as root:
+        exe = root / "BeamNG.tech.exe"
+        assert resolve_tech_exe(home=str(root)) is None
+        exe.write_text("x", encoding="utf-8")
+        assert resolve_tech_exe(home=str(root)) == exe
+
+        saved = {k: os.environ.get(k) for k in ("BNG_HOME", "BEAMNG_HOME")}
+        orig_load = tech_mod.load_tech_config
+        try:
+            os.environ.pop("BEAMNG_HOME", None)
+            os.environ["BNG_HOME"] = str(root)
+            assert resolve_tech_exe() == exe
+            del os.environ["BNG_HOME"]
+            os.environ["BEAMNG_HOME"] = str(root)
+            assert resolve_tech_exe() == exe
+            del os.environ["BEAMNG_HOME"]
+            tech_mod.load_tech_config = lambda: {"home": str(root)}
+            assert resolve_tech_exe() == exe
+            tech_mod.load_tech_config = lambda: {"home": ""}
+            assert resolve_tech_exe() is None
+        finally:
+            tech_mod.load_tech_config = orig_load
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    print("resolve_tech_exe: BNG_HOME / BEAMNG_HOME / yaml home, only when the exe exists")
+
+
+def check_tech_pids_port_owner_and_exe() -> None:
+    from python.collect.tech_watchdog import _tech_pids, kill_tech_process_tree
+    from scripts.gvd_test_env import collect_root
+
+    netstat = (
+        "Active Connections\n"
+        "\n"
+        "  Proto  Local Address          Foreign Address        State           PID\n"
+        "  TCP    0.0.0.0:25252          0.0.0.0:0              LISTENING       44888\n"
+        "  TCP    127.0.0.1:80           0.0.0.0:0              LISTENING       4\n"
+    )
+    with collect_root() as root:
+        exe = root / "BeamNG.tech.exe"
+        exe.write_text("x", encoding="utf-8")
+        commands: list[list[str]] = []
+
+        def run(cmd, **kwargs):
+            commands.append(list(cmd))
+            if cmd[0] == "netstat":
+                return subprocess.CompletedProcess(cmd, 0, stdout=netstat, stderr="")
+            if cmd[0] == "wmic":
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if cmd[0] == "tasklist":
+                raise AssertionError(f"tasklist fallback must not run when a port owner exists: {cmd}")
+            if cmd[0] == "taskkill":
+                return subprocess.CompletedProcess(cmd, 0, stdout="SUCCESS", stderr="")
+            raise AssertionError(cmd)
+
+        with patch("python.collect.tech_watchdog.sys.platform", "win32"), patch(
+            "python.collect.tech_watchdog.subprocess.run", side_effect=run
+        ):
+            assert _tech_pids(exe, port=25252) == [44888]
+            killed = kill_tech_process_tree(log=lambda s: None, exe=exe, port=25252)
+            assert killed == [44888]
+            assert any(c[:2] == ["taskkill", "/F"] and "44888" in c for c in commands), commands
+    print("_tech_pids: prefers the research-port owner over unscoped tasklist")
+
+
+def check_tech_pids_install_root_exe() -> None:
+    from python.collect.tech_watchdog import _tech_pids
+    from scripts.gvd_test_env import collect_root
+
+    with collect_root() as root:
+        exe = root / "BeamNG.tech.exe"
+        exe.write_text("x", encoding="utf-8")
+        wmic = (
+            "\nNode,ExecutablePath,ProcessId\n"
+            f"BOX,{exe},55111\n"
+            f"BOX,{root / 'other' / 'BeamNG.tech.exe'},999\n"
+        )
+
+        def run(cmd, **kwargs):
+            if cmd[0] == "netstat":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Active Connections\n", stderr="")
+            if cmd[0] == "wmic":
+                return subprocess.CompletedProcess(cmd, 0, stdout=wmic, stderr="")
+            if cmd[0] == "tasklist":
+                raise AssertionError("tasklist fallback must not run when install-root exe PIDs exist")
+            raise AssertionError(cmd)
+
+        with patch("python.collect.tech_watchdog.sys.platform", "win32"), patch(
+            "python.collect.tech_watchdog.subprocess.run", side_effect=run
+        ):
+            assert _tech_pids(exe, port=25252) == [55111]
+    print("_tech_pids: scopes fallback-free hits to the install-root exe path")
+
+
+def check_tech_pids_tasklist_validates_image_name() -> None:
+    from python.collect.tech_watchdog import _tech_pids
+
+    tasklist = (
+        '"BeamNG.tech.exe","44888","Console","1","1,234 K"\n'
+        '"chrome.exe","123","Console","1","80 K"\n'
+        "INFO: No tasks are running which match the specified criteria.\n"
+        '"","999","Console","1","1 K"\n'
+    )
+
+    def run(cmd, **kwargs):
+        if cmd[0] in ("netstat", "wmic"):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[0] == "tasklist":
+            return subprocess.CompletedProcess(cmd, 0, stdout=tasklist, stderr="")
+        raise AssertionError(cmd)
+
+    with patch("python.collect.tech_watchdog.sys.platform", "win32"), patch(
+        "python.collect.tech_watchdog.subprocess.run", side_effect=run
+    ):
+        assert _tech_pids(port=25252) == [44888]
+    print("_tech_pids: tasklist fallback validates parts[0] is the Tech image name")
+
+
+def check_kill_tech_logs_taskkill_failure() -> None:
+    from python.collect.tech_watchdog import kill_tech_process_tree
+
+    logs: list[str] = []
+    netstat = "  TCP    127.0.0.1:25252        0.0.0.0:0              LISTENING       44888\n"
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "netstat":
+            return subprocess.CompletedProcess(cmd, 0, stdout=netstat, stderr="")
+        if cmd[0] == "wmic":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[0] == "taskkill":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="ERROR: Access denied")
+        raise AssertionError(cmd)
+
+    with patch("python.collect.tech_watchdog.sys.platform", "win32"), patch(
+        "python.collect.tech_watchdog.subprocess.run", side_effect=run
+    ):
+        assert kill_tech_process_tree(log=logs.append, port=25252) == [44888]
+    assert any("taskkill" in line and "44888" in line and "rc=1" in line for line in logs), logs
+    print("kill_tech_process_tree: logs a failed taskkill returncode")
+
+
+def check_kill_tech_drops_non_win32_os_kill() -> None:
+    from python.collect.tech_watchdog import kill_tech_process_tree
+
+    with patch("python.collect.tech_watchdog._tech_pids", return_value=[44888]), patch(
+        "python.collect.tech_watchdog.sys.platform", "linux"
+    ), patch("python.collect.tech_watchdog.os.kill") as okill, patch(
+        "python.collect.tech_watchdog.subprocess.run"
+    ) as run:
+        logs: list[str] = []
+        pids = kill_tech_process_tree(log=logs.append)
+        assert pids == [44888]
+        okill.assert_not_called()
+        run.assert_not_called()
+    src = (ROOT / "python" / "collect" / "tech_watchdog.py").read_text(encoding="utf-8")
+    assert "os.kill" not in src
+    assert "SIGKILL" not in src
+    print("kill_tech_process_tree: no dead non-win32 os.kill branch")
+
+
+def check_wait_live_hello_applies_env_overrides() -> None:
+    from python.collect.tech_watchdog import wait_live_hello
+    import python.sensors.tech as tech_mod
+
+    class Bng:
+        quit_on_close = True
+
+        def close(self) -> None:
+            pass
+
+    calls: list[tuple] = []
+
+    def fake_listen(host, port, **kwargs):
+        calls.append(("listen", host, int(port)))
+        return True
+
+    def fake_open(host, port, home=None, user=None, launch=False, **kwargs):
+        calls.append(("open", host, int(port), home, user, launch))
+        return Bng()
+
+    keys = ("GVD_BEAMNG_HOST", "GVD_BEAMNG_PORT", "BNG_HOME", "BEAMNG_HOME", "GVD_BEAMNG_USER")
+    saved = {k: os.environ.get(k) for k in keys}
+    orig_listen = tech_mod.research_port_listening
+    orig_open = tech_mod.open_tech_beamngpy
+    orig_load = tech_mod.load_tech_config
+    try:
+        os.environ.pop("BEAMNG_HOME", None)
+        os.environ["GVD_BEAMNG_HOST"] = "10.0.0.9"
+        os.environ["GVD_BEAMNG_PORT"] = "34567"
+        os.environ["BNG_HOME"] = r"E:\BeamNG"
+        os.environ["GVD_BEAMNG_USER"] = r"E:\BeamNG\user"
+        tech_mod.research_port_listening = fake_listen
+        tech_mod.open_tech_beamngpy = fake_open
+        tech_mod.load_tech_config = lambda: {"host": "127.0.0.1", "port": 25252, "home": "", "user": ""}
+        assert wait_live_hello(timeout_s=0.5, log=lambda s: None) is True
+        assert ("listen", "10.0.0.9", 34567) in calls, calls
+        assert ("open", "10.0.0.9", 34567, r"E:\BeamNG", r"E:\BeamNG\user", False) in calls, calls
+    finally:
+        tech_mod.research_port_listening = orig_listen
+        tech_mod.open_tech_beamngpy = orig_open
+        tech_mod.load_tech_config = orig_load
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("wait_live_hello: apply_env_overrides honors GVD_BEAMNG_HOST/PORT/USER and BNG_HOME")
+
+
+def check_launch_tech_popen_argv_devnull() -> None:
+    from python.collect.tech_watchdog import TECH_RELAUNCH_ARGV, launch_tech
+    from scripts.gvd_test_env import collect_root
+
+    with collect_root() as root:
+        exe = root / "BeamNG.tech.exe"
+        exe.write_text("x", encoding="utf-8")
+        proc = MagicMock()
+        with patch("python.collect.tech_watchdog.sys.platform", "win32"), patch(
+            "python.collect.tech_watchdog.subprocess.Popen", return_value=proc
+        ) as popen:
+            got = launch_tech(exe, log=lambda s: None)
+            assert got is proc
+            args, kwargs = popen.call_args
+            cmd = args[0] if args else kwargs.get("args")
+            assert cmd == [str(exe), *TECH_RELAUNCH_ARGV] == [str(exe), "-tcom", "-console", "-gfx", "vk"]
+            assert kwargs["stdin"] is subprocess.DEVNULL
+            assert kwargs["stdout"] is subprocess.DEVNULL
+            assert kwargs["stderr"] is subprocess.DEVNULL
+            assert kwargs["cwd"] == str(exe.parent)
+            flags = kwargs["creationflags"]
+            detached = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            new_grp = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            assert flags & detached, flags
+            assert flags & new_grp, flags
+    print("launch_tech: Popen argv is human tail and stdin/stdout/stderr=DEVNULL")
+
+
+
 def main() -> None:
     check_cli_defaults()
     check_clip_tech_fail_reason()
@@ -403,8 +785,20 @@ def main() -> None:
     check_hello_failure_halts()
     check_relaunch_cap_halts()
     check_wait_hello_rejects_listen_only()
+    check_wait_hello_retries_exception_then_succeeds()
     check_wait_hello_requires_hello_ok()
     check_relaunch_kills_then_starts_human_argv()
+    check_relaunch_does_not_launch_while_port_listening()
+    check_wait_live_hello_sets_quit_on_close_false_before_close()
+    check_wait_live_hello_applies_env_overrides()
+    check_collect_clips_main_exits_2_on_halt()
+    check_resolve_tech_exe()
+    check_tech_pids_port_owner_and_exe()
+    check_tech_pids_install_root_exe()
+    check_tech_pids_tasklist_validates_image_name()
+    check_kill_tech_logs_taskkill_failure()
+    check_kill_tech_drops_non_win32_os_kill()
+    check_launch_tech_popen_argv_devnull()
     check_run_clips_halt_records_stop_reason()
     check_dirt_road_has_no_unpaved_spawn_kind()
     print("test_tech_watchdog ok")

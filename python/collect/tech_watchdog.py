@@ -3,14 +3,14 @@
 A listening research port is not a liveness check: a hung Tech can keep
 ``127.0.0.1:25252`` LISTENING while Hello times out. After N consecutive
 ``session_open_failed`` or ``level_load_failed`` clips, stop attaching,
-kill the process tree, relaunch the install-root exe with
-``-tcom -console -gfx vk``, and continue only after a real Hello.
+kill the process tree, wait for the research port to close, relaunch the
+install-root exe with ``-tcom -console -gfx vk``, and continue only after
+a real Hello. Hello exceptions are retried until the wait deadline.
 """
 from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -24,10 +24,13 @@ DEFAULT_TECH_FAIL_RELAUNCH = 2
 DEFAULT_TECH_RELAUNCH_CAP = 3
 TECH_RELAUNCH_ARGV = TECH_HUMAN_TAIL
 DEFAULT_HELLO_WAIT_S = 180.0
+DEFAULT_PORT_CLEAR_S = 20.0
+DEFAULT_PORT_CLEAR_POLL_S = 0.2
 
 STOP_RELAUNCH_LIMIT = "tech_relaunch_limit"
 STOP_RELAUNCH_UNAVAILABLE = "tech_relaunch_unavailable"
 STOP_RELAUNCH_HELLO_FAILED = "tech_relaunch_hello_failed"
+STOP_RELAUNCH_PORT_STUCK = "tech_relaunch_port_stuck"
 
 TECH_IMAGE_NAMES = ("BeamNG.tech.exe", "BeamNG.tech.x64.exe", "BeamNG.tech")
 
@@ -70,45 +73,126 @@ def resolve_tech_exe(home: str | None = None) -> Path | None:
     return exe if exe.is_file() else None
 
 
-def _tech_pids() -> list[int]:
+def _configured_host_port() -> tuple[str, int]:
+    from python.sensors.tech import apply_env_overrides, load_tech_config
+
+    try:
+        cfg = apply_env_overrides(load_tech_config())
+    except Exception:
+        return "127.0.0.1", TECH_RESEARCH_PORT
+    host = str(cfg.get("host") or "127.0.0.1")
+    try:
+        port = int(cfg.get("port") or TECH_RESEARCH_PORT)
+    except (TypeError, ValueError):
+        port = TECH_RESEARCH_PORT
+    return host, port
+
+
+def _port_owner_pids(port: int) -> list[int]:
+    """PIDs with a TCP LISTENING socket on ``port`` (Windows ``netstat``)."""
+    proc = subprocess.run(
+        ["netstat", "-ano", "-p", "tcp"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     pids: list[int] = []
-    if sys.platform == "win32":
-        for name in TECH_IMAGE_NAMES:
-            proc = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                errors="replace",
-            )
-            for line in proc.stdout.splitlines():
-                # "BeamNG.tech.x64.exe","44888","Session Name",...
-                parts = [p.strip().strip('"') for p in line.split(",")]
-                if len(parts) >= 2 and parts[1].isdigit():
-                    pids.append(int(parts[1]))
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP" or parts[3].upper() != "LISTENING":
+            continue
+        _head, sep, rest = parts[1].rpartition(":")
+        if not sep:
+            continue
+        try:
+            local_port = int(rest)
+        except ValueError:
+            continue
+        if local_port != int(port) or not parts[4].isdigit():
+            continue
+        pid = int(parts[4])
+        if pid > 0:
+            pids.append(pid)
     return list(dict.fromkeys(pids))
 
 
-def kill_tech_process_tree(log: LogFn = print) -> list[int]:
-    """Force-kill the BeamNG.tech process tree. No-op when none are running."""
-    pids = _tech_pids()
+def _exe_pids(exe: Path) -> list[int]:
+    """PIDs whose ExecutablePath is the install-root Tech exe (Windows ``wmic``)."""
+    want = os.path.normcase(os.path.normpath(str(exe)))
+    proc = subprocess.run(
+        ["wmic", "process", "get", "ProcessId,ExecutablePath", "/FORMAT:CSV"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    pids: list[int] = []
+    for line in proc.stdout.splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        pid: int | None = None
+        matched = False
+        for part in parts:
+            if part.isdigit():
+                pid = int(part)
+            elif part and os.path.normcase(os.path.normpath(part)) == want:
+                matched = True
+        if matched and pid is not None and pid > 0:
+            pids.append(pid)
+    return list(dict.fromkeys(pids))
+
+
+def _tech_pids(exe: Path | str | None = None, *, port: int = TECH_RESEARCH_PORT) -> list[int]:
+    """Research-port owner and install-root exe PIDs; tasklist is last-resort fallback."""
+    if sys.platform != "win32":
+        return []
+    pids: list[int] = []
+    pids.extend(_port_owner_pids(int(port)))
+    if exe is not None and str(exe).strip():
+        pids.extend(_exe_pids(Path(exe)))
+    if pids:
+        return list(dict.fromkeys(pids))
+    for name in TECH_IMAGE_NAMES:
+        proc = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        for line in proc.stdout.splitlines():
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) < 2 or parts[0].lower() != name.lower() or not parts[1].isdigit():
+                continue
+            pid = int(parts[1])
+            if pid > 0:
+                pids.append(pid)
+    return list(dict.fromkeys(pids))
+
+
+def kill_tech_process_tree(
+    log: LogFn = print,
+    *,
+    exe: Path | None = None,
+    port: int = TECH_RESEARCH_PORT,
+) -> list[int]:
+    """Force-kill the scoped BeamNG.tech process tree. No-op when none are running."""
+    pids = _tech_pids(exe, port=port)
     if not pids:
         log("collect tech relaunch: no BeamNG.tech process to kill")
         return []
     log(f"collect tech relaunch: killing BeamNG.tech pids={pids}")
-    if sys.platform == "win32":
-        for pid in pids:
-            subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid), "/T"],
-                capture_output=True,
-                text=True,
-                errors="replace",
-            )
-    else:
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+    if sys.platform != "win32":
+        return pids
+    for pid in pids:
+        proc = subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid), "/T"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            log(f"collect tech relaunch: taskkill pid={pid} failed rc={proc.returncode} {err}")
     return pids
 
 
@@ -116,7 +200,12 @@ def launch_tech(exe: Path, argv: tuple[str, ...] = TECH_RELAUNCH_ARGV, log: LogF
     """Start install-root ``BeamNG.tech.exe -tcom -console -gfx vk``, detached from this process."""
     cmd = [str(exe), *argv]
     log(f"collect tech relaunch: starting {' '.join(cmd)}")
-    kwargs: dict[str, Any] = {"cwd": str(Path(exe).parent)}
+    kwargs: dict[str, Any] = {
+        "cwd": str(Path(exe).parent),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
     if sys.platform == "win32":
         kwargs["creationflags"] = (
             getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
@@ -125,6 +214,30 @@ def launch_tech(exe: Path, argv: tuple[str, ...] = TECH_RELAUNCH_ARGV, log: LogF
     else:
         kwargs["start_new_session"] = True
     return subprocess.Popen(cmd, **kwargs)
+
+
+def wait_port_closed(
+    listening_fn: Callable[[], bool],
+    *,
+    timeout_s: float = DEFAULT_PORT_CLEAR_S,
+    poll_s: float = DEFAULT_PORT_CLEAR_POLL_S,
+    log: LogFn = print,
+) -> bool:
+    """True when the research port is no longer LISTENING."""
+    deadline = time.monotonic() + float(timeout_s)
+    while True:
+        try:
+            up = bool(listening_fn())
+        except Exception as exc:
+            log(f"collect tech relaunch: port-listen check failed: {type(exc).__name__}: {exc}")
+            up = True
+        if not up:
+            return True
+        if time.monotonic() >= deadline:
+            log(f"collect tech relaunch: research port still LISTENING after {timeout_s:g}s")
+            return False
+        remaining = deadline - time.monotonic()
+        time.sleep(max(0.01, min(float(poll_s), remaining)))
 
 
 def wait_tech_hello(
@@ -136,7 +249,10 @@ def wait_tech_hello(
     poll_s: float = 0.5,
     log: LogFn = print,
 ) -> bool:
-    """True only after a real Hello succeeds. A listening port alone is not ready."""
+    """True only after a real Hello succeeds. A listening port alone is not ready.
+
+    ``hello_fn`` exceptions are logged and retried until ``timeout_s``.
+    """
     deadline = time.monotonic() + float(timeout_s)
     while time.monotonic() <= deadline:
         if listening_fn():
@@ -144,13 +260,20 @@ def wait_tech_hello(
                 bng = hello_fn()
             except Exception as exc:
                 log(f"collect tech relaunch Hello failed: {type(exc).__name__}: {exc}")
-                return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(max(0.01, min(float(poll_s), remaining)))
+                continue
             try:
                 close_fn(bng)
             except Exception as exc:
                 log(f"collect tech relaunch Hello close: {type(exc).__name__}: {exc}")
             return True
-        time.sleep(max(0.01, float(poll_s)))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(max(0.01, min(float(poll_s), remaining)))
     log(f"collect tech relaunch: Hello not ready after {timeout_s:g}s")
     return False
 
@@ -158,15 +281,19 @@ def wait_tech_hello(
 def wait_live_hello(*, timeout_s: float = DEFAULT_HELLO_WAIT_S, log: LogFn = print) -> bool:
     """Attach Hello on the configured research host/port; close the probe, leave Tech running."""
     from python.sensors.tech import (
+        apply_env_overrides,
         hold_tech_process,
         load_tech_config,
         open_tech_beamngpy,
         research_port_listening,
     )
 
-    cfg = load_tech_config()
+    cfg = apply_env_overrides(load_tech_config())
     host = str(cfg.get("host") or "127.0.0.1")
-    port = int(cfg.get("port") or TECH_RESEARCH_PORT)
+    try:
+        port = int(cfg.get("port") or TECH_RESEARCH_PORT)
+    except (TypeError, ValueError):
+        port = TECH_RESEARCH_PORT
     home = str(cfg.get("home") or "") or None
     user = str(cfg.get("user") or "") or None
 
@@ -194,17 +321,47 @@ def wait_live_hello(*, timeout_s: float = DEFAULT_HELLO_WAIT_S, log: LogFn = pri
 def relaunch_tech(
     *,
     exe: Path,
-    kill_fn: KillFn = kill_tech_process_tree,
+    kill_fn: KillFn | None = None,
     launch_fn: LaunchFn = launch_tech,
     wait_fn: WaitFn | None = None,
+    listening_fn: Callable[[], bool] | None = None,
+    wait_port_fn: Callable[[], bool] | None = None,
+    port_clear_timeout_s: float = DEFAULT_PORT_CLEAR_S,
     log: LogFn = print,
-) -> bool:
-    """Kill hung Tech, start the same human argv, wait for Hello (not just LISTEN)."""
+) -> str | None:
+    """Kill hung Tech, wait for the port to close, start the human argv, wait for Hello.
+
+    Returns None on success, or a ``stop_reason`` if relaunch cannot proceed.
+    A listening port after kill aborts without launching a second Tech.
+    """
+    from python.sensors.tech import research_port_listening
+
+    _host, port = _configured_host_port()
+    if kill_fn is None:
+
+        def kill_fn() -> Iterable[int]:
+            return kill_tech_process_tree(log=log, exe=Path(exe), port=port)
+
     killed = list(kill_fn())
     log(f"collect tech relaunch: killed pids={killed or 'none'}")
+
+    def _listening() -> bool:
+        if listening_fn is not None:
+            return listening_fn()
+        return research_port_listening(_host, port)
+
+    def _wait_port() -> bool:
+        if wait_port_fn is not None:
+            return wait_port_fn()
+        return wait_port_closed(_listening, timeout_s=port_clear_timeout_s, log=log)
+
+    if not _wait_port():
+        return STOP_RELAUNCH_PORT_STUCK
     launch_fn(Path(exe), TECH_RELAUNCH_ARGV)
     waiter = wait_fn if wait_fn is not None else lambda: wait_live_hello(log=log)
-    return bool(waiter())
+    if not waiter():
+        return STOP_RELAUNCH_HELLO_FAILED
+    return None
 
 
 class TechWatchdog:
@@ -226,6 +383,7 @@ class TechWatchdog:
         self._relaunch = relaunch if relaunch is not None else self._default_relaunch
         self._streak = 0
         self._relaunches = 0
+        self._fail_reason: str | None = None
         self.halt_reason: str | None = None
 
     @property
@@ -235,7 +393,11 @@ class TechWatchdog:
     def _default_relaunch(self) -> bool:
         if self.exe is None:
             return False
-        return relaunch_tech(exe=self.exe, log=self.log)
+        reason = relaunch_tech(exe=self.exe, log=self.log)
+        if reason:
+            self._fail_reason = reason
+            return False
+        return True
 
     def after_clip(self, clip: Path | str, exit_code: int = 0) -> str | None:
         """Return a session ``stop_reason`` to halt the batch, or None to continue."""
@@ -259,7 +421,7 @@ class TechWatchdog:
             f"reason={reason} exe={self.exe}"
         )
         if not self._relaunch():
-            return self._halt(STOP_RELAUNCH_HELLO_FAILED)
+            return self._halt(self._fail_reason or STOP_RELAUNCH_HELLO_FAILED)
         self._streak = 0
         return None
 

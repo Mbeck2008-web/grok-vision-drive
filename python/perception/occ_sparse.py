@@ -743,6 +743,14 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
             & (lvl >= gfloor[col] - 1e-6) & (lvl <= gceil[col] + 1e-6))
     if cand.any() and vs.size:
         ci = np.flatnonzero(cand)
+        # One cell per voxel: a duplicate weaker cell at the same column and
+        # level is not a second buried candidate (it would pool a 0.05 gap
+        # into its neighbours' ground).
+        o = np.lexsort((-p_hot[ci], lvl[ci], col[ci]))
+        ci = ci[o]
+        keep = np.ones(ci.size, dtype=bool)
+        keep[1:] = (col[ci][1:] != col[ci][:-1]) | (lvl[ci][1:] != lvl[ci][:-1])
+        ci = np.sort(ci[keep])
         seed_cell = (lvl == raw[col]) & vote[col]
         si = np.flatnonzero(seed_cell)
         levels = np.unique(lvl[ci])
@@ -833,15 +841,7 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     # under half a layer (a grade step the plane smooths over, a column
     # next to a building). An object a full layer above stays off.
     own = np.where(valid, np.rint(fit_z), np.nan)
-    # Unless the plane level already holds a strong cell and the own level
-    # is only the raw seed (a wall or car on that cell, not buried ground
-    # found by the exposed-ground test).
-    strong_at = np.zeros(n_col, dtype=bool)
-    hit = near & ok[col] & (lvl == target[col])
-    strong_at[col[hit]] = True
-    snap_own = valid & ok & ~inlier & ~snap_low & (own >= target) & (own <= expected + 0.5) & (
-        has_env_layer | ~strong_at
-    )
+    snap_own = valid & ok & ~inlier & ~snap_low & (own >= target) & (own <= expected + 0.5)
     target[snap_own] = own[snap_own].astype(np.int64)
     leftover = used & ~ok
     if leftover.any():

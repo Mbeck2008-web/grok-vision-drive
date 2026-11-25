@@ -196,13 +196,6 @@ def with_brake_lights(cars: list[dict[str, Any]] | None, bng: Any) -> list[dict[
         if not isinstance(car, dict):
             continue
         name = str(car.get("name") or "")
-        out.append(
-            {
-                "name": name,
-                "pos": car.get("pos"),
-                "vel": car.get("vel"),
-                "dir": car.get("dir"),
-                "brake_lights": _brake_lights_for(name, handles),
-            }
-        )
+        # Every parsed field rides along (id, heading, dims from recorder v2).
+        out.append({**car, "name": name, "brake_lights": _brake_lights_for(name, handles)})
     return out

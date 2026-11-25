@@ -459,7 +459,7 @@ def _assert_prediction(pred: ScenePrediction, state: object) -> None:
     assert tuple(pred.curbs.shape) == (2, 16, 2)
     assert tuple(pred.curb_valid.shape) == (2,)
     assert tuple(pred.objects.shape) == (16, 8)
-    assert tuple(pred.object_class.shape) == (16, 6)
+    assert tuple(pred.object_class.shape) == (16, 5)  # recorder v2: no pedestrian class
     assert tuple(pred.object_valid.shape) == (16,)
     assert tuple(pred.signs.shape) == (8, 4)
     assert tuple(pred.sign_class.shape) == (8, 4)

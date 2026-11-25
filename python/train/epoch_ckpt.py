@@ -268,6 +268,9 @@ def load_into_net(net: Any, weights: Mapping[str, Any]) -> None:
     missing = [key for key in current if key not in weights]
     if extra or missing:
         raise KeyError(f"checkpoint does not match the net: extra={extra[:3]} missing={missing[:3]}")
+    from python.train.scene_net import check_object_class_head
+
+    check_object_class_head(weights, "epoch checkpoint")
     mapped = {
         key: torch.tensor(np.array(value, copy=True), dtype=current[key].dtype, device=current[key].device)
         for key, value in weights.items()

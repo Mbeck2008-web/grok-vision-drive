@@ -30,8 +30,8 @@ is a smoke collect: if those PNGs do not decode, the process stops.
 ``--check-maps`` loads each level as a scenario and exits without recording.
 
     py -3 scripts\\collect_scene_lanes.py --check-maps --list-levels
-    py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island
-    py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60
+    py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa
+    py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa --segment-min 12 --smoke-s 60
 
 IQU45 smoke for brake lights and per-tick signals. Tech is already
 running and ``GVD_DATA_DIR`` is the data disk. One minute is the shortest
@@ -214,7 +214,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import controls_from_state
-from python.collect.spawn_mix import clamp_speed_range, traffic_count
+from python.collect.spawn_mix import clamp_speed_range, spawn_roads_path, traffic_count
 from python.collect import control_log
 from python.collect.boundary import BoundaryDefer, CarryOver, boundary_wait_reason
 from python.collect.level_session import EGO_CONFIG_DEFAULT, EGO_MODEL_DEFAULT
@@ -384,6 +384,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minutes", type=float, default=45.0, help="Stop after this much driving. 0 with --until-disk runs to the 20 GB floor.")
     parser.add_argument("--until-disk", action="store_true", help="Ignore the clock. Stop only under 20 GB free.")
     parser.add_argument("--map", default="", help="Level to load. Empty keeps the current level.")
+    parser.add_argument(
+        "--clip-s",
+        type=float,
+        default=0.0,
+        help="Clip mode: stop after this many seconds of driving (overrides --minutes and its 60 s floor). 0 is off.",
+    )
+    parser.add_argument(
+        "--cam-transport",
+        default="shmem",
+        choices=["shmem", "socket"],
+        help="shmem (default): cameras stream through BeamNG.tech shared memory. "
+        "socket: fallback, pictures come back in the PollCamera reply (slower, always serial).",
+    )
+    parser.add_argument(
+        "--cam-fetch",
+        default="parallel",
+        choices=["parallel", "serial"],
+        help="parallel (default): read + decode the shared-memory cameras on a thread pool, "
+        "one reading per camera per tick. serial: one after another.",
+    )
+    parser.add_argument(
+        "--gt-thin",
+        default="auto",
+        choices=["auto", "off"],
+        help="auto: depth/sem drop to every other frame while the loop runs behind 10 Hz. off: always full rate.",
+    )
     parser.add_argument("--route", default="span", choices=["span", "waypoints", "random"])
     parser.add_argument(
         "--speed-min", type=float, default=None,
@@ -409,7 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="On west_coast_usa, teleport to a new stratified spawn after this many minutes.",
     )
-    parser.add_argument("--time-of-day", default="", help="0-1 day fraction, or an hour 0-24. Empty leaves the sky.")
+    parser.add_argument("--time-of-day", default="", help="BeamNG 0-1 time (0 noon, 0.5 midnight), or a clock hour above 1. Empty leaves the sky.")
     parser.add_argument("--weather", default="", help="clear, rain, or fog. Empty leaves the weather.")
     parser.add_argument(
         "--out",
@@ -586,6 +612,26 @@ def build_parser() -> argparse.ArgumentParser:
             "Off by default. Every allowlist stem is still an unverified guess, so leave this "
             "off until a real scenetree dump has been checked."
         ),
+    )
+    parser.add_argument(
+        "--chase-cam",
+        action="store_true",
+        help=(
+            "Also record the recording-only chase camera (cameras.yaml chase_camera: behind and above the "
+            "ego, RGB + depth + sem at chase_hz) into raw/chase*. Never in the strip or the model."
+        ),
+    )
+    parser.add_argument(
+        "--spawn-seed",
+        type=int,
+        default=None,
+        help="West coast: seed for the spawn deck shuffle (clip mode passes one per clip). Unset: seed 0 as before.",
+    )
+    parser.add_argument(
+        "--spawn-kind",
+        default=None,
+        choices=["city", "highway", "ramp"],
+        help="West coast: draw spawns from this road kind only (clip mode: ramp for merges). Unset: the 40/35/25 mix.",
     )
     parser.add_argument(
         "--recheck-cov-min",
@@ -1723,10 +1769,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     )
     from python.data.raw_frames import (
         CAMERA_HZ,
+        COLLECT_HZ,
+        chase_hz,
         PNG_RATIO_MAX,
         PNG_RATIO_MEAN,
         CameraSchedule,
         RawFrameWriter,
+        TrainGtGate,
         camera_sidecar,
         capture_plan,
         frame_nbytes,
@@ -1798,7 +1847,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         return 2
     progress_path = out / "collect.json"
     done_s = load_progress(progress_path)
-    target_s = float("inf") if until_disk else max(60.0, float(args.minutes) * 60.0)
+    clip_s = float(getattr(args, "clip_s", 0.0) or 0.0)
+    if clip_s > 0.0:
+        # Clip mode (collect_clips): the planned 30-60 s length, not the 60 s floor.
+        until_disk = False
+        target_s = clip_s
+    else:
+        target_s = float("inf") if until_disk else max(60.0, float(args.minutes) * 60.0)
     flag = stop_file(out)
     if flag.is_file():
         flag.unlink()
@@ -1812,11 +1867,25 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     # Only a level load spawns the ego model (see ego_spawned below); a single-level
     # run drives the car already there and keeps the base rig.
     rig_for = ego["model"] if (map_names or args.reload_level) else None
+    _CAM_TRANSPORT["mode"] = str(getattr(args, "cam_transport", "shmem") or "shmem")
+    cam_parallel = str(getattr(args, "cam_fetch", "parallel")) == "parallel"
+    _CAM_FETCH["parallel"] = cam_parallel
+    print(f"collect cameras transport={_CAM_TRANSPORT['mode']} fetch={'parallel' if cam_parallel else 'serial'}", flush=True)
     base_cam_cfg = load_camera_config()
     cam_cfg = rig_for_model(base_cam_cfg, rig_for)
     camera_rig = rig_model(base_cam_cfg, rig_for)
     camera_overrides = rig_overrides(base_cam_cfg, rig_for)
-    plan = capture_plan(cam_cfg, PNG_RATIO_MAX)
+    chase_spec = cam_cfg.pop("chase_camera", None)
+    if args.chase_cam:
+        if not isinstance(chase_spec, dict):
+            print("collect --chase-cam: config/cameras.yaml has no chase_camera block", file=sys.stderr)
+            return 2
+        # Recording-only: attached by _attach_cameras, written to raw/chase*, never in CAM_IDS.
+        cam_cfg["chase_camera"] = {**chase_spec, "enabled": True}
+        cam_rates["chase"] = chase_hz(chase_spec)
+    # Disk ceiling: colour, every train_gt depth/sem plane (raw size; PNG ratio
+    # unmeasured) and the chase camera when --chase-cam is on.
+    plan = capture_plan(cam_cfg, PNG_RATIO_MAX, gt=True)
     totals = plan_totals(plan)
     ceiling_gb = float(totals["png_gb_per_hour"])
     print(
@@ -1942,7 +2011,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if opened.spawn is not None:
                 spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
             spawn_seq += 1
-        writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
+        writer = RawWriteQueue(
+            RawFrameWriter(
+                out,
+                camera_sidecar(cam_cfg, rig_model=camera_rig, overrides=camera_overrides, chase=bool(args.chase_cam)),
+            )
+        )
         sem_classes_written = False
         ticks = TickLog(out / TICKS_FILE, 0.1)
         from python.data.strip_writer import STRIP_ORDER
@@ -2059,6 +2133,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # against the planned ramp (None between lane changes).
         lane_change_run: dict[str, float] | None = None
         spawn_deck = None
+        spawn_deck_map = ""
         spawn_kind = ""
         spawn_mark = -1.0e9
         respawn_s = max(0.0, float(args.respawn_min)) * 60.0
@@ -2076,6 +2151,30 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # Phase-scheduled capture (raw_frames.CameraSchedule). Reset on
         # respawn and level load; the first tick after is the new anchor.
         cam_sched = CameraSchedule(cam_rates)
+        # Training-only depth/sem drop to every other frame per camera while the
+        # loop runs behind the 10 Hz plan; colour frames are never thinned.
+        gt_gate = TrainGtGate(1.0 / COLLECT_HZ, thin=str(getattr(args, "gt_thin", "auto")) != "off")
+        gt_prev_mono: list[float | None] = [None]
+
+        def _flush_failed() -> bool:
+            """Flush the background writer on exit; a lost or failed tick stops the run loudly."""
+            report = writer.close() if writer is not None else {"ok": True}
+            if isinstance(report, dict) and not report.get("ok", True):
+                message = (
+                    f"flush on exit: written={report.get('written')}/{report.get('enqueued')} "
+                    f"failed={report.get('failed')} unflushed={report.get('unflushed')} error={report.get('error')}"
+                )
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                print(f"collect stop writer_failed {message}", flush=True)
+                run.stop("writer_failed", message)
+                return True
+            return False
+
+        def _reset_gt_gate() -> None:
+            # A level load, teleport or camera warm-up is a gap, not loop lag: the
+            # first interval after it must not halve GT (TrainGtGate.reset).
+            gt_gate.reset()
+            gt_prev_mono[0] = None
         prev_dir: list[float] | None = None
         prev_dir_t: float | None = None
         last_error = ""
@@ -2263,6 +2362,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     segment_open = False
                     spawn_pos = moved
                     spawn_seq += 1
+                    _reset_gt_gate()
                     mark_recover = True
                     impact.reset()
                     yield_guard.reset()
@@ -2294,40 +2394,47 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 rows.append(entry)
             return speeds_for(lo, hi)
 
-        def _apply_spawn(force: bool, source: str = "spawn") -> None:
-            """Teleport west coast to the next unused stratified spawn."""
-            nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, spawn_seq, last_ai, segment_open, speed, spawn_cov
+        def _apply_spawn(force: bool, source: str = "spawn") -> str | None:
+            """Teleport to the next unused legal, on-road stratified spawn.
+
+            Works on every map that has a road dump. Returns an error string
+            when the map has no dump, the deck cannot load, or a forced first
+            spawn finds no legal pose on the correct side of the road. Never
+            silently keeps the level's fixed spawn or skips traffic.
+            """
+            nonlocal spawn_deck, spawn_deck_map, spawn_kind, spawn_mark, spawn_pos, spawn_seq, last_ai, segment_open, speed, spawn_cov
             nonlocal spawn_road, recheck_mark
-            if map_name != "west_coast_usa" or vehicle is None:
-                return
+            if vehicle is None:
+                return None
             if not force and (respawn_s <= 0.0 or done_s - spawn_mark < respawn_s):
-                return
+                return None
+            if spawn_deck is not None and spawn_deck_map != map_name:
+                spawn_deck = None
+                spawn_deck_map = ""
             if spawn_deck is None:
                 from python.collect.spawn_mix import SpawnDeck
 
-                dump = None
-                try:
-                    from python.data.data_root import roads_dir
-
-                    candidate = roads_dir() / "west_coast_usa.json.gz"
-                    if candidate.is_file():
-                        dump = candidate
-                except Exception:
-                    dump = None
+                dump = spawn_roads_path(map_name)
                 if dump is None:
-                    bundled = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "roads" / "west_coast_usa.json.gz"
-                    if bundled.is_file():
-                        dump = bundled
-                if dump is None:
-                    return
+                    return f"{map_name}: no road dump for a legal seeded spawn"
                 load_t0 = time.perf_counter()
                 cov_min = max(0.0, float(args.min_paint_cov))
-                spawn_deck = SpawnDeck.load(
-                    dump,
-                    painted=painted if cov_min > 0.0 and painted else None,
-                    min_paint_cov=cov_min,
-                    log=lambda text: print(f"collect {text}", flush=True),
-                )
+                import random as _random
+
+                try:
+                    spawn_deck = SpawnDeck.load(
+                        dump,
+                        None if args.spawn_seed is None else _random.Random(int(args.spawn_seed)),
+                        only_kind=args.spawn_kind,
+                        painted=painted if cov_min > 0.0 and painted else None,
+                        min_paint_cov=cov_min,
+                        log=lambda text: print(f"collect {text}", flush=True),
+                    )
+                except Exception as exc:
+                    spawn_deck = None
+                    spawn_deck_map = ""
+                    return f"{map_name}: spawn deck failed to load: {type(exc).__name__}: {exc}"
+                spawn_deck_map = map_name
                 print(
                     f"collect spawn deck paint filter "
                     f"{'min_cov=' + format(cov_min, '.2f') if spawn_deck.filtering() else 'off'} "
@@ -2353,7 +2460,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         flush=True,
                     )
             if spawn_deck.exhausted:
-                return
+                if spawn_deck.summary()["picks"] == 0:
+                    return f"{map_name}: no legal on-road spawn (correct side of the road)"
+                return None
             picked = spawn_deck.take(source)
             if picked is None:
                 mix = spawn_deck.summary()
@@ -2376,14 +2485,18 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     flush=True,
                 )
                 _save_progress(done_s, done_s if target_s == float("inf") else target_s)
-                return
+                if mix["picks"] == 0:
+                    return f"{map_name}: no legal on-road spawn (correct side of the road)"
+                return None
             from python.collect.level_session import place_vehicle
             from python.collect.spawn_mix import queue_companion_traffic
 
             shift = place_vehicle(bng, vehicle, picked.pos, picked.rot)
             if shift:
                 print(f"collect spawn {segment_id} {picked.kind} failed {shift}", flush=True)
-                return
+                if source == "spawn":
+                    return f"{map_name}: legal spawn pose could not be placed: {shift}"
+                return None
             spawn_kind = picked.kind
             spawn_cov = picked.paint_cov
             spawn_road = str(picked.road_id)
@@ -2391,6 +2504,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             recheck_mark = done_s
             spawn_pos = picked.pos
             spawn_seq += 1
+            _reset_gt_gate()
             lane_track.reset()
             impact.reset()
             yield_guard.reset()
@@ -2430,7 +2544,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             return (
                 stall_respawn_s > 0.0
                 and not (stall_streak[0] >= STALL_RESPAWN_STREAK and done_s <= stall_streak[1] + 1e-3)
-                and map_name == "west_coast_usa"
                 and vehicle is not None
                 and spawn_deck is not None
                 and not spawn_deck.exhausted
@@ -2619,6 +2732,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
                 _say_repeats()
                 print("collect stop requested", flush=True)
+                if _flush_failed():
+                    return 2
                 run.stop("requested", f"stop file {stop_file(out)}")
                 return 0
             elapsed = done_s
@@ -2745,6 +2860,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 prev_dir = None
                 prev_dir_t = None
                 cam_sched.reset()
+                _reset_gt_gate()
                 impact.reset()
                 yield_guard.reset()
                 settle.start(done_s)
@@ -2758,7 +2874,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 # A new level starts on the off-deck range; a deck spawn below replaces it.
                 speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
                 speed = speed_at(done_s, tuple(speed_span[0]))
-                _apply_spawn(True)
+                spawn_err = _apply_spawn(True)
+                if spawn_err:
+                    last_error = spawn_err
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _publish(None, speed, waypoint)
+                    _write_collect_crash(status_root, last_error, {})
+                    print(f"collect stop {last_error}", flush=True)
+                    run.stop("spawn_failed", last_error)
+                    return 2
                 for command in sky_commands:
                     try:
                         _queue(vehicle, command)
@@ -2895,6 +3019,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if attached_frames_ready(cams, frames):
                     cams_ready = True
                     warmup_since = None
+                    _reset_gt_gate()
                     print(f"collect cameras live {sorted(cams)}", flush=True)
                 else:
                     if warmup_since is None:
@@ -2920,9 +3045,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if cid in stamps:
                     due_stamps[cid] = stamps[cid]
             train_gt = take_train_gt()
+            gt_dt = None if gt_prev_mono[0] is None else mono - gt_prev_mono[0]
+            gt_prev_mono[0] = mono
+            gt_bases = sorted({gid.rsplit("_", 1)[0] for gid in train_gt} & set(due))
+            gt_keep = gt_gate.select(gt_dt, gt_bases)
             for gid, garr in train_gt.items():
                 base = gid.rsplit("_", 1)[0]
-                if base in due:
+                if base in due and base in gt_keep:
                     due[gid] = garr
                     if base in due_stamps:
                         due_stamps[gid] = due_stamps[base]
@@ -3407,6 +3536,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tags["ai_cmd"] = dict(ai_cmd)
             tags["road"] = control_log.road_tag(hit, lanes_here)
             tags["traffic"] = traffic_now
+            tags["gt_stride"] = int(gt_gate.stride)
             if ctl_meta_for != spawn_seq:
                 meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))
                 # A spawned ego is the model the spawn asked for; the live object (maybe None)
@@ -3522,7 +3652,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 here = None if pos is None else [round(float(v), 2) for v in list(pos)[:3]]
                 road_here = None if hit is None else (str(getattr(hit, "road_id", "") or "") or None)
                 kind_was, road_was = spawn_kind or None, spawn_road
-                can_respawn = map_name == "west_coast_usa" and vehicle is not None and spawn_deck is not None
+                can_respawn = vehicle is not None and spawn_deck is not None
                 boundary = None if can_respawn else segment_boundary(
                     done_s + schedule_cut,
                     map_names,
@@ -3579,7 +3709,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 and recheck_due(recheck_s, done_s, recheck_mark)
                 and spawn_deck is not None
                 and spawn_deck.filtering()
-                and map_name == "west_coast_usa"
                 and vehicle is not None
                 and not settle.active(done_s)
             ):
@@ -3696,14 +3825,30 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         if spawn_deck is not None:
             print(f"collect {spawn_deck.summary_line()}", flush=True)
         _say_repeats()
+        if _flush_failed():
+            return 2
         run.stop("target_reached")
         run.done_s = float(done_s)
         return 0
     finally:
         if writer is not None:
-            writer.close()
+            report = writer.close()
+            if isinstance(report, dict) and not report.get("ok", True):
+                print(f"collect WARNING writer flush report {json.dumps(report, sort_keys=True)}", flush=True)
         ticks.close()
         release_tech_beamngpy(bng)
+
+
+# --cam-transport (set by main): "shmem" streams every camera through BeamNG.tech
+# shared memory (stream_raw, no GE request); "socket" is the fallback that polls.
+_CAM_TRANSPORT: dict[str, str] = {"mode": "shmem"}
+
+
+def _camera_kwargs_for_transport(kwargs: dict[str, Any], transport: str) -> dict[str, Any]:
+    """Shared memory on (default) or the socket fallback: no shmem, no streaming, poll_raw."""
+    if transport == "socket":
+        return {**kwargs, "is_using_shared_memory": False, "is_streaming": False}
+    return {**kwargs, "is_using_shared_memory": True, "is_streaming": True}
 
 
 def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -3751,12 +3896,51 @@ def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, An
             cid=cid,
             train_gt=bool(spec.get("train_gt")),
         )
-        attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **kwargs)
+        transport = _CAM_TRANSPORT["mode"]
+        attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **_camera_kwargs_for_transport(kwargs, transport))
+        _mark_transport(attached[cid], transport)
         if spec.get("train_gt"):
+            _attach_sem_palette(attached[cid], bng)
+    chase = cfg.get("chase_camera")
+    if isinstance(chase, dict) and chase.get("enabled"):
+        # Recording-only chase camera (--chase-cam): behind and above the ego,
+        # follows its yaw. Same kwargs path as the rig; never in CAM_IDS.
+        cid = str(chase.get("id") or "chase")
+        pos = list(chase.get("pos_m") or [0.0, -8.0, 4.0])
+        direction, up = yaw_pitch_to_dir_up(float(chase.get("yaw_deg") or 0.0), float(chase.get("pitch_deg") or 0.0))
+        res = chase.get("live_res") or [640, 360]
+        near_m, far_m = camera_clip_planes(chase, cid=cid, defaults={"near_m": cfg.get("near_m", 0.05)})
+        kwargs = beamng_camera_sensor_kwargs(
+            pos=gvd_to_bng_vehicle(*[float(v) for v in pos]),
+            direction=gvd_to_bng_vehicle(*direction),
+            up=gvd_to_bng_vehicle(*up),
+            fov_v=float(chase.get("fov_v") or 60.0),
+            resolution=(int(res[0]), int(res[1])),
+            update_s=camera_update_s(chase, cid=cid),
+            near_m=near_m,
+            far_m=far_m,
+            shmem=True,
+            streaming=True,
+            rgb_only=True,
+            update_priority=camera_update_priority(chase, cid=cid),
+            cid=cid,
+            train_gt=bool(chase.get("train_gt")),
+        )
+        transport = _CAM_TRANSPORT["mode"]
+        attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **_camera_kwargs_for_transport(kwargs, transport))
+        _mark_transport(attached[cid], transport)
+        if chase.get("train_gt"):
             _attach_sem_palette(attached[cid], bng)
     if "main" not in attached:
         raise RuntimeError("main camera did not attach")
     return attached
+
+
+def _mark_transport(cam: Any, transport: str) -> None:
+    try:
+        cam.gvd_transport = transport
+    except Exception:  # noqa: BLE001 — a sensor object without attributes reads as shmem
+        pass
 
 
 def _camera_resolution(cam: Any) -> tuple[int, int] | None:
@@ -3793,7 +3977,21 @@ def _read_camera(cid: str, cam: Any, window: dict[str, Any] | None = None) -> tu
     # monotonic pair) only time the call: on Windows the monotonic pair can
     # read equal (15.6 ms clock).
     window = {} if window is None else window
-    if callable(getattr(cam, "stream_raw", None)):
+    if getattr(cam, "gvd_transport", "shmem") == "socket" and callable(getattr(cam, "poll_raw", None)):
+        # --cam-transport socket: the picture comes back in the PollCamera reply
+        # (no shared memory). One GE round trip per camera; never run in parallel.
+        how = "poll_raw"
+        window["mono_before"] = time.monotonic()
+        window["perf_before"] = time.perf_counter()
+        try:
+            raw = cam.poll_raw()
+        except Exception as exc:
+            return None, f"poll_raw {type(exc).__name__}: {exc}", None
+        finally:
+            window["perf_after"] = time.perf_counter()
+            window["mono_after"] = time.monotonic()
+            window["wall"] = time.time()
+    elif callable(getattr(cam, "stream_raw", None)):
         how = "stream_raw"
         window["mono_before"] = time.monotonic()
         window["perf_before"] = time.perf_counter()
@@ -3853,34 +4051,103 @@ def take_train_gt() -> dict[str, Any]:
     return out
 
 
-def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
-    """Pictures as the sensor returned them, plus why each camera was dropped."""
+def _fetch_camera(cid: str, cam: Any) -> dict[str, Any]:
+    """One camera's picture, capture window and training-only GT (safe on a worker thread).
+
+    Nothing global is touched here; ``_poll_cameras`` merges the results in
+    camera order on the calling thread.
+    """
+    window: dict[str, Any] = {}
+    image, reason, raw = _read_camera(cid, cam, window)
+    gt: dict[str, Any] = {}
+    gt_exc: BaseException | None = None
+    if image is not None and (
+        getattr(cam, "is_render_depth", False) is True or getattr(cam, "is_render_annotations", False) is True
+    ):
+        from python.data import raw_frames
+
+        try:
+            gt = dict(raw_frames.train_gt_from_raw(str(cid), cam, raw))
+        except Exception as exc:  # noqa: BLE001 — reported by _poll_cameras
+            gt_exc = exc
+    return {"image": image, "reason": reason, "raw": raw, "window": window, "gt": gt, "gt_exc": gt_exc}
+
+
+def parallel_safe(cams: dict[str, Any]) -> bool:
+    """True when every camera reads shared memory only (``stream_raw``, no GE request).
+
+    BeamNGpy's ``stream_raw`` copies the camera's own shared-memory buffers and
+    sends nothing; ``poll``/``poll_raw`` (socket transport) talk over the one
+    BeamNGpy socket, which is not thread-safe, so those stay serial.
+    """
+    for cam in cams.values():
+        if getattr(cam, "gvd_transport", "shmem") == "socket" or not callable(getattr(cam, "stream_raw", None)):
+            return False
+    return True
+
+
+_FETCH_POOL: dict[str, Any] = {"pool": None, "n": 0}
+
+
+def _fetch_pool(n: int) -> Any:
+    from concurrent.futures import ThreadPoolExecutor
+
+    if _FETCH_POOL["pool"] is None or _FETCH_POOL["n"] < n:
+        if _FETCH_POOL["pool"] is not None:
+            _FETCH_POOL["pool"].shutdown(wait=True)
+        _FETCH_POOL["pool"] = ThreadPoolExecutor(max_workers=max(1, n), thread_name_prefix="gvd-cam-fetch")
+        _FETCH_POOL["n"] = n
+    return _FETCH_POOL["pool"]
+
+
+# --cam-fetch (set by main). Module state, so a test that swaps in its own
+# ``_poll_cameras(cams)`` keeps working.
+_CAM_FETCH: dict[str, bool] = {"parallel": False}
+
+
+def _poll_cameras(
+    cams: dict[str, Any], *, parallel: bool | None = None
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """Pictures as the sensor returned them, plus why each camera was dropped.
+
+    ``parallel`` (``--cam-fetch parallel``) reads and decodes every camera on a
+    thread pool when ``parallel_safe(cams)``; it returns only after all of them
+    are back, so the tick still holds one reading per camera, each with its own
+    capture window. Results merge in camera order: same frames, stamps and GT
+    as the serial path.
+    """
     frames: dict[str, Any] = {}
     stamps: dict[str, Any] = {}
     reasons: dict[str, str] = {}
     _TRAIN_GT.clear()
-    for cid, cam in cams.items():
-        window: dict[str, Any] = {}
-        image, reason, raw = _read_camera(cid, cam, window)
+    if parallel is None:
+        parallel = bool(_CAM_FETCH["parallel"])
+    items = list(cams.items())
+    if parallel and len(items) > 1 and parallel_safe(cams):
+        pool = _fetch_pool(len(items))
+        futures = [pool.submit(_fetch_camera, str(cid), cam) for cid, cam in items]
+        results = [f.result() for f in futures]
+    else:
+        results = [_fetch_camera(str(cid), cam) for cid, cam in items]
+    for (cid, cam), got in zip(items, results):
+        image, reason, raw, window = got["image"], got["reason"], got["raw"], got["window"]
         if image is None:
             reasons[str(cid)] = reason or "missing"
             continue
         frames[cid] = image
-        if getattr(cam, "is_render_depth", False) is True or getattr(cam, "is_render_annotations", False) is True:
-            from python.data import raw_frames
-
-            try:
-                _TRAIN_GT.update(raw_frames.train_gt_from_raw(str(cid), cam, raw))
-            except Exception as exc:
-                # Training-only GT never stops collection; colour frames still go out.
-                _TRAIN_GT_FAIL["n"] += 1
-                if _TRAIN_GT_FAIL["n"] == 1:
-                    print(
-                        f"collect WARNING train_gt decode failed for {cid} "
-                        f"({type(exc).__name__}: {exc}); GT skipped, colour kept "
-                        "(count in train_gt_failures)",
-                        flush=True,
-                    )
+        if got["gt_exc"] is not None:
+            exc = got["gt_exc"]
+            # Training-only GT never stops collection; colour frames still go out.
+            _TRAIN_GT_FAIL["n"] += 1
+            if _TRAIN_GT_FAIL["n"] == 1:
+                print(
+                    f"collect WARNING train_gt decode failed for {cid} "
+                    f"({type(exc).__name__}: {exc}); GT skipped, colour kept "
+                    "(count in train_gt_failures)",
+                    flush=True,
+                )
+        else:
+            _TRAIN_GT.update(got["gt"])
         sensor_t = None
         if isinstance(raw, dict):
             for key in ("timestamp", "time", "t"):

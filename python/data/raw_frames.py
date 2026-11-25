@@ -161,26 +161,60 @@ class CameraSchedule:
             self._undo.pop(cid, None)
 
 
-def capture_plan(cfg: Mapping[str, Any] | None, ratio: float = PNG_RATIO_MAX) -> list[dict[str, Any]]:
-    """Per-camera bytes and GB/h at ``CAMERA_HZ`` and a PNG/raw ratio."""
+DEFAULT_CHASE_HZ = 2.0
+
+
+def chase_hz(spec: Mapping[str, Any] | None = None) -> float:
+    """Configured chase-camera rate in Hz. Missing or zero falls back to 2."""
+    return float((spec or {}).get("chase_hz") or DEFAULT_CHASE_HZ)
+
+
+def capture_plan(
+    cfg: Mapping[str, Any] | None, ratio: float = PNG_RATIO_MAX, *, gt: bool = False
+) -> list[dict[str, Any]]:
+    """Per-plane bytes and GB/h: colour at ``CAMERA_HZ`` and a PNG/raw ratio.
+
+    ``gt=False`` is the colour-only plan (the 8 RGB cameras). With ``gt=True``
+    (what the collector reports as its disk ceiling) every ``train_gt`` camera
+    also writes a ``<cam>_depth`` (uint16) and a
+    ``<cam>_sem`` (uint8) plane at its colour rate. Their PNG ratio is not
+    measured, so they count at raw size (``png_ratio`` 1.0) as the ceiling.
+    An enabled ``chase_camera`` (``--chase-cam``) adds its colour and GT
+    planes at ``chase_hz``. The GT gate can only thin GT below this.
+    """
+    cfg = dict(cfg or {})
+    chase_spec = cfg.get("chase_camera")
+    chase_on = isinstance(chase_spec, dict) and bool(chase_spec.get("enabled"))
     rows = []
-    for cam in camera_sidecar(cfg):
-        cid = str(cam["id"])
-        width, height = cam["resolution"]
-        raw = int(width) * int(height) * 3
-        hz = float(CAMERA_HZ.get(cid, 0.0))
+
+    def _row(cid: str, width: int, height: int, channels: int, bytes_per: int, hz: float, png_ratio: float) -> None:
+        raw = int(width) * int(height) * int(channels) * int(bytes_per)
         rows.append(
             {
                 "id": cid,
                 "width": int(width),
                 "height": int(height),
-                "channels": 3,
+                "channels": int(channels),
+                "bytes_per_channel": int(bytes_per),
                 "hz": hz,
+                "png_ratio": float(png_ratio),
                 "uncompressed_bytes": raw,
                 "uncompressed_gb_per_hour": gb_per_hour(raw, hz),
-                "png_gb_per_hour": gb_per_hour(raw, hz) * float(ratio),
+                "png_gb_per_hour": gb_per_hour(raw, hz) * float(png_ratio),
             }
         )
+
+    for cam in camera_sidecar(cfg, chase=gt and chase_on):
+        cid = str(cam["id"])
+        width, height = cam["resolution"]
+        if cam.get("recording_only"):
+            hz = chase_hz(chase_spec)
+        else:
+            hz = float(CAMERA_HZ.get(cid, 0.0))
+        _row(cid, width, height, 3, 1, hz, float(ratio))
+        if gt and cam.get("train_gt"):
+            _row(f"{cid}_depth", width, height, 1, 2, hz, 1.0)
+            _row(f"{cid}_sem", width, height, 1, 1, hz, 1.0)
     return rows
 
 
@@ -201,9 +235,112 @@ def describe_raw_disk(tick_bytes: int, hz: float) -> str:
     )
 
 
-def camera_sidecar(cfg: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    """Pose and intrinsics from the camera yaml. Not read off the pixels."""
-    from python.sensors.cameras import CAM_IDS, camera_clip_planes, yaw_pitch_to_dir_up
+# Stored depth planes are planar optical-axis depth (distance along the camera
+# forward axis), in cm: ``depth01 * far_m * 100``. Not the length of the ray
+# through the pixel. A ground-plane fit on the authentic sgt frame 037126
+# separates the two (``python/data/depth_check.py``): planar z fits the road
+# to 0.4 cm rms, a ray reading leaves 2 cm and bends the plane. The absolute
+# scale (``* far_m``) is still a spot-check item on IQU45.
+DEPTH_KIND = "planar_z_cm"
+DEPTH_NOTE = (
+    "uint16 cm = depth01 * far_m * 100, distance along the camera forward axis (planar z), "
+    "not the ray length; ray = z * sqrt(1 + ((u+0.5-cx)/fx)^2 + ((v+0.5-cy)/fy)^2). "
+    "Absolute scale vs a surveyed mount: UNVERIFIED (scripts/check_depth_scale.py)."
+)
+# Cameras that are recorded for offline use only (refinement supervision at a
+# viewpoint the car does not have). They are never in CAM_IDS, the strip, or
+# any live attach, and every listing that skips training-only GT skips them.
+RECORDING_ONLY_CAMS: tuple[str, ...] = ("chase",)
+
+
+def camera_intrinsics(fov_v: float, resolution: Any) -> dict[str, Any]:
+    """Pinhole K derived from the vertical FOV and the image size.
+
+    Square pixels, principal point at the image centre (pixel-edge
+    convention: pixel ``u`` spans ``[u, u+1)``, so its centre is ``u + 0.5``),
+    no distortion: ``fy = (H/2) / tan(fov_v/2)``, ``fx = fy``. Derived, not a
+    calibration; BeamNG renders an ideal pinhole from the same two numbers.
+    """
+    w, h = int(resolution[0]), int(resolution[1])
+    fy = round((h / 2.0) / math.tan(math.radians(float(fov_v)) / 2.0), 6)
+    fx = fy
+    cx, cy = w / 2.0, h / 2.0
+    return {
+        "model": "pinhole",
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "K": [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        "distortion": None,
+        "source": "derived from fov_v and resolution (square pixels, centred principal point); not a calibration",
+    }
+
+
+def _camera_record(
+    spec: Mapping[str, Any],
+    cid: str,
+    origin: Any,
+    near_default: Any,
+    *,
+    rig: str | None,
+    overrides: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    from python.sensors.cameras import camera_clip_planes, yaw_pitch_to_dir_up
+
+    pos = list(spec.get("pos_m") or [0.0, 1.2, 1.2])
+    pos = [
+        float(pos[0]) + float(origin[0]),
+        float(pos[1]) + float(origin[1]),
+        float(pos[2]) + float(origin[2]),
+    ]
+    yaw = float(spec.get("yaw_deg") or 0.0)
+    pitch = float(spec.get("pitch_deg") or 0.0)
+    direction, up = yaw_pitch_to_dir_up(yaw, pitch)
+    res = spec.get("live_res") or [640, 480]
+    near_m, far_m = camera_clip_planes(spec, cid=cid, defaults={"near_m": near_default})
+    fov_v = float(spec.get("fov_v") or 70.0)
+    record: dict[str, Any] = {
+        "id": cid,
+        "pos_m": [float(v) for v in pos],
+        "yaw_deg": yaw,
+        "pitch_deg": pitch,
+        "fov_v": fov_v,
+        "near_m": float(near_m),
+        "far_m": float(far_m),
+        "resolution": [int(res[0]), int(res[1])],
+        "direction": [float(v) for v in direction],
+        "up": [float(v) for v in up],
+        "intrinsics": camera_intrinsics(fov_v, res),
+        "train_gt": bool(spec.get("train_gt")),
+    }
+    if record["train_gt"]:
+        record["depth_kind"] = DEPTH_KIND
+    over = dict((overrides or {}).get(cid) or {})
+    record["mount"] = {
+        "rig_model": rig,
+        # vehicle_override: the per-model mount in cameras.yaml vehicle_overrides
+        # (tuned live on that car). yaml_draft: the rig drafted on the etk800.
+        "source": "vehicle_override" if over else "yaml_draft",
+        "override_keys": sorted(str(k) for k in over),
+        "frame": "GVD vehicle frame: +X right, +Y forward, +Z up, metres from the vehicle origin",
+    }
+    return record
+
+
+def camera_sidecar(
+    cfg: Mapping[str, Any] | None,
+    *,
+    rig_model: str | None = None,
+    overrides: Mapping[str, Any] | None = None,
+    chase: bool = False,
+) -> list[dict[str, Any]]:
+    """Pose and intrinsics from the camera yaml. Not read off the pixels.
+
+    ``rig_model`` / ``overrides`` (``rig_overrides``) say which mount each
+    camera got. ``chase`` adds the recording-only chase camera record.
+    """
+    from python.sensors.cameras import CAM_IDS
 
     cfg = dict(cfg or {})
     origin = cfg.get("origin_offset") or [0.0, 0.0, 0.0]
@@ -214,33 +351,15 @@ def camera_sidecar(cfg: Mapping[str, Any] | None) -> list[dict[str, Any]]:
         cid = str(spec.get("id") or "")
         if cid not in CAM_IDS:
             continue
-        pos = list(spec.get("pos_m") or [0.0, 1.2, 1.2])
-        pos = [
-            float(pos[0]) + float(origin[0]),
-            float(pos[1]) + float(origin[1]),
-            float(pos[2]) + float(origin[2]),
-        ]
-        yaw = float(spec.get("yaw_deg") or 0.0)
-        pitch = float(spec.get("pitch_deg") or 0.0)
-        direction, up = yaw_pitch_to_dir_up(yaw, pitch)
-        res = spec.get("live_res") or [640, 480]
-        near_m, far_m = camera_clip_planes(
-            spec, cid=cid, defaults={"near_m": cfg.get("near_m", 0.05)},
-        )
         records.append(
-            {
-                "id": cid,
-                "pos_m": [float(v) for v in pos],
-                "yaw_deg": yaw,
-                "pitch_deg": pitch,
-                "fov_v": float(spec.get("fov_v") or 70.0),
-                "near_m": float(near_m),
-                "far_m": float(far_m),
-                "resolution": [int(res[0]), int(res[1])],
-                "direction": [float(v) for v in direction],
-                "up": [float(v) for v in up],
-            }
+            _camera_record(spec, cid, origin, cfg.get("near_m", 0.05), rig=rig_model, overrides=overrides)
         )
+    spec = cfg.get("chase_camera")
+    if chase and isinstance(spec, dict) and str(spec.get("id") or "") in RECORDING_ONLY_CAMS:
+        rec = _camera_record(spec, str(spec["id"]), origin, cfg.get("near_m", 0.05), rig=rig_model, overrides=None)
+        rec["recording_only"] = True
+        rec["mount"]["source"] = "chase_yaml"
+        records.append(rec)
     return records
 
 
@@ -523,7 +642,8 @@ def encode_cameras(
         if not isinstance(image, np.ndarray) or image.size == 0 or image.ndim < 2:
             continue
         arr = np.ascontiguousarray(image)
-        png = _gt_png_bytes(arr) if is_train_only_cam(cam_id) else _png_bytes(arr)
+        gt_plane = is_train_only_cam(cam_id) and arr.ndim == 2
+        png = _gt_png_bytes(arr) if gt_plane else _png_bytes(arr)
         shape = tuple(int(v) for v in arr.shape)
         if png is not None:
             encoded.append((str(cam_id), png, ".png", shape, str(arr.dtype)))
@@ -562,9 +682,87 @@ TRAIN_ONLY_SUFFIXES: tuple[str, ...] = ("_depth", "_sem")
 DEPTH_CM_MAX = 65535
 
 
+def train_only_base(cam_id: Any) -> str:
+    """``main`` for ``main_depth`` / ``main_sem``; the id itself otherwise."""
+    name = str(cam_id or "")
+    for sfx in TRAIN_ONLY_SUFFIXES:
+        if name.endswith(sfx) and name[: -len(sfx)]:
+            return name[: -len(sfx)]
+    return name
+
+
+def is_recording_only_cam(cam_id: Any) -> bool:
+    """The chase camera and its depth/sem planes: offline recording only."""
+    return train_only_base(cam_id) in RECORDING_ONLY_CAMS
+
+
 def is_train_only_cam(cam_id: Any) -> bool:
     name = str(cam_id or "")
+    if is_recording_only_cam(name):
+        return True
     return any(name.endswith(sfx) and name[: -len(sfx)] for sfx in TRAIN_ONLY_SUFFIXES)
+
+
+class TrainGtGate:
+    """Which cameras get their training-only depth/sem written this tick.
+
+    Colour frames are never thinned here; only the GT planes are. On time
+    (the smoothed tick interval within ``behind_ratio`` of the plan period)
+    every due camera keeps its GT. Behind it, each camera keeps every other
+    one of its own GT frames (``stride`` 2), so a 1 Hz camera is not starved
+    by a 10 Hz one. Back under ``recover_ratio`` the full rate returns.
+
+    ``thin=False`` keeps every due GT frame whatever the tick rate (clip mode:
+    a clip that runs at a steady 4-5 Hz would otherwise thin for its whole
+    length, IQU45 smoke at d3cfb7d). The EMA is still tracked.
+    """
+
+    def __init__(
+        self,
+        period_s: float = 1.0 / COLLECT_HZ,
+        *,
+        behind_ratio: float = 1.2,
+        recover_ratio: float = 1.05,
+        alpha: float = 0.2,
+        thin: bool = True,
+    ) -> None:
+        self.period_s = float(period_s)
+        self.thin = bool(thin)
+        self.behind_ratio = float(behind_ratio)
+        self.recover_ratio = float(recover_ratio)
+        self.alpha = float(alpha)
+        self.ema_s: float | None = None
+        self.stride = 1
+        self._seen: dict[str, int] = {}
+
+    def reset(self) -> None:
+        """Forget the tick history (respawn, level load, camera warm-up).
+
+        The interval across a load or teleport is not loop lag. Without a
+        reset that one long ``dt`` lifts the EMA over ``behind_ratio`` and GT
+        drops to every other frame for seconds after every spawn.
+        """
+        self.ema_s = None
+        self.stride = 1
+        self._seen.clear()
+
+    def select(self, dt_s: float | None, bases: Any) -> set[str]:
+        if dt_s is not None and float(dt_s) > 0.0:
+            dt = float(dt_s)
+            self.ema_s = dt if self.ema_s is None else self.ema_s + self.alpha * (dt - self.ema_s)
+        if self.ema_s is not None and self.thin:
+            if self.stride == 1 and self.ema_s > self.period_s * self.behind_ratio:
+                self.stride = 2
+            elif self.stride == 2 and self.ema_s < self.period_s * self.recover_ratio:
+                self.stride = 1
+        keep: set[str] = set()
+        for base in bases:
+            cid = str(base)
+            n = self._seen.get(cid, 0)
+            self._seen[cid] = n + 1
+            if self.stride == 1 or n % self.stride == 0:
+                keep.add(cid)
+        return keep
 
 
 def _gt_png_bytes(arr: np.ndarray) -> bytes | None:
@@ -750,6 +948,8 @@ class RawFrameWriter:
                 "Resize, stitch, and the ego-edge mask run in the trainer loader."
             ),
             "cameras": self.cameras,
+            "depth_kind": DEPTH_KIND,
+            "depth_note": DEPTH_NOTE,
             "hz": dict(CAMERA_HZ),
             "png_ratio_measured": {
                 "mean": PNG_RATIO_MEAN,
@@ -826,7 +1026,8 @@ class RawFrameWriter:
                 cam_dt = round(float(wall) - prev, 6)
             if wall is not None:
                 self._prev_cam_t[str(cam_id)] = float(wall)
-            pose = dict(self._by_id.get(str(cam_id)) or {})
+            pose = dict(self._by_id.get(str(cam_id)) or self._by_id.get(train_only_base(cam_id)) or {})
+            intr = pose.get("intrinsics") or {}
             cams[str(cam_id)] = {
                 "file": str(final.relative_to(self.root)).replace("\\", "/"),
                 "t": wall,
@@ -844,6 +1045,7 @@ class RawFrameWriter:
                 "near_m": pose.get("near_m"),
                 "far_m": pose.get("far_m"),
                 "resolution": pose.get("resolution"),
+                "K": [intr["fx"], intr["fy"], intr["cx"], intr["cy"]] if intr else None,
             }
             if is_train_only_cam(cam_id):
                 cams[str(cam_id)]["train_only"] = True
@@ -875,6 +1077,7 @@ class RawFrameWriter:
                 "gt": "gt.jsonl",
             },
             "cams": cams,
+            "cam_span_ms": _rgb_span_ms(cams),
         }
         for key, value in dict(tags or {}).items():
             line[str(key)] = _jsonable(value)
@@ -895,6 +1098,22 @@ class RawFrameWriter:
             self.close()
         except Exception:
             pass
+
+
+def _rgb_span_ms(cams: Mapping[str, Any]) -> float | None:
+    """Host-wall spread of the colour cameras read this tick (max - min), ms.
+
+    The cameras are read one after another, so this is the skew a fusion
+    step has to warp out. None with fewer than two stamped colour cameras.
+    """
+    walls = [
+        float(entry["t"])
+        for cid, entry in cams.items()
+        if not is_train_only_cam(cid) and isinstance(entry, dict) and entry.get("t") is not None
+    ]
+    if len(walls) < 2:
+        return None
+    return round((max(walls) - min(walls)) * 1000.0, 3)
 
 
 def _jsonable(value: Any) -> Any:

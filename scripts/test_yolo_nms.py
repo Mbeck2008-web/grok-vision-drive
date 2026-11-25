@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from python.perception.detect import OnnxYoloDetector  # noqa: E402
 
-CAR, TRUCK, PERSON = 2, 7, 0  # COCO ids
+CAR, TRUCK, PERSON, BIKE = 2, 7, 0, 1  # COCO ids
 
 
 class _Input:
@@ -60,9 +60,12 @@ def main() -> None:
     apart = _detect([(100, 100, 50, 50, CAR, 0.9), (500, 500, 50, 50, CAR, 0.8)])
     assert len(apart) == 2, apart
     print("two disjoint rows -> 2 detections OK")
-    mixed = _detect([(320, 320, 100, 80, CAR, 0.9), (320, 320, 100, 80, PERSON, 0.8)])
-    assert sorted(d.cls for d in mixed) == ["pedestrian", "vehicle"], mixed
+    mixed = _detect([(320, 320, 100, 80, CAR, 0.9), (320, 320, 100, 80, BIKE, 0.8)])
+    assert sorted(d.cls for d in mixed) == ["bike", "vehicle"], mixed
     print("different classes on the same box are not suppressed OK")
+    person = _detect([(320, 320, 100, 80, PERSON, 0.95), (100, 100, 50, 50, CAR, 0.9)])
+    assert [d.cls for d in person] == ["vehicle"], person
+    print("COCO person is dropped (no pedestrian class) OK")
     car_truck = _detect([(320, 320, 100, 80, CAR, 0.9), (320, 320, 100, 80, TRUCK, 0.8)])
     assert len(car_truck) == 2 and [d.cls for d in car_truck] == ["vehicle", "vehicle"], car_truck
     print("car and truck (both 'vehicle') on the same box: NMS by COCO id keeps 2 OK")

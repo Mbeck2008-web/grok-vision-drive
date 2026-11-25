@@ -68,6 +68,11 @@ VE_META_PROBE = (
 
 TRAFFIC_EVERY_S = 0.5
 # Walks every non-player object. It does not look companions up by name.
+# Recorder v2 adds the object id (``getID``) and its spawn-world oriented box
+# (``getSpawnWorldOOBB``: half extents + three axes), each in its own pcall so
+# an object without one still reports pos/vel/dir. Only the half extents feed
+# the dimensions (pose-invariant); position and heading stay the live
+# getPosition / getDirectionVector.
 TRAFFIC_CHUNK = (
     "local out={};"
     "local player=nil;"
@@ -82,7 +87,11 @@ TRAFFIC_CHUNK = (
     "pcall(function() name=tostring(o:getField('name',0) or '') end);"
     "if name=='' or name=='nil' then pcall(function() name=tostring(o:getName() or '') end) end;"
     "local p=o:getPosition();local v=o:getVelocity();local d=o:getDirectionVector();"
-    "out[#out+1]={name=name,pos={p.x,p.y,p.z},vel={v.x,v.y,v.z},dir={d.x,d.y,d.z}} "
+    "local id=nil;pcall(function() id=o:getID() end);"
+    "local box=nil;pcall(function() local b=o:getSpawnWorldOOBB();local h=b:getHalfExtents();"
+    "local ax={};for k=0,2 do local a=b:getAxis(k);ax[k+1]={a.x,a.y,a.z} end;"
+    "box={half={h.x,h.y,h.z},ax=ax} end);"
+    "out[#out+1]={name=name,id=id,pos={p.x,p.y,p.z},vel={v.x,v.y,v.z},dir={d.x,d.y,d.z},box=box} "
     "end end) end;"
     "return jsonEncode(out)"
 )
@@ -181,9 +190,51 @@ def parse_traffic(reply: Any) -> list[dict[str, Any]] | None:
     cars = []
     for car in blob:
         if isinstance(car, dict):
-            cars.append({"name": str(car.get("name") or ""), "pos": _vec(car.get("pos")),
-                         "vel": _vec(car.get("vel")), "dir": _vec(car.get("dir"))})
+            direction = _vec(car.get("dir"))
+            length, width, height = actor_dims(car.get("box"))
+            raw_id = car.get("id")
+            actor_id = int(raw_id) if isinstance(raw_id, (int, float)) and not isinstance(raw_id, bool) and math.isfinite(raw_id) else None
+            cars.append({
+                "name": str(car.get("name") or ""),
+                "id": actor_id,
+                "pos": _vec(car.get("pos")),
+                "vel": _vec(car.get("vel")),
+                "dir": direction,
+                "heading_rad": (
+                    None
+                    if direction is None or direction[0] is None or direction[1] is None
+                    or (direction[0] == 0.0 and direction[1] == 0.0)
+                    else math.atan2(direction[1], direction[0])
+                ),
+                "length_m": length,
+                "width_m": width,
+                "height_m": height,
+                "dims_source": None if length is None else "oobb_half_extents",
+            })
     return cars
+
+
+def actor_dims(box: Any) -> tuple[float | None, float | None, float | None]:
+    """Length, width, height (m) from a ``{half, ax}`` OOBB; all None when any part is missing.
+
+    Height is the extent along the axis closest to world up. Length is the
+    longer of the other two (road vehicles are longer than wide), width the
+    shorter. Only the half extents and the up-ness of the axes are used, so
+    the result does not depend on whether the box follows the car's yaw.
+    A zero, negative, or non-finite half extent is not a size: all None.
+    """
+    if not isinstance(box, dict):
+        return None, None, None
+    half = _vec(box.get("half"))
+    axes = box.get("ax")
+    if half is None or not isinstance(axes, list) or len(axes) != 3:
+        return None, None, None
+    vecs = [_vec(a) for a in axes]
+    if any(v is None or None in v for v in vecs) or any(h is None or h <= 0.0 for h in half):
+        return None, None, None
+    up_i = max(range(3), key=lambda i: abs(vecs[i][2]) / max(1e-9, math.hypot(*vecs[i])))
+    rest = sorted((2.0 * half[i] for i in range(3) if i != up_i), reverse=True)
+    return round(rest[0], 6), round(rest[1], 6), round(2.0 * half[up_i], 6)
 
 
 _SET = re.compile(r'^\s*ai\.(setMode|setSpeedMode|setSpeed|setLine)\((.*)\)\s*$', re.S)

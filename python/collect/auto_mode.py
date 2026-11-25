@@ -16,8 +16,10 @@ from python.data.raw_frames import CAMERA_HZ
 from python.debug.remote_status import COLLECT_NAME, read_json, status_dir
 
 MAPS = ("", "west_coast_usa", "italy", "east_coast_usa", "utah", "jungle_rock_island")
-# Levels that ship with BeamNG.tech 0.39. A multi-map run rotates these.
-DEFAULT_MAPS = ("west_coast_usa", "italy", "east_coast_usa", "utah", "jungle_rock_island")
+# Levels a multi-map run rotates: only those with a bundled road dump, so
+# every segment gets a legal seeded spawn. utah and jungle_rock_island stay
+# selectable (MAPS, --maps) but stop with spawn_failed until dumps exist.
+DEFAULT_MAPS = ("west_coast_usa", "italy", "east_coast_usa")
 ROUTES = ("span", "waypoints", "random")
 LANE_CAMERAS = "main,narrow,wide"
 CAMERA_PRESETS = ("", LANE_CAMERAS)
@@ -136,6 +138,15 @@ def rates_table(rates: str, cameras: str) -> dict[str, float]:
     return table
 
 
+def hour_to_beamng_tod(hour: float) -> float:
+    """A clock hour (0-24) as BeamNG ``TimeOfDay.time``: 0 is local noon, 0.5 midnight.
+
+    documentation.beamng.com/modding/levels/level_classes/tod/: 0.00 12:00,
+    0.25 18:00, 0.50 00:00, 0.75 06:00. Plain hour/24 would put noon at midnight.
+    """
+    return ((float(hour) - 12.0) / 24.0) % 1.0
+
+
 def environment_commands(time_of_day: str, weather: str) -> list[str]:
     """Best-effort BeamNG environment lines. Empty when the option is blank."""
     commands: list[str] = []
@@ -147,7 +158,7 @@ def environment_commands(time_of_day: str, weather: str) -> list[str]:
             tod = None
         if tod is not None:
             if tod > 1.0:
-                tod = tod / 24.0
+                tod = hour_to_beamng_tod(tod)
             tod = min(1.0, max(0.0, tod))
             commands.append(f"core_environment.setTimeOfDay({{time={tod:.4f}}})")
     sky = str(weather or "").strip().replace("\\", "").replace('"', "")

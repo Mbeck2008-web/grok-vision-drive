@@ -89,13 +89,15 @@ def check_collector() -> None:
     assert ego["camera_overrides"] == json.loads(json.dumps(want_over)), ego
     assert set(ego["camera_overrides"]) == REPEATERS and rig_overrides(load_camera_config(), "sbr") == want_over
     cams = {c["id"]: c for c in json.loads((out / "cameras.json").read_text(encoding="utf-8"))["cameras"]}
-    want = {c["id"]: c for c in camera_sidecar(rig_for_model(load_camera_config(), "sbr"))}
+    # Recorder v2: each record also names the rig and which mounts the override set.
+    want = {c["id"]: c for c in camera_sidecar(rig_for_model(load_camera_config(), "sbr"), rig_model="sbr", overrides=want_over)}
+    assert {cid for cid, c in cams.items() if c["mount"]["source"] == "vehicle_override"} == REPEATERS, cams
     assert cams == json.loads(json.dumps(want)), "sbr cameras.json is the sbr rig"
 
     code, text, out = _west(lambda n: "", ["--ego-model", "etk800", "--ego-config", ""], 60)
     assert code == 0 and "camera rig calibrated" not in text, text[:2000]
     with tempfile.TemporaryDirectory() as tmp:
-        RawFrameWriter(tmp, camera_sidecar(_base(load_camera_config())))
+        RawFrameWriter(tmp, camera_sidecar(_base(load_camera_config()), rig_model="etk800", overrides={}))
         ref = (Path(tmp) / "cameras.json").read_bytes()
     assert (out / "cameras.json").read_bytes() == ref, "etk800 cameras.json byte-identical to the base rig"
     ego = json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]

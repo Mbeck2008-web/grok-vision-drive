@@ -1,4 +1,4 @@
-"""Stratified west-coast spawns from a dumped navgraph.
+"""Stratified on-road spawns from a dumped navgraph.
 
 Highway is a wide or one-way multi-lane road. A ramp is a short one-way
 road that touches both a highway and a local road. Everything else that
@@ -46,6 +46,27 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from python.data.data_root import roads_dir
+
+
+def spawn_roads_path(map_name: str) -> Path | None:
+    """Gzip road dump for ``map_name``, or None if no dump exists.
+
+    A live file under ``roads_dir()`` wins; otherwise a bundled fixture
+    at ``tests/fixtures/roads/{map}.json.gz``. Callers must fail loudly
+    when this returns None rather than silently using the level's fixed
+    spawn or skipping traffic.
+    """
+    name = f"{map_name}.json.gz"
+    live = roads_dir() / name
+    if live.is_file():
+        return live
+    bundled = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "roads" / name
+    if bundled.is_file():
+        return bundled
+    return None
+
 
 CITY = "city"
 HIGHWAY = "highway"
@@ -123,6 +144,11 @@ SOURCES = ("spawn", "recheck")
 TRAFFIC_AHEAD_M = 60.0
 TRAFFIC_BEHIND_M = 40.0
 TRAFFIC_MIN_M = 8.0
+# Cars after the first two (clip mode's random count): alternate ahead/behind,
+# each pair this much farther out along the road. A slot that lands within
+# TRAFFIC_MIN_M of a car already placed (a short road walk falls back to the
+# same farthest spot) is dropped, never stacked.
+TRAFFIC_STAGGER_M = 25.0
 # Legal-lane search. The first fraction is the historical 40% station.
 LEGAL_FRACTIONS = (0.40, 0.30, 0.50, 0.22, 0.62)
 LEGAL_ATTEMPTS = 8
@@ -1169,8 +1195,17 @@ class SpawnDeck:
         max_tries: int = PAINT_MAX_TRIES,
         log: Callable[[str], None] | None = None,
         min_probe_m: float = PAINT_MIN_PROBE_M,
+        only_kind: str | None = None,
     ) -> None:
-        self.pools = {kind: list(pools.get(kind) or []) for kind in KINDS}
+        if only_kind is not None and only_kind not in KINDS:
+            raise ValueError(f"only_kind must be one of {KINDS}, got {only_kind!r}")
+        # only_kind (clip mode's --spawn-kind): the other pools start empty, so
+        # every pick is that kind until it runs out (then take() returns None).
+        self.only_kind = only_kind
+        self.pools = {
+            kind: (list(pools.get(kind) or []) if only_kind in (None, kind) else [])
+            for kind in KINDS
+        }
         self.rng = rng or random.Random(0)
         for pool in self.pools.values():
             self.rng.shuffle(pool)
@@ -1566,6 +1601,12 @@ class SpawnDeck:
         yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
         hx, hy = math.cos(yaw), math.sin(yaw)
         wants = [("ahead", float(ahead_m), False), ("behind", float(behind_m), True)][: max(0, int(count))]
+        for k in range(2, max(0, int(count))):
+            step = TRAFFIC_STAGGER_M * (k // 2)
+            if k % 2 == 0:
+                wants.append((f"ahead{k // 2 + 1}", float(ahead_m) + step, False))
+            else:
+                wants.append((f"behind{k // 2 + 1}", float(behind_m) + step, True))
         slots: list[tuple[str, tuple[float, float, float], tuple[float, float, float, float], float]] = []
         notes: list[str] = []
         for where, want, back in wants:
@@ -1589,6 +1630,9 @@ class SpawnDeck:
             y += ry * shift
             if shift and not self._slot_is_legal(x, y, z + 0.5, fx, fy):
                 notes.append(f"traffic {where} skipped: not in a legal lane")
+                continue
+            if any(math.dist((x, y, z + 0.5), placed[1]) < TRAFFIC_MIN_M for placed in slots):
+                notes.append(f"traffic {where} skipped: within {TRAFFIC_MIN_M:.0f} m of a car already placed")
                 continue
             slots.append((where, (x, y, z + 0.5), _yaw_quat(fx, fy), along))
         return slots, notes

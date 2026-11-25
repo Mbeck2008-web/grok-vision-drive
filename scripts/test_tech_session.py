@@ -820,7 +820,7 @@ def check_collector_train_gt_stays_on() -> None:
     assert set(attached) == set(CAM_IDS)
     for cid in CAM_IDS:
         kw = made[f"gvd_collect_{cid}"]
-        want = cid in ("main", "wide")
+        want = True  # recorder v2: depth + semantics on all eight collector cameras
         assert kw["is_render_depth"] is want, cid
         assert kw["is_render_annotations"] is want, cid
         if want:
@@ -829,8 +829,8 @@ def check_collector_train_gt_stays_on() -> None:
         else:
             assert "integer_depth" not in kw, cid
             assert not hasattr(attached[cid], "gvd_sem_palette"), cid
-    assert palette_calls["n"] == 2
-    print("collector train_gt stays on for main and wide")
+    assert palette_calls["n"] == len(CAM_IDS)  # one palette read per train_gt camera
+    print("collector train_gt stays on for all eight cameras")
 
 
 def check_beamngpy_side_grab_half_rate() -> None:

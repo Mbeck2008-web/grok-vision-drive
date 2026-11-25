@@ -137,29 +137,40 @@ GROUND_WIDE_WINDOW_CELLS = 21
 # above the road (a roof) weighs exp(-15) as much as the road; the exponent
 # stays in [-60, 0] over the z band, well inside float32.
 GROUND_SOFTMIN_K = 10.0
-# How steeply a cell's ground may rise above the wide-scale mean, as a grade.
-# Surfaces steeper than this relative to the wide-scale ground are not used
-# as local ground (the band itself, GROUND_BAND_M, is the height cutoff).
-GROUND_SLOPE_CAP = 0.15
 # A surface this far above the local ground is a 2.5D occluder for the
 # camera-to-ground sight line. 0.3 m is below GROUND_BAND_M (so a 0.6 m
 # wall's front-face hits, which sit at ~0.35-0.45 m and never become
 # "raised" for the band, still close the umbra) and above a 6 % grade's
 # residual versus the local soft-min.
 RAISED_OCC_M = 0.3
+# Smooth max exponent (per metre) for per-cell occluder top via scatter_add.
+OCC_SOFTMAX_K = 50.0
 # Dilate those occluders by one cell (+-0.5 m) so a sparsely sampled wall
 # still closes, without eating the open ground just in front of a car.
-# Sight line is tested at this step count with this clearance under the
-# occluder top (Skeptic's hidden test uses 0.1 m).
+# Sight line uses 12 steps (~2.5 m max spacing across 32 m, still under a
+# 1-cell-dilated front after extend) with 0 clearance under the estimated
+# occluder top bound. 14 steps exceeded the 25% activation-memory cap.
 OCC_WINDOW_CELLS = 3
 SIGHTLINE_STEPS = 12
-SIGHTLINE_CLEARANCE_M = 0.05
-# Occluders closer to the destination than this are ignored, so a dilated
-# wall does not close the last open cell in front of it, and a constant-depth
-# fixture wall whose high and low hits sit in neighbouring cells does not
-# self-occlude. A 0.6 m barrier's front-face hits still sit far enough in
-# front of the hidden cells to close the umbra.
-SIGHTLINE_MARGIN_M = 1.5
+SIGHTLINE_CLEARANCE_M = 0.0
+# Occluders closer to the destination than this are ignored, so a 1-cell
+# dilated wall does not close the last open cell in front of it, and a
+# constant-depth fixture wall does not self-occlude, while close barriers
+# (y = 3-5 m) still hide their near umbra. 1.2 m is tight enough for those
+# near umbras and still leaves check_occlusion_branches a shared wide view.
+SIGHTLINE_MARGIN_M = 1.2
+# Laterally extend a raised front through unobserved cells in the same row
+# (up to 4 m). A 24x32 feature grid can miss a low barrier outside a narrow
+# camera's FOV while a wide camera still lands on the ground behind it.
+# A pole or short wall with visible road beside it stops immediately.
+OCC_FRONT_EXTEND_CELLS = 8
+# Only extend a row that already has a wide raised front (3 m). A pole or
+# a diagonal stair step must not grow a 4 m bar of phantom wall.
+OCC_MIN_FRONT_CELLS = 6
+# When a pixel row above a raised hit clears, the top sits at most this
+# far above the hit. Raw z_up at close range can be >1 m and would hide
+# ground that is geometrically visible over a low close wall.
+OCC_GRAZE_CAP_M = 0.35
 
 # Categorical depth (audit item 9: 40 log bins, 1-48 m).
 DEPTH_BINS = 40
@@ -426,16 +437,15 @@ def two_scale_ground(
 ) -> tuple[Any, Any, Any, Any]:
     """Local ground from surfaces that sit near a wider-scale soft-min ground.
 
-    The wide-scale ground is the same soft-min as ``ground_height``, over
-    ``wide_window`` cells. A per-cell surface is kept only when it is less
-    than ``near_m`` above that wide-scale height (and some wide-scale mass
-    exists). The local soft-min then runs on the kept surfaces only, so a
-    barrier wider than the local window cannot become the ground behind it.
-    Surfaces at least ``near_m`` above the wide-scale ground are returned
-    as a raised-surface mask. ``GROUND_SLOPE_CAP`` documents the allowed
-    grade; ``near_m`` is the height cutoff.
+    The wide-scale ground is a cell-normalized soft-min over ``wide_window``
+    cells (each occupied cell has equal weight 1, so dense near-range wall
+    hits cannot outvote sparser road hits). A per-cell surface is kept only
+    when it is less than ``near_m`` above that wide-scale height (and some
+    wide-scale mass exists). The local soft-min then runs on the kept
+    surfaces only, so a barrier wider than the local window cannot become
+    the ground behind it. Surfaces at least ``near_m`` above the wide-scale
+    ground are returned as a raised-surface mask.
     """
-    g_wide, has_wide = ground_height(z_sum, w_sum, window=wide_window, k=k)
     cell_has = w_sum > 0
     safe_w = torch.where(cell_has, w_sum, torch.ones_like(w_sum))
     cell_z = torch.where(
@@ -443,6 +453,9 @@ def two_scale_ground(
         BEV_Z_MIN_M - torch.log((z_sum / safe_w).clamp(min=1e-30)) / k,
         torch.zeros_like(z_sum),
     )
+    cw_w = cell_has.to(z_sum.dtype)
+    cw_z = torch.where(cell_has, torch.exp((-k * (cell_z - BEV_Z_MIN_M)).clamp(min=-60.0, max=0.0)), torch.zeros_like(z_sum))
+    g_wide, has_wide = ground_height(cw_z, cw_w, window=wide_window, k=k)
     has_w = has_wide > 0
     near = cell_has & has_w & ((cell_z - g_wide) < near_m)
     raised = (cell_has & has_w & ((cell_z - g_wide) >= near_m)).to(z_sum.dtype)
@@ -455,20 +468,60 @@ def two_scale_ground(
     return ground, has, raised, g_wide
 
 
-def ray_crossed_raised(idx: Any, ok: Any, raised: Any) -> Any:
+def ray_crossed_raised(
+    idx: Any,
+    ok: Any,
+    raised: Any,
+    z: Any = None,
+    z_top: Any = None,
+    clearance: float = 0.0,
+) -> Any:
     """Per-sample mask: an earlier bin of the same ray sits in a raised cell.
 
     ``idx`` / ``ok`` are B x N x D x h x w (or D-1 at the bin edges). ``raised``
     is B x 1 x N x N. Cumulative along the depth dimension, so an overflight
-    that later re-enters the ground band stays blocked.
+    that later re-enters the ground band stays blocked. When ``z`` / ``z_top``
+    are given, a sample in a raised cell does not count if it is already at or
+    above the occluder top (the ray is going over, not through).
     """
     b = raised.shape[0]
     ids = idx.reshape(b, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
     at = raised.reshape(b, BEV_N * BEV_N).gather(1, ids).view_as(idx) * ok.to(raised.dtype)
+    if z is not None and z_top is not None:
+        top = z_top.reshape(b, BEV_N * BEV_N).gather(1, ids).view_as(idx)
+        at = at * (z < top + clearance).to(at.dtype)
     # Exclusive prefix: any earlier bin was raised. cumsum of a 0/1 mask, not
     # cummax, so the ONNX opset-17 export stays legal.
     prior = (at.cumsum(dim=2) - at) > 0
     return prior.to(raised.dtype)
+
+
+def extend_occluder_front(
+    has_occ: Any,
+    z_occ: Any,
+    low_surf: Any,
+    max_cells: int = OCC_FRONT_EXTEND_CELLS,
+) -> tuple[Any, Any]:
+    """Copy a raised front sideways through unobserved cells in the same row.
+
+    ``low_surf`` marks cells with a near-ground surface (an opening). Walking
+    stops there, so a 0.2 m pole does not hide the road beside it. Each step
+    is a 1-cell pad, legal for ONNX opset-17.
+    """
+    occ = has_occ
+    z = z_occ
+    wide_row = (has_occ > 0).sum(dim=-1, keepdim=True) >= int(OCC_MIN_FRONT_CELLS)
+    for _ in range(int(max_cells)):
+        occ_l = F.pad(occ[:, :, :, :-1], (1, 0))
+        occ_r = F.pad(occ[:, :, :, 1:], (0, 1))
+        z_l = F.pad(z[:, :, :, :-1], (1, 0))
+        z_r = F.pad(z[:, :, :, 1:], (0, 1))
+        can = (occ <= 0) & (low_surf <= 0) & wide_row
+        take_l = can & (occ_l > 0)
+        take_r = can & (occ_r > 0) & (~take_l)
+        z = torch.where(take_l, z_l, torch.where(take_r, z_r, z))
+        occ = torch.maximum(occ, torch.maximum(take_l, take_r).to(occ.dtype))
+    return occ, z
 
 
 def sightline_blocked(
@@ -502,20 +555,19 @@ def sightline_blocked(
     sy = cam_y.unsqueeze(2) + t * (grid_y.unsqueeze(2) - cam_y.unsqueeze(2))
     sz = cam_z.unsqueeze(2) + t * (dest_z.unsqueeze(2) - cam_z.unsqueeze(2))
     grid = torch.stack([sx / 32.0, -sy / 32.0], dim=-1).reshape(b * ncam, n_steps, BEV_N * BEV_N, 2)
-    occ = z_occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
-    has = has_occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
-    z_s = F.grid_sample(occ, grid, mode="nearest", padding_mode="zeros", align_corners=False)
-    h_s = F.grid_sample(has, grid, mode="nearest", padding_mode="zeros", align_corners=False)
+    occ_both = torch.cat([z_occ, has_occ], dim=1).unsqueeze(1).expand(b, ncam, 2, BEV_N, BEV_N).reshape(
+        b * ncam, 2, BEV_N, BEV_N
+    )
+    sampled = F.grid_sample(occ_both, grid, mode="nearest", padding_mode="zeros", align_corners=False)
+    z_s = sampled[:, 0]
+    h_s = sampled[:, 1]
     margin = float(SIGHTLINE_MARGIN_M)
-    dx_s, dy_s = sx - cam_x.unsqueeze(2), sy - cam_y.unsqueeze(2)
-    r_s = torch.sqrt(dx_s * dx_s + dy_s * dy_s)
     dx_d, dy_d = grid_x - cam_x, grid_y - cam_y
     r_d = torch.sqrt(dx_d * dx_d + dy_d * dy_d).unsqueeze(2)
-    in_front = r_s < (r_d - margin)
-    hit = (h_s > 0) & (z_s > sz.reshape(b * ncam, 1, n_steps, BEV_N * BEV_N) + clearance) & in_front.reshape(
-        b * ncam, 1, n_steps, BEV_N * BEV_N
-    )
-    return hit.any(dim=2).view(b, ncam, BEV_N, BEV_N).to(dtype)
+    # Since s = cam + t * (dest - cam), radial distance r_s = t * r_d, so r_s < r_d - margin iff (1 - t) * r_d > margin.
+    in_front = ((1.0 - t) * r_d > margin).reshape(b * ncam, n_steps, BEV_N * BEV_N)
+    hit = (h_s > 0) & (z_s > sz.reshape(b * ncam, n_steps, BEV_N * BEV_N) + clearance) & in_front
+    return hit.any(dim=1).view(b, ncam, BEV_N, BEV_N).to(dtype)
 
 
 def near_ground(z: Any, ground: Any, band_m: float = GROUND_BAND_M) -> Any:
@@ -695,7 +747,6 @@ class BevLssHead(nn.Module):
         ground, has_ground, raised, g_wide = two_scale_ground(g_sum[:, 0:1], g_sum[:, 1:2])
         flat_g = (ground * has_ground).reshape(b, BEV_N * BEV_N)
         flat_has = has_ground.reshape(b, BEV_N * BEV_N)
-        crossed = 1.0 - ray_crossed_raised(idx, ok, raised)
         g_at = flat_g.gather(1, idx.reshape(b, -1)).view_as(z)
         # Threshold tracks the configured band: default 0.5 m -> 0.3 m, so a
         # 0.6 m wall's 0.35-0.45 m front-face hits still close the umbra; a
@@ -703,16 +754,68 @@ class BevLssHead(nn.Module):
         # so a 1.5 m car roof is not an occluder.
         occ_m = self.ground_band_m - (GROUND_BAND_M - RAISED_OCC_M)
         high = surf * ray_w * ((z - g_at) >= occ_m) * ok.to(prob.dtype)
-        high_vals = torch.stack([high * z, high], dim=-1).reshape(b, n * d * h * w, 2)
-        high_sum = splat(high_vals, idx.reshape(b, -1), ok.reshape(b, -1))
-        has_occ = (high_sum[:, 1:2] > 0).to(prob.dtype)
-        z_occ = torch.where(
-            has_occ > 0,
-            high_sum[:, 0:1] / torch.where(has_occ > 0, high_sum[:, 1:2], torch.ones_like(has_occ)),
-            torch.zeros_like(has_occ),
+        # When a ray hits a raised obstacle and the valid pixel row just above it
+        # passes beyond that depth bin, the true top edge can sit up to that
+        # upper ray's height at the hit depth. Bound z_occ by that height too.
+        z_up = torch.cat([z[:, :, :, :1, :], z[:, :, :, :-1, :]], dim=3)
+        pv_up = torch.cat([torch.zeros_like(weight[:, :, :, :1, :]), weight[:, :, :, :-1, :]], dim=3)
+        above_cleared = torch.cat([torch.zeros_like(through[:, :, :, :1, :]), through[:, :, :, :-1, :]], dim=3) * pv_up
+        # Bound the top by the clearing ray, but never more than GRAZE_CAP above the hit
+        # (close-range row spacing is coarse). Hits with no clear-above bound are tall
+        # of unknown height: if a cell has only those, use BEV_Z_MAX_M so a thin pole
+        # whose pixels miss the true top still closes its far umbra.
+        z_bound_hit = torch.minimum(torch.maximum(z, z_up), z + OCC_GRAZE_CAP_M)
+        z_eff = torch.where(above_cleared > 0, z_bound_hit, z)
+        bound = high * (above_cleared > 0).to(prob.dtype)
+        unbound = high * (above_cleared <= 0).to(prob.dtype)
+        bound_vals = torch.stack([bound * z_eff, bound], dim=-1).reshape(b, n * d * h * w, 2)
+        bound_sum = splat(bound_vals, idx.reshape(b, -1), ok.reshape(b, -1))
+        has_bound = (bound_sum[:, 1:2] > 0).to(prob.dtype)
+        has_unbound = splat(unbound.reshape(b, n * d * h * w, 1), idx.reshape(b, -1), ok.reshape(b, -1))
+        has_occ = ((bound_sum[:, 1:2] + has_unbound) > 0).to(prob.dtype)
+        z_mean = torch.where(
+            has_bound > 0,
+            bound_sum[:, 0:1] / torch.where(has_bound > 0, bound_sum[:, 1:2], torch.ones_like(has_bound)),
+            torch.zeros_like(has_bound),
         )
-        has_occ = F.max_pool2d(has_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
-        z_occ = F.max_pool2d(z_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
+        z_mean_at = z_mean.reshape(b, BEV_N * BEV_N).gather(1, idx.reshape(b, -1)).view_as(z)
+        dz = (z_eff - z_mean_at).clamp(min=-1.4, max=1.4)
+        exp_sum = splat((bound * torch.exp(OCC_SOFTMAX_K * dz)).reshape(b, n * d * h * w, 1), idx.reshape(b, -1), ok.reshape(b, -1))
+        z_bound = torch.where(
+            has_bound > 0,
+            z_mean + torch.log(exp_sum.clamp(min=1e-30)) / OCC_SOFTMAX_K,
+            torch.full_like(has_occ, BEV_Z_MIN_M - 1.0),
+        )
+        z_occ = torch.where(has_bound > 0, z_bound, torch.where(has_occ > 0, torch.full_like(has_occ, BEV_Z_MAX_M), z_bound))
+        safe_w = torch.where(g_sum[:, 1:2] > 0, g_sum[:, 1:2], torch.ones_like(g_sum[:, 1:2]))
+        cell_z = torch.where(
+            g_sum[:, 1:2] > 0,
+            BEV_Z_MIN_M - torch.log((g_sum[:, 0:1] / safe_w).clamp(min=1e-30)) / GROUND_SOFTMIN_K,
+            torch.zeros_like(g_sum[:, 0:1]),
+        )
+        low_surf = ((g_sum[:, 1:2] > 0) & ((cell_z - g_wide) < RAISED_OCC_M)).to(prob.dtype)
+        # Hits on a wall front often splat into the cell just in front of the
+        # wall. Seed the next farther cell (larger y) when it has no road
+        # surface, then extend laterally along that true front.
+        occ_far = F.pad(has_occ[:, :, 1:, :], (0, 0, 0, 1))
+        z_far = F.pad(z_occ[:, :, 1:, :], (0, 0, 0, 1))
+        n_occ = (has_occ > 0).sum(dim=-1, keepdim=True)
+        thin_row = (n_occ >= 1) & (n_occ <= 2)
+        seed = (has_occ <= 0) & (low_surf <= 0) & (occ_far > 0) & (~thin_row)
+        has_occ = torch.maximum(has_occ, seed.to(has_occ.dtype))
+        z_occ = torch.where(seed, torch.maximum(z_occ, z_far), z_occ)
+        has_occ, z_occ = extend_occluder_front(has_occ, z_occ, low_surf)
+        # A 1-2 cell front (a pole) has no reliable top bound: treat it as tall,
+        # and do not dilate it (dilation would hide the visible road beside it).
+        n_occ = (has_occ > 0).sum(dim=-1, keepdim=True)
+        thin_row = (n_occ >= 1) & (n_occ <= 2)
+        z_occ = torch.where((has_occ > 0) & thin_row, torch.full_like(z_occ, BEV_Z_MAX_M), z_occ)
+        occ_d = F.max_pool2d(has_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
+        z_d = F.max_pool2d(z_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
+        has_occ = torch.where(thin_row, has_occ, occ_d)
+        z_occ = torch.where(thin_row, z_occ, z_d)
+        z_occ = torch.where(has_occ > 0, z_occ, torch.zeros_like(z_occ))
+        crossed = 1.0 - ray_crossed_raised(idx, ok, raised, z, z_occ)
         blocked = sightline_blocked(z_occ, has_occ, g_wide, T)
         ids_c = idx.reshape(b, n, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
         visible = (1.0 - blocked.reshape(b, n, BEV_N * BEV_N).gather(2, ids_c).view_as(idx)) * ok.to(prob.dtype)
@@ -733,8 +836,9 @@ class BevLssHead(nn.Module):
         # from just before the edge, never opens the edge point.
         pts_e = frustum_ego_points(K, T, self.edges.to(K.dtype), (h, w), FEAT_STRIDE, time_offset_s, ego_speed_mps)
         idx_e, ok_e = bev_flat_index(pts_e)
-        band_e = _band(pts_e[..., 2].to(prob.dtype), idx_e)
-        crossed_e = 1.0 - ray_crossed_raised(idx_e, ok_e, raised)
+        z_e = pts_e[..., 2].to(prob.dtype)
+        band_e = _band(z_e, idx_e)
+        crossed_e = 1.0 - ray_crossed_raised(idx_e, ok_e, raised, z_e, z_occ)
         ids_e = idx_e.reshape(b, n, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
         visible_e = (1.0 - blocked.reshape(b, n, BEV_N * BEV_N).gather(2, ids_e).view_as(idx_e)) * ok_e.to(prob.dtype)
         s_e = beyond[:, :, 1:]

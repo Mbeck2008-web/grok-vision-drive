@@ -91,7 +91,8 @@ def test_export_shapes_and_opset(tmp: Path) -> None:
     from python.train.scene_net import OUTPUT_FIELDS, count_module_parameters
 
     net, path = _model(tmp)
-    assert count_module_parameters(net) == 2203694, count_module_parameters(net)
+    # labels v2 (8bbd07d/29f6f0f) dropped one object class: 16 slots x (512+1) = 8208 fewer than 2203694.
+    assert count_module_parameters(net) == 2195486, count_module_parameters(net)
     model = onnx.load(str(path))
     assert {i.domain or "ai.onnx": i.version for i in model.opset_import}.get("ai.onnx") == 17
     sess = ob.make_session(path, "cpu")

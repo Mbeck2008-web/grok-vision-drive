@@ -961,6 +961,41 @@ def begin_level(bng: Any, level: str) -> OpenedLevel:
         if not roads:
             detail = note or "no road network"
             return OpenedLevel(vehicle, [], f"no road network after loading {clean} ({detail})", pos, source)
+        from python.collect.liveness import (
+            LEVEL_SETTLE_HOLD_S,
+            LEVEL_SETTLE_MIN_HZ,
+            LEVEL_SETTLE_TIMEOUT_S,
+            SETTLE_S,
+            wait_for_stable_rate,
+        )
+
+        if SETTLE_S > 0.0 and callable(getattr(vehicle, "poll_sensors", None)) and getattr(vehicle, "sensors", None):
+            def _step_probe() -> bool:
+                try:
+                    vehicle.poll_sensors()
+                    return True
+                except Exception as exc:
+                    if not is_session_error(exc):
+                        raise
+                    return False
+
+            ok, elapsed_s, hz, _t0, polls, _ready = wait_for_stable_rate(
+                _step_probe,
+                now=time.monotonic,
+                sleep=time.sleep,
+                min_hz=LEVEL_SETTLE_MIN_HZ,
+                hold_s=LEVEL_SETTLE_HOLD_S,
+                timeout_s=LEVEL_SETTLE_TIMEOUT_S,
+            )
+            if not ok:
+                return OpenedLevel(
+                    vehicle,
+                    list(roads),
+                    f"level step rate did not settle for {clean} ({hz:.2f} Hz < {LEVEL_SETTLE_MIN_HZ:.1f} Hz after {elapsed_s:.1f}s)",
+                    pos,
+                    source,
+                )
+            print(f"collect level_step_settle {clean} elapsed={elapsed_s:.2f}s hz={hz:.2f} polls={polls}", flush=True)
         placed = snap_to_road(bng, pos)
         if placed is not None:
             moved, mrot = placed

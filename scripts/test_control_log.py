@@ -77,7 +77,9 @@ def check_schema() -> None:
     # Traffic: GE reply list, empty Lua table, garbage.
     car = {"name": "gvd_traffic_0", "pos": [1, 2, 3], "vel": [0, 9.5, 0], "dir": [0, 1, 0]}
     assert cl.parse_traffic(json.dumps([car])) == [
-        {"name": "gvd_traffic_0", "pos": [1.0, 2.0, 3.0], "vel": [0.0, 9.5, 0.0], "dir": [0.0, 1.0, 0.0]}
+        {"name": "gvd_traffic_0", "id": None, "pos": [1.0, 2.0, 3.0], "vel": [0.0, 9.5, 0.0],
+         "dir": [0.0, 1.0, 0.0], "heading_rad": math.pi / 2, "length_m": None, "width_m": None,
+         "height_m": None, "dims_source": None}
     ]
     assert cl.parse_traffic("{}") == [] and cl.parse_traffic("[]") == []
     assert cl.parse_traffic(None) is None and cl.parse_traffic("nope") is None

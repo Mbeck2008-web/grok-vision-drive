@@ -1,4 +1,4 @@
-"""Stratified west-coast spawns from a dumped navgraph.
+"""Stratified on-road spawns from a dumped navgraph.
 
 Highway is a wide or one-way multi-lane road. A ramp is a short one-way
 road that touches both a highway and a local road. Everything else that
@@ -46,6 +46,27 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from python.data.data_root import roads_dir
+
+
+def spawn_roads_path(map_name: str) -> Path | None:
+    """Gzip road dump for ``map_name``, or None if no dump exists.
+
+    A live file under ``roads_dir()`` wins; otherwise a bundled fixture
+    at ``tests/fixtures/roads/{map}.json.gz``. Callers must fail loudly
+    when this returns None rather than silently using the level's fixed
+    spawn or skipping traffic.
+    """
+    name = f"{map_name}.json.gz"
+    live = roads_dir() / name
+    if live.is_file():
+        return live
+    bundled = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "roads" / name
+    if bundled.is_file():
+        return bundled
+    return None
+
 
 CITY = "city"
 HIGHWAY = "highway"
@@ -123,6 +144,11 @@ SOURCES = ("spawn", "recheck")
 TRAFFIC_AHEAD_M = 60.0
 TRAFFIC_BEHIND_M = 40.0
 TRAFFIC_MIN_M = 8.0
+# Cars after the first two (clip mode's random count): alternate ahead/behind,
+# each pair this much farther out along the road. A slot that lands within
+# TRAFFIC_MIN_M of a car already placed (a short road walk falls back to the
+# same farthest spot) is dropped, never stacked.
+TRAFFIC_STAGGER_M = 25.0
 # Legal-lane search. The first fraction is the historical 40% station.
 LEGAL_FRACTIONS = (0.40, 0.30, 0.50, 0.22, 0.62)
 LEGAL_ATTEMPTS = 8
@@ -251,7 +277,13 @@ def _walk_ahead(
                     if rid in seen:
                         continue
                     other = roads_by_id.get(rid)
-                    if other is None or (other["oneway"] and (at_start if reverse else not at_start)):
+                    if other is None:
+                        continue
+                    is_oneway = bool(other.get("oneway")) or (
+                        int(other.get("lanes_left") or 0) == 0 and int(other.get("lanes_right") or 0) >= 1
+                    )
+                    entered_legal_start = (not at_start) if other.get("flip") else at_start
+                    if is_oneway and (entered_legal_start if reverse else not entered_legal_start):
                         continue
                     seq = list(other["pts"]) if at_start else list(other["pts"])[::-1]
                     if math.hypot(seq[0][0] - tail[0], seq[0][1] - tail[1]) > PAINT_JOIN_M:
@@ -1169,8 +1201,17 @@ class SpawnDeck:
         max_tries: int = PAINT_MAX_TRIES,
         log: Callable[[str], None] | None = None,
         min_probe_m: float = PAINT_MIN_PROBE_M,
+        only_kind: str | None = None,
     ) -> None:
-        self.pools = {kind: list(pools.get(kind) or []) for kind in KINDS}
+        if only_kind is not None and only_kind not in KINDS:
+            raise ValueError(f"only_kind must be one of {KINDS}, got {only_kind!r}")
+        # only_kind (clip mode's --spawn-kind): the other pools start empty, so
+        # every pick is that kind until it runs out (then take() returns None).
+        self.only_kind = only_kind
+        self.pools = {
+            kind: (list(pools.get(kind) or []) if only_kind in (None, kind) else [])
+            for kind in KINDS
+        }
         self.rng = rng or random.Random(0)
         for pool in self.pools.values():
             self.rng.shuffle(pool)
@@ -1566,6 +1607,12 @@ class SpawnDeck:
         yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
         hx, hy = math.cos(yaw), math.sin(yaw)
         wants = [("ahead", float(ahead_m), False), ("behind", float(behind_m), True)][: max(0, int(count))]
+        for k in range(2, max(0, int(count))):
+            step = TRAFFIC_STAGGER_M * (k // 2)
+            if k % 2 == 0:
+                wants.append((f"ahead{k // 2 + 1}", float(ahead_m) + step, False))
+            else:
+                wants.append((f"behind{k // 2 + 1}", float(behind_m) + step, True))
         slots: list[tuple[str, tuple[float, float, float], tuple[float, float, float, float], float]] = []
         notes: list[str] = []
         for where, want, back in wants:
@@ -1585,16 +1632,22 @@ class SpawnDeck:
             fx, fy = (-tx, -ty) if back else (tx, ty)
             shift = 0.0 if pick.offset_m is None else float(pick.offset_m)
             rx, ry = fy, -fx
-            x += rx * shift
-            y += ry * shift
-            if shift and not self._slot_is_legal(x, y, z + 0.5, fx, fy):
-                notes.append(f"traffic {where} skipped: not in a legal lane")
+            cx, cy, cz = x + rx * shift, y + ry * shift, z + 0.5
+            slot_pos, slot_rot = (cx, cy, cz), _yaw_quat(fx, fy)
+            if not self._slot_is_legal(cx, cy, cz, fx, fy):
+                resolved = self._legal_traffic_pose(x, y, z, fx, fy)
+                if resolved is None:
+                    notes.append(f"traffic {where} skipped: not in a legal lane")
+                    continue
+                slot_pos, slot_rot = resolved
+            if any(math.dist(slot_pos, placed[1]) < TRAFFIC_MIN_M for placed in slots):
+                notes.append(f"traffic {where} skipped: within {TRAFFIC_MIN_M:.0f} m of a car already placed")
                 continue
-            slots.append((where, (x, y, z + 0.5), _yaw_quat(fx, fy), along))
+            slots.append((where, slot_pos, slot_rot, along))
         return slots, notes
 
     def _slot_is_legal(self, x: float, y: float, z: float, fx: float, fy: float) -> bool:
-        """Companion cars use the ego's lane shift, and are dropped when that is rejected."""
+        """Validate a companion car pose against measured road lanes."""
         from python.train.frame_quality import classify_wrong_way, spawn_pose_rejected
 
         quality, grid = self._ensure_quality()
@@ -1604,6 +1657,39 @@ class SpawnDeck:
         if spawn_pose_rejected(got):
             return False
         return str(got.get("verdict") or "") == "ok"
+
+    def _legal_traffic_pose(
+        self, x: float, y: float, z: float, fx: float, fy: float
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """Snap a traffic slot onto a legal right-hand lane aligned with ``(fx, fy)``."""
+        from python.train.frame_quality import classify_wrong_way
+
+        quality, grid = self._ensure_quality()
+        if not quality:
+            return None
+        found = self.nearest_road((x, y, z), (fx, fy), near_m=12.0)
+        if found is None:
+            return None
+        road, _dist = found
+        if not road.get("width"):
+            return None
+        hit = _project_station(road.get("pts") or [], x, y, road.get("widths"))
+        if hit is None:
+            return None
+        _d, center, tangent, local = hit
+        flip = bool(road.get("flip"))
+        station = _station_width(local, road)
+        road_id = str(road.get("id"))
+        for offset in _offset_candidates(road, station):
+            if not body_inside(offset, station):
+                continue
+            pos, rot, heading = _pose_shifted(center, tangent, flip, offset, 0.5)
+            if heading[0] * fx + heading[1] * fy <= 0.5:
+                continue
+            got = classify_wrong_way(pos[0], pos[1], math.atan2(heading[1], heading[0]), quality, grid, z=pos[2])
+            if _pose_accepted(got, road_id):
+                return pos, rot
+        return None
 
     # ------------------------------------------------------------ recheck
     def nearest_road(
@@ -1743,6 +1829,12 @@ def traffic_count(requested: int | None, map_name: str) -> int:
     return max(0, int(requested))
 
 
+def _traffic_spawn_rot(qx: float, qy: float, qz: float, qw: float) -> tuple[float, float, float, float]:
+    """Convert world-heading quat (atan2(dy, dx)) to BeamNG spawnNewVehicle quat (pi/2 - yaw)."""
+    yaw = math.atan2(2.0 * (float(qw) * float(qz) + float(qx) * float(qy)), 1.0 - 2.0 * (float(qy) * float(qy) + float(qz) * float(qz)))
+    return _yaw_quat(math.sin(yaw), math.cos(yaw))
+
+
 def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> list[str]:
     """GE Lua that replaces the companion cars ahead of and behind the ego.
 
@@ -1783,17 +1875,19 @@ def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> 
             dist = offsets[slot]
             poses.append(((x0 + dx * dist, y0 + dy * dist, z0), tuple(pick.rot)))
     for slot, ((x, y, z), (qx, qy, qz, qw)) in enumerate(poses):
+        sqx, sqy, sqz, sqw = _traffic_spawn_rot(qx, qy, qz, qw)
         name = f"gvd_traffic_{slot}"
         lines.append(
             "local veh = core_vehicles.spawnNewVehicle(\"etk800\", "
             f"{{pos=vec3({x:.2f},{y:.2f},{z:.2f}), "
-            f"rot=quat({qx:.5f},{qy:.5f},{qz:.5f},{qw:.5f}), "
+            f"rot=quat({sqx:.5f},{sqy:.5f},{sqz:.5f},{sqw:.5f}), "
             "autoEnterVehicle=false})"
         )
         lines.append("if veh then")
         lines.append(f"  pcall(function() veh:setField('name', 0, '{name}') end)")
-        lines.append("  veh:queueLuaCommand('ai.setMode(\"span\")')")
+        lines.append("  veh:queueLuaCommand('ai.setMode(\"traffic\")')")
         lines.append("  veh:queueLuaCommand('ai.driveInLane(\"on\")')")
+        lines.append("  veh:queueLuaCommand('ai.setAvoidCars(\"on\")')")
         lines.append("  veh:queueLuaCommand('ai.setSpeedMode(\"limit\")')")
         lines.append(f"  veh:queueLuaCommand('ai.setSpeed({speed:.1f})')")
         lines.append("end")

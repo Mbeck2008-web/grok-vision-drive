@@ -57,6 +57,12 @@ def check_options_and_status() -> None:
     rates = rates_table("main=4", "")
     assert rates["main"] == 4.0 and rates["rear"] == 1.0
     assert any("setTimeOfDay" in line for line in environment_commands("12", ""))
+    # BeamNG TimeOfDay.time: 0 is local noon, 0.25 18:00, 0.5 midnight, 0.75 06:00
+    # (documentation.beamng.com/modding/levels/level_classes/tod/). An hour maps
+    # to (h - 12) / 24 wrapped; a 0-1 value is already BeamNG's own time.
+    for hour, want in (("12", 0.0), ("18", 0.25), ("24", 0.5), ("6", 0.75), ("21", 0.375), ("3", 0.625)):
+        assert environment_commands(hour, "") == [f"core_environment.setTimeOfDay({{time={want:.4f}}})"], hour
+    assert environment_commands("0.5", "") == ["core_environment.setTimeOfDay({time=0.5000})"]
     assert any("rain" in line for line in environment_commands("", "rain"))
     assert environment_commands("", "") == []
     lines = format_status(
@@ -112,9 +118,23 @@ def check_stop_and_panel() -> None:
         assert ui.auto.options.traffic is True
 
 
+def check_default_maps_have_a_dump() -> None:
+    """AUTO rotation only uses maps with a road dump; utah stays selectable."""
+    from python.collect.auto_mode import DEFAULT_MAPS, MAPS
+    from python.collect.spawn_mix import spawn_roads_path
+
+    assert DEFAULT_MAPS, DEFAULT_MAPS
+    assert "utah" not in DEFAULT_MAPS and "jungle_rock_island" not in DEFAULT_MAPS, DEFAULT_MAPS
+    for name in DEFAULT_MAPS:
+        path = spawn_roads_path(name)
+        assert path is not None and path.is_file(), (name, path)
+    assert "utah" in MAPS and "jungle_rock_island" in MAPS, MAPS
+
+
 def main() -> None:
     check_options_and_status()
     check_stop_and_panel()
+    check_default_maps_have_a_dump()
     print("automatic mode ok")
 
 

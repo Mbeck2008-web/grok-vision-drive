@@ -2143,6 +2143,9 @@ def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any]
         )
     import torch
 
+    from python.train.scene_net import check_object_class_head
+
+    check_object_class_head(fields["weights"], "pause checkpoint")
     current = net.state_dict()
     mapped = {}
     for key, value in fields["weights"].items():

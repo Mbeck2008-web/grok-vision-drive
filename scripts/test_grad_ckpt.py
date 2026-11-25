@@ -170,7 +170,13 @@ def check_cli_and_run() -> None:
         assert "[GVD] grad-ckpt:" in log.getvalue()
         vals = fx._val_records(Path(tmp) / "_s")
         assert vals
-        for rec in vals[:2] + vals[-1:]:
+        # First two plus the last, unique by epoch. exact_epochs=2 makes the
+        # last row already sit in the prefix; a second export to ep{epoch}.onnx
+        # would trip the create-only guard.
+        recs = list(vals[:2])
+        if vals[-1]["epoch"] not in {row["epoch"] for row in recs}:
+            recs.append(vals[-1])
+        for rec in recs:
             out = Path(tmp) / f"ep{rec['epoch']}.onnx"
             export_epoch_onnx(ckpts / rec["ckpt"], out)
             got = evaluate(root, out, holdout_blocks=1, eval_chunk=16)

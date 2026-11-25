@@ -9,13 +9,22 @@ written.
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 STALL_SPEED_MPS = 1.0
 STALL_S = 10.0
 TIP_Z = 0.3
 DAMAGE_SPIKE = 400.0
 SETTLE_S = 2.5
+# Map-load / level-switch FPS settle gate: require at least LEVEL_SETTLE_MIN_HZ
+# for LEVEL_SETTLE_HOLD_S consecutive seconds before spawning or recording.
+LEVEL_SETTLE_MIN_HZ = 4.0
+LEVEL_SETTLE_HOLD_S = 2.0
+LEVEL_SETTLE_TIMEOUT_S = 60.0
+# Post-teleport / respawn settle wait before recording frames.
+TELEPORT_SETTLE_S = 5.0
+TELEPORT_RATE_HOLD_S = 1.0
+TELEPORT_SETTLE_MAX_S = 30.0
 # The live tip check. |dir_z| > 0.3 is only 17 deg of pitch, and a steep
 # west-coast mountain road tripped it. With the State sensor's up vector a
 # car is tipped when its roof points more than 60 deg from vertical, which a
@@ -57,18 +66,209 @@ class SettleWindow:
 
     The clock is the collector's driving clock, which only advances on
     written rows, so a car that takes 4 s to roll off still gets 3 s of
-    flagged rows.
+    flagged rows. Also tracks settle-window timestamps/sources for
+    ``state.jsonl`` and ``collect.json`` so training can mask them.
     """
 
     def __init__(self, span_s: float = SETTLE_FLAG_S) -> None:
         self.span_s = float(span_s)
         self.until: float | None = None
+        self.seq: int = 0
+        self.source: str = ""
+        self.segment: str = ""
+        self.wait_t0: float | None = None
+        self.wait_t1: float | None = None
+        self.wait_s: float = 0.0
+        self.settled_hz: float | None = None
+        self.t0: float | None = None
+        self.done_s0: float | None = None
+        self.windows: list[dict[str, Any]] = []
+        self._active_entry: dict[str, Any] | None = None
 
-    def start(self, clock_s: float) -> None:
-        self.until = float(clock_s) + self.span_s
+    def start(
+        self,
+        clock_s: float,
+        *,
+        source: str = "spawn",
+        segment: str = "",
+        wall_t: float | None = None,
+        wait_t0: float | None = None,
+        wait_t1: float | None = None,
+        settled_hz: float | None = None,
+    ) -> None:
+        if self._active_entry is not None and self._active_entry.get("i0") is None:
+            # An uncommitted pre-spawn entry (e.g. segment_changed followed immediately
+            # by _apply_spawn) is superseded by the real spawn's settle window.
+            self.windows.pop()
+        self.close()
+        c0 = float(clock_s)
+        self.until = c0 + self.span_s
+        self.seq += 1
+        self.source = str(source or "spawn")
+        self.segment = str(segment or "")
+        self.wait_t0 = None if wait_t0 is None else round(float(wait_t0), 6)
+        self.wait_t1 = None if wait_t1 is None else round(float(wait_t1), 6)
+        self.wait_s = (
+            max(0.0, float(wait_t1) - float(wait_t0))
+            if wait_t0 is not None and wait_t1 is not None
+            else 0.0
+        )
+        self.settled_hz = None if settled_hz is None else round(float(settled_hz), 3)
+        self.t0 = None if wall_t is None else round(float(wall_t), 6)
+        self.done_s0 = c0
+        self._active_entry = {
+            "seq": self.seq,
+            "source": self.source,
+            "segment": self.segment,
+            "wait_t0": self.wait_t0,
+            "wait_t1": self.wait_t1,
+            "wait_s": round(self.wait_s, 3),
+            "settled_hz": self.settled_hz,
+            "t0": self.t0,
+            "t1": self.t0,
+            "done_s0": round(c0, 3),
+            "done_s1": round(c0, 3),
+            "i0": None,
+            "i1": None,
+        }
+        self.windows.append(self._active_entry)
+
+    def close(self) -> None:
+        self._active_entry = None
+
+    def note_meta(
+        self,
+        *,
+        source: str = "spawn",
+        segment: str = "",
+        wall_t: float | None = None,
+        wait_t0: float | None = None,
+        wait_t1: float | None = None,
+        settled_hz: float | None = None,
+    ) -> None:
+        """Attach wait/source metadata to the active settle window."""
+        self.source = str(source or "spawn")
+        self.segment = str(segment or "")
+        self.wait_t0 = None if wait_t0 is None else round(float(wait_t0), 6)
+        self.wait_t1 = None if wait_t1 is None else round(float(wait_t1), 6)
+        self.wait_s = (
+            max(0.0, float(wait_t1) - float(wait_t0))
+            if wait_t0 is not None and wait_t1 is not None
+            else 0.0
+        )
+        self.settled_hz = None if settled_hz is None else round(float(settled_hz), 3)
+        if wall_t is not None:
+            self.t0 = round(float(wall_t), 6)
+        entry = self._active_entry
+        if entry is not None:
+            entry["source"] = self.source
+            entry["segment"] = self.segment
+            entry["wait_t0"] = self.wait_t0
+            entry["wait_t1"] = self.wait_t1
+            entry["wait_s"] = round(self.wait_s, 3)
+            entry["settled_hz"] = self.settled_hz
+            if self.t0 is not None and entry.get("t0") is None:
+                entry["t0"] = self.t0
+                entry["t1"] = self.t0
 
     def active(self, clock_s: float) -> bool:
         return self.until is not None and float(clock_s) < self.until
+
+    def stamp(
+        self,
+        row: dict[str, Any],
+        clock_s: float,
+        wall_t: float,
+        row_index: int | None,
+    ) -> bool:
+        """Annotate ``row`` when inside the active settle window."""
+        if not self.active(clock_s):
+            self.close()
+            return False
+        t_now = round(float(wall_t), 6)
+        if self.t0 is None:
+            self.t0 = t_now
+        entry = self._active_entry
+        if entry is not None:
+            if entry["t0"] is None:
+                entry["t0"] = t_now
+            entry["t1"] = t_now
+            entry["done_s1"] = round(float(clock_s), 3)
+            if row_index is not None:
+                if entry["i0"] is None:
+                    entry["i0"] = int(row_index)
+                entry["i1"] = int(row_index)
+        row["settle"] = True
+        row["settle_t0"] = self.t0
+        row["settle_source"] = self.source
+        row["settle_window"] = {
+            "seq": self.seq,
+            "source": self.source,
+            "wait_t0": self.wait_t0,
+            "wait_t1": self.wait_t1,
+            "wait_s": round(self.wait_s, 3),
+            "settled_hz": self.settled_hz,
+            "t0": self.t0,
+            "done_s0": round(float(self.done_s0 if self.done_s0 is not None else clock_s), 3),
+            "done_s1": round(float(clock_s), 3),
+        }
+        return True
+
+    def summary(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self.windows]
+
+
+def wait_for_stable_rate(
+    probe: Callable[[], bool],
+    *,
+    now: Callable[[], float],
+    sleep: Callable[[float], None],
+    step_sleep: Callable[[float], float] | None = None,
+    min_hz: float = LEVEL_SETTLE_MIN_HZ,
+    hold_s: float = LEVEL_SETTLE_HOLD_S,
+    min_wait_s: float = 0.0,
+    timeout_s: float = LEVEL_SETTLE_TIMEOUT_S,
+    cam_ready_timeout_s: float | None = None,
+    period_s: float = 0.1,
+) -> tuple[bool, float, float, float, int, bool]:
+    """Wait until ``probe()`` succeeds AND step/frame rate stays >= ``min_hz`` for ``hold_s``.
+
+    Returns ``(ok, elapsed_s, last_hz, t0, polls, ready_ever)``.
+    """
+    t0 = float(now())
+    steady_s = 0.0
+    last_hz = 0.0
+    polls = 0
+    ready_ever = False
+    target_hold = max(0.0, float(hold_s))
+    target_wait = max(0.0, float(min_wait_s))
+    limit = max(target_wait, float(timeout_s))
+    while True:
+        tick_t0 = float(now())
+        ok = bool(probe())
+        polls += 1
+        if ok:
+            ready_ever = True
+        elapsed = max(0.0, float(now()) - tick_t0)
+        if step_sleep is not None:
+            extra = max(0.0, float(step_sleep(elapsed) or 0.0))
+            if extra > 0.0:
+                sleep(extra)
+        elif elapsed < period_s:
+            sleep(period_s - elapsed)
+        tick_dt = max(1e-6, float(now()) - tick_t0)
+        last_hz = 1.0 / tick_dt
+        total_elapsed = max(0.0, float(now()) - t0)
+        if ok and last_hz >= float(min_hz):
+            steady_s += tick_dt
+        else:
+            steady_s = 0.0
+        if ok and total_elapsed >= target_wait and steady_s >= target_hold:
+            return True, total_elapsed, last_hz, t0, polls, ready_ever
+        if cam_ready_timeout_s is not None and not ready_ever and total_elapsed >= float(cam_ready_timeout_s):
+            return False, total_elapsed, last_hz, t0, polls, ready_ever
+        if total_elapsed >= limit:
+            return False, total_elapsed, last_hz, t0, polls, ready_ever
 
 
 class ImpactWatch:
@@ -96,10 +296,14 @@ class ImpactWatch:
         self.speed_before: float | None = None
         self.rows.clear()
 
-    def update(self, dt_s: float, speed_mps: float | None) -> float | None:
+    def update(self, dt_s: float, speed_mps: float | None, *, settling: bool = False) -> float | None:
         dt = max(0.0, float(dt_s or 0.0))
         self.clock += dt
         speed = None if speed_mps is None else float(speed_mps)
+        if settling:
+            # Post-teleport physics drop/bounce must not trigger false impacts during settle.
+            self.prev_speed = speed
+            return None
         hit: float | None = None
         if speed is not None and self.prev_speed is not None and IMPACT_DT_MIN_S <= dt <= IMPACT_DT_MAX_S:
             decel = (self.prev_speed - speed) / dt

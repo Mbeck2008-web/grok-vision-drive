@@ -90,7 +90,13 @@ def check_train_direct_api_order() -> None:
             fx._train(root, cams=("main", "pillarL"), ckpt_dir=ckpts, status_root=Path(tmp) / "_s")
         vals = fx._val_records(Path(tmp) / "_s")
         assert vals
-        for rec in vals[:3] + vals[-1:]:
+        # First few plus the last, unique by epoch. exact_epochs=2 (and a
+        # short holdout stop) makes the last row already sit in the prefix;
+        # exporting twice to ep{epoch}.onnx would trip the create-only guard.
+        recs = list(vals[:3])
+        if vals[-1]["epoch"] not in {row["epoch"] for row in recs}:
+            recs.append(vals[-1])
+        for rec in recs:
             path = ckpts / rec["ckpt"]
             assert load_epoch_ckpt(path)["meta"]["cams"] == ["pillarL", "main"]
             out = Path(tmp) / f"ep{rec['epoch']}.onnx"

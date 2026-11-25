@@ -89,7 +89,7 @@ Until curb labels exist, do not train with an empty `--heads`. Pass an explicit 
 
 ### 4. Cones
 
-**Blocked until palette proof.** A separate cone class is unproven: no annotation palette is on hand, so this repo cannot show that BeamNG names cones on their own. `OBJECT_CLASSES` is `vehicle, car, truck, bus, pedestrian, bike` (`python/train/scene_net.py:62`). Inserting `cone` there would shift indices and break old checkpoints.
+**Blocked until palette proof.** A separate cone class is unproven: no annotation palette is on hand, so this repo cannot show that BeamNG names cones on their own. `OBJECT_CLASSES` is `vehicle, car, truck, bus, bike` (`python/train/scene_net.py:67`). Inserting `cone` there would shift indices and break old checkpoints.
 
 If a later `sem_classes.json` contains a name a human marks as a cone, the label is connected components of that id, median depth, ego xy, written to `cones.jsonl` `{t, cones:[{x,y}]}`. Components with invalid depth are dropped, not placed at a default range. The head, when added, is a new training-only slot, not a new `OBJECT_CLASSES` entry, and not in default ONNX. LiDAR blobs are not a cone label.
 
@@ -133,6 +133,12 @@ Do not copy the ego lamp onto other boxes, and do not threshold red pixels. `OBJ
 4. Keep LiDAR and radar false.
 
 Offline labelers (`intent`, `stoplines`, `signs`, `obstacles`, `road_edge`) run after the collect, BeamNG closed.
+
+## Recorder v2 decisions
+
+- **No pedestrians (Michael's decision, 2026-11-23 23:19 CST).** There are no pedestrians in the game: BeamNG spawns none, so the live detector drops COCO person (id 0) on purpose (`coco_class_name` in `python/perception/detect.py` returns None for it) and `OBJECT_CLASSES` has no pedestrian slot. His words: "But there's no people in the game so it's not necessary anyways". This was not proven safe: with person dropped, the tracker, CIPV/AEB and the path predictor never see a person the camera does. `scripts/test_recorder_v2.py::check_person_dropped_by_decision` pins it; revisit before anything that can put a person in front of the car.
+- **Traffic and random spawn on every map (Michael's decision, 2026-11-24 15:14 CST).** This replaces the west-coast-only scope he approved at 14:28 CST the same day. His words: "Add traffic and random spawns on every map". Clip mode plans traffic and a seeded spawn on every map in the pool. The collector loads that map's road dump, places a legal on-road spawn (correct side of the road) and companion traffic, and stops with a visible error if the map has no dump or no legal pose. It never falls back to the level's fixed spawn or to zero traffic silently. merge, cut_in and heavy_traffic pin to west_coast_usa when it is in the pool (`clip_mode.py:57`, `:137-139`, `:173-176`), because the other maps lack highway or ramp pools.
+- **`pretrain_only` is advisory.** Clip QC writes `quality` and `reasons` into each clip's `clip_tags.json`. No loader or trainer reads that file yet, so a `pretrain_only` clip trains like any other clip unless it is left out by hand.
 
 ## Implementation PRs (smallest first)
 

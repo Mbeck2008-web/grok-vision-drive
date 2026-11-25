@@ -419,7 +419,7 @@ def check_smoke_rate_and_flags() -> None:
     opts = AutoOptions(minutes=120, maps=",".join(DEFAULT_MAPS), excursions=True, smoke_s=60, vary_env=True)
     argv = collect_argv(opts, "collect_scene_lanes.py", python="py")
     text = " ".join(argv)
-    assert "--maps" in argv and "jungle_rock_island" in text
+    assert "--maps" in argv and "east_coast_usa" in text and "utah" not in text
     assert "--segment-min" in argv and "--smoke-s" in argv
     assert "--no-excursions" not in argv and "--no-vary-env" not in argv
     opts.excursions = False

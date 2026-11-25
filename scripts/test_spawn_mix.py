@@ -13,6 +13,7 @@ from python.collect.spawn_mix import (  # noqa: E402
     SPEED,
     SpawnDeck,
     queue_companion_traffic,
+    spawn_roads_path,
     traffic_count,
     traffic_lua,
 )
@@ -80,9 +81,21 @@ def check_empty_slots_still_delete_traffic() -> None:
     assert queue_companion_traffic(None, picked, 2, []) == 0
     print("empty traffic slots still delete leftover cars")
 
+
+def check_spawn_roads_path_finds_fixture_or_none() -> None:
+    italy = spawn_roads_path("italy")
+    assert italy is not None and italy.name == "italy.json.gz" and italy.is_file(), italy
+    east = spawn_roads_path("east_coast_usa")
+    assert east is not None and east.name == "east_coast_usa.json.gz" and east.is_file(), east
+    assert spawn_roads_path("utah") is None
+    assert spawn_roads_path("no_such_map") is None
+    print("spawn_roads_path: bundled italy/east_coast, missing utah is None")
+
+
 def main() -> None:
     check_mix_and_traffic()
     check_empty_slots_still_delete_traffic()
+    check_spawn_roads_path_finds_fixture_or_none()
     print("spawn mix ok")
 
 

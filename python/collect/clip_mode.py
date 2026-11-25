@@ -58,6 +58,9 @@ DECK_MAP = "west_coast_usa"
 DECK_ONLY = ("merge", "cut_in", "heavy_traffic")
 # Maps with unpaved roads, from the map descriptions (UNVERIFIED per map: the
 # clip's own quality check reads the semantic planes for dirt).
+# spawn_mix only classifies city / highway / ramp — there is no unpaved spawn
+# kind — so a dirt_road plan picks one of these maps but a legal pose can still
+# be pavement (dirt share of the lower third 0.00, as on italy clip_002).
 DIRT_MAPS: tuple[str, ...] = ("utah", "jungle_rock_island", "italy", "east_coast_usa", "small_island")
 EGO_MODEL = "sbr"
 # Requested renderer, recorded in the tags and manifest (--gfx, default Vulkan).
@@ -142,6 +145,7 @@ def plan_clip(
             map_name = rng.choice(pool)
             notes.append(f"{case} wants {DECK_MAP} (spawn deck/companions); not in the map pool")
     elif case == "dirt_road":
+        # Map pool only. Do not set spawn_kind: the deck has no dirt/unpaved kind.
         dirt = [m for m in pool if m in DIRT_MAPS]
         map_name = rng.choice(dirt or list(pool))
         if not dirt:
@@ -497,17 +501,24 @@ def run_clips(
     extra: Iterable[str] = (),
     log: Callable[[str], None] = print,
     gfx: str = GFX,
+    after_clip: Callable[..., str | None] | None = None,
 ) -> Path:
-    """Record ``clips`` clips into a new session folder. ``runner(argv)`` runs the collector."""
+    """Record ``clips`` clips into a new session folder. ``runner(argv)`` runs the collector.
+
+    ``after_clip(clip, plan, code, qc)`` may return a ``stop_reason`` to halt
+    the batch; that reason is written to ``session.json`` and remaining clips
+    are not started.
+    """
     maps = tuple(maps)
     cases = tuple(edge_cases or EDGE_CASES)
     session = new_session_dir(root)
     results: list[dict[str, Any]] = []
+    stop_reason: str | None = None
     manifest = session / "session.json"
 
     def _save() -> None:
         tmp = manifest.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({
+        payload: dict[str, Any] = {
             "kind": "gvd_clip_session",
             "clips": int(clips),
             "seed": int(seed),
@@ -520,7 +531,10 @@ def run_clips(
             "ego_model": EGO_MODEL,
             "gfx": gfx,
             "results": results,
-        }, indent=2) + "\n", encoding="utf-8")
+        }
+        if stop_reason:
+            payload["stop_reason"] = stop_reason
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         tmp.replace(manifest)
 
     _save()
@@ -542,4 +556,11 @@ def run_clips(
         results.append({"dir": clip.name, "edge_case": plan.edge_case, "map": plan.map,
                         "quality": qc["quality"], "exit": code})
         _save()
+        if after_clip is not None:
+            halt = after_clip(clip, plan, code, qc)
+            if halt:
+                stop_reason = str(halt)
+                log(f"session stop reason={stop_reason}")
+                _save()
+                break
     return session

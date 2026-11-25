@@ -58,6 +58,8 @@ def _make_row(
     spawn_type: str = "road",
     damage: float = 0.0,
     cam_path: str | None = None,
+    dt_s: float | None = None,
+    dir_z: float = 0.0,
 ) -> dict:
     vx = -math.sin(yaw) * speed
     vy = math.cos(yaw) * speed
@@ -74,10 +76,11 @@ def _make_row(
         "ego": {
             "pos": [round(x, 4), round(y, 4), 0.0],
             "vel": [round(vx, 4), round(vy, 4), 0.0],
-            "dir": [round(-math.sin(yaw), 6), round(math.cos(yaw), 6), 0.0],
+            "dir": [round(-math.sin(yaw), 6), round(math.cos(yaw), 6), round(dir_z, 6)],
             "quat": _yaw_quat(yaw),
             "speed_mps": round(speed, 4),
             "yaw_rate": round(yaw_rate, 4),
+            "sim_t": round(t, 4),
             "damage": damage,
         },
         "veh": {
@@ -102,8 +105,10 @@ def _make_row(
             "lane_gt": [0.0] * 13 + [1.0],
         },
     }
+    if dt_s is not None:
+        row["dt_s"] = dt_s
     if cam_path is not None:
-        row["cams"] = {"main": cam_path}
+        row["cams"] = {"main": {"file": cam_path, "t": round(t, 4)}}
     return row
 
 
@@ -477,9 +482,13 @@ def test_training_integration_ctl_and_scene_net() -> None:
         targets, _counts = build_ctl(rows, rows, plan=None)
         # Masked row 32 has zero ctl_valid
         assert float(targets[32][1].sum()) == 0.0
-        # Row 25 (t=105.0) is clean now, but horizon +1.0s (t=106.0 -> i=30 y=60, masked!) must be zeroed while t=0 is valid
+        # Clean non-crossing row i=2: all future horizons stay valid (kills M7 if dirty ignores clip_qc)
+        assert float(targets[2][1][:, 1:].min()) == 1.0
+        # Row 25 (t=105.0) is clean now: h0 valid, h1 (t=106.0, i=30, inside signal) masked,
+        # h3 (t=108.0, past the signal) still zeroed because the trajectory crossed the masked window.
         assert float(targets[25][1][:, 0].min()) == 1.0
-        assert float(targets[25][1][:, 2].max()) == 0.0  # +1.0s horizon masked
+        assert float(targets[25][1][:, 1].max()) == 0.0
+        assert float(targets[25][1][:, 3].max()) == 0.0
 
         # scene_net driving targets masked, perception heads kept
         masked_labels = labels_for_row(rows[32])
@@ -502,6 +511,154 @@ def test_training_integration_ctl_and_scene_net() -> None:
         assert float(reg.detach()) == 0.0
 
 
+
+
+
+def test_liveness_tipped_stationary_damage_and_settle_i0_none() -> None:
+    from python.train.clip_qc import analyze_clip, analyze_rows
+
+    # (a) tipped car (dir_z > 0.3) with non-zero speed, non-0-based i, and a damage spike
+    tipped = []
+    for k, i in enumerate(range(10, 20)):
+        tipped.append(
+            _make_row(
+                i,
+                100.0 + k * 0.2,
+                0.0,
+                k * 2.0,
+                speed=5.0,
+                dir_z=0.9,
+                damage=(500.0 if i == 15 else 0.0),
+                dt_s=0.2,
+            )
+        )
+    tip_res = analyze_rows(tipped, warmup_s=0.0, settle_s=0.0)
+    by_i = {r["i"]: r for r in tip_res["rows"]}
+    assert "stuck" in by_i[10]["reasons"]
+    assert "stuck" in by_i[19]["reasons"]
+    assert "impact" in by_i[15]["reasons"]
+    assert tip_res["reason_counts"]["stuck"] >= 9
+    assert tip_res["reason_counts"]["impact"] >= 1
+
+    # (b) >10 s stationary wait at a red light with dt_s is near_signal, NOT stuck
+    wait = [
+        _make_row(i, 100.0 + i * 0.2, 0.0, 60.0, speed=0.2, throttle=0.0, brake=0.2, dt_s=0.2)
+        for i in range(65)
+    ]
+    wait_res = analyze_rows(
+        wait,
+        world_signals=[("traffic_light", 0.0, 60.0, 0.0)],
+        has_signal_files=True,
+        warmup_s=0.0,
+        settle_s=0.0,
+    )
+    assert wait_res["reason_counts"]["near_signal"] == 65
+    assert wait_res["reason_counts"]["stuck"] == 0
+    assert "stuck" not in wait_res["rows"][40]["reasons"]
+    assert "near_signal" in wait_res["rows"][40]["reasons"]
+
+    # (c) the same >10 s stationary wait on an open road IS stuck
+    open_road = [
+        _make_row(i, 100.0 + i * 0.2, 0.0, i * 0.01, speed=0.2, throttle=0.0, brake=0.0, dt_s=0.2)
+        for i in range(65)
+    ]
+    open_res = analyze_rows(open_road, warmup_s=0.0, settle_s=0.0)
+    assert open_res["reason_counts"]["stuck"] == 65
+    assert "stuck" in open_res["rows"][40]["reasons"]
+
+    # (d) settle_windows with i0=None and t0 < first_t anchors to first_t (25 rows / 5.0 s)
+    with tempfile.TemporaryDirectory() as td:
+        clip = Path(td) / "clip_settle_none"
+        clip.mkdir()
+        rows = [_make_row(i, 100.0 + i * 0.2, 0.0, i * 2.0, dt_s=0.2) for i in range(40)]
+        _write_jsonl(clip / "state.jsonl", rows)
+        (clip / "collect.json").write_text(
+            json.dumps({"settle_windows": [{"seq": 0, "source": "spawn", "t0": 98.0, "i0": None, "wait_s": 5.0}]}),
+            encoding="utf-8",
+        )
+        res = analyze_clip(clip, check_images=False, warmup_s=0.0, settle_s=5.0)
+        settle_rows = [r for r in res["rows"] if "settle_5s" in r["reasons"]]
+        assert len(settle_rows) == 25, len(settle_rows)
+        by_i = {r["i"]: r for r in res["rows"]}
+        assert "settle_5s" in by_i[0]["reasons"]
+        assert "settle_5s" in by_i[24]["reasons"]  # t=104.8
+        assert "settle_5s" not in by_i[25]["reasons"]  # t=105.0
+
+
+def test_train_directory_mask_clip_qc() -> None:
+    from python.train.scene_net import torch_ready
+
+    if not torch_ready():
+        gvd_test_env.skip_check("torch unavailable for train_directory mask_clip_qc")
+        return
+    import contextlib
+    import io
+
+    from python.train.train_scene import train_directory
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "scene"
+        cam = root / "raw" / "main"
+        cam.mkdir(parents=True)
+        rows = []
+        # 30 s @ 5 Hz so map_warmup covers [0, 20) and later rows stay eligible.
+        # A stoplight at y=130 masks a mid-clip band after warmup.
+        for i in range(150):
+            t = 100.0 + i * 0.2
+            p = f"raw/main/{i:06d}.png"
+            _write_png(root / p)
+            row = _make_row(i, t, 0.0, i * 2.0, speed=10.0, steer=0.1, throttle=0.3, brake=0.0, cam_path=p, dt_s=0.2)
+            row["segment"] = "west_coast_usa#0"
+            row["tech"]["lane_gt"] = [0.25, -1.5, 2.0] * 4 + [0.0, 1.0]
+            row["tech"]["lane_gt_valid"] = [1.0] * 14
+            rows.append(row)
+        _write_jsonl(root / "state.jsonl", rows)
+        _write_jsonl(
+            root / "signals.jsonl",
+            [
+                {
+                    "t": r["t"],
+                    "signals": {
+                        "n1": {
+                            "n2": [
+                                {
+                                    "action": 2.0,
+                                    "instance": "trafficLight 1",
+                                    "pos": {"x": 0.0, "y": 130.0, "z": 0.0},
+                                    "state": "redTrafficLight",
+                                }
+                            ]
+                        }
+                    },
+                }
+                for r in rows
+            ],
+        )
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            stats = train_directory(
+                root,
+                epochs=1,
+                lr=1e-3,
+                capability=None,
+                export_path=None,
+                free_vram_bytes=0,
+                free_ram_bytes=8_000_000_000,
+                resume=False,
+                dry_run=True,
+                open_panel=False,
+                autostart=True,
+                cams=("main",),
+                heads=("lane_gt", "ctl"),
+                mask_clip_qc=True,
+                augment=False,
+                workers=0,
+                status_root=root / "_status",
+            )
+        text = log.getvalue()
+        assert "[GVD] clip-qc:" in text, text[-3000:]
+        assert "masked=" in text
+        assert int(stats.get("dry_run") or 0) or stats.get("dry_run") is True
 
 
 def test_cli_and_camera_only_runtime() -> None:
@@ -543,6 +700,8 @@ def main() -> int:
         test_clip_classification_train_pretrain_reject,
         test_highway_lane_position_spread_report,
         test_training_integration_ctl_and_scene_net,
+        test_liveness_tipped_stationary_damage_and_settle_i0_none,
+        test_train_directory_mask_clip_qc,
         test_cli_and_camera_only_runtime,
     ]
     for fn in tests:

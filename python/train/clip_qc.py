@@ -450,16 +450,27 @@ def analyze_rows(
             if not isinstance(sw, Mapping):
                 continue
             t0 = _num(sw.get("t0"))
-            i0 = sw.get("i0")
-            if t0 is None and isinstance(i0, int) and 0 <= i0 < n:
-                t0 = ts[i0]
+            i0_raw = sw.get("i0")
+            i0_idx = None
+            if isinstance(i0_raw, int) and not isinstance(i0_raw, bool):
+                for j, row in enumerate(rows):
+                    rid = row.get("i")
+                    if isinstance(rid, int) and not isinstance(rid, bool) and rid == i0_raw:
+                        i0_idx = j
+                        break
+            if t0 is None and i0_idx is not None:
+                t0 = ts[i0_idx]
             if t0 is None:
                 continue
             # Anchor at first recorded frame inside/starting the window so initial spawn
             # wait that happened before first state row still masks a full settle_s of frames.
+            # When i0 is None (SettleWindow.start before frame 0) and t0 is earlier than
+            # the first recorded row, anchor to first_t so a full settle_s of frames is masked.
             anchor = t0
-            if isinstance(i0, int) and 0 <= i0 < n and ts[i0] is not None and ts[i0] > t0:
-                anchor = ts[i0]
+            if i0_idx is not None and ts[i0_idx] is not None and ts[i0_idx] > t0:
+                anchor = ts[i0_idx]
+            elif i0_raw is None and first_t is not None and t0 < first_t:
+                anchor = first_t
             settle_intervals.append((min(t0, anchor), anchor + float(settle_s)))
     # Also detect settle_t0 / settle=True runs / segment or sim_t resets directly on rows
     in_settle_run = False
@@ -553,17 +564,19 @@ def analyze_rows(
         dmg_spike = prev_dmg is not None and dmg is not None and (dmg - prev_dmg) > 0.05
         if dmg is not None:
             prev_dmg = dmg
-        if ev_flags[idx] or bool(row.get("impact")) or dmg_spike or (
-            idx in bad_liveness and "damage_spike" in bad_liveness[idx]
-        ):
+        live = bad_liveness.get(rid_int) if rid_int is not None else None
+        if ev_flags[idx] or bool(row.get("impact")) or dmg_spike or live == "damage":
             # event_mask includes settle/stall too; only tag "impact" on real impact/damage
-            if bool(row.get("impact")) or dmg_spike or (
-                idx in bad_liveness and "damage_spike" in bad_liveness[idx]
-            ) or any(
-                abs((t or 0.0) - (_num(imp.get("t")) or -1e9)) <= 5.0
-                for imp in impacts
-                if isinstance(imp, Mapping)
-            ):
+            impact_near = False
+            if t is not None:
+                for imp in impacts:
+                    if not isinstance(imp, Mapping):
+                        continue
+                    t_imp = _num(imp.get("t"))
+                    if t_imp is not None and abs(t - t_imp) <= 5.0:
+                        impact_near = True
+                        break
+            if bool(row.get("impact")) or dmg_spike or live == "damage" or impact_near:
                 reasons_per_row[idx].add("impact")
 
         # Near stoplights / stop signs / yield signs
@@ -646,8 +659,13 @@ def analyze_rows(
     # 5. Stuck (stall flag, bad_row_reasons, or throttle while stationary outside settle/signal)
     stuck_throttle_run: list[int] = []
     for idx, row in enumerate(rows):
-        if bool(row.get("stall")) or (
-            idx in bad_liveness and any(r in ("stationary", "tipped") for r in bad_liveness[idx])
+        rid = row.get("i")
+        rid_int = rid if isinstance(rid, int) and not isinstance(rid, bool) else None
+        live = bad_liveness.get(rid_int) if rid_int is not None else None
+        if bool(row.get("stall")) or live == "tipped" or (
+            live == "stationary"
+            and "near_signal" not in reasons_per_row[idx]
+            and "settle_5s" not in reasons_per_row[idx]
         ):
             reasons_per_row[idx].add("stuck")
             stuck_throttle_run.clear()

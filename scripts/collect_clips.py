@@ -25,6 +25,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.collect.clip_mode import EDGE_CASES, GFX, MAX_CLIP_S, MIN_CLIP_S, run_clips  # noqa: E402
+from python.collect.tech_watchdog import (  # noqa: E402
+    DEFAULT_TECH_FAIL_RELAUNCH,
+    DEFAULT_TECH_RELAUNCH_CAP,
+    TechWatchdog,
+    resolve_tech_exe,
+)
 
 COLLECTOR = ROOT / "scripts" / "collect_scene_lanes.py"
 DEFAULT_MAPS = "west_coast_usa,italy,east_coast_usa"
@@ -54,6 +60,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              f"launches BeamNG.tech with -gfx {GFX}; an already-running BeamNG keeps its own renderer.",
     )
     parser.add_argument("--python", default=sys.executable, help="Python that runs the collector.")
+    parser.add_argument(
+        "--tech-fail-relaunch",
+        type=int,
+        default=DEFAULT_TECH_FAIL_RELAUNCH,
+        metavar="N",
+        help=(
+            "After N consecutive session_open_failed or level_load_failed clips, "
+            "stop attaching, kill hung Tech, relaunch, and wait for Hello "
+            f"(default {DEFAULT_TECH_FAIL_RELAUNCH}; 0=off)."
+        ),
+    )
+    parser.add_argument(
+        "--tech-relaunch-cap",
+        type=int,
+        default=DEFAULT_TECH_RELAUNCH_CAP,
+        metavar="N",
+        help=(
+            f"Max Tech relaunches in this batch (default {DEFAULT_TECH_RELAUNCH_CAP}). "
+            "A further trigger halts the session with stop_reason=tech_relaunch_limit. "
+            "Other session.json stop_reason values: tech_relaunch_unavailable (no known exe), "
+            "tech_relaunch_hello_failed (relaunch ran, Hello did not succeed), "
+            "tech_relaunch_port_stuck (research port still LISTENING after the 20 s "
+            "kill wait; no second Tech is launched)."
+        ),
+    )
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -65,6 +96,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-traffic must be 0 or more")
     if not (MIN_CLIP_S <= args.min_s <= args.max_s <= MAX_CLIP_S):
         parser.error(f"clip length must satisfy {MIN_CLIP_S:.0f} <= --min-s <= --max-s <= {MAX_CLIP_S:.0f}")
+    if args.tech_fail_relaunch < 0:
+        parser.error("--tech-fail-relaunch must be 0 or more")
+    if args.tech_relaunch_cap < 1:
+        parser.error("--tech-relaunch-cap must be at least 1")
     cases = tuple(c.strip() for c in args.edge_cases.split(",") if c.strip())
     bad = [c for c in cases if c not in EDGE_CASES]
     if bad:
@@ -85,6 +120,16 @@ def main(argv: list[str] | None = None) -> int:
     def runner(clip_argv: list[str]) -> int:
         return subprocess.run(collector_command(clip_argv, python=args.python), cwd=str(ROOT)).returncode
 
+    watchdog = TechWatchdog(
+        fail_relaunch=args.tech_fail_relaunch,
+        relaunch_cap=args.tech_relaunch_cap,
+        exe=resolve_tech_exe(),
+    )
+
+    def after_clip(clip: Path, plan, code: int, qc) -> str | None:
+        del plan, qc
+        return watchdog.after_clip(clip, exit_code=code)
+
     session = run_clips(
         args.out,
         clips=args.clips,
@@ -98,8 +143,12 @@ def main(argv: list[str] | None = None) -> int:
         chase=args.chase_cam,
         extra=args.extra,
         gfx=args.gfx,
+        after_clip=after_clip,
     )
     print(f"session {session}")
+    if watchdog.halt_reason:
+        print(f"session stop reason={watchdog.halt_reason}")
+        return 2
     return 0
 
 

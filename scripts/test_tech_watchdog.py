@@ -52,6 +52,38 @@ def check_cli_defaults() -> None:
         except SystemExit:
             continue
         raise AssertionError(f"accepted {bad}")
+    import python.collect.tech_watchdog as tw
+    doc = " ".join((tw.__doc__ or "").split())
+    assert "tech_relaunch_port_stuck" in doc
+    assert "20 s" in doc
+    assert "second Tech is not launched" in doc
+    for reason in (
+        "tech_relaunch_limit",
+        "tech_relaunch_unavailable",
+        "tech_relaunch_hello_failed",
+        "tech_relaunch_port_stuck",
+    ):
+        assert reason in doc, reason
+    from io import StringIO
+    from contextlib import redirect_stdout
+    buf = StringIO()
+    try:
+        with redirect_stdout(buf):
+            cli.parse_args(["--help"])
+    except SystemExit:
+        pass
+    help_text = " ".join(buf.getvalue().split())
+    assert "tech_relaunch_port_stuck" in help_text, help_text
+    assert "20 s" in help_text
+    assert "LISTENING" in help_text
+    assert "no second Tech is launched" in help_text
+    for reason in (
+        "tech_relaunch_limit",
+        "tech_relaunch_unavailable",
+        "tech_relaunch_hello_failed",
+        "tech_relaunch_port_stuck",
+    ):
+        assert reason in help_text, reason
     print("collect_clips CLI: --tech-fail-relaunch default 2, 0=off; cap default 3")
 
 
@@ -571,6 +603,9 @@ def check_tech_pids_port_owner_and_exe() -> None:
         "\n"
         "  Proto  Local Address          Foreign Address        State           PID\n"
         "  TCP    0.0.0.0:25252          0.0.0.0:0              LISTENING       44888\n"
+        "  TCP    [::]:25252             [::]:0                 LISTENING       55112\n"
+        "  TCP    0.0.0.0:252520         0.0.0.0:0              LISTENING       77777\n"
+        "  TCP    127.0.0.1:50000        10.0.0.8:25252         ESTABLISHED     88888\n"
         "  TCP    127.0.0.1:80           0.0.0.0:0              LISTENING       4\n"
     )
     with collect_root() as root:
@@ -593,11 +628,14 @@ def check_tech_pids_port_owner_and_exe() -> None:
         with patch("python.collect.tech_watchdog.sys.platform", "win32"), patch(
             "python.collect.tech_watchdog.subprocess.run", side_effect=run
         ):
-            assert _tech_pids(exe, port=25252) == [44888]
+            assert _tech_pids(exe, port=25252) == [44888, 55112], _tech_pids(exe, port=25252)
             killed = kill_tech_process_tree(log=lambda s: None, exe=exe, port=25252)
-            assert killed == [44888]
-            assert any(c[:2] == ["taskkill", "/F"] and "44888" in c for c in commands), commands
-    print("_tech_pids: prefers the research-port owner over unscoped tasklist")
+            assert killed == [44888, 55112], killed
+            kill_cmds = [c for c in commands if c and c[0] == "taskkill"]
+            killed_pids = [c[c.index("/PID") + 1] for c in kill_cmds if "/PID" in c]
+            assert killed_pids == ["44888", "55112"], killed_pids
+            assert "77777" not in killed_pids and "88888" not in killed_pids and "4" not in killed_pids
+    print("_tech_pids: only exact local LISTENING PIDs (IPv4 and IPv6); 252520 and ESTABLISHED remote ignored")
 
 
 def check_tech_pids_install_root_exe() -> None:
@@ -773,6 +811,81 @@ def check_launch_tech_popen_argv_devnull() -> None:
 
 
 
+def check_port_stuck_halt_records_stop_reason_and_main_exits_2() -> None:
+    from python.collect.clip_mode import run_clips
+    from python.collect.tech_watchdog import TechWatchdog
+    from scripts.gvd_test_env import collect_root
+    from scripts.test_clip_mode import MAPS, _fake_recording
+
+    with collect_root() as root:
+        exe = root / "BeamNG.tech.exe"
+        exe.write_text("x", encoding="utf-8")
+        # No injected relaunch: after_clip must take _default_relaunch's _fail_reason.
+        dog = TechWatchdog(fail_relaunch=2, relaunch_cap=3, exe=exe)
+
+        def runner(argv: list[str]) -> int:
+            out = Path(argv[argv.index("--out") + 1])
+            _fake_recording(out, rows=8, speed=10.0)
+            _write_stop(out, "session_open_failed")
+            return 2
+
+        with patch(
+            "python.collect.tech_watchdog.relaunch_tech",
+            return_value="tech_relaunch_port_stuck",
+        ) as mocked:
+            session = run_clips(
+                root,
+                clips=8,
+                seed=5,
+                maps=MAPS,
+                max_traffic=0,
+                runner=runner,
+                min_s=4.0,
+                max_s=5.0,
+                after_clip=lambda clip, plan, code, qc: dog.after_clip(clip),
+            )
+            assert mocked.called
+
+        halt = dog.halt_reason
+        assert halt == "tech_relaunch_port_stuck", halt
+        assert dog.relaunches == 1
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest.get("stop_reason") == "tech_relaunch_port_stuck", manifest
+        # 2 consecutive Tech fails -> one relaunch that reports port stuck; 2 clips, not 8.
+        assert len(manifest["results"]) == 2, manifest["results"]
+        dirs = sorted(p for p in session.iterdir() if p.is_dir())
+        assert len(dirs) == 2
+
+        cli = _cli()
+        orig_run = cli.run_clips
+        orig_resolve = cli.resolve_tech_exe
+        try:
+            def fake_run(out, **kwargs):
+                after = kwargs["after_clip"]
+                sess = out / "clips_port_stuck_main"
+                sess.mkdir()
+                stops = []
+                for name in ("a", "b"):
+                    clip = sess / name
+                    _write_stop(clip, "session_open_failed")
+                    stops.append(after(clip, None, 2, None))
+                assert stops == [None, "tech_relaunch_port_stuck"], stops
+                return sess
+
+            cli.run_clips = fake_run
+            cli.resolve_tech_exe = lambda: exe
+            with patch(
+                "python.collect.tech_watchdog.relaunch_tech",
+                return_value="tech_relaunch_port_stuck",
+            ):
+                assert cli.main(["--out", str(root), "--clips", "8"]) == 2
+        finally:
+            cli.run_clips = orig_run
+            cli.resolve_tech_exe = orig_resolve
+    print("run_clips / main: tech_relaunch_port_stuck is the session stop_reason, no further clips, exit 2")
+
+
+
 def main() -> None:
     check_cli_defaults()
     check_clip_tech_fail_reason()
@@ -800,6 +913,7 @@ def main() -> None:
     check_kill_tech_drops_non_win32_os_kill()
     check_launch_tech_popen_argv_devnull()
     check_run_clips_halt_records_stop_reason()
+    check_port_stuck_halt_records_stop_reason_and_main_exits_2()
     check_dirt_road_has_no_unpaved_spawn_kind()
     print("test_tech_watchdog ok")
 

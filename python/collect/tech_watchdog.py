@@ -6,6 +6,11 @@ A listening research port is not a liveness check: a hung Tech can keep
 kill the process tree, wait for the research port to close, relaunch the
 install-root exe with ``-tcom -console -gfx vk``, and continue only after
 a real Hello. Hello exceptions are retried until the wait deadline.
+
+If the research port is still LISTENING after the 20 s kill wait, the
+session halts with ``stop_reason=tech_relaunch_port_stuck`` and a second
+Tech is not launched. Other halt reasons: ``tech_relaunch_limit``,
+``tech_relaunch_unavailable``, and ``tech_relaunch_hello_failed``.
 """
 from __future__ import annotations
 

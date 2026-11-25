@@ -76,8 +76,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_TECH_RELAUNCH_CAP,
         metavar="N",
-        help=f"Max Tech relaunches in this batch (default {DEFAULT_TECH_RELAUNCH_CAP}). "
-             "A further trigger halts the session with stop_reason=tech_relaunch_limit.",
+        help=(
+            f"Max Tech relaunches in this batch (default {DEFAULT_TECH_RELAUNCH_CAP}). "
+            "A further trigger halts the session with stop_reason=tech_relaunch_limit. "
+            "Other session.json stop_reason values: tech_relaunch_unavailable (no known exe), "
+            "tech_relaunch_hello_failed (relaunch ran, Hello did not succeed), "
+            "tech_relaunch_port_stuck (research port still LISTENING after the 20 s "
+            "kill wait; no second Tech is launched)."
+        ),
     )
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":

@@ -520,7 +520,8 @@ def extend_occluder_front(
         take_l = can & (occ_l > 0)
         take_r = can & (occ_r > 0) & (~take_l)
         z = torch.where(take_l, z_l, torch.where(take_r, z_r, z))
-        occ = torch.maximum(occ, torch.maximum(take_l, take_r).to(occ.dtype))
+        # Cast before Max: opset 17 rejects Max on bool (take_l/take_r are masks).
+        occ = torch.maximum(occ, (take_l | take_r).to(occ.dtype))
     return occ, z
 
 

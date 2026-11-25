@@ -497,63 +497,59 @@ def ray_crossed_raised(idx: Any, ok: Any, raised: Any) -> Any:
 
 
 def column_top_samples(
-    pts: Any,
-    high: Any,
+    top_vals: Any,
+    z: Any,
     ref_at: Any,
     ok: Any,
     surf: Any,
+    reached: Any,
     d_surf: Any,
+    pts: Any,
     passed: Any,
     weight: Any,
     depths: Any,
     k: float = COL_TOP_K,
     window_m: float = COL_TOP_WINDOW_M,
 ) -> Any:
-    """Per-sample values (B x N x D x h x w x 4) that ``column_top_bound`` needs, to be splatted.
+    """Per-sample values (B x N x D x h x w x 3) to splat: ``top_vals`` (the occluder-top terms) and the
+    two that ``column_top_bound`` needs.
 
-    A 2.5D occluder is a column: a ray sample the ray passed through (``passed`` * ``weight`` > 0, at a bin
-    strictly before its surface bin) at height zp over a cell proves the column there tops out below zp.
-    Samples less than 1.5 cells (horizontally) from where their ray lands (``d_surf``, B x N x h x w, its
-    surface depth) are left out: in front of a thin wall's face, inside its cell, the ray is still below
-    the top. Heights are relative to ``ref_at`` (the cell's occluder mean, gathered per sample) and only
-    those within ``window_m`` of it count. Channels: pass soft-min terms exp(-k rel), pass count, hit
-    soft-max terms exp(k rel) of the occluder hits ``high``, and hits outside the window.
+    A 2.5D occluder is a column: a ray sample the ray passed through (``passed`` * ``weight`` > 0, ``reached``
+    and strictly before its surface bin ``surf``) at height zp over a cell proves the column there tops out
+    below zp. Samples less than 1.5 cells (horizontally) from where their ray lands (``d_surf``, its surface
+    depth) are left out: in front of a thin wall's face, inside its cell, the ray is still below the top.
+    Heights ``z`` are relative to ``ref_at`` (the cell's occluder mean, gathered per sample) and only those
+    within ``window_m`` of it count. Channels 1-2: soft-min terms exp(-k rel) and the pass count.
     """
-    dtype = ref_at.dtype
-    zero = torch.zeros((), dtype=dtype, device=ref_at.device)
-    rel = pts[..., 2].to(dtype) - ref_at
-    inwin = (rel >= -window_m) & (rel <= window_m)
+    dtype = z.dtype
+    zero = torch.zeros((), dtype=dtype, device=z.device)
+    rel = z - ref_at
     # horizontal distance of every sample from where its ray lands: (landing depth - sample depth) times
     # the ray's horizontal run per metre of depth (ego compensation shifts a ray's points alike)
     dv = depths.to(dtype).view(1, 1, -1, 1, 1)
     run = torch.linalg.vector_norm(pts[:, :, 1, ..., :2] - pts[:, :, 0, ..., :2], dim=-1).unsqueeze(2) / (dv[:, :, 1] - dv[:, :, 0])
     away = (d_surf.unsqueeze(2) - dv).mul_(run) > 1.5 * BEV_CELL_M
-    mask = (surf.cumsum(dim=2) <= 0) & (away | (surf.sum(dim=2, keepdim=True) <= 0)) & inwin & ok
+    mask = (reached > 0) & (surf <= 0) & (away | (surf.sum(dim=2, keepdim=True) <= 0))
+    mask = mask & (rel >= -window_m) & (rel <= window_m) & ok
     use = torch.where(mask, passed, zero).mul_(weight)
-    hi_w = torch.where(inwin, high, zero)
-    out_win = torch.where(inwin, zero, high)
-    rel = rel.clamp_(-window_m, window_m).mul_(k)
-    e_pass = rel.neg().exp_().mul_(use)
-    e_hit = rel.exp_().mul_(hi_w)
-    return torch.stack([e_pass, use, e_hit, out_win], dim=-1)
+    e_pass = rel.clamp_(-window_m, window_m).mul_(-k).exp_().mul_(use)
+    return torch.stack([top_vals, e_pass, use], dim=-1)
 
 
 def column_top_bound(z_occ: Any, has_occ: Any, ref: Any, sums: Any, k: float = COL_TOP_K) -> Any:
     """Tighten a cell's occluder top (``z_occ``, B x 1 x N x N) with the rays that went over it.
 
-    ``sums`` (B x 4 x N x N) is ``column_top_samples`` splatted; ``ref`` the cell's occluder mean. The bound
-    is the soft minimum of the passing heights lifted by its own worst-case error (log n / k), so it is
-    never under the lowest pass. A cell keeps ``z_occ`` when no ray passed over it, when a hit lies outside
-    the window, or when the bound falls below its highest hit (soft max, >= the highest hit: an overhang
-    such as a sign panel with open road under it). The result is in [highest hit, z_occ].
+    ``sums`` (B x 2 x N x N) is channels 1-2 of ``column_top_samples`` splatted; ``ref`` (B x 1 x N x N) the
+    cell's occluder mean, z_mean (the mean of its hits' one-pitch upper bounds, never below the mean hit
+    height, which was 858b7ab's whole z_occ). The bound is the soft minimum of the passing heights lifted by
+    its own worst-case error (log n / k), so it is never under the lowest pass. The result is
+    min(z_occ, bound) where a ray passed over the cell, floored at ``ref``: in [ref, z_occ].
     """
     has_p = sums[:, 1:2] > 0
-    has_h = sums[:, 2:3] > 0
     one = torch.ones_like(sums[:, 1:2])
-    hit_max = ref + torch.log(torch.where(has_h, sums[:, 2:3], one)) / k
     bound = ref + (torch.log(torch.where(has_p, sums[:, 1:2], one)) - torch.log(torch.where(has_p, sums[:, 0:1], one))) / k
-    tight = has_p & has_h & (has_occ > 0) & (sums[:, 3:4] <= 0) & (bound >= hit_max)
-    return torch.where(tight, torch.minimum(z_occ, bound), z_occ)
+    tight = has_p & (has_occ > 0)
+    return torch.where(tight, torch.minimum(z_occ, bound).clamp_(min=ref), z_occ)
 
 
 def sightline_blocked(
@@ -589,17 +585,19 @@ def sightline_blocked(
     delta = torch.stack([(grid_x - cam_x) / 32.0, -(grid_y - cam_y) / 32.0], dim=-1).unsqueeze(2)
     grid = torch.addcmul(start, t.unsqueeze(-1), delta).reshape(b * ncam, n_steps, BEV_N * BEV_N, 2)
     sz = torch.addcmul((cam_z + clearance).unsqueeze(2), t, (dest_z - cam_z).unsqueeze(2))
-    occ = z_occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
-    has = has_occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
+    # One sampled map: occluder height above a floor below every sight line (cells with no occluder,
+    # and grid_sample's zero padding outside the map, read 0 = never above the line).
+    floor = BEV_Z_MIN_M - 1.0
+    occ = torch.where(has_occ > 0, z_occ - floor, torch.zeros_like(z_occ))
+    occ = occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
     z_s = F.grid_sample(occ, grid, mode="nearest", padding_mode="zeros", align_corners=False)
-    h_s = F.grid_sample(has, grid, mode="nearest", padding_mode="zeros", align_corners=False)
     margin = float(SIGHTLINE_MARGIN_M)
     dx_d, dy_d = grid_x - cam_x, grid_y - cam_y
-    r_d = torch.sqrt(dx_d * dx_d + dy_d * dy_d).unsqueeze(2)
+    r_d = torch.sqrt(dx_d * dx_d + dy_d * dy_d).unsqueeze(2).clamp(min=1e-6)
     # a sample at fraction t lies t * r_d from the camera (horizontally): "more than margin in front
-    # of the cell" needs no per-sample distance
-    in_front = t * r_d < (r_d - margin)
-    hit = (h_s > 0) & (z_s > sz.reshape(b * ncam, 1, n_steps, BEV_N * BEV_N)) & in_front.reshape(
+    # of the cell" is t < 1 - margin / r_d, with no per-sample distance
+    in_front = t < (1.0 - margin / r_d)
+    hit = (z_s > (sz - floor).reshape(b * ncam, 1, n_steps, BEV_N * BEV_N)) & in_front.reshape(
         b * ncam, 1, n_steps, BEV_N * BEV_N
     )
     return hit.any(dim=2).view(b, ncam, BEV_N, BEV_N).to(dtype)
@@ -926,18 +924,21 @@ class BevLssHead(nn.Module):
         # Occluder top, not the mean of its face hits: log-sum-exp relative to the cell mean, never
         # below the highest hit and at most log(n) / OCC_TOP_K above it.
         mean_at = z_mean.reshape(b, BEV_N * BEV_N).gather(1, idx.reshape(b, -1)).view_as(z)
-        rel = torch.where(high > 0, z_up - mean_at, torch.zeros_like(z))
-        top_vals = (high * torch.exp(OCC_TOP_K * rel)).unsqueeze(-1)
+        top_vals = torch.where(high > 0, z_up - mean_at, torch.zeros((), dtype=z.dtype, device=z.device))
+        top_vals = top_vals.mul_(OCC_TOP_K).exp_().mul_(high)
         d_surf = (surf * self.depths.to(prob.dtype).view(1, 1, -1, 1, 1)).sum(dim=2)
-        col_vals = column_top_samples(pts, high, mean_at, ok, surf, d_surf, through, weight, self.depths)
-        top_sums = splat(torch.cat([top_vals, col_vals], dim=-1).reshape(b, n * d * h * w, 5), idx.reshape(b, -1), ok.reshape(b, -1))
+        top_sums = splat(
+            column_top_samples(top_vals, z, mean_at, ok, surf, reached, d_surf, pts, through, weight, self.depths).reshape(b, n * d * h * w, 3),
+            idx.reshape(b, -1),
+            ok.reshape(b, -1),
+        )
         top_sum = top_sums[:, 0:1]
         z_occ = torch.where(
             has_occ > 0,
             z_mean + torch.log(torch.where(has_occ > 0, top_sum, torch.ones_like(top_sum))) / OCC_TOP_K,
             torch.zeros_like(has_occ),
         )
-        z_occ = column_top_bound(z_occ, has_occ, z_mean, top_sums[:, 1:5])
+        z_occ = column_top_bound(z_occ, has_occ, z_mean, top_sums[:, 1:3])
         has_occ = F.max_pool2d(has_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
         z_occ = F.max_pool2d(z_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
         blocked = sightline_blocked(z_occ, has_occ, g_wide, T)

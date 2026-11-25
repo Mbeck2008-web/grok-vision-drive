@@ -505,7 +505,7 @@ def ray_crossed_raised(idx: Any, ok: Any, raised: Any) -> Any:
     return prior.to(raised.dtype)
 
 
-def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float, reached: Any = None) -> tuple[Any, Any, Any, Any]:
+def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float, reached: Any = None, cam_xyz: Any = None) -> tuple[Any, Any, Any, Any]:
     """Bounds on occluder extents from ray surfaces (G5). Returns (top, bottom, weight, flat cell index), B x P.
 
     ``pts`` B x N x D x h x w x 3 (bin centres), ``pts_e`` the same at the D - 1 inner bin edges,
@@ -596,6 +596,23 @@ def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float,
         g = g_flat.gather(1, i.reshape(b, -1)).view_as(wr)
         r = (p[..., 2] - g >= occ_m).to(surf_w.dtype)
         raised = r if raised is None else torch.maximum(raised, r)
+    # Riser (G5): a face too low to clear ``occ_m`` above the local ground (a 0.45 m wall at 12 m whose
+    # only hits are under 0.3 m) still stands out from the row below it in the same column. The ground
+    # rises at most GROUND_SLOPE_CAP per metre of range, so if even the least steep reading of the two
+    # hits (this hit at its bin's far edge, the row below's at its near edge, where each could be in its
+    # bin) climbs faster than that, this hit is on a face, not on the road: it is an occluder. Both
+    # points are ego-frame, measured per column of one camera; nothing is tuned to a wall.
+    if h >= 2 and cam_xyz is not None:
+        cam = cam_xyz.to(pts.dtype).view(b, n, 1, 1, 3)
+        def _shift_down(t: Any) -> Any:  # row r gets row r + 1 (B x N x h x w [x 3])
+            return torch.cat([t[:, :, 1:], t[:, :, -1:]], dim=2)
+        a_n = _shift_down(n_h)
+        not_last = (torch.arange(h, device=pts.device) < h - 1).view(1, 1, h, 1)
+        has_a = (_shift_down(has_hit.to(pts.dtype)) > 0.5) & not_last
+        rng = lambda q: torch.sqrt((q[..., 0] - cam[..., 0]) ** 2 + (q[..., 1] - cam[..., 1]) ** 2)  # noqa: E731
+        d_r = (rng(f_h) - rng(a_n)).clamp(min=0.0)
+        riser = has_hit & has_a & ((f_h[..., 2] - a_n[..., 2]) > GROUND_SLOPE_CAP * d_r)
+        raised = torch.maximum(raised, riser.to(raised.dtype))
     weight = wr * raised
     tops, bots, ws, ids = [], [], [], []
     m_r, m_l = TOP_RADIAL_SAMPLES, TOP_LATERAL_SAMPLES
@@ -943,7 +960,7 @@ def trusted_band(pts: Any, T: Any, K: Any, z_rel: Any, band: float, occ_m: float
     return torch.where(own | covered, z_rel < band, (z_rel < band) & (shadow < tight)).to(z_rel.dtype)
 
 
-def tight_clear(pts: Any, T: Any, z_rel: Any, tight: float = SEEN_TIGHT_M) -> Any:
+def tight_clear(pts: Any, T: Any, z_rel: Any, tight: float = SEEN_TIGHT_M, z_land: Any = None) -> Any:
     """0/1 per ray point: the point is so close to its ground that no occluder can hide that ground (G5).
 
     The ray reached the point, so it passed over every occluder before it. At an occluder at range
@@ -953,6 +970,11 @@ def tight_clear(pts: Any, T: Any, z_rel: Any, tight: float = SEEN_TIGHT_M) -> An
     anywhere before the point), the cell centre is hidden by less than ``tight`` under any top, which
     is the hidden test, whatever the viewshed found. Used to keep a ray's own landing cells (and its
     last few cm above the road) seen behind a conservatively bounded top.
+
+    ``z_land`` (the height of the ray's own surface, broadcast against ``z_rel``): the point must also be
+    less than ``tight`` above it. The local ground is a stand-in where no road is visible in the window
+    (only a wall face seen behind a wall close ahead), so "near the ground" alone can hold for a ray
+    point in mid-air behind the wall; a point near its own ray's landing is over measured ground.
     """
     b, n = T.shape[:2]
     cam = T[..., :3, 3].to(pts.dtype).view(b, n, *([1] * (pts.dim() - 3)), 3)
@@ -961,7 +983,10 @@ def tight_clear(pts: Any, T: Any, z_rel: Any, tight: float = SEEN_TIGHT_M) -> An
     d_c = 0.5 * math.sqrt(2.0) * BEV_CELL_M
     g = pts[..., 2] - z_rel
     worst = z_rel.clamp(min=0.0) + (cam[..., 2] - g).clamp(min=0.0) * d_c / (r_h - d_c).clamp(min=1e-3)
-    return ((r_h > 2.0 * d_c) & (worst < tight)).to(z_rel.dtype)
+    ok = (r_h > 2.0 * d_c) & (worst < tight)
+    if z_land is not None:
+        ok = ok & ((pts[..., 2].to(z_rel.dtype) - z_land) < tight)
+    return ok.to(z_rel.dtype)
 
 
 def near_ground(z: Any, ground: Any, band_m: float = GROUND_BAND_M) -> Any:
@@ -1094,6 +1119,46 @@ class BevLssHead(nn.Module):
         yaw = torch.atan2(fwd[..., 0], fwd[..., 1])
         return torch.stack([K[..., 0, 0] / FX_REF_PX, torch.sin(yaw), torch.cos(yaw), T[..., 2, 3]], dim=-1)
 
+    def _lateral_midpoints(
+        self, pts: Any, T: Any, K: Any, idx: Any, pass_r: Any, crossed: Any, through: Any, ray_w: Any, z_land: Any,
+        raised: Any, flat_g: Any, flat_has: Any, blocked: Any, occ_m: float, ground: Any, unc: Any,
+    ) -> Any:
+        """Seen / free masses (B x 2 x N x N) from virtual rays half way between neighbouring pixel columns (G5).
+
+        Columns are 8 px apart, wider than a 0.5 m cell past ~4 m on the side cameras, so road between two
+        columns that both reach it is otherwise never sampled. The virtual ray between columns c and c + 1
+        reaches / passes a depth bin only if both real rays do (minimum of their gates), never crosses a
+        raised cell either of them crossed or that it crosses itself, and its own point is judged on its own
+        cell: ground band, trusted band, viewshed (``blocked``) and tight clearance, exactly as a real ray
+        point. An occluder narrower than the column gap that both rays miss and no other ray touches can hide
+        it: by construction that object is unobservable to the rig (named limitation in spec.md).
+        """
+        b, n, d, h, w = idx.shape
+        if w < 2:
+            return torch.zeros(b, 2, BEV_N, BEV_N, dtype=pass_r.dtype, device=pass_r.device)
+
+        def mid(t: Any) -> Any:
+            return torch.minimum(t[..., :-1], t[..., 1:])
+
+        pts_m = 0.5 * (pts[..., :-1, :] + pts[..., 1:, :])
+        idx_m, ok_m = bev_flat_index(pts_m)
+        ids = idx_m.reshape(b, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
+        z_m = pts_m[..., 2].to(pass_r.dtype)
+        z_rel_m = z_m - flat_g.gather(1, ids).view_as(z_m)
+        ok_rel_m = flat_has.gather(1, ids).view_as(z_m) * mid(ray_w)
+        band_m = near_ground(z_rel_m, 0.0, self.ground_band_m).to(z_m.dtype) * ok_rel_m
+        seen_m = trusted_band(pts_m, T, K, z_rel_m, self.ground_band_m, occ_m, ground, unc) * ok_rel_m
+        crossed_m = (1.0 - ray_crossed_raised(idx_m, ok_m, raised)) * mid(crossed)
+        ids_c = idx_m.reshape(b, n, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
+        visible_m = (1.0 - blocked.reshape(b, n, BEV_N * BEV_N).gather(2, ids_c).view_as(idx_m)) * ok_m.to(z_m.dtype)
+        tight_m = tight_clear(pts_m, T, z_rel_m, min(float(self.ground_band_m), SEEN_TIGHT_M), mid(z_land)) * ok_rel_m * mid(through)
+        vis = torch.maximum(visible_m, tight_m) * crossed_m
+        # only bins both real rays passed through (S >= FREE_PASS_TAU): never a bin either of them stopped in,
+        # so a virtual ray never lands on (or behind) a surface between them
+        through_r = mid(pass_r)
+        vals = torch.stack([through_r * seen_m * vis, through_r * band_m * vis], dim=-1).reshape(b, -1, 2)
+        return splat(vals, idx_m.reshape(b, -1), ok_m.reshape(b, -1))
+
     def forward(
         self,
         f4: Any,
@@ -1139,6 +1204,7 @@ class BevLssHead(nn.Module):
         z = pts[..., 2].to(prob.dtype)
         surf, has_surf = ray_surface(reached, dim=2)  # B N D h w one-hot, B N 1 h w
         ray_w = has_surf * weight
+        z_land = (surf * pts[..., 2].to(prob.dtype)).sum(dim=2, keepdim=True)  # B N 1 h w: own surface height
         g_vals = torch.stack([surf * ray_w * torch.exp(-GROUND_SOFTMIN_K * (z - BEV_Z_MIN_M)), surf * ray_w], dim=-1)
         g_sum = splat(g_vals.reshape(b, n * d * h * w, 2), idx.reshape(b, -1), ok.reshape(b, -1))
         ground, has_ground, raised, g_wide = two_scale_ground(g_sum[:, 0:1], g_sum[:, 1:2])
@@ -1150,7 +1216,7 @@ class BevLssHead(nn.Module):
         # wall's face hits are occluders; a 2.0 m band raises it so a 1.5 m car roof is not one.
         occ_m = self.ground_band_m - (GROUND_BAND_M - RAISED_OCC_M)
         g_low = torch.where(has_ground > 0, torch.minimum(ground, g_wide), g_wide)
-        top_bound, bot_bound, hit_w, hit_idx = ray_top_bounds(pts, pts_e, surf * ray_w, ground * has_ground, occ_m, reached)
+        top_bound, bot_bound, hit_w, hit_idx = ray_top_bounds(pts, pts_e, surf * ray_w, ground * has_ground, occ_m, reached, T[..., :3, 3])
         tops, has_occ = occluder_tops(top_bound, hit_idx, hit_w)
         # lowest bottom per cell: an upper bound on -bottom by the same log-sum-exp (never above the min)
         neg_bot, _ = occluder_tops(-bot_bound, hit_idx, hit_w)
@@ -1172,7 +1238,7 @@ class BevLssHead(nn.Module):
         seen_w = trusted_band(pts, T, K, z_rel, self.ground_band_m, occ_m, ground * has_ground, unc) * ok_rel
         # only where the ray passed the point (not in its surface bin: a binned surface can sit up to half
         # a bin past the true one, e.g. behind a wall's foot)
-        tight_c = tight_clear(pts, T, z_rel, min(float(self.ground_band_m), SEEN_TIGHT_M)) * ok_rel * through
+        tight_c = tight_clear(pts, T, z_rel, min(float(self.ground_band_m), SEEN_TIGHT_M), z_land) * ok_rel * through
         clear_w = reach * reached * seen_w * crossed * torch.maximum(visible, tight_c)
         through_w = beyond * through * band_w * crossed * torch.maximum(visible, tight_c)
         occ_w = (1.0 - reach) * (1.0 - reached) * band_w
@@ -1191,7 +1257,7 @@ class BevLssHead(nn.Module):
 
         s_e = beyond[:, :, 1:]
         reached_e, through_e = visibility_gates(s_e, s_e, self.reach_tau, self.free_pass_tau)
-        visible_e = torch.maximum(visible_e, tight_clear(pts_e, T, z_rel_e, min(float(self.ground_band_m), SEEN_TIGHT_M)) * ok_rel_e * through_e)
+        visible_e = torch.maximum(visible_e, tight_clear(pts_e, T, z_rel_e, min(float(self.ground_band_m), SEEN_TIGHT_M), z_land) * ok_rel_e * through_e)
         vis_e = torch.stack(
             [
                 (1.0 - s_e) * (1.0 - reached_e) * band_e,
@@ -1201,6 +1267,8 @@ class BevLssHead(nn.Module):
             dim=-1,
         ).reshape(b, n * (d - 1) * h * w, 3)
         vis_e = splat(vis_e, idx_e.reshape(b, -1), ok_e.reshape(b, -1))
+        vis_m = self._lateral_midpoints(pts, T, K, idx, beyond * through, crossed, through, ray_w, z_land, raised, flat_g, flat_has, blocked, occ_m, ground * has_ground, unc)
+        vis_m = vis_m + self._lateral_midpoints(pts_e, T, K, idx_e, s_e * through_e, crossed_e, through_e, ray_w, z_land, raised, flat_g, flat_has, blocked, occ_m, ground * has_ground, unc)
         ctx = ctx.view(b, n, 1, CTX_CH, h, w)
         lifted = prob_w.unsqueeze(3) * ctx  # B N D C h w
         values = torch.cat(
@@ -1220,9 +1288,9 @@ class BevLssHead(nn.Module):
         passed = bev[:, CTX_CH + 1 : CTX_CH + 2]
         occ = bev[:, CTX_CH + 2 : CTX_CH + 3]
         clear = bev[:, CTX_CH + 3 : CTX_CH + 4]
-        thru = bev[:, CTX_CH + 4 : CTX_CH + 5] + vis_e[:, 2:3]
+        thru = bev[:, CTX_CH + 4 : CTX_CH + 5] + vis_e[:, 2:3] + vis_m[:, 1:2]
         occ = occ + vis_e[:, 0:1]
-        clear = clear + vis_e[:, 1:2]
+        clear = clear + vis_e[:, 1:2] + vis_m[:, 0:1]
         logits = self.encoder(torch.cat([feat, torch.log1p(hit), torch.log1p(passed)], dim=1))
         logits = apply_visibility(logits, clear, thru, occluded_mass=occ)
         return {

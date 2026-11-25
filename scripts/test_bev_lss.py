@@ -1852,10 +1852,10 @@ def check_ground_band_pinned_and_plumbed() -> None:
     assert bl.GROUND_BAND_M == 0.5, bl.GROUND_BAND_M
     assert bl.GROUND_WINDOW_CELLS == 13 and bl.GROUND_SOFTMIN_K == 10.0
     assert bl.GROUND_WIDE_WINDOW_CELLS == 21 and bl.GROUND_SLOPE_CAP == 0.15
-    assert bl.RAISED_OCC_M == 0.3 and bl.SIGHTLINE_MARGIN_M == 0.5 and bl.SEEN_TIGHT_M == 0.1 and bl.DESIGN_WALL_M == 0.6
+    assert bl.RAISED_OCC_M == 0.3 and bl.SIGHTLINE_MARGIN_M == 0.5 and bl.SEEN_TIGHT_M == 0.1 and bl.BUMP_M == 0.1
     assert bl.VIEWSHED_AZ_BINS == 720 and bl.VIEWSHED_RANGE_STEP_M == 0.25 and bl.VIEWSHED_RANGE_M == 48.0
-    assert bl.TOP_RADIAL_SAMPLES == 13 and bl.TOP_LATERAL_SAMPLES == 13 and bl.OCC_N == 2 * bl.BEV_N and bl.TOP_LSE_K == (5.0, 40.0, 300.0, 2000.0)
-    assert bl.EGO_CONTACT_HALF_X_M == 0.8 and bl.EGO_CONTACT_HALF_Y_M == 1.4 and bl.EGO_GROUND_DROP_M == 0.5
+    assert bl.TOP_RADIAL_SAMPLES == 13 and bl.TOP_LATERAL_SAMPLES == 13 and bl.OCC_N == 2 * bl.BEV_N and bl.TOP_LSE_K == (5.0, 60.0)
+    assert bl.EGO_CONTACT_HALF_X_M == 0.8 and bl.EGO_CONTACT_HALF_Y_M == 1.4
     assert bl.BevLssHead().ground_band_m == 0.5
     span = bl.BEV_Z_MAX_M - bl.BEV_Z_MIN_M
     for bad in (0.0, -0.5, span + 0.1, float("nan")):

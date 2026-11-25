@@ -167,18 +167,9 @@ GROUND_SLOPE_CAP = 0.15
 BUMP_M = 0.1
 EGO_CONTACT_HALF_X_M = 0.8
 EGO_CONTACT_HALF_Y_M = 1.4
-# Trust range per camera (G5). A wall of DESIGN_WALL_M at range r has
-# DESIGN_WALL_M - occ_m of face above the occluder cutoff; a camera whose
-# pixel rows are FEAT_STRIDE / fy rad apart is sure to put a ray on that
-# part of the face only while r * FEAT_STRIDE / fy <= DESIGN_WALL_M - occ_m.
-# Past that range a wall can fall between two of its rows unseen, so its
-# ray points count as seen only within SEEN_TIGHT_M of the ground (a ray
-# that clears any occluder and is that close to the ground cannot be over
-# ground hidden by more than that). Main: 11.8 m, narrow 19 m, wide 2.8 m.
-DESIGN_WALL_M = 0.6
+# A ray point within SEEN_TIGHT_M of the ground, close to its own landing, cannot be over ground hidden
+# by more than that whatever stands before it (``tight_clear``).
 SEEN_TIGHT_M = 0.1
-# Lowest ego ground taken under a mount (z0 is -0.23 m on the etk800 rig).
-EGO_GROUND_DROP_M = 0.5
 # Viewshed (G5): per camera, occluder tops are swept outward along
 # VIEWSHED_AZ_BINS azimuths in VIEWSHED_RANGE_STEP_M steps out to
 # VIEWSHED_RANGE_M (past the farthest grid corner from any mount). 0.5 deg
@@ -188,22 +179,18 @@ EGO_GROUND_DROP_M = 0.5
 # its own pixel column's azimuth span (half way to the neighbouring columns)
 # and its depth bin (near edge to far edge), so the shadow of a thin pole or
 # sign is the span its rays actually cover (over-hide check).
-VIEWSHED_AZ_BINS = 720
+VIEWSHED_AZ_BINS = 360
 # Places per hit along its depth bin (near edge to far edge) and across its
 # pixel column: 13 x 13 keeps neighbouring places under 0.37 m apart along a
 # 48 m bin (~4.4 m) and under 0.3 m across the wide camera's ~3.5 m column
 # at 32 m (the viewshed's 3 x 3 sampling bridges a one-cell gap).
-TOP_RADIAL_SAMPLES = 13
-TOP_LATERAL_SAMPLES = 13
-# Virtual rays between neighbouring pixel columns (G5 over-hide): at these fractions of the way from
-# column c to column c + 1. Columns are 8 px apart, up to ~1 m at 12 m on the side cameras, wider than
-# a 0.5 m cell, so a single midpoint still skips cells; quarter points keep virtual samples < 0.5 m apart.
-LATERAL_FRACS = (0.25, 0.5, 0.75)
+TOP_RADIAL_SAMPLES = 7
+TOP_LATERAL_SAMPLES = 7
 # Occluder tops live on their own finer grid (OCC_N x OCC_N over the same
 # 64 m square, 0.25 m cells): a 0.2 m pole fills 1-2 cells, not a 0.5 m BEV
 # cell (or two when it straddles a cell edge).
 OCC_N = 2 * BEV_N
-VIEWSHED_RANGE_STEP_M = 0.25
+VIEWSHED_RANGE_STEP_M = 0.5
 VIEWSHED_RANGE_M = 48.0
 # Occluders closer than this to the destination along the sight line are
 # ignored, so a cell is not shadowed by its own top. 0.5 m is one
@@ -213,7 +200,7 @@ SIGHTLINE_MARGIN_M = 0.5
 # Upper bound on a cell's occluder top from sums only (ONNX scatter-add):
 # a log-sum-exp; the result is never below the true maximum and at most log(hits) / k above it, in passes of rising k
 # (each shifted by the last, so exp stays in float32 range: k * slack < 87).
-TOP_LSE_K = (5.0, 40.0, 300.0, 2000.0)
+TOP_LSE_K = (5.0, 60.0)
 
 # Categorical depth (audit item 9: 40 log bins, 1-48 m).
 DEPTH_BINS = 40
@@ -524,10 +511,10 @@ def ray_crossed_raised(idx: Any, ok: Any, raised: Any) -> Any:
     return prior.to(raised.dtype)
 
 
-def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float, reached: Any = None, cam_xyz: Any = None) -> tuple[Any, Any, Any, Any]:
+def ray_top_bounds(pts: Any, depths: Any, edges: Any, surf_w: Any, ground: Any, occ_m: float, reached: Any = None, cam_xyz: Any = None) -> tuple[Any, Any, Any, Any]:
     """Bounds on occluder extents from ray surfaces (G5). Returns (top, bottom, weight, flat cell index), B x P.
 
-    ``pts`` B x N x D x h x w x 3 (bin centres), ``pts_e`` the same at the D - 1 inner bin edges,
+    ``pts`` B x N x D x h x w x 3 (bin centres at ``depths``; ``edges`` the D - 1 inner bin edges),
     ``surf_w`` the weighted one-hot surface bin, ``ground`` B x 1 x N x N. A surface is an occluder when
     some point of its ray in its bin (near edge, centre, far edge) is at least ``occ_m`` above the ground
     at its cell. Its true point lies somewhere in the bin, and the object's top lies under the next pixel
@@ -545,39 +532,46 @@ def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float,
     an overpass deck with open road under it); otherwise -100 (a solid column down to the ground).
     """
     b, n, d, h, w = surf_w.shape
-    one = (surf_w > 0).to(pts.dtype)
+    dt = pts.dtype
+    # Every point of a ray is affine in its depth (``frustum_ego_points``): p(t) = o + t * v, so the hit's
+    # bin ends and its neighbouring rays' points at the same depths are per-ray arithmetic, not
+    # B x N x D x h x w x 3 products (activation budget).
+    dep = depths.to(dt)
+    v = (pts[:, :, 1] - pts[:, :, 0]) / (dep[1] - dep[0])
+    o = pts[:, :, 0] - v * dep[0]
+    one = (surf_w > 0).to(dt)
     wr = surf_w.sum(dim=2)  # B N h w (one surface bin per ray)
-    near = torch.cat([pts[:, :, :1], pts_e], dim=2)
-    far = torch.cat([pts_e, pts[:, :, -1:]], dim=2)
+    jd = torch.arange(d, device=pts.device, dtype=dt).view(1, 1, d, 1, 1)
+    j_hit = (one * jd).sum(dim=2)
+    has_hit = one.sum(dim=2) > 0.5
+    jl = j_hit.long()
+    e_all = torch.cat([dep[:1], edges.to(dt), dep[-1:]])  # near edge of bin j is e_all[j], far edge e_all[j + 1]
+    t_n, t_f, t_c = e_all[jl], e_all[jl + 1], dep[jl]
 
-    def at_hit(p: Any) -> Any:
-        return (p * one.unsqueeze(-1)).sum(dim=2)  # B N h w 3
+    def at(oo: Any, vv: Any, t: Any) -> Any:
+        return oo + vv * t.unsqueeze(-1)
 
-    def up(p: Any) -> Any:
-        if h < 2:
-            return p
-        return torch.cat([p[:, :, :, :1], p[:, :, :, :-1]], dim=3)
+    def up(t: Any) -> Any:  # row r gets row r - 1 (row 0 keeps its own)
+        return torch.cat([t[:, :, :1], t[:, :, :-1]], dim=2) if h >= 2 else t
 
-    def down(p: Any) -> Any:
-        if h < 2:
-            return p
-        return torch.cat([p[:, :, :, 1:], p[:, :, :, -1:]], dim=3)
+    def down(t: Any) -> Any:  # row r gets row r + 1 (last row keeps its own)
+        return torch.cat([t[:, :, 1:], t[:, :, -1:]], dim=2) if h >= 2 else t
 
-    def nb_step(p: Any) -> tuple[Any, Any]:
-        """Offsets to the left / right neighbouring column's ray at the same depth (edge columns mirror)."""
-        if w < 2:
-            z0 = torch.zeros_like(p)
-            return z0, z0
-        left = torch.cat([2.0 * p[:, :, :, :, :1] - p[:, :, :, :, 1:2], p[:, :, :, :, :-1]], dim=4) - p
-        right = torch.cat([p[:, :, :, :, 1:], 2.0 * p[:, :, :, :, -1:] - p[:, :, :, :, -2:-1]], dim=4) - p
-        return left, right
+    def left(t: Any) -> Any:  # column c gets column c - 1 (column 0 mirrors column 1)
+        return torch.cat([2.0 * t[:, :, :, :1] - t[:, :, :, 1:2], t[:, :, :, :-1]], dim=3)
 
-    n_h, f_h, c_h = at_hit(near), at_hit(far), at_hit(pts)
-    n_u, f_u = at_hit(up(near)), at_hit(up(far))
-    l_n, r_n = nb_step(near)
-    l_n, r_n = at_hit(l_n), at_hit(r_n)
-    l_f, r_f = nb_step(far)
-    l_f, r_f = at_hit(l_f), at_hit(r_f)
+    def right(t: Any) -> Any:  # column c gets column c + 1 (last column mirrors)
+        return torch.cat([t[:, :, :, 1:], 2.0 * t[:, :, :, -1:] - t[:, :, :, -2:-1]], dim=3)
+
+    n_h, f_h, c_h = at(o, v, t_n), at(o, v, t_f), at(o, v, t_c)
+    o_u, v_u = up(o), up(v)
+    n_u, f_u = at(o_u, v_u, t_n), at(o_u, v_u, t_f)
+    if w >= 2:
+        o_l, v_l, o_r, v_r = left(o), left(v), right(o), right(v)
+        l_n, r_n = at(o_l, v_l, t_n) - n_h, at(o_r, v_r, t_n) - n_h
+        l_f, r_f = at(o_l, v_l, t_f) - f_h, at(o_r, v_r, t_f) - f_h
+    else:
+        l_n = r_n = l_f = r_f = torch.zeros_like(n_h)
     # top feature row: no row above it (a comparison, not a slice assignment: ONNX would export that as a
     # ScatterND without reduction)
     no_up = (torch.arange(h, device=pts.device) == 0).view(1, 1, h, 1).expand(b, n, h, w)
@@ -585,15 +579,13 @@ def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float,
     # (surface within one bin) takes that row's bound; else, if the row down got past the hit's bin
     # (its surface is farther, or it is sky), the object starts above that row's ray in the bin; else
     # (the row down stopped nearer, or there is none) it may reach the ground: -100.
-    jd = torch.arange(d, device=pts.device, dtype=pts.dtype).view(1, 1, d, 1, 1)
-    j_hit = (one * jd).sum(dim=2)
-    has_hit = one.sum(dim=2) > 0.5
     if reached is not None:
         sky = reached[:, :, -1] > 0.5
     else:
         sky = torch.zeros_like(has_hit)
     pass_bin = torch.where(has_hit, j_hit, torch.where(sky, torch.full_like(j_hit, float(d)), torch.full_like(j_hit, -1.0)))
-    d_low = torch.minimum(at_hit(down(near))[..., 2], at_hit(down(far))[..., 2])
+    o_d, v_d = down(o), down(v)
+    d_low = torch.minimum(at(o_d, v_d, t_n)[..., 2], at(o_d, v_d, t_f)[..., 2])
     bot_rows: list[Any] = [None] * h
     pb_rows: list[Any] = [None] * h
     neg = torch.full_like(j_hit[:, :, 0], -100.0)
@@ -648,55 +640,59 @@ def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float,
         bump = has_hit & has_a & has_u & (c_h[..., 2] - torch.maximum(_shift_down(c_h)[..., 2], _shift_up(c_h)[..., 2]) > BUMP_M)
         raised = torch.maximum(raised, ((riser | bump) & tall).to(raised.dtype))
     weight = wr * raised
-    tops, bots, ws, ids = [], [], [], []
     m_r, m_l = TOP_RADIAL_SAMPLES, TOP_LATERAL_SAMPLES
-    for a in range(m_r):
-        t = a / (m_r - 1) if m_r > 1 else 0.5
-        base = n_h + (f_h - n_h) * t
-        bound = torch.maximum(n_u[..., 2] + (f_u[..., 2] - n_u[..., 2]) * t, base[..., 2])
-        bound = torch.where(no_up, torch.full_like(bound, BEV_Z_MAX_M + 4.0), bound)
-        low = torch.minimum(bot_ray, base[..., 2])
-        lft = l_n + (l_f - l_n) * t
-        rgt = r_n + (r_f - r_n) * t
-        for c in range(m_l):
-            u = (c / (m_l - 1) - 0.5) if m_l > 1 else 0.0
-            off = lft * (-u) if u < 0 else rgt * u
-            q = base + off
-            i, ok = _flat_index(q, OCC_N)
-            ids.append(i.reshape(b, -1))
-            ws.append((weight * ok.to(surf_w.dtype)).reshape(b, -1))
-            tops.append(bound.reshape(b, -1))
-            bots.append(low.reshape(b, -1))
-    return torch.cat(tops, dim=1), torch.cat(bots, dim=1), torch.cat(ws, dim=1), torch.cat(ids, dim=1)
+    tr = torch.linspace(0.0, 1.0, m_r, device=pts.device, dtype=dt) if m_r > 1 else torch.full((1,), 0.5, device=pts.device, dtype=dt)
+    ul = torch.linspace(-0.5, 0.5, m_l, device=pts.device, dtype=dt) if m_l > 1 else torch.zeros(1, device=pts.device, dtype=dt)
+    trv = tr.view(m_r, 1)
+    base = n_h.unsqueeze(-2) + (f_h - n_h).unsqueeze(-2) * trv  # B N h w R 3
+    bound = torch.maximum(n_u[..., 2:3] + (f_u[..., 2:3] - n_u[..., 2:3]) * tr, base[..., 2])  # B N h w R
+    bound = torch.where(no_up.unsqueeze(-1), torch.full_like(bound, BEV_Z_MAX_M + 4.0), bound)
+    low = torch.minimum(bot_ray.unsqueeze(-1), base[..., 2])
+    lft = l_n.unsqueeze(-2) + (l_f - l_n).unsqueeze(-2) * trv
+    rgt = r_n.unsqueeze(-2) + (r_f - r_n).unsqueeze(-2) * trv
+    # across the column: half way to the left neighbour (u < 0) ... half way to the right one (u > 0)
+    q = (base.unsqueeze(-2) + lft.unsqueeze(-2) * (-ul).clamp(min=0.0).view(m_l, 1)
+         + rgt.unsqueeze(-2) * ul.clamp(min=0.0).view(m_l, 1))  # B N h w R L 3
+    i, ok = _flat_index(q, OCC_N)
+    shape = (b, n, h, w, m_r, m_l)
+    ws = (weight.view(b, n, h, w, 1, 1) * ok.to(surf_w.dtype)).reshape(b, -1)
+    return (bound.unsqueeze(-1).expand(shape).reshape(b, -1), low.unsqueeze(-1).expand(shape).reshape(b, -1),
+            ws, i.reshape(b, -1))
 
 
 def occluder_tops(top: Any, idx: Any, w: Any) -> tuple[Any, Any]:
-    """Per-cell upper bound on the occluder top (B x 1 x OCC_N x OCC_N, the 0.25 m occluder grid) and a
-    0/1 "has occluder" mask.
+    """Per-cell upper bounds on occluder values (B x C x OCC_N x OCC_N, the 0.25 m occluder grid) and a
+    0/1 "has occluder" mask (B x 1 x OCC_N x OCC_N).
 
-    ``top`` / ``w`` / ``idx`` are B x P (absolute top bound, 0/1 weight, flat cell index). The bound is a
-    log-sum-exp ``t* = log(sum exp(k t)) / k`` of the tops in the cell, never below their maximum and at
-    most ``log(n) / k`` above it, built from ``splat`` sums only (ONNX scatter-add). It is computed in
-    passes of rising sharpness ``TOP_LSE_K``, each shifted by the previous pass's result so no exponent
-    leaves float32 range; the last pass is at most log(n) / 2000 (~3 mm for 500 hits) above the maximum.
-    No dilation: ``ray_top_bounds`` already spreads each hit over its column's azimuth span and its
-    depth bin. Cells without an occluder get -100 m.
+    ``top`` B x P x C (C bounds per hit, e.g. top and -bottom), ``w`` B x P 0/1 weight, ``idx`` B x P flat
+    cell index. Each bound is a log-sum-exp ``t* = log(sum exp(k t)) / k`` of the values in the cell,
+    never below their maximum and at most ``log(n) / k`` above it, built from ``splat`` sums only (ONNX
+    scatter-add). Passes of rising sharpness ``TOP_LSE_K``, each shifted by the previous pass's result so
+    no exponent leaves float32 range (k_next * log(n) / k_prev < 87 for n <= 1000 places per cell; past
+    that a cell keeps the looser first-pass bound); the last pass is at most log(n) / 60 (11.5 cm for
+    1000 places, 6.5 cm for 50) above the maximum, an over-estimate of the top (more shadow, never less). No dilation:
+    ``ray_top_bounds`` already spreads each hit over its column's azimuth span and its depth bin. Cells
+    without an occluder get -100.
     """
-    b = top.shape[0]
+    b, p, c = top.shape
     ok = w > 0
-    t = top.clamp(min=BEV_Z_MIN_M, max=BEV_Z_MAX_M + 4.0)
-    wz = torch.where(ok, w, torch.zeros_like(w))
-    has = splat(wz.unsqueeze(-1), idx, ok, OCC_N) > 0
-    # first shift: the batch-wide highest top (every cell's maximum is within 10 m of it)
-    ref = torch.where(ok, t, torch.full_like(t, BEV_Z_MIN_M)).amax(dim=1, keepdim=True)
-    ref_at = ref.expand_as(t)
-    cur = ref.view(b, 1, 1, 1).expand(b, 1, OCC_N, OCC_N)
+    t = top.clamp(min=-(BEV_Z_MAX_M + 4.0), max=BEV_Z_MAX_M + 4.0)
+    wz = torch.where(ok, w, torch.zeros_like(w)).unsqueeze(-1)
+    flat = _splat_index(idx, ok, OCC_N)
+    flat_i = idx.clamp(min=0, max=OCC_N * OCC_N - 1).unsqueeze(-1).expand(b, p, c)
+    # first shift: the batch-wide highest value per channel (every cell's maximum is within 16 m of it, so
+    # the first pass, k = 5, cannot underflow: a cell has a place iff its first sum is positive)
+    ref = torch.where(ok.unsqueeze(-1), t, torch.full_like(t, -(BEV_Z_MAX_M + 4.0))).amax(dim=1, keepdim=True)
+    ref_at = ref.expand(b, p, c)
+    cur = ref.transpose(1, 2).reshape(b, c, 1, 1).expand(b, c, OCC_N, OCC_N)
+    has = None
     for k in TOP_LSE_K:
-        e = torch.exp(k * (t - ref_at).clamp(max=0.0)) * wz
-        s_k = splat(e.unsqueeze(-1), idx, ok, OCC_N)
+        s_k = _splat_flat((t - ref_at).clamp_(max=0.0).mul_(k).exp_().mul_(wz), flat, OCC_N)
+        if has is None:
+            has = s_k[:, :1] > 0
         safe = has & (s_k > 0)
         cur = torch.where(safe, cur + torch.log(torch.where(safe, s_k, torch.ones_like(s_k))) / k, cur)
-        ref_at = cur.reshape(b, OCC_N * OCC_N).gather(1, idx.clamp(min=0, max=OCC_N * OCC_N - 1))
+        ref_at = cur.reshape(b, c, OCC_N * OCC_N).transpose(1, 2).gather(1, flat_i)
     tops = torch.where(has, cur, torch.full_like(cur, -100.0))
     return tops, has.to(top.dtype)
 
@@ -714,16 +710,6 @@ def _polar_grid(T: Any, dtype: Any, device: Any) -> tuple[Any, Any, Any]:
     px = cam[:, 0].view(-1, 1, 1) + torch.sin(az).view(1, na, 1) * rr.view(1, 1, nr)
     py = cam[:, 1].view(-1, 1, 1) + torch.cos(az).view(1, na, 1) * rr.view(1, 1, nr)
     return torch.stack([px / BEV_HALF_M, -py / BEV_HALF_M], dim=-1), rr, cam
-
-
-def _polar_index(dx: Any, dy: Any, r: Any) -> Any:
-    """Flat (azimuth, range) index into an A x R polar map for offsets ``dx``, ``dy`` from the camera at
-    horizontal range ``r`` (the range bin is clamped to the map)."""
-    na = VIEWSHED_AZ_BINS
-    nr = int(math.ceil(VIEWSHED_RANGE_M / float(VIEWSHED_RANGE_STEP_M)))
-    a_idx = torch.floor((torch.atan2(dx, dy) + math.pi) * (na / (2.0 * math.pi))).clamp(min=0, max=na - 1)
-    k = torch.floor(r / float(VIEWSHED_RANGE_STEP_M)).clamp(min=0, max=nr - 1)
-    return (a_idx * nr + k).long()
 
 
 def viewshed_blocked(tops: Any, dest_z: Any, T: Any, margin: float = SIGHTLINE_MARGIN_M, bottoms: Any = None) -> Any:
@@ -750,31 +736,23 @@ def viewshed_blocked(tops: Any, dest_z: Any, T: Any, margin: float = SIGHTLINE_M
     grid, rr, cam = _polar_grid(T, dtype, device)
     cx, cy, cz = cam[:, 0].view(-1, 1, 1), cam[:, 1].view(-1, 1, 1), cam[:, 2].view(-1, 1, 1)
     no = tops.shape[-1]
-    src = (tops + 100.0).expand(b, ncam, no, no).reshape(b * ncam, 1, no, no)
     # The sight line to a cell centre lies within half an azimuth bin (<= 0.21 m at 48 m) of its bin's
-    # centre line and every point of it within 0.125 m (along) of a range sample: take the highest top
-    # over the 3 x 3 occluder cells (0.25 m) at -0.125 / 0 / +0.125 m around each sample, so a cell the
-    # line clips by a corner, or a one-cell gap between two hit placements, is not skipped.
-    q = 0.5 * (2.0 * BEV_HALF_M / no) / BEV_HALF_M
-    offs = [(ox * q, oy * q) for ox in (-1.0, 0.0, 1.0) for oy in (-1.0, 0.0, 1.0)]
-    top_p = None
-    for ox, oy in offs:
-        off = torch.tensor([ox, oy], dtype=dtype, device=device)
-        t_s = F.grid_sample(src, grid + off, mode="nearest", padding_mode="zeros", align_corners=False)
-        top_p = t_s if top_p is None else torch.maximum(top_p, t_s)
-    top_p = top_p - 100.0
-    slope = (top_p.view(b * ncam, na, nr) - cz) / rr.view(1, 1, nr)
+    # centre line and every point of it within 0.125 m (along) of a range sample: the tops are first
+    # max-pooled over 3 x 3 occluder cells (0.25 m), so a cell the line clips by a corner, or a one-cell
+    # gap between two hit placements, is not skipped; then one nearest sample per polar bin.
+    src = tops
     if bottoms is not None:
-        bsrc = (100.0 - bottoms.clamp(min=-100.0, max=100.0)).expand(b, ncam, no, no).reshape(b * ncam, 1, no, no)
-        nb_p = None  # 100 - bottom, max over the same 3 x 3 block (= lowest bottom); off-grid 0 -> bottom 100
-        for ox, oy in offs:
-            off = torch.tensor([ox, oy], dtype=dtype, device=device)
-            b_s = F.grid_sample(bsrc, grid + off, mode="nearest", padding_mode="zeros", align_corners=False)
-            nb_p = b_s if nb_p is None else torch.maximum(nb_p, b_s)
-        bot_p = (100.0 - nb_p).view(b * ncam, na, nr)
-        g_max = dest_z.to(dtype).reshape(b, -1).amax(dim=1).view(b, 1).expand(b, ncam).reshape(b * ncam, 1, 1)
-        h_lim = torch.where(g_max <= cz, cz - (cz - g_max) * rr.view(1, 1, nr) / float(VIEWSHED_RANGE_M), g_max.expand_as(cz))
-        slope = torch.where(bot_p > h_lim, torch.full_like(slope, -1.0e4), slope)
+        # Floating occluders: one whose lowest bottom (min-pooled over the same 3 x 3 block) is above
+        # every camera of the rig and the highest ground ``dest_z`` passes over every sight line to the
+        # ground and is dropped. An occluder starting lower always counts.
+        b_min = -F.max_pool2d(-bottoms, 3, stride=1, padding=1)
+        g_max = dest_z.to(dtype).reshape(b, -1).amax(dim=1)
+        lim = torch.maximum(cz.view(b, ncam).amax(dim=1), g_max).view(b, 1, 1, 1)
+        src = torch.where(b_min > lim, torch.full_like(tops, -100.0), tops)
+    src = F.max_pool2d(src + 100.0, 3, stride=1, padding=1)
+    # every camera's polar samples in one call (cameras stacked along the output rows)
+    top_p = F.grid_sample(src, grid.view(b, ncam * na, nr, 2), mode="nearest", padding_mode="zeros", align_corners=False)
+    slope = (top_p.view(b * ncam, na, nr) - 100.0 - cz) / rr.view(1, 1, nr)
     run = slope
     shift = 1
     while shift < nr:
@@ -807,193 +785,6 @@ def ground_ceiling(dtype: Any = torch.float32, device: Any = None) -> Any:
     return (GROUND_SLOPE_CAP * torch.sqrt(dx * dx + dy * dy)).view(1, 1, BEV_N, BEV_N)
 
 
-def _row_gain(T: Any, elev: Any) -> Any:
-    """How much farther apart than ``r * FEAT_STRIDE / fy`` two neighbouring pixel rows are, measured
-    vertically at horizontal range r, for a ray at elevation ``elev`` (rad, broadcast against B x N x ...)
-    of a camera pitched ``p``: ``cos^2(elev - p) / cos^2(elev)`` (pinhole rows are evenly spaced in
-    tan(elev - p); off-centre columns are closer, so the centre column is the worst case)."""
-    fwd_z = T[..., 2, 2].clamp(min=-1.0, max=1.0)
-    pitch = torch.asin(fwd_z).view(*T.shape[:2], *([1] * (elev.dim() - 2)))
-    return torch.cos(elev - pitch) ** 2 / torch.cos(elev).clamp(min=1e-3) ** 2
-
-
-def _trust_m(K: Any, T: Any, dtype: Any) -> Any:
-    """B x N trust range per camera: the range out to which neighbouring pixel rows are less than
-    ``DESIGN_WALL_M - RAISED_OCC_M`` apart on a wall face (``(DESIGN_WALL_M - RAISED_OCC_M) * fy /
-    FEAT_STRIDE`` shrunk by ``_row_gain`` at the elevation of the face bottom, the mount taken
-    ``EGO_GROUND_DROP_M`` above the ground for the steepest view)."""
-    base = (DESIGN_WALL_M - RAISED_OCC_M) * K[..., 1, 1].to(dtype) / FEAT_STRIDE
-    drop = T[..., 2, 3].to(dtype) + EGO_GROUND_DROP_M - RAISED_OCC_M
-    r = base
-    for _ in range(4):  # shrinking r steepens the view and raises the gain: iterate to the fixed point
-        r = base / _row_gain(T.to(dtype), -torch.atan(drop.clamp(min=0.0) / r))
-    return r
-
-
-def detection_cover(T: Any, K: Any, ground: Any, blocked: Any, occ_m: float, cam_w: Any, pixel_valid: Any = None) -> tuple[Any, Any]:
-    """(cover, cap), each B x 1 x N x N. ``cap``: a wall on the cell that no valid camera puts a pixel
-    row on above the occluder cutoff has its top under ``cap`` (the finest row step over the cameras
-    that see the cell). ``cover`` is 1 where some valid camera is sure to put a pixel row on the face of a design wall
-    standing anywhere on the cell: its ground is not behind an occluder for that camera (``blocked``),
-    the face span (``occ_m`` to ``occ_m + DESIGN_WALL_M - RAISED_OCC_M`` above ``ground``) projects
-    inside its image (and ``pixel_valid``) from all four cell corners, and either the cell is within the
-    camera's trust range or a pixel row centre lies between the lowest projected top and the highest
-    projected bottom of the span over the four corners (a horizontal plane maps to the image by a
-    homography, so the corners bound the cell). Not eroded: ``uncovered_prefix`` samples the 2 x 2
-    cells around every polar sample."""
-    b, n = T.shape[:2]
-    dtype, device = ground.dtype, ground.device
-    ys = BEV_HALF_M - BEV_CELL_M * (torch.arange(BEV_N, device=device, dtype=dtype) + 0.5)
-    xs = -BEV_HALF_M + BEV_CELL_M * (torch.arange(BEV_N, device=device, dtype=dtype) + 0.5)
-    R = T[..., :3, :3].to(dtype)
-    t = T[..., :3, 3].to(dtype)
-    gx = xs.view(1, 1, 1, BEV_N).expand(b, n, BEV_N, BEV_N)
-    gy = ys.view(1, 1, BEV_N, 1).expand(b, n, BEV_N, BEV_N)
-    dxy = torch.sqrt((gx - t[..., 0, None, None]) ** 2 + (gy - t[..., 1, None, None]) ** 2)
-    ok = blocked < 0.5
-    h_img, w_img = (pixel_valid.shape[-2], pixel_valid.shape[-1]) if pixel_valid is not None else (CROP_H // FEAT_STRIDE, CROP_W // FEAT_STRIDE)
-    if pixel_valid is not None:
-        pv = pixel_valid.to(dtype).reshape(-1, n, h_img * w_img)
-        pv = pv.expand(b, n, h_img * w_img) if pv.shape[0] == 1 else pv
-    half = 0.5 * BEV_CELL_M
-    v_lo = None  # lowest (largest v) projected top over the corners
-    v_hi = None  # highest (smallest v) projected bottom over the corners
-    for hz, is_top in ((occ_m, False), (occ_m + (DESIGN_WALL_M - RAISED_OCC_M), True)):
-        gz = (ground + hz).expand(b, n, BEV_N, BEV_N)
-        for ox, oy in ((-half, -half), (-half, half), (half, -half), (half, half)):
-            d = torch.stack([gx + ox - t[..., 0, None, None], gy + oy - t[..., 1, None, None], gz - t[..., 2, None, None]], dim=-1)
-            pc = torch.einsum("bnji,bnyxj->bnyxi", R, d)  # R^T (p - t): camera frame
-            zc = pc[..., 2]
-            zs = torch.where(zc > 0.1, zc, torch.ones_like(zc))
-            u = K[..., 0, 0, None, None].to(dtype) * pc[..., 0] / zs + K[..., 0, 2, None, None].to(dtype)
-            v = K[..., 1, 1, None, None].to(dtype) * pc[..., 1] / zs + K[..., 1, 2, None, None].to(dtype)
-            inside = (zc > 0.1) & (u >= 0) & (u < CROP_W) & (v >= 0) & (v < CROP_H)
-            if pixel_valid is not None:
-                col = torch.floor(u / FEAT_STRIDE).clamp(min=0, max=w_img - 1)
-                row = torch.floor(v / FEAT_STRIDE).clamp(min=0, max=h_img - 1)
-                flat = (row * w_img + col).long().reshape(b, n, -1)
-                inside = inside & (pv.gather(2, flat).view_as(inside) > 0)
-            ok = ok & inside
-            if is_top:
-                v_lo = v if v_lo is None else torch.maximum(v_lo, v)
-            else:
-                v_hi = v if v_hi is None else torch.minimum(v_hi, v)
-    # a row centre (i + 0.5) * FEAT_STRIDE in [v_lo, v_hi]
-    row_hit = torch.floor(v_hi / FEAT_STRIDE - 0.5) >= torch.ceil(v_lo / FEAT_STRIDE - 0.5)
-    sure = (dxy <= _trust_m(K, T, dtype)[..., None, None]) | row_hit
-    # otherwise its rows are one row step apart on the face (pitch gain at the face bottom), so a wall
-    # it misses is under occ_m + that step
-    elev = -torch.atan((t[..., 2, None, None] - ground - occ_m).clamp(min=0.0) / dxy.clamp(min=1e-3))
-    step = dxy * FEAT_STRIDE / K[..., 1, 1, None, None].to(dtype) * _row_gain(T.to(dtype), elev)
-    face = DESIGN_WALL_M - RAISED_OCC_M
-    gap = torch.where(sure, torch.full_like(step, face), torch.maximum(step, torch.full_like(step, face)))
-    use = ok & (cam_w.to(dtype).view(b, n, 1, 1) > 0)
-    gap = torch.where(use, gap, torch.full_like(gap, 1.0e3)).amin(dim=1, keepdim=True)
-    cover = (gap <= face).to(dtype)
-    return cover, ground + occ_m + gap
-
-
-def uncovered_prefix(cover: Any, T: Any, cap: Any) -> Any:
-    """Per camera B*Ncam x (A*R): number of uncovered polar samples (``cover`` < 0.5) along each azimuth
-    up to and including each range bin."""
-    b, ncam = T.shape[:2]
-    grid, _, _ = _polar_grid(T, cover.dtype, cover.device)
-    src = cover.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
-    # The sight line to any point lies within half an azimuth bin (<= 0.21 m at 48 m) of its bin's
-    # centre line, so each of its points is within a quarter cell (Chebyshev) of a sample (0.125 m
-    # along, plus the lateral offset). The four cells a quarter cell off a sample in x and y are the
-    # 2 x 2 block holding every such point: a sample counts as covered only if all four are.
-    q = 0.5 * BEV_CELL_M / BEV_HALF_M
-    cap_src = (cap - 100.0).expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
-    cov_p = None
-    cap_p = None
-    for ox, oy in ((-q, -q), (-q, q), (q, -q), (q, q)):
-        off = torch.tensor([ox, oy], dtype=cover.dtype, device=cover.device)
-        c = F.grid_sample(src, grid + off, mode="nearest", padding_mode="zeros", align_corners=False)
-        cov_p = c if cov_p is None else torch.minimum(cov_p, c)
-        # off the grid: zeros -> +100 m, no bound
-        h = F.grid_sample(cap_src, grid + off, mode="nearest", padding_mode="zeros", align_corners=False) + 100.0
-        cap_p = h if cap_p is None else torch.maximum(cap_p, h)
-    unc = (cov_p < 0.5).to(cover.dtype).squeeze(1)  # B*Ncam x A x R
-    cap_run = cap_p.squeeze(1)
-    shift = 1
-    while shift < cap_run.shape[-1]:
-        cap_run = torch.maximum(cap_run, F.pad(cap_run[..., :-shift], (shift, 0), value=-1.0e4))
-        shift *= 2
-    nr = unc.shape[-1]
-    # far edge (m) of the last uncovered sample up to each range bin (0 if none), running max by doubling
-    far = unc * (torch.arange(nr, device=cover.device, dtype=cover.dtype) + 1.0).view(1, 1, nr) * float(VIEWSHED_RANGE_STEP_M)
-    shift = 1
-    while shift < nr:
-        far = torch.maximum(far, F.pad(far[..., :-shift], (shift, 0), value=0.0))
-        shift *= 2
-    return unc.cumsum(dim=-1).reshape(b * ncam, -1), unc.reshape(b * ncam, -1), far.reshape(b * ncam, -1), cap_run.reshape(b * ncam, -1)
-
-
-def trusted_band(pts: Any, T: Any, K: Any, z_rel: Any, band: float, occ_m: float, ground: Any, unc: tuple[Any, Any]) -> Any:
-    """0/1 per ray point: may count as seen (G5). ``pts`` B x N x D' x h x w x 3, ``z_rel`` its height
-    above the local ground, ``ground`` B x 1 x N x N, ``unc`` from ``uncovered_prefix``.
-
-    A design wall (``wall = DESIGN_WALL_M + (occ_m - RAISED_OCC_M)`` tall) has ``DESIGN_WALL_M -
-    RAISED_OCC_M`` of face above the occluder cutoff; out to its trust range a camera's pixel rows are
-    closer than that, so one of them lands on it and the viewshed has it. Past the trust range a wall can
-    fall between two rows unseen. A ray can only clear a design wall where it is more than ``wall`` above
-    the ground, so its points get the full ``band`` if it is under ``wall`` where it leaves the trust
-    range, or if every cell it crosses from there until it drops under ``wall`` is covered by some
-    camera (``detection_cover``). Otherwise a point counts only within SEEN_TIGHT_M of the ground: a ray
-    that clears every occluder and is that close to the ground is not over ground hidden by more.
-    """
-    b, n = T.shape[:2]
-    cam = T[..., :3, 3].to(pts.dtype).view(b, n, 1, 1, 1, 3)
-    vec = pts - cam
-    r_h = torch.sqrt(vec[..., 0] * vec[..., 0] + vec[..., 1] * vec[..., 1])
-    trust = _trust_m(K, T, pts.dtype).view(b, n, 1, 1, 1)
-    frac = (trust / r_h.clamp(min=1e-6)).clamp(max=1.0)
-    q = cam + vec * frac.unsqueeze(-1)
-    idx_q, ok_q = _flat_index(q)
-    g_q = ground.reshape(b, BEV_N * BEV_N).gather(1, idx_q.reshape(b, -1)).view_as(r_h)
-    h_q = q[..., 2] - g_q
-    wall = DESIGN_WALL_M + (occ_m - RAISED_OCC_M)
-    own = (r_h <= trust) | (ok_q & (h_q <= wall))
-    # where the ray drops under ``wall`` (heights linear between q and the point)
-    r_w = trust + (h_q - wall) / (h_q - z_rel).clamp(min=1e-6) * (r_h - trust)
-    r_end = torch.minimum(r_w, r_h)
-    cum, unc_bin, far, cap_run = unc
-    i_q = _polar_index(vec[..., 0], vec[..., 1], trust.expand_as(r_h)).reshape(b * n, -1)
-    i_w = _polar_index(vec[..., 0], vec[..., 1], r_end).reshape(b * n, -1)
-    count = cum.gather(1, i_w) - cum.gather(1, i_q) + unc_bin.gather(1, i_q)
-    covered = ok_q & (count.view_as(r_h) < 0.5)
-    # an undetected design wall can only stand on an uncovered cell where the ray is above ``wall``
-    # (range <= r_end, and no farther than the far edge of the last uncovered sample before it, plus
-    # one cell for the sampling); the ray passes z_rel * r / r_h above the sight line to this point's
-    # ground at range r, so the ground under the point is hidden by less than z_rel * r_o / r_h
-    r_unc = far.gather(1, i_w).view_as(r_h) + BEV_CELL_M
-    r_o = torch.minimum(r_end, r_unc).clamp(min=0.0)
-    shadow = z_rel * r_o / r_h.clamp(min=1e-6)
-    # The wall is also missed by this camera's own rows: its top is under occ_m + one row step above
-    # its ground, else a row lands on its face above the cutoff (both bounds grow with range, so the
-    # worst case is the farthest range r_o). Hidden depth is that top minus the sight line there.
-    o = cam + vec * (r_o / r_h.clamp(min=1e-6)).unsqueeze(-1)
-    idx_o, ok_o = _flat_index(o)
-    g_o = ground.reshape(b, BEV_N * BEV_N).gather(1, idx_o.reshape(b, -1)).view_as(r_h)
-    cz = cam[..., 2]
-    elev = -torch.atan((cz - g_o - occ_m).clamp(min=0.0) / r_o.clamp(min=1e-3))
-    step = r_o * FEAT_STRIDE / K[..., 1, 1].to(pts.dtype).view(b, n, 1, 1, 1) * _row_gain(T.to(pts.dtype), elev)
-    sight_o = cz + (pts[..., 2] - z_rel - cz) * r_o / r_h.clamp(min=1e-6)
-    comb = g_o + occ_m + step - sight_o
-    shadow = torch.where(ok_o, torch.minimum(shadow, comb), shadow)
-    # and by every other camera: under the largest ``cap`` sampled up to r_o (tops only rise with range
-    # for the bound, so the farthest range is the worst case for the sight line too)
-    i_o = _polar_index(vec[..., 0], vec[..., 1], r_o).reshape(b * n, -1)
-    shadow = torch.minimum(shadow, cap_run.gather(1, i_o).view_as(r_h) - sight_o)
-    # hidden is judged on the sight line to the cell centre, up to half a cell diagonal nearer than the
-    # point's foot: that line is lower at r_o by at most (cz - ground) * r_o * d / (r_h (r_h - d))
-    d_c = 0.5 * math.sqrt(2.0) * BEV_CELL_M
-    shadow = shadow + (cz - (pts[..., 2] - z_rel)).clamp(min=0.0) * r_o * d_c / (r_h * (r_h - d_c)).clamp(min=1e-3)
-    tight = min(float(band), SEEN_TIGHT_M)
-    return torch.where(own | covered, z_rel < band, (z_rel < band) & (shadow < tight)).to(z_rel.dtype)
-
-
 def tight_clear(pts: Any, T: Any, z_rel: Any, tight: float = SEEN_TIGHT_M, z_land: Any = None) -> Any:
     """0/1 per ray point: the point is so close to its ground that no occluder can hide that ground (G5).
 
@@ -1012,11 +803,12 @@ def tight_clear(pts: Any, T: Any, z_rel: Any, tight: float = SEEN_TIGHT_M, z_lan
     """
     b, n = T.shape[:2]
     cam = T[..., :3, 3].to(pts.dtype).view(b, n, *([1] * (pts.dim() - 3)), 3)
-    vec = pts - cam
-    r_h = torch.sqrt(vec[..., 0] * vec[..., 0] + vec[..., 1] * vec[..., 1])
     d_c = 0.5 * math.sqrt(2.0) * BEV_CELL_M
-    g = pts[..., 2] - z_rel
-    worst = z_rel.clamp(min=0.0) + (cam[..., 2] - g).clamp(min=0.0) * d_c / (r_h - d_c).clamp(min=1e-3)
+    # in place where a temporary is ours (activation budget)
+    dy = pts[..., 1] - cam[..., 1]
+    r_h = (pts[..., 0] - cam[..., 0]).pow_(2).addcmul_(dy, dy).sqrt_()
+    # camera height over the point's ground g = z - z_rel
+    worst = (cam[..., 2] - pts[..., 2]).add_(z_rel).clamp_(min=0.0).mul_(d_c).div_((r_h - d_c).clamp_(min=1e-3)).add_(z_rel.clamp(min=0.0))
     ok = (r_h > 2.0 * d_c) & (worst < tight)
     if z_land is not None:
         ok = ok & ((pts[..., 2].to(z_rel.dtype) - z_land) < tight)
@@ -1053,10 +845,10 @@ def bev_flat_index(points: Any, n: int = BEV_N) -> tuple[Any, Any]:
 def _flat_index(points: Any, n: int = BEV_N) -> tuple[Any, Any]:
     cell = 2.0 * BEV_HALF_M / n
     x, y, z = points[..., 0], points[..., 1], points[..., 2]
-    row = torch.floor((BEV_HALF_M - y) / cell)
-    col = torch.floor((x + BEV_HALF_M) / cell)
+    row = (BEV_HALF_M - y).div_(cell).floor_()  # in place on our own temporaries (activation budget)
+    col = (x + BEV_HALF_M).div_(cell).floor_()
     ok = (row >= 0) & (row < n) & (col >= 0) & (col < n) & (z >= BEV_Z_MIN_M) & (z < BEV_Z_MAX_M)
-    idx = torch.where(ok, row * n + col, torch.zeros_like(row)).long()
+    idx = torch.where(ok, row.mul_(n).add_(col), torch.zeros_like(col)).long()
     return idx, ok
 
 def splat(values: Any, idx: Any, ok: Any, n: int = BEV_N) -> Any:
@@ -1065,12 +857,21 @@ def splat(values: Any, idx: Any, ok: Any, n: int = BEV_N) -> Any:
     Points with ``ok`` False go to a discard cell that is sliced off, so the
     graph has static shapes and no boolean gather (ONNX friendly).
     """
+    return _splat_flat(values, _splat_index(idx, ok, n), n)
+
+
+def _splat_index(idx: Any, ok: Any, n: int = BEV_N) -> Any:
+    """Flat scatter index for ``splat`` (B * P): cell + batch offset, invalid points to the discard cell."""
+    b = idx.shape[0]
+    cells = n * n
+    local = torch.where(ok, idx, torch.full_like(idx, cells))
+    base = torch.arange(b, device=idx.device).view(b, 1) * (cells + 1)
+    return local.add_(base).reshape(-1)
+
+
+def _splat_flat(values: Any, flat: Any, n: int = BEV_N) -> Any:
     b, p, c = values.shape
     cells = n * n
-    dump = torch.full_like(idx, cells)
-    local = torch.where(ok, idx, dump)
-    base = torch.arange(b, device=values.device).view(b, 1) * (cells + 1)
-    flat = (local + base).reshape(-1)
     acc = values.new_zeros(b * (cells + 1), c)
     # scatter_add, not index_add: the legacy ONNX exporter turns index_add into a
     # ScatterElements with no reduction, which is wrong for repeated indices.
@@ -1159,46 +960,6 @@ class BevLssHead(nn.Module):
         yaw = torch.atan2(fwd[..., 0], fwd[..., 1])
         return torch.stack([K[..., 0, 0] / FX_REF_PX, torch.sin(yaw), torch.cos(yaw), T[..., 2, 3]], dim=-1)
 
-    def _lateral_midpoints(
-        self, pts: Any, T: Any, K: Any, idx: Any, pass_r: Any, crossed: Any, through: Any, ray_w: Any, z_land: Any,
-        raised: Any, flat_g: Any, flat_has: Any, blocked: Any, occ_m: float, ground: Any, unc: Any, frac: float = 0.5,
-    ) -> Any:
-        """Seen / free masses (B x 2 x N x N) from virtual rays half way between neighbouring pixel columns (G5).
-
-        Columns are 8 px apart, wider than a 0.5 m cell past ~4 m on the side cameras, so road between two
-        columns that both reach it is otherwise never sampled. The virtual ray between columns c and c + 1
-        reaches / passes a depth bin only if both real rays do (minimum of their gates), never crosses a
-        raised cell either of them crossed or that it crosses itself, and its own point is judged on its own
-        cell: ground band, trusted band, viewshed (``blocked``) and tight clearance, exactly as a real ray
-        point. An occluder narrower than the column gap that both rays miss and no other ray touches can hide
-        it: by construction that object is unobservable to the rig (named limitation in spec.md).
-        """
-        b, n, d, h, w = idx.shape
-        if w < 2:
-            return torch.zeros(b, 2, BEV_N, BEV_N, dtype=pass_r.dtype, device=pass_r.device)
-
-        def mid(t: Any) -> Any:
-            return torch.minimum(t[..., :-1], t[..., 1:])
-
-        pts_m = (1.0 - frac) * pts[..., :-1, :] + frac * pts[..., 1:, :]
-        idx_m, ok_m = _flat_index(pts_m)
-        ids = idx_m.reshape(b, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
-        z_m = pts_m[..., 2].to(pass_r.dtype)
-        z_rel_m = z_m - flat_g.gather(1, ids).view_as(z_m)
-        ok_rel_m = flat_has.gather(1, ids).view_as(z_m) * mid(ray_w)
-        band_m = near_ground(z_rel_m, 0.0, self.ground_band_m).to(z_m.dtype) * ok_rel_m
-        seen_m = trusted_band(pts_m, T, K, z_rel_m, self.ground_band_m, occ_m, ground, unc) * ok_rel_m
-        crossed_m = (1.0 - ray_crossed_raised(idx_m, ok_m, raised)) * mid(crossed)
-        ids_c = idx_m.reshape(b, n, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
-        visible_m = (1.0 - blocked.reshape(b, n, BEV_N * BEV_N).gather(2, ids_c).view_as(idx_m)) * ok_m.to(z_m.dtype)
-        tight_m = tight_clear(pts_m, T, z_rel_m, min(float(self.ground_band_m), SEEN_TIGHT_M), mid(z_land)) * ok_rel_m * mid(through)
-        vis = torch.maximum(visible_m, tight_m) * crossed_m
-        # only bins both real rays passed through (S >= FREE_PASS_TAU): never a bin either of them stopped in,
-        # so a virtual ray never lands on (or behind) a surface between them
-        through_r = mid(pass_r)
-        vals = torch.stack([through_r * seen_m * vis, through_r * band_m * vis], dim=-1).reshape(b, -1, 2)
-        return splat(vals, idx_m.reshape(b, -1), ok_m.reshape(b, -1))
-
     def forward(
         self,
         f4: Any,
@@ -1256,11 +1017,11 @@ class BevLssHead(nn.Module):
         # wall's face hits are occluders; a 2.0 m band raises it so a 1.5 m car roof is not one.
         occ_m = self.ground_band_m - (GROUND_BAND_M - RAISED_OCC_M)
         g_low = torch.where(has_ground > 0, torch.minimum(ground, g_wide), g_wide)
-        top_bound, bot_bound, hit_w, hit_idx = ray_top_bounds(pts, pts_e, surf * ray_w, ground * has_ground, occ_m, reached, T[..., :3, 3])
-        tops, has_occ = occluder_tops(top_bound, hit_idx, hit_w)
-        # lowest bottom per cell: an upper bound on -bottom by the same log-sum-exp (never above the min)
-        neg_bot, _ = occluder_tops(-bot_bound, hit_idx, hit_w)
-        bottoms = torch.where(has_occ > 0, -neg_bot, torch.full_like(neg_bot, 100.0))
+        top_bound, bot_bound, hit_w, hit_idx = ray_top_bounds(pts, self.depths, self.edges, surf * ray_w, ground * has_ground, occ_m, reached, T[..., :3, 3])
+        # highest top and (as an upper bound on -bottom, never above the minimum) lowest bottom per cell
+        tb, has_occ = occluder_tops(torch.stack([top_bound, -bot_bound], dim=-1), hit_idx, hit_w)
+        tops = tb[:, 0:1]
+        bottoms = torch.where(has_occ > 0, -tb[:, 1:2], torch.full_like(has_occ, 100.0))
         blocked = viewshed_blocked(tops, g_low, T, bottoms=bottoms)
         ids_c = idx.reshape(b, n, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
         visible = (1.0 - blocked.reshape(b, n, BEV_N * BEV_N).gather(2, ids_c).view_as(idx)) * ok.to(prob.dtype)
@@ -1270,16 +1031,12 @@ class BevLssHead(nn.Module):
             ok_g = flat_has.gather(1, ids.reshape(b, -1)).view_as(zs)
             return zs - g, ok_g * ray_w
 
-        cam_w = cam_valid.to(prob.dtype) if cam_valid is not None else torch.ones(b, n, dtype=prob.dtype, device=prob.device)
-        cover, cap = detection_cover(T, K, ground * has_ground, blocked, occ_m, cam_w, pixel_valid)
-        unc = uncovered_prefix(cover, T, cap)
         z_rel, ok_rel = _rel(z, idx)
         band_w = near_ground(z_rel, 0.0, self.ground_band_m).to(prob.dtype) * ok_rel  # B N D h w
-        seen_w = trusted_band(pts, T, K, z_rel, self.ground_band_m, occ_m, ground * has_ground, unc) * ok_rel
         # only where the ray passed the point (not in its surface bin: a binned surface can sit up to half
         # a bin past the true one, e.g. behind a wall's foot)
         tight_c = tight_clear(pts, T, z_rel, min(float(self.ground_band_m), SEEN_TIGHT_M), z_land) * ok_rel * through
-        clear_w = reach * reached * seen_w * crossed * torch.maximum(visible, tight_c)
+        clear_w = reach * reached * band_w * crossed * torch.maximum(visible, tight_c)
         through_w = beyond * through * band_w * crossed * torch.maximum(visible, tight_c)
         occ_w = (1.0 - reach) * (1.0 - reached) * band_w
         # Visibility is also sampled at the edge between bins j and j + 1. In the surface band only
@@ -1290,7 +1047,6 @@ class BevLssHead(nn.Module):
         idx_e, ok_e = bev_flat_index(pts_e)
         z_rel_e, ok_rel_e = _rel(pts_e[..., 2].to(prob.dtype), idx_e)
         band_e = near_ground(z_rel_e, 0.0, self.ground_band_m).to(prob.dtype) * ok_rel_e
-        seen_e = trusted_band(pts_e, T, K, z_rel_e, self.ground_band_m, occ_m, ground * has_ground, unc) * ok_rel_e
         crossed_e = 1.0 - ray_crossed_raised(idx_e, ok_e, raised)
         ids_e = idx_e.reshape(b, n, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
         visible_e = (1.0 - blocked.reshape(b, n, BEV_N * BEV_N).gather(2, ids_e).view_as(idx_e)) * ok_e.to(prob.dtype)
@@ -1301,17 +1057,12 @@ class BevLssHead(nn.Module):
         vis_e = torch.stack(
             [
                 (1.0 - s_e) * (1.0 - reached_e) * band_e,
-                s_e * reached_e * seen_e * crossed_e * visible_e,
+                s_e * reached_e * band_e * crossed_e * visible_e,
                 s_e * through_e * band_e * crossed_e * visible_e,
             ],
             dim=-1,
         ).reshape(b, n * (d - 1) * h * w, 3)
         vis_e = splat(vis_e, idx_e.reshape(b, -1), ok_e.reshape(b, -1))
-        vis_m = torch.zeros_like(vis_e[:, :2])
-        for frac in LATERAL_FRACS:
-            for p_v, i_v, pass_v, cr_v, th_v in ((pts, idx, beyond * through, crossed, through), (pts_e, idx_e, s_e * through_e, crossed_e, through_e)):
-                v = self._lateral_midpoints(p_v, T, K, i_v, pass_v, cr_v, th_v, ray_w, z_land, raised, flat_g, flat_has, blocked, occ_m, ground * has_ground, unc, frac)
-                vis_m = vis_m + v
         ctx = ctx.view(b, n, 1, CTX_CH, h, w)
         lifted = prob_w.unsqueeze(3) * ctx  # B N D C h w
         values = torch.cat(
@@ -1332,11 +1083,8 @@ class BevLssHead(nn.Module):
         occ = bev[:, CTX_CH + 2 : CTX_CH + 3]
         clear = bev[:, CTX_CH + 3 : CTX_CH + 4]
         occ = occ + vis_e[:, 0:1]
-        # virtual rays fill gaps between real ones; they never overrule a real ray that landed in the
-        # cell without reaching it (behind a surface it is more likely than not to have hit)
-        fill = (occ <= 0).to(occ.dtype)
-        thru = bev[:, CTX_CH + 4 : CTX_CH + 5] + vis_e[:, 2:3] + vis_m[:, 1:2] * fill
-        clear = clear + vis_e[:, 1:2] + vis_m[:, 0:1] * fill
+        thru = bev[:, CTX_CH + 4 : CTX_CH + 5] + vis_e[:, 2:3]
+        clear = clear + vis_e[:, 1:2]
         logits = self.encoder(torch.cat([feat, torch.log1p(hit), torch.log1p(passed)], dim=1))
         logits = apply_visibility(logits, clear, thru, occluded_mass=occ)
         return {

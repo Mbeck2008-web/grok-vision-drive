@@ -1,0 +1,24 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -699,8 +699,10 @@
+     env = np.full(n_col, np.inf)
+     env[used] = env2d[tix[used], tiy[used]]
+     gfloor = env.copy()
++    gplane = np.full(n_col, np.nan)
+     if vs.size:
+         gfloor[used] = floor2d[tix[used], tiy[used]]
++        gplane[used] = pl[tix[used], tiy[used]]
+     # Envelope votes are absolute so a hotter car cannot silence the
+     # road. Plane inliers still use a relative p vote, so far-uphill
+     # columns whose ground was clipped (only a 0.05-weaker below cell
+@@ -734,8 +736,9 @@
+     # level that passes is the column's ground.
+     has_env_layer = np.zeros(n_col, dtype=bool)
+     gnd_lvl = np.full(n_col, np.iinfo(np.int64).max)
++    gceil = np.where(np.isfinite(gplane), gplane + 0.5, np.inf)
+     cand = (finite_env[col] & (lvl < raw[col]) & (lvl >= env_lvl[col])
+-            & (lvl >= gfloor[col] - 1e-6))
++            & (lvl >= gfloor[col] - 1e-6) & (lvl <= gceil[col] + 1e-6))
+     if cand.any() and vs.size:
+         ci = np.flatnonzero(cand)
+         # One cell per voxel: a duplicate weaker cell at the same column and

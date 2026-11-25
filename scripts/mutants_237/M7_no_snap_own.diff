@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -837,7 +837,7 @@
+     # next to a building). An object a full layer above stays off.
+     own = np.where(valid, np.rint(fit_z), np.nan)
+     snap_own = valid & ok & ~inlier & ~snap_low & (own >= target) & (own <= expected + 0.5)
+-    target[snap_own] = own[snap_own].astype(np.int64)
++    snap_own[:] = False
+     leftover = used & ~ok
+     if leftover.any():
+         # Inherit the nearest finite expected height (tile grid, O(tiles)),

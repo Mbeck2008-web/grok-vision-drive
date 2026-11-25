@@ -1,0 +1,1045 @@
+"""Sparse occupancy net: camera images in, occupancy at a sparse point set out.
+
+Runtime is camera-only. ``SparseOccNet.forward(images, points)`` takes the rig
+RGB frames and ego-frame query points; it has no depth, semantic, or box
+input, and this module never imports the training-only label builder
+(``python/train/occ_labels.py``; ``scripts/test_occ_runtime_imports.py``).
+
+Sparse, never dense: features are sampled at query points only. ``predict``
+runs coarse-to-fine over ``LEVELS`` (cells 4x, then 2x the fine voxel): every
+4x cell some camera sees is queried once for "any fine cell occupied"; only
+the 2x children of hot 4x cells are queried next, and only the fine children
+of hot 2x cells get an occupancy query. No dense volume tensor exists at any
+point. Three levels, not two, because the measured labels are a surface
+sheet (15 of 64 fine cells in a hot 4x cell; ``docs/specs/occ_sparse.md``).
+
+Outputs per point: ``occ`` (this fine cell occupied), ``any`` (B,N,levels:
+the level-``l`` cell holding the point has an occupied fine cell), ``cls``
+logits over ``OCC_CLASS_COUNT`` coarse classes (other / drivable / vehicle).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+
+from python.perception.occ_geometry import DEFAULT_GRID, OccGrid, PinholeCam
+
+try:
+    import torch
+    from torch import nn
+    import torch.nn.functional as F
+except ImportError:  # pragma: no cover - torch-free hosts
+    torch = None
+    nn = None
+    F = None
+
+OCC_CLASS_COUNT = 3
+FEAT = 64
+ENC_CHANNELS = (32, 64, 96)
+PE_FREQS = 6
+HIDDEN = 128
+LEVELS = (4, 2)
+COARSE_FACTOR = LEVELS[0]
+COARSE_THRESH = 0.3
+FINE_THRESH = 0.5
+LIVE_LONG_SIDE = 640
+# Net sizes. "cheap" aims at the planner tick on a shared Pascal card (fp16 compute
+# there is ~1/64 of fp32, so AMP buys memory, not speed: run cheap in fp32).
+NET_CONFIGS = {
+    "default": {"channels": ENC_CHANNELS, "feat": FEAT, "hidden": HIDDEN, "ctx": True},
+    "cheap": {"channels": (16, 32, 48), "feat": 32, "hidden": 64, "ctx": True},
+}
+# Reduced-camera presets. The live supervisor reads all 8 cams but the 8-cam live
+# rate at the planner tick is unproven: main+wide is the minimum.
+CAM_PRESETS = {
+    "min": ("main", "wide"),
+    "front3": ("main", "wide", "narrow"),
+    "all8": ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"),
+}
+# Run profiles for the GTX 1080 Ti shared with BeamNG. Compute is fp32: Pascal
+# fp16 math is ~1/64 of fp32, so fp16 is a memory option only, never a speed
+# claim. ``max_points`` is the per-stage top-k cap on the descent (16,384 = 5% of
+# the grid, 5.1% of the 8-camera fine frustum). int8 (TensorRT, DP4A) is the only precision speed-up on this card and is
+# NOT implemented: it would need a calibration set and an accuracy delta vs fp32
+# (both UNMEASURED) and adds TensorRT as a dependency.
+PROFILES = {
+    "1080ti": {"config": "default", "long_side": 640, "cams": "all8", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
+    "1080ti_cheap": {"config": "cheap", "long_side": 480, "cams": "front3", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
+    "1080ti_min": {"config": "cheap", "long_side": 320, "cams": "min", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
+    # Michael's front_cluster knob: main+wide only, main at a higher resolution,
+    # against front3 (main+wide+narrow, all at 640). Trade-off measured by
+    # scripts/compare_front_cluster.py.
+    "front_cluster": {"config": "default", "long_side": 640, "main_long_side": 800, "cams": "min", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
+    "front3": {"config": "default", "long_side": 640, "cams": "front3", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
+}
+# Absolute cap on the top (4x coarse) stage. 8 cams see 5,044 of the 5,120 top
+# cells; the cap keeps that stage from scaling with the grid.
+MAX_COARSE = 2048
+# Per-camera age weight: exp(-age / tau), 0 past max age (or no frame).
+AGE_TAU_S = 0.5
+AGE_MAX_S = 1.5
+
+
+def cam_weights(cam_ids: Sequence[str], *, preset: str | None = None, ages_s: Mapping[str, float] | None = None,
+                tau_s: float = AGE_TAU_S, max_age_s: float = AGE_MAX_S) -> np.ndarray:
+    """Fusion weight per camera (``cam_ids`` order), float32 in [0, 1].
+
+    ``preset`` masks cameras outside ``CAM_PRESETS[preset]`` (weight 0).
+    ``ages_s`` is each camera's own frame age at this tick (now - its frame
+    timestamp): a fresh frame weighs 1, a stale one ``exp(-age/tau)``, one older
+    than ``max_age_s`` or missing from ``ages_s`` weighs 0. A NaN or negative
+    age counts as missing.
+    """
+    w = np.ones((len(cam_ids),), dtype=np.float32)
+    if preset is not None:
+        keep = set(CAM_PRESETS[preset])
+        w *= np.array([c in keep for c in cam_ids], dtype=np.float32)
+    if ages_s is not None:
+        for i, c in enumerate(cam_ids):
+            a = ages_s.get(c)
+            a = float(a) if a is not None else float("nan")
+            w[i] *= 0.0 if not (np.isfinite(a) and 0.0 <= a <= max_age_s) else float(np.exp(-a / tau_s))
+    return w
+
+
+def positional_encoding_dim(freqs: int = PE_FREQS) -> int:
+    return 3 + 3 * 2 * int(freqs)
+
+
+def visible_mask(cams: Sequence[PinholeCam], pts: np.ndarray) -> np.ndarray:
+    """True where at least one camera's frustum holds the point."""
+    from python.perception.occ_geometry import project
+
+    vis = np.zeros((np.asarray(pts).shape[0],), dtype=bool)
+    for cam in cams:
+        vis |= project(cam, pts)[2]
+    return vis
+
+
+def children_offsets(factor: int, voxel_m: float) -> np.ndarray:
+    """Fine-cell centre offsets inside one coarse cell, relative to its centre."""
+    f = int(factor)
+    o = (np.arange(f) + 0.5) * float(voxel_m) - f * float(voxel_m) / 2.0
+    return np.stack(np.meshgrid(o, o, o, indexing="ij"), axis=-1).reshape(-1, 3)
+
+
+@dataclass
+class OccPrediction:
+    keys: np.ndarray       # fine cell keys predicted occupied (sorted)
+    prob: np.ndarray       # their occupancy probability
+    cls: np.ndarray        # their coarse class
+    n_coarse: int          # coarse points queried
+    n_fine: int            # fine points queried
+    stage_queries: tuple = ()  # points queried per stage: (4x coarse, 2x coarse, fine)
+
+    @property
+    def n_queried(self) -> int:
+        return int(self.n_coarse + self.n_fine)
+
+    def queried_ratio(self, grid: OccGrid = DEFAULT_GRID) -> float:
+        """Points queried / dense fine cells. Dense would be 1.0."""
+        return float(self.n_queried) / float(grid.dense_cells)
+
+
+if nn is not None:
+
+    class CamEncoder(nn.Module):
+        """Shared per-camera CNN, stride 8. GroupNorm: batch 1 is legal."""
+
+        def __init__(self, channels: Sequence[int] = ENC_CHANNELS, feat: int = FEAT) -> None:
+            super().__init__()
+            layers: list[nn.Module] = []
+            prev = 3
+            for ch in channels:
+                layers += [nn.Conv2d(prev, ch, 3, stride=2, padding=1), nn.GroupNorm(8, ch), nn.ReLU()]
+                prev = ch
+            layers += [nn.Conv2d(prev, feat, 3, padding=1), nn.GroupNorm(8, feat), nn.ReLU(), nn.Conv2d(feat, feat, 1)]
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, x: Any) -> Any:
+            return self.net(x)
+
+    class SparseOccNet(nn.Module):
+        """Camera features sampled at sparse 3-D query points."""
+
+        def __init__(self, cams: Sequence[PinholeCam], *, grid: OccGrid = DEFAULT_GRID, feat: int | None = None,
+                     hidden: int | None = None, channels: Sequence[int] | None = None, config: str = "default",
+                     ctx: bool | None = None, decode_unseen: bool = True) -> None:
+            super().__init__()
+            if not cams:
+                raise ValueError("SparseOccNet needs at least one camera")
+            cfg = NET_CONFIGS[config]
+            feat = int(feat or cfg["feat"])
+            hidden = int(hidden or cfg["hidden"])
+            self.config = config
+            self.cam_ids = tuple(c.cam_id for c in cams)
+            self.cams = list(cams)
+            self.grid = grid
+            self.channels = tuple(int(c) for c in (channels or cfg["channels"]))
+            self.hidden = hidden
+            # ctx: a per-tick scene vector (cam_w-weighted mean of every camera's
+            # pooled feature map, B x feat) fed to every query, so a query no
+            # camera ray reaches (occluded / out of view) still decodes from the
+            # scene, not from position alone. decode_unseen: predict() also
+            # queries top-stage cells outside every frustum.
+            self.ctx = bool(cfg.get("ctx", True) if ctx is None else ctx)
+            self.decode_unseen = bool(decode_unseen)
+            self.encoder = CamEncoder(self.channels, feat=feat)
+            self.feat_dim = feat
+            rot = np.stack([c.rotation() for c in cams]).astype(np.float32)
+            pos = np.stack([np.asarray(c.pos) for c in cams]).astype(np.float32)
+            intr = np.array([[c.focal_px, c.width, c.height, c.near_m, c.far_m] for c in cams], dtype=np.float32)
+            self.register_buffer("cam_rot", torch.from_numpy(rot), persistent=False)
+            self.register_buffer("cam_pos", torch.from_numpy(pos), persistent=False)
+            self.register_buffer("cam_intr", torch.from_numpy(intr), persistent=False)
+            lo = torch.tensor(grid.lo, dtype=torch.float32)
+            hi = torch.tensor(grid.hi, dtype=torch.float32)
+            self.register_buffer("box_lo", lo, persistent=False)
+            self.register_buffer("box_hi", hi, persistent=False)
+            pe = positional_encoding_dim()
+            self.head = nn.Sequential(
+                nn.Linear(feat + pe + 1 + (feat if self.ctx else 0), hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden), nn.ReLU(),
+                nn.Linear(hidden, 1 + len(LEVELS) + OCC_CLASS_COUNT),
+            )
+
+        def _pe(self, pts: Any) -> Any:
+            unit = (pts - self.box_lo) / (self.box_hi - self.box_lo) * 2.0 - 1.0
+            out = [unit]
+            for i in range(PE_FREQS):
+                out += [torch.sin((2.0 ** i) * np.pi * unit), torch.cos((2.0 ** i) * np.pi * unit)]
+            return torch.cat(out, dim=-1)
+
+        def encode(self, images: Sequence[Any], cam_w: Any = None) -> list[Any]:
+            """One feature map per camera, in ``cam_ids`` order. Each image is (B,3,H,W) in [0,1].
+
+            A ``None`` image, or a camera whose weight in ``cam_w`` is 0, is not
+            encoded (its feature map is ``None`` and it drops out of fusion).
+            """
+            if len(images) != len(self.cam_ids):
+                raise ValueError(f"expected {len(self.cam_ids)} camera images (None for a missing cam), got {len(images)}")
+            w = None if cam_w is None else np.asarray(cam_w, dtype=np.float32).reshape(-1)
+            return [None if (img is None or (w is not None and w[k] <= 0.0)) else self.encoder(img)
+                    for k, img in enumerate(images)]
+
+        def project(self, k: int, pts: Any) -> tuple[Any, Any, Any]:
+            """Pixel (u, v) and frustum mask of ego points in camera ``k``."""
+            c = (pts - self.cam_pos[k]) @ self.cam_rot[k].T
+            f, w, h, near, far = (self.cam_intr[k, i] for i in range(5))
+            z = c[..., 2]
+            zs = torch.where(z > 1e-6, z, torch.ones_like(z))
+            u = w / 2.0 + f * c[..., 0] / zs
+            v = h / 2.0 - f * c[..., 1] / zs
+            ok = (z > near) & (z < far) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+            return u, v, ok
+
+        def query(self, feats: Sequence[Any], pts: Any, cam_w: Any = None) -> dict[str, Any]:
+            """Head outputs at ego points ``pts`` (B,N,3).
+
+            Fusion is the ``cam_w``-weighted mean of the features of the cameras
+            that see a point (default weight 1; ``None`` feature map = weight 0).
+            ``seen`` is the summed weight, clipped to 1.
+            """
+            bsz, n, _ = pts.shape
+            acc = pts.new_zeros((bsz, n, self.feat_dim))
+            cnt = pts.new_zeros((bsz, n, 1))
+            if cam_w is not None and not torch.is_tensor(cam_w):
+                cam_w = torch.as_tensor(np.asarray(cam_w, dtype=np.float32))
+            if cam_w is not None:
+                cam_w = cam_w.to(device=pts.device, dtype=pts.dtype)
+                cam_w = cam_w.reshape(1, -1).expand(bsz, -1) if cam_w.dim() == 1 else cam_w
+            for k, fm in enumerate(feats):
+                if fm is None:
+                    continue
+                u, v, ok = self.project(k, pts)
+                w, h = self.cam_intr[k, 1], self.cam_intr[k, 2]
+                gx = u / w * 2.0 - 1.0
+                gy = v / h * 2.0 - 1.0
+                grid = torch.stack([gx, gy], dim=-1).unsqueeze(1).to(fm.dtype)  # B,1,N,2
+                samp = F.grid_sample(fm, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+                samp = samp.squeeze(2).transpose(1, 2).to(acc.dtype)  # B,N,C
+                m = ok.unsqueeze(-1).to(acc.dtype)
+                if cam_w is not None:
+                    m = m * cam_w[:, k].reshape(bsz, 1, 1)
+                acc = acc + samp * m
+                cnt = cnt + m
+            mean = acc / cnt.clamp(min=1e-6)
+            seen = cnt.clamp(max=1.0)
+            parts = [mean, self._pe(pts).to(acc.dtype), seen]
+            if self.ctx:
+                parts.append(self.scene_ctx(feats, cam_w, bsz, acc).unsqueeze(1).expand(-1, n, -1))
+            out = self.head(torch.cat(parts, dim=-1))
+            nl = len(LEVELS)
+            return {"occ": out[..., 0], "any": out[..., 1 : 1 + nl], "cls": out[..., 1 + nl :], "seen": seen.squeeze(-1)}
+
+        def scene_ctx(self, feats: Sequence[Any], cam_w: Any, bsz: int, like: Any) -> Any:
+            """(B, feat): cam_w-weighted mean of the cameras' spatially pooled feature maps."""
+            acc = like.new_zeros((bsz, self.feat_dim))
+            tot = like.new_zeros((bsz, 1))
+            for k, fm in enumerate(feats):
+                if fm is None:
+                    continue
+                w = like.new_ones((bsz, 1)) if cam_w is None else cam_w[:, k].reshape(bsz, 1).to(like.dtype)
+                acc = acc + fm.mean(dim=(2, 3)).to(like.dtype) * w
+                tot = tot + w
+            return acc / tot.clamp(min=1e-6)
+
+        def forward(self, images: Sequence[Any], pts: Any, cam_w: Any = None) -> dict[str, Any]:
+            return self.query(self.encode(images), pts, cam_w)
+
+        def reset_temporal(self) -> None:
+            """Forget the carried hot top cells and the sweep phase (scene cut, teleport, tests)."""
+            self.__dict__.pop("_hot_top", None)
+            self.__dict__.pop("_sweep_phase", None)
+
+        @torch.no_grad()
+        def predict(
+            self,
+            images: Sequence[Any],
+            *,
+            coarse_thresh: float = COARSE_THRESH,
+            fine_thresh: float = FINE_THRESH,
+            max_points: int = 65536,
+            max_coarse: int = MAX_COARSE,
+            cam_w: Any = None,
+        ) -> OccPrediction:
+            """Coarse-to-fine sparse occupancy for one frame (batch 1).
+
+            Every stage has an absolute cap. The top (4x) stage queries at most
+            ``max_coarse`` of the visible coarse cells: last frame's hot top
+            cells first (sparse temporal carry, <= half the cap), then a
+            rotating stride subset of the rest, so every visible coarse cell is
+            revisited within ``ceil(visible / cap)`` frames. Each later stage
+            keeps the top-``max_points`` children by probability.
+            """
+            grid = self.grid
+            w = np.array([img is not None for img in images], dtype=np.float32)
+            if cam_w is not None:
+                w = w * np.asarray(cam_w, dtype=np.float32).reshape(-1)
+            active = tuple(bool(x > 0.0) for x in w)
+            on = [c for c, a in zip(self.cams, active) if a]
+            top = grid.coarse(LEVELS[0])
+            cap0 = max(1, int(max_coarse))
+            # Top-stage candidates are generated arithmetically (never by enumerating the
+            # grid): last frame's hot top keys first (<= half the cap), then the keys
+            # phase, phase+stride, ... over the top index space, visible ones kept.
+            # Every array here is <= cap0 long whatever the grid size.
+            carry = self.__dict__.get("_hot_top", {}).get(active, np.zeros((0,), np.int64))[: cap0 // 2]
+            n_top = int(top.dense_cells)
+            budget = cap0 - int(carry.shape[0])
+            stride = max(1, int(np.ceil(n_top / float(max(1, budget)))))
+            phase = self.__dict__.setdefault("_sweep_phase", {}).get(active, 0) % stride
+            self._sweep_phase[active] = phase + 1
+            sweep = np.arange(phase, n_top, stride, dtype=np.int64)[:budget]
+            sweep = sweep[~np.isin(sweep, carry)]
+            idx = np.concatenate([carry, sweep])[:cap0]
+            cpts = top.centers_of_keys(idx)
+            if not on:
+                vis = np.zeros((idx.shape[0],), bool)
+            elif self.decode_unseen:  # occluded / out-of-view cells decode too (from ctx + memory)
+                vis = np.ones((idx.shape[0],), bool)
+            else:
+                vis = visible_mask(on, cpts)
+            idx = idx[vis]
+            cands = cpts[vis].astype(np.float32)
+            self._top_keys = idx
+            self._index_bytes = int(idx.nbytes + cpts.nbytes + sweep.nbytes + carry.nbytes)
+            self._coarse_pts = cands
+            dev = self.cam_pos.device
+            feats = self.encode(images, w)
+            cw = torch.from_numpy(w).to(dev)
+            pts = self._coarse_pts
+            stages: list[int] = []
+            if pts.shape[0] == 0:
+                empty = np.zeros((0,), dtype=np.int64)
+                return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), 0, 0,
+                                     (0,) * (len(LEVELS) + 1))
+            n_coarse = 0
+            for li, f in enumerate(LEVELS):
+                n_coarse += int(pts.shape[0])
+                stages.append(int(pts.shape[0]))
+                p_any = torch.sigmoid(self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0), cw)["any"][0, :, li].float()).cpu().numpy()
+                sel = p_any >= float(coarse_thresh)
+                if li == 0:  # remember this frame's hot top cells (indices into the candidate list)
+                    hot_idx = idx[sel][np.argsort(-p_any[sel], kind="stable")]
+                    self.__dict__.setdefault("_hot_top", {})[active] = hot_idx.astype(np.int64)
+                hot, p_hot = pts[sel], p_any[sel]
+                nxt = LEVELS[li + 1] if li + 1 < len(LEVELS) else 1
+                offs = children_offsets(f // nxt, grid.voxel_m * nxt)
+                cap = max(1, int(max_points) // offs.shape[0])
+                if hot.shape[0] > cap:
+                    hot = hot[_capped_hot(hot, p_hot, cap, float(grid.z_min), grid.voxel_m * f)]
+                pts = (hot[:, None, :] + offs[None, :, :]).reshape(-1, 3).astype(np.float32)
+                self._index_bytes = max(self._index_bytes, int(pts.nbytes + hot.nbytes))
+                if pts.shape[0] == 0:
+                    break
+            if pts.shape[0] == 0:
+                empty = np.zeros((0,), dtype=np.int64)
+                return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), n_coarse, 0,
+                                    tuple(stages + [0] * (len(LEVELS) + 1 - len(stages))))
+            out = self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0), cw)
+            p = torch.sigmoid(out["occ"][0].float()).cpu().numpy()
+            c = out["cls"][0].float().argmax(-1).cpu().numpy().astype(np.uint8)
+            sel = p >= float(fine_thresh)
+            keys = grid.keys_of(pts[sel].astype(np.float64))
+            order = np.argsort(keys)
+            return OccPrediction(keys[order], p[sel][order], c[sel][order], n_coarse, int(pts.shape[0]),
+                                 tuple(stages) + (int(pts.shape[0]),))
+
+
+
+
+def _local_plane(h: np.ndarray, w: int) -> np.ndarray:
+    """Least-squares plane ``z = a + b dx + c dy`` in each ``(2w+1)`` window.
+
+    Returns the intercept ``a`` (the fitted height at the window centre).
+    Degenerate windows fall back to the inlier mean.
+
+    The window sums come from 2-D prefix sums (integral images), so memory
+    is O(nx * ny), not O(nx * ny * (2w+1)^2): a materialised sliding
+    window ran the 64x grid-growth test out of memory.
+    """
+    nx, ny = h.shape
+    mask = np.isfinite(h)
+    m = mask.astype(np.float64)
+    z = np.where(mask, h, 0.0)
+    X = np.arange(nx, dtype=np.float64)[:, None]
+    Y = np.arange(ny, dtype=np.float64)[None, :]
+    k = 2 * w + 1
+
+    def box(v: np.ndarray) -> np.ndarray:
+        c = np.zeros((nx + 2 * w + 1, ny + 2 * w + 1))
+        c[1:, 1:] = np.pad(v, w).cumsum(0).cumsum(1)
+        return c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+
+    n = box(m)
+    Sx, Sy = box(m * X), box(m * Y)
+    Sxx, Syy, Sxy = box(m * X * X), box(m * Y * Y), box(m * X * Y)
+    Sz, Szx, Szy = box(z), box(z * X), box(z * Y)
+    # Shift absolute index moments to window-centre offsets dx = X - i.
+    i, j = X, Y
+    sx = Sx - i * n
+    sy = Sy - j * n
+    sx2 = Sxx - 2.0 * i * Sx + i * i * n
+    sy2 = Syy - 2.0 * j * Sy + j * j * n
+    sxy = Sxy - j * Sx - i * Sy + i * j * n
+    sz = Sz
+    szx = Szx - i * Sz
+    szy = Szy - j * Sz
+    det = (
+        n * (sx2 * sy2 - sxy * sxy)
+        - sx * (sx * sy2 - sxy * sy)
+        + sy * (sx * sxy - sx2 * sy)
+    )
+    det_a = (
+        sz * (sx2 * sy2 - sxy * sxy)
+        - sx * (szx * sy2 - sxy * szy)
+        + sy * (szx * sxy - sx2 * szy)
+    )
+    n = np.rint(n)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        a = det_a / det
+        mean = sz / np.maximum(n, 1.0)
+        # Inliers on one line (a single row or column of the window, e.g.
+        # the edge of the voter support): fit that line instead of the
+        # mean, so the grade along it is kept.
+        vx = n * sx2 - sx * sx
+        vy = n * sy2 - sy * sy
+        line_y = (sz - (n * szy - sy * sz) / vy * sy) / n
+        line_x = (sz - (n * szx - sx * sz) / vx * sx) / n
+    a = np.where((n >= 3) & (np.abs(det) > 1e-9), a, np.nan)
+    line = np.where(vy > vx, line_y, line_x)
+    line = np.where((n >= 2) & (np.maximum(vx, vy) > 1e-9), line, np.nan)
+    return np.where(np.isfinite(a), a, np.where(np.isfinite(line), line, np.where(n > 0, mean, np.nan)))
+
+
+
+def _box_sum_xy(a: np.ndarray, r: int) -> np.ndarray:
+    """Sum over a ``(2r+1)^2`` xy window for each trailing slice (prefix sums)."""
+    nx, ny = a.shape[:2]
+    k = 2 * r + 1
+    c = np.zeros((nx + k, ny + k) + a.shape[2:])
+    c[1:, 1:] = np.pad(a, ((r, r), (r, r)) + ((0, 0),) * (a.ndim - 2)).cumsum(0).cumsum(1)
+    return c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+
+
+def _nearest_finite(val: np.ndarray) -> np.ndarray:
+    """Replace non-finite entries with the Manhattan-nearest finite value.
+
+    Two axial passes, O(nx * ny), no ``q×g`` matrix. A column with no
+    seed in the 12 m window inherits the closest band without a
+    quadratic copy (grid-growth / low-p scenes stay a few MiB).
+    """
+    finite = np.isfinite(val)
+    if finite.all() or not finite.any():
+        return val
+    out = val.copy()
+    nx, ny = val.shape
+    big = float(nx + ny + 1)
+    dist = np.where(finite, 0.0, big)
+    for j in range(1, ny):
+        sl = dist[:, j] > dist[:, j - 1] + 1.0
+        if sl.any():
+            dist[sl, j] = dist[sl, j - 1] + 1.0
+            out[sl, j] = out[sl, j - 1]
+    for j in range(ny - 2, -1, -1):
+        sl = dist[:, j] > dist[:, j + 1] + 1.0
+        if sl.any():
+            dist[sl, j] = dist[sl, j + 1] + 1.0
+            out[sl, j] = out[sl, j + 1]
+    for i in range(1, nx):
+        sl = dist[i] > dist[i - 1] + 1.0
+        if sl.any():
+            dist[i, sl] = dist[i - 1, sl] + 1.0
+            out[i, sl] = out[i - 1, sl]
+    for i in range(nx - 2, -1, -1):
+        sl = dist[i] > dist[i + 1] + 1.0
+        if sl.any():
+            dist[i, sl] = dist[i + 1, sl] + 1.0
+            out[i, sl] = out[i + 1, sl]
+    return out
+
+
+def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
+                       ix0: np.ndarray, iy0: np.ndarray, cell_m: float) -> np.ndarray:
+    """Ground layer index per xy column id (see ``_column_ground_lvl_compact``).
+
+    Works on the occupied columns only, so the per-column arrays scale
+    with the hot set, not with the grid's xy extent; the result is
+    indexed by the caller's ``col`` ids (unused ids hold int64 min).
+    """
+    uniq, inv = np.unique(col, return_inverse=True)
+    t = _column_ground_lvl_compact(inv.reshape(col.shape), lvl, p_hot, ix0, iy0, cell_m)
+    out = np.full(int(col.max()) + 1, np.iinfo(np.int64).min)
+    out[uniq] = t
+    return out
+
+
+def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
+                               ix0: np.ndarray, iy0: np.ndarray, cell_m: float) -> np.ndarray:
+    """Ground layer index per xy column, chosen from the bottom up.
+
+    ``col`` holds dense ids 0..n-1 (every id occupied).
+
+    The seed is the highest near-max layer (within ``BAND_MARGIN`` of the
+    column max) in a three-layer window starting at the lowest near-max
+    layer: the surface of a fill+ground stack, including when a cold
+    fill leaves a gap. Seeds with p >= ``VOTE_P_MIN`` vote (a hotter car
+    cannot silence the road; a weak hole fill does not vote). A robust
+    12 m lower envelope (a 5x5 median of votes, then the min of seeds not
+    a full layer below it, not a raw window min) rejects roofs, a lone
+    low outlier, and sparse hole fills; inliers up to a 15% grade over
+    that radius fit a local ground plane. A column holds real ground
+    below its seed when a cell between the envelope and the seed matches
+    the exposed ground at that level (the mean p of voting seeds there
+    within 12 m), pooled over a 5x5 of same-kind cells: a road under a
+    car matches, a fill under a grade or plateau is weaker. The band is
+    the plane's height, so far ground on a hill stays the band, a
+    one-layer car or guardrail on real ground goes to the above-ground
+    pool whatever its p, and a column with no cell at the plane (a
+    building with no ground) has no band, so every structure layer
+    stays in the above-ground pool. Missing tiles inherit the nearest
+    finite band in linear time, never a q×g matrix.
+    """
+    BAND_MARGIN = 0.05
+    # Absolute vote floor, pinned by road p=0.66 and p=0.80 fixtures
+    # (and by P8, whose 0.60 hole fill must not vote). Not a p-gap
+    # margin: it is the minimum p at which a seed is trusted to mark
+    # ground, so a 6x12 m hole of weaker fill cannot become the
+    # envelope. Columns below this inherit the nearest trusted band
+    # in linear time.
+    VOTE_P_MIN = 0.65
+    MEDIAN_R = 2  # 5x5 median of tile seeds before the 12 m envelope
+    # Pooled (5x5) gap between a buried cell and the exposed ground seeds
+    # at its level. A road under a car is ~0; fills the tests use sit
+    # 0.02-0.05 under the ground. Pooling makes it a mean, not a per-cell
+    # margin (sigma 0.01 -> ~0.003). A fill within 0.01 of the exposed
+    # ground is indistinguishable from a road under a car (documented).
+    EXPOSED_GAP = 0.01
+    from numpy.lib.stride_tricks import sliding_window_view
+    SEED_SPAN = 2  # window is lo_near .. lo_near + SEED_SPAN (3 layers)
+    n_col = int(col.max()) + 1
+    order = np.lexsort((-p_hot, col))
+    _, first = np.unique(col[order], return_index=True)
+    pmax = np.full(n_col, -np.inf)
+    pmax[col[order][first]] = p_hot[order][first]
+    near = p_hot >= (pmax[col] - BAND_MARGIN)
+
+    raw = np.full(n_col, np.iinfo(np.int64).min)
+    lo_all = np.zeros(n_col, np.int64)
+    near_idx = np.flatnonzero(near)
+    if near_idx.size:
+        c_n, l_n = col[near_idx], lvl[near_idx]
+        order = np.lexsort((l_n, c_n))
+        c_s, l_s = c_n[order], l_n[order]
+        _, first = np.unique(c_s, return_index=True)
+        lo = np.full(n_col, np.iinfo(np.int64).max)
+        lo[c_s[first]] = l_s[first]
+        lo_all = lo
+        in_win = l_s <= (lo[c_s] + SEED_SPAN)
+        if in_win.any():
+            np.maximum.at(raw, c_s, np.where(in_win, l_s, np.iinfo(np.int64).min))
+
+    nx = int(ix0.max()) + 1
+    ny = int(iy0.max()) + 1
+    _, first = np.unique(col, return_index=True)
+    col_ix = np.full(n_col, -1, np.int64)
+    col_iy = np.full(n_col, -1, np.int64)
+    col_ix[col[first]] = ix0[first]
+    col_iy[col[first]] = iy0[first]
+    used = np.zeros(n_col, dtype=bool)
+    used[col[first]] = True
+
+    valid = raw > np.iinfo(np.int64).min // 2
+    cs = np.flatnonzero(valid)
+    radius_m = 12.0
+    # The 2-D envelope / plane rasters use tiles of at least TILE_M, so
+    # their size depends on the metric extent, not the grid resolution
+    # (test_occ_cams grid growth). At the production cells (0.8 / 1.6 m)
+    # a tile is one column and this is exact.
+    TILE_M = 0.8
+    s_t = max(1, int(np.floor(TILE_M / float(cell_m) + 1e-6)))
+    tix = col_ix // s_t
+    tiy = col_iy // s_t
+    ntx = (nx - 1) // s_t + 1
+    nty = (ny - 1) // s_t + 1
+    w = max(1, int(np.ceil(radius_m / (float(cell_m) * s_t))))
+    # Seeds with p at least VOTE_P_MIN vote, so a sparse hotter car
+    # cannot stop a 0.65-0.80 road from voting (relative p-max vote
+    # would). A 0.60 hole fill does not vote (P8). Tile
+    # seeds are median-filtered on a 5x5, then the 12 m envelope is
+    # the min of seeds not a full layer below that median. A lone low
+    # outlier or a sparse hole fill cannot drag ~1000 neighbours down
+    # a layer, and the envelope stays the downhill min on a grade.
+    # The sliding min is a view, so memory stays flat as the grid
+    # grows (check_grid_growth / check_ground_band_growth).
+    pmax2d = np.full((ntx, nty), -np.inf)
+    if cs.size:
+        np.maximum.at(pmax2d, (tix[cs], tiy[cs]), pmax[cs])
+    local_pmax = sliding_window_view(
+        np.pad(pmax2d, w, constant_values=-np.inf), (2 * w + 1, 2 * w + 1)
+    ).max(axis=(-1, -2))
+    vote = np.zeros(n_col, dtype=bool)
+    if cs.size:
+        # Absolute floor, or within BAND_MARGIN of the strongest seed in
+        # 12 m when that seed itself is trusted: a weak road next to
+        # slightly hotter one-layer cars votes, so the cars are not the only
+        # voters. A weak hole fill next to strong ground (local max .95)
+        # still does not, and a region with no trusted seed in 12 m has no
+        # voters at all (leftover, below).
+        lp = local_pmax[tix[cs], tiy[cs]]
+        vote[cs] = (pmax[cs] >= VOTE_P_MIN) | (
+            (lp >= VOTE_P_MIN) & (pmax[cs] >= lp - BAND_MARGIN)
+        )
+    vs = np.flatnonzero(vote)
+    env2d = np.full((ntx, nty), np.inf)
+    filt = np.full((ntx, nty), np.nan)
+    if vs.size:
+        seed_h = np.full((ntx, nty), np.nan)
+        tmpmin = np.full((ntx, nty), np.inf)
+        np.minimum.at(tmpmin, (tix[vs], tiy[vs]), raw[vs].astype(np.float64))
+        seed_h = np.where(tmpmin < np.inf / 2, tmpmin, np.nan)
+        r = int(MEDIAN_R)
+        pad = np.pad(seed_h, r, constant_values=np.nan)
+        stack = np.stack([
+            pad[r + dx:r + dx + ntx, r + dy:r + dy + nty]
+            for dx in range(-r, r + 1) for dy in range(-r, r + 1)
+        ])
+        with np.errstate(all="ignore"):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                filt = np.nanmedian(stack, axis=0)
+        # 12 m min of seeds not a full layer below the 5x5 median. A
+        # lone low outlier or hole fill is left out; a 15% grade over
+        # the 5x5 (under one layer) stays in, so the min is the
+        # downhill ground on a grade.
+        use = np.isfinite(seed_h) & (
+            ~np.isfinite(filt) | (seed_h >= filt - 1.0 + 1e-6)
+        )
+        tmp = np.where(use, seed_h, np.inf)
+        env2d = sliding_window_view(
+            np.pad(tmp, w, constant_values=np.inf), (2 * w + 1, 2 * w + 1)
+        ).min(axis=(-1, -2))
+        # Buried-ground floor that follows the grade: a plane of the same
+        # envelope seeds (refit without seeds more than half a layer above
+        # it, i.e. roofs and walls), shifted down by the lowest residual in
+        # the 12 m window. On a grade the 12 m min lags downhill by several
+        # layers, so a fill under the road sat above it; the shifted plane
+        # does not lag, and a dense car lot only lowers the shift (its road
+        # seeds are the low residuals). Never below the envelope. Tile
+        # mean, not min (the min drops a layer at every grade step on
+        # grids finer than a tile). A column whose whole strong stack sits
+        # on the top level may be the grid ceiling (ground above z_max
+        # leaves only its fill): it does not shape the plane.
+        ts = np.zeros((ntx, nty))
+        tn = np.zeros((ntx, nty))
+        vp = vs[lo_all[vs] < int(lvl.max())]
+        np.add.at(ts, (tix[vp], tiy[vp]), raw[vp].astype(np.float64))
+        np.add.at(tn, (tix[vp], tiy[vp]), 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            hu = np.where(use & (tn > 0), ts / tn, np.nan)
+        pl = _local_plane(hu, w)
+        for _ in range(3):  # walls first, then one-layer objects
+            hu = np.where(np.isfinite(hu) & (hu - pl <= 0.5), hu, np.nan)
+            pl = _local_plane(hu, w)
+        res = np.where(np.isfinite(hu) & np.isfinite(pl), hu - pl, np.inf)
+        minres = sliding_window_view(
+            np.pad(res, w, constant_values=np.inf), (2 * w + 1, 2 * w + 1)
+        ).min(axis=(-1, -2))
+        minres = np.maximum(0.98 * minres, -0.56)
+        with np.errstate(invalid="ignore"):
+            lb = pl + minres
+        floor2d = np.where(np.isfinite(lb), np.maximum(env2d, lb), env2d)
+    local_med = np.full(n_col, np.nan)
+    if vs.size and np.isfinite(filt).any():
+        local_med[used] = filt[tix[used], tiy[used]]
+    env = np.full(n_col, np.inf)
+    env[used] = env2d[tix[used], tiy[used]]
+    gfloor = env.copy()
+    if vs.size:
+        gfloor[used] = floor2d[tix[used], tiy[used]]
+    # Envelope votes are absolute so a hotter car cannot silence the
+    # road. Plane inliers still use a relative p vote, so far-uphill
+    # columns whose ground was clipped (only a 0.05-weaker below cell
+    # left) do not pull the plane off the 6cdfb8d +15% floor. If no
+    # relative inlier remains (hot cars only), the plane falls back
+    # to the envelope.
+    vote_inlier = np.zeros(n_col, dtype=bool)
+    if cs.size:
+        vote_inlier[cs] = pmax[cs] >= (local_pmax[tix[cs], tiy[cs]] - BAND_MARGIN)
+    # Inliers follow the lower envelope up to a 15% grade over the
+    # window (far ground on a hill). A column that already has a cell
+    # at the envelope (a car or guardrail on real ground) votes at the
+    # envelope, not at the object. Roofs of a 3-layer building sit
+    # higher than that and stay out of the plane fit.
+    GRADE = 0.15
+    max_rise = GRADE * radius_m / float(cell_m)  # in layers
+    finite_env = np.isfinite(env)
+    env_lvl = np.full(n_col, np.iinfo(np.int64).min)
+    env_lvl[finite_env] = np.rint(env[finite_env]).astype(np.int64)
+    # Does the column hold real ground below its seed (a road under a
+    # one-layer car, a wall's footing) or only a weaker fill? Geometry
+    # alone cannot tell: a packed car row and a +1-layer plateau (or the
+    # downhill-lagged 12 m envelope on a grade) are the same 1-layer
+    # step. The test is the buried cell against the SAME level's exposed
+    # ground: the mean p of voting seeds at that level within 12 m. A road
+    # under a car matches the road around it (gap ~0, whatever the car's
+    # p); a fill under a grade or plateau is weaker than the ground seeds
+    # at its level. The gap is pooled over the 5x5 at that level, so
+    # sigma=0.01 cell noise averages to ~0.003; no column-max margin.
+    # Candidates sit between the 12 m envelope and the seed; the lowest
+    # level that passes is the column's ground.
+    has_env_layer = np.zeros(n_col, dtype=bool)
+    gnd_lvl = np.full(n_col, np.iinfo(np.int64).max)
+    cand = (finite_env[col] & (lvl < raw[col]) & (lvl >= env_lvl[col])
+            & (lvl >= gfloor[col] - 1e-6))
+    if cand.any() and vs.size:
+        ci = np.flatnonzero(cand)
+        # One cell per voxel: a duplicate weaker cell at the same column and
+        # level is not a second buried candidate (it would pool a 0.05 gap
+        # into its neighbours' ground).
+        o = np.lexsort((-p_hot[ci], lvl[ci], col[ci]))
+        ci = ci[o]
+        keep = np.ones(ci.size, dtype=bool)
+        keep[1:] = (col[ci][1:] != col[ci][:-1]) | (lvl[ci][1:] != lvl[ci][:-1])
+        ci = np.sort(ci[keep])
+        seed_cell = (lvl == raw[col]) & vote[col]
+        si = np.flatnonzero(seed_cell)
+        levels = np.unique(lvl[ci])
+        nl = levels.size
+        li_c = np.searchsorted(levels, lvl[ci])
+        li_s = np.searchsorted(levels, lvl[si])
+        ok_s = (li_s < nl) & (levels[np.minimum(li_s, nl - 1)] == lvl[si])
+        si, li_s = si[ok_s], li_s[ok_s]
+        ref_s = np.zeros((ntx, nty, nl))
+        ref_n = np.zeros((ntx, nty, nl))
+        if si.size:
+            np.add.at(ref_s, (tix[col[si]], tiy[col[si]], li_s), p_hot[si].astype(np.float64))
+            np.add.at(ref_n, (tix[col[si]], tiy[col[si]], li_s), 1.0)
+        ref_s, ref_n = _box_sum_xy(ref_s, w), _box_sum_xy(ref_n, w)
+        tc, tcy = tix[col[ci]], tiy[col[ci]]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ref = ref_s[tc, tcy, li_c] / ref_n[tc, tcy, li_c]
+        gap = ref - p_hot[ci].astype(np.float64)
+        fin = np.isfinite(gap)
+        # Pool cells of the same kind: same level AND same offset from
+        # their column's lowest near-max layer. On a grade (or where z_max
+        # clips a wall) one level holds the fill under one column's ground
+        # next to another column's ground under a wall; mixing them would
+        # average a real 0 gap with 0.05.
+        depth = np.minimum(lvl[ci] - lo_all[col[ci]], 0).astype(np.int64)
+        kinds, ki = np.unique(np.stack([li_c, depth], 1), axis=0, return_inverse=True)
+        ki = ki.reshape(-1)
+        nk = kinds.shape[0]
+        g_s = np.zeros((ntx, nty, nk))
+        g_n = np.zeros((ntx, nty, nk))
+        np.add.at(g_s, (tc[fin], tcy[fin], ki[fin]), gap[fin])
+        np.add.at(g_n, (tc[fin], tcy[fin], ki[fin]), 1.0)
+        g_s, g_n = _box_sum_xy(g_s, int(MEDIAN_R)), _box_sum_xy(g_n, int(MEDIAN_R))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            pooled = g_s[tc, tcy, ki] / g_n[tc, tcy, ki]
+        good = fin & (pooled <= EXPOSED_GAP)
+        if good.any():
+            gc = col[ci[good]]
+            np.minimum.at(gnd_lvl, gc, lvl[ci[good]])
+            has_env_layer[gc] = True
+    fit_z = raw.astype(np.float64).copy()
+    fit_z[has_env_layer] = gnd_lvl[has_env_layer].astype(np.float64)
+    near_local = ~np.isfinite(local_med) | (
+        raw.astype(np.float64) < local_med + 1.0
+    )
+    inlier = vote_inlier & finite_env & near_local & (
+        (has_env_layer & (raw.astype(np.float64) >= env))
+        | (
+            ~has_env_layer
+            & (raw.astype(np.float64) >= env)
+            & (raw.astype(np.float64) <= env + max_rise + 1e-6)
+        )
+    )
+    expected = np.full(n_col, np.nan)
+    ins = np.flatnonzero(inlier)
+    if ins.size:
+        hs = np.zeros((ntx, nty))
+        hn = np.zeros((ntx, nty))
+        np.add.at(hs, (tix[ins], tiy[ins]), fit_z[ins])
+        np.add.at(hn, (tix[ins], tiy[ins]), 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            h = np.where(hn > 0, hs / hn, np.nan)
+        plane2d = _local_plane(h, w)
+        expected[used] = plane2d[tix[used], tiy[used]]
+    # No inliers in the window: fall back to the lower envelope.
+    expected = np.where(np.isfinite(expected), expected, env)
+    target = np.full(n_col, np.iinfo(np.int64).min)
+    ok = used & np.isfinite(expected)
+    # Bias a slightly high plane down so a 0.6-layer error cannot put
+    # a wall in the band. Prefer the column's own seed when it sits on
+    # the plane (true ground, including a hill). A one-layer car at
+    # expected+1 is a full layer off the plane and stays in the above-ground pool.
+    target[ok] = np.floor(expected[ok] + 0.25).astype(np.int64)
+    # Inlier columns use the fit height (envelope if they have real ground,
+    # otherwise the seed). This keeps a 1-layer quantization step on the
+    # band when the plane undershoots, without promoting a one-layer object.
+    ins = np.flatnonzero(inlier & ok)
+    if ins.size:
+        target[ins] = np.rint(fit_z[ins]).astype(np.int64)
+    # A seed below the envelope must not become the band (P8). With the
+    # lower bound removed, a weak hole fill at env-1 would snap here.
+    snap_low = valid & ok & vote_inlier & (raw.astype(np.float64) >= env) & (
+        raw.astype(np.float64) <= env + 1.0
+    ) & (raw.astype(np.float64) < expected - 0.5)
+    target[snap_low] = raw[snap_low]
+    # A non-inlier column whose own surface (fit height) sits on the plane
+    # keeps it, including the upper level when the plane undershoots by
+    # under half a layer (a grade step the plane smooths over, a column
+    # next to a building). An object a full layer above stays off.
+    own = np.where(valid, np.rint(fit_z), np.nan)
+    snap_own = valid & ok & ~inlier & ~snap_low & (own >= target) & (own <= expected + 0.5)
+    target[snap_own] = own[snap_own].astype(np.int64)
+    leftover = used & ~ok
+    if leftover.any():
+        # Inherit the nearest finite expected height (tile grid, O(tiles)),
+        # never a q×g distance matrix.
+        # Columns that kept their own surface hand on that level, not the
+        # smoothed plane.
+        exp2d = np.full((ntx, nty), np.nan)
+        if ok.any():
+            mine_ok = (snap_own | snap_low)[ok]
+            exp2d[tix[ok], tiy[ok]] = np.where(mine_ok, target[ok], expected[ok])
+        exp2d = _nearest_finite(exp2d)
+        fill = leftover & np.isfinite(exp2d[tix, tiy])
+        target[fill] = np.floor(exp2d[tix[fill], tiy[fill]] + 0.25).astype(np.int64)
+        # No trusted voter within 12 m: the inherited height is only a lower
+        # bound. A column whose own lowest strong layer is higher keeps it
+        # (ground rising away from a far corner); a lone weaker fill below
+        # the inherited ground does not pull the band down.
+        mine = fill & valid & (lo_all < np.iinfo(np.int64).max)
+        target[mine] = np.maximum(target[mine], lo_all[mine])
+        still = leftover & ~fill
+        if still.any():
+            target[still] = raw[still]
+    return target
+
+
+def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell_m: float) -> np.ndarray:
+    """Indices of the ``cap`` hot cells to refine.
+
+    The ground band is chosen from the bottom of each xy column, not the
+    top. The seed is the highest near-max layer in a three-layer window
+    starting at the lowest near-max layer (the surface of a fill+ground
+    stack). Seeds at p >= VOTE_P_MIN vote on a robust 12 m lower
+    envelope; a local plane on the inliers is the band, and buried
+    ground is the cell that matches the exposed ground at its level
+    (see ``_column_ground_lvl_compact``). Far ground on a hill stays the
+    band; a one-layer car or guardrail on real ground (including when
+    its p is above the road, or in a dense hotter lot), and a wall or
+    roof (or a building with no ground under it), stay in the above-ground
+    pool. On flat, offset and
+    3% downhill roads the below-ground pool is empty; where a grade
+    starts inside the 12 m window some below-ground fill still reaches
+    the cap (0.8 m: 128 / 124 at +10% / +15%; the uphill maxima are
+    pinned in test_occ_net). Below and above are relative to that column's
+    ground, so a downhill or height-offset road stays the band instead
+    of a fixed z=0 slab. A thinner or holed ground layer still wins its
+    columns when it is within the margin of the strongest layer there,
+    even if a below-ground fill has more cells globally. At most half
+    the cap goes to the band. Above-ground structure is filled next,
+    then below-ground leftovers, so a hot below-ground fill cannot
+    starve posts / buildings that VO and occluders need. Unused budget
+    returns to the ground, then to structure.
+
+    Within each of those three pools, slots are spread in xy rather than a
+    global top-k by probability, so a high-p off-road region cannot take the
+    whole ground budget from a side road.
+    """
+    if hot.size == 0 or cap <= 0:
+        return np.zeros((0,), np.int64)
+    cell_m = float(cell_m)
+    z_min = float(z_min)
+    lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
+    # Per-column ground: bottom-up surface, not the highest near-max
+    # layer (a wall or car roof at the same p would steal the band).
+    ix = np.floor(hot[:, 0] / cell_m + 1e-6).astype(np.int64)
+    iy = np.floor(hot[:, 1] / cell_m + 1e-6).astype(np.int64)
+    ix0 = ix - int(ix.min())
+    iy0 = iy - int(iy.min())
+    col = ix0 * (int(iy0.max()) + 1) + iy0
+    gl = _column_ground_lvl(col, lvl, p_hot, ix0, iy0, cell_m)[col]
+    band = lvl == gl
+    below = lvl < gl
+    above = lvl > gl
+
+    def _spread(idxs: np.ndarray, budget: int) -> np.ndarray:
+        if budget <= 0 or idxs.size == 0:
+            return np.zeros((0,), dtype=idxs.dtype)
+        if idxs.size <= budget:
+            return idxs
+        xy = hot[idxs, :2]
+        lo = xy.min(0)
+        span = np.maximum(xy.max(0) - lo, 1e-6)
+        nx = max(1, int(np.ceil(np.sqrt(budget))))
+        ny = max(1, int(np.ceil(budget / nx)))
+        bx = np.minimum(((xy[:, 0] - lo[0]) / span[0] * nx).astype(np.int64), nx - 1)
+        by = np.minimum(((xy[:, 1] - lo[1]) / span[1] * ny).astype(np.int64), ny - 1)
+        bin_id = bx * ny + by
+        order = np.argsort(-p_hot[idxs], kind="stable")
+        _, first = np.unique(bin_id[order], return_index=True)
+        winners = order[first]
+        if winners.size >= budget:
+            return idxs[winners[np.argsort(-p_hot[idxs[winners]], kind="stable")[:budget]]]
+        taken = np.zeros(idxs.size, dtype=bool)
+        taken[winners] = True
+        fill = order[~taken[order]][: budget - winners.size]
+        return idxs[np.concatenate([winners, fill])]
+
+    low = np.flatnonzero(band)
+    up = np.flatnonzero(above)
+    dn = np.flatnonzero(below)
+    n_low = min(low.size, cap // 2) if low.size else 0
+    n_up = min(up.size, cap - n_low)
+    n_dn = min(dn.size, cap - n_low - n_up)
+    leftover = cap - (n_low + n_up + n_dn)
+    n_low = min(low.size, n_low + leftover)
+    leftover = cap - (n_low + n_up + n_dn)
+    n_up = min(up.size, n_up + leftover)
+    leftover = cap - (n_low + n_up + n_dn)
+    n_dn = min(dn.size, n_dn + leftover)
+    parts = [_spread(up, n_up), _spread(low, n_low), _spread(dn, n_dn)]
+    parts = [p for p in parts if p.size]
+    return np.concatenate(parts) if parts else np.zeros((0,), np.int64)
+
+
+def profile_cams(cfg: Any, profile: str, *, scale: float = 1.0) -> list[PinholeCam]:
+    """Cameras of ``PROFILES[profile]`` (preset + input sizes); ``scale`` shrinks every long side."""
+    from python.perception.occ_geometry import rig_cams
+
+    pr = PROFILES[profile]
+    keep = set(CAM_PRESETS[pr["cams"]])
+    out = []
+    for c in rig_cams(cfg):
+        if c.cam_id in keep:
+            ls = pr.get("main_long_side", pr["long_side"]) if c.cam_id == "main" else pr["long_side"]
+            out.append(c.scaled(max(8, int(round(ls * scale)))))
+    return out
+
+
+def memory_estimate(cams: Sequence[PinholeCam], *, config: str = "default", max_points: int = 65536,
+                    bytes_per: int = 4, temporal_k: int = 1, batch: int = 1) -> dict[str, float]:
+    """ESTIMATE (arithmetic, not measured) of inference memory in MB.
+
+    weights + temporal feature cache (K x cams x C x H/8 x W/8 x bytes; K = 1:
+    the net keeps only this frame's maps, temporal state is the tracker's few
+    floats per track) + encoder peak (largest consecutive stage pair of one
+    camera at a time) + query activations (max_points rows through the head,
+    x3 for the coarse-to-fine copies in flight).
+    """
+    cfg = NET_CONFIGS[config]
+    ch, feat, hid = tuple(cfg["channels"]), int(cfg["feat"]), int(cfg["hidden"])
+    params = 0
+    prev = 3
+    for c in ch:
+        params += prev * c * 9 + c + 2 * c
+        prev = c
+    params += prev * feat * 9 + feat + 2 * feat + feat * feat + feat
+    pe = positional_encoding_dim()
+    cx = feat if cfg.get("ctx", True) else 0  # scene context vector into every query
+    params += (feat + pe + 1 + cx) * hid + hid + hid * hid + hid + hid * (1 + len(LEVELS) + OCC_CLASS_COUNT) + 1 + len(LEVELS) + OCC_CLASS_COUNT
+    mb = 2.0 ** 20
+    cache = sum(temporal_k * feat * (c.height // 8) * (c.width // 8) * bytes_per for c in cams)
+    stages = []
+    for c in cams:
+        h, w, maps = c.height, c.width, [3]
+        sizes = [3 * h * w]
+        for k in ch:
+            h, w = (h + 1) // 2, (w + 1) // 2
+            sizes.append(k * h * w)
+        sizes.append(feat * h * w)
+        stages.append(max(a + b for a, b in zip(sizes, sizes[1:])) * bytes_per)
+    query = 3 * int(max_points) * (feat + pe + 1 + cx + 2 * hid + 1 + len(LEVELS) + OCC_CLASS_COUNT + 3) * bytes_per
+    b = max(1, int(batch))  # everything but the weights scales with the batch
+    out = {"weights_mb": params * 4 / mb, "feature_cache_mb": b * cache / mb, "encoder_peak_mb": b * max(stages) / mb,
+           "query_mb": b * query / mb, "batch": float(b), "params_formula": float(params), "temporal_k": float(temporal_k)}
+    out["total_mb"] = out["weights_mb"] + out["feature_cache_mb"] + out["encoder_peak_mb"] + out["query_mb"]
+    return out
+
+
+def live_cams(cfg: Any, long_side: int = LIVE_LONG_SIDE) -> list[PinholeCam]:
+    """Rig cameras from cameras.yaml at the live input long side."""
+    from python.perception.occ_geometry import rig_cams
+
+    return [c.scaled(long_side) for c in rig_cams(cfg)]
+
+
+class CheckpointMismatch(ValueError):
+    """A checkpoint's width/depth does not match the net it is loaded into."""
+
+
+def net_spec(net: Any) -> dict[str, Any]:
+    """The knobs that shape the weights. Any change here forces a retrain."""
+    return {"channels": list(net.channels), "feat": int(net.feat_dim), "hidden": int(net.hidden),
+            "levels": list(LEVELS), "classes": OCC_CLASS_COUNT, "pe_freqs": PE_FREQS, "ctx": bool(getattr(net, "ctx", False))}
+
+
+def save_checkpoint(net: Any, path: Any, **meta: Any) -> None:
+    """Weights + ``net_spec``. Cameras, input size and grid are NOT stored as
+    weights (they are non-persistent buffers): those knobs stay loadable."""
+    torch.save({"spec": net_spec(net), "state_dict": net.state_dict(), "meta": dict(meta)}, path)
+
+
+def load_checkpoint(net: Any, path: Any) -> dict[str, Any]:
+    """Strict load into ``net``. Raises ``CheckpointMismatch`` naming the knobs
+    that differ (width / depth / levels / classes / PE), never a partial load."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(ck, dict) or "spec" not in ck or "state_dict" not in ck:
+        raise CheckpointMismatch(f"{path}: not an occ_sparse checkpoint (no spec/state_dict)")
+    want, got = net_spec(net), dict(ck["spec"])
+    diff = {k: (got.get(k), want[k]) for k in want if got.get(k) != want[k]}
+    if diff:
+        raise CheckpointMismatch(f"{path}: checkpoint vs net differ in {diff}; width/depth changes need a retrain")
+    try:
+        net.load_state_dict(ck["state_dict"], strict=True)
+    except RuntimeError as e:  # same spec but different tensors: still refuse
+        raise CheckpointMismatch(f"{path}: {e}") from e
+    return dict(ck.get("meta") or {})

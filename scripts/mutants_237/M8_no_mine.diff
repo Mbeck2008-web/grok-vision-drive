@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -856,7 +856,7 @@
+         # (ground rising away from a far corner); a lone weaker fill below
+         # the inherited ground does not pull the band down.
+         mine = fill & valid & (lo_all < np.iinfo(np.int64).max)
+-        target[mine] = np.maximum(target[mine], lo_all[mine])
++        pass
+         still = leftover & ~fill
+         if still.any():
+             target[still] = raw[still]

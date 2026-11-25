@@ -1,0 +1,12 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -744,8 +744,7 @@
+         o = np.lexsort((-p_hot[ci], lvl[ci], col[ci]))
+         ci = ci[o]
+         keep = np.ones(ci.size, dtype=bool)
+-        keep[1:] = (col[ci][1:] != col[ci][:-1]) | (lvl[ci][1:] != lvl[ci][:-1])
+-        ci = np.sort(ci[keep])
++        ci = np.sort(ci)
+         seed_cell = (lvl == raw[col]) & vote[col]
+         si = np.flatnonzero(seed_cell)
+         levels = np.unique(lvl[ci])

@@ -1,0 +1,13 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -630,9 +630,7 @@
+         # still does not, and a region with no trusted seed in 12 m has no
+         # voters at all (leftover, below).
+         lp = local_pmax[tix[cs], tiy[cs]]
+-        vote[cs] = (pmax[cs] >= VOTE_P_MIN) | (
+-            (lp >= VOTE_P_MIN) & (pmax[cs] >= lp - BAND_MARGIN)
+-        )
++        vote[cs] = pmax[cs] >= VOTE_P_MIN
+     vs = np.flatnonzero(vote)
+     env2d = np.full((ntx, nty), np.inf)
+     filt = np.full((ntx, nty), np.nan)

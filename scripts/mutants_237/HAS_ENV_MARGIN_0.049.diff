@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -557,7 +557,7 @@
+     # 0.02-0.05 under the ground. Pooling makes it a mean, not a per-cell
+     # margin (sigma 0.01 -> ~0.003). A fill within 0.01 of the exposed
+     # ground is indistinguishable from a road under a car (documented).
+-    EXPOSED_GAP = 0.01
++    EXPOSED_GAP = 0.049
+     from numpy.lib.stride_tricks import sliding_window_view
+     SEED_SPAN = 2  # window is lo_near .. lo_near + SEED_SPAN (3 layers)
+     n_col = int(col.max()) + 1

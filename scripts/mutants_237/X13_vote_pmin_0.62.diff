@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -550,7 +550,7 @@
+     # ground, so a 6x12 m hole of weaker fill cannot become the
+     # envelope. Columns below this inherit the nearest trusted band
+     # in linear time.
+-    VOTE_P_MIN = 0.65
++    VOTE_P_MIN = 0.62
+     MEDIAN_R = 2  # 5x5 median of tile seeds before the 12 m envelope
+     # Pooled (5x5) gap between a buried cell and the exposed ground seeds
+     # at its level. A road under a car is ~0; fills the tests use sit

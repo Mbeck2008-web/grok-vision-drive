@@ -825,6 +825,15 @@ class BevLssHead(nn.Module):
         g_vals = torch.stack([surf * ray_w * torch.exp(-GROUND_SOFTMIN_K * (z - BEV_Z_MIN_M)), surf * ray_w], dim=-1)
         g_sum = splat(g_vals.reshape(b, n * d * h * w, 2), idx.reshape(b, -1), ok.reshape(b, -1))
         ground, has_ground, raised, g_wide = two_scale_ground(g_sum[:, 0:1], g_sum[:, 1:2])
+        # Occluder reference ground (shadow map and occluder-height map): it leaves out surfaces in the
+        # first depth bin. A surface nearer than that bin is clamped onto it, so its height there runs
+        # low (a low-mounted camera's own near road would drag the reference under the road it sees
+        # further out, which then reads as an occluder).
+        far_bin = (torch.arange(d, device=prob.device) > 0).to(prob.dtype).view(1, 1, d, 1, 1)
+        s_sum = splat((g_vals * far_bin.unsqueeze(-1)).reshape(b, n * d * h * w, 2), idx.reshape(b, -1), ok.reshape(b, -1))
+        s_ground, s_has, _, s_wide = two_scale_ground(s_sum[:, 0:1], s_sum[:, 1:2])
+        s_ground = torch.where(s_has > 0, s_ground, ground)
+        s_wide = torch.where(s_has > 0, s_wide, g_wide)
         flat_g = (ground * has_ground).reshape(b, BEV_N * BEV_N)
         flat_has = has_ground.reshape(b, BEV_N * BEV_N)
         crossed = 1.0 - ray_crossed_raised(idx, ok, raised)
@@ -834,8 +843,15 @@ class BevLssHead(nn.Module):
         # 2.0 m band (objects under the band may be passed over) raises it
         # so a 1.5 m car roof is not an occluder.
         occ_m = self.ground_band_m - (GROUND_BAND_M - RAISED_OCC_M)
-        high = surf * ray_w * ((z - g_at) >= occ_m) * ok.to(prob.dtype)
-        high_vals = torch.stack([high * z, high], dim=-1).reshape(b, n * d * h * w, 2)
+        s_at = (s_ground * has_ground).reshape(b, BEV_N * BEV_N).gather(1, idx.reshape(b, -1)).view_as(z)
+        high = surf * ray_w * ((z - s_at) >= occ_m) * ok.to(prob.dtype)
+        # An occluder's top lies anywhere up to where the next ray row above crosses it: one ray pitch
+        # (FEAT_STRIDE / fy rad) times the depth above its topmost hit. Other cameras' sight lines are
+        # judged against that upper bound, so a top that falls between this camera's rows still hides
+        # what lies behind it from them.
+        pitch = (FEAT_STRIDE / K[..., 1, 1].to(prob.dtype)).view(b, n, 1, 1, 1)
+        z_up = torch.addcmul(z, self.depths.to(prob.dtype).view(1, 1, -1, 1, 1), pitch)
+        high_vals = torch.stack([high * z_up, high], dim=-1).reshape(b, n * d * h * w, 2)
         high_sum = splat(high_vals, idx.reshape(b, -1), ok.reshape(b, -1))
         has_occ = (high_sum[:, 1:2] > 0).to(prob.dtype)
         z_mean = torch.where(
@@ -846,7 +862,7 @@ class BevLssHead(nn.Module):
         # Occluder top, not the mean of its face hits: log-sum-exp relative to the cell mean, never
         # below the highest hit and at most log(n) / OCC_TOP_K above it.
         mean_at = z_mean.reshape(b, BEV_N * BEV_N).gather(1, idx.reshape(b, -1)).view_as(z)
-        rel = torch.where(high > 0, z - mean_at, torch.zeros_like(z))
+        rel = torch.where(high > 0, z_up - mean_at, torch.zeros_like(z))
         top_vals = (high * torch.exp(OCC_TOP_K * rel)).reshape(b, n * d * h * w, 1)
         top_sum = splat(top_vals, idx.reshape(b, -1), ok.reshape(b, -1))
         z_occ = torch.where(
@@ -860,14 +876,6 @@ class BevLssHead(nn.Module):
         # Shadow map: per ray, the near edge of its surface bin when that surface is an occluder.
         # Shadow map (``shadow_blocked``). Reference ground: the local ground, unless it sits more than
         # occ_m above the wide-scale ground (it has collapsed onto a near wall's face); then the wide one.
-        # Its ground estimate leaves out surfaces in the first depth bin: a surface nearer than that bin
-        # is clamped onto it, so its height there runs low (a low-mounted camera's own near road would
-        # drag the reference under the road it sees further out, which then reads as an occluder).
-        far_bin = (torch.arange(d, device=prob.device) > 0).to(prob.dtype).view(1, 1, d, 1, 1)
-        s_sum = splat((g_vals * far_bin.unsqueeze(-1)).reshape(b, n * d * h * w, 2), idx.reshape(b, -1), ok.reshape(b, -1))
-        s_ground, s_has, _, s_wide = two_scale_ground(s_sum[:, 0:1], s_sum[:, 1:2])
-        s_ground = torch.where(s_has > 0, s_ground, ground)
-        s_wide = torch.where(s_has > 0, s_wide, g_wide)
         g_ref = torch.where((has_ground > 0) & (s_ground - s_wide <= occ_m), s_ground, s_wide)
         # A wider band (objects under it may be passed over) lifts both thresholds by the same amount.
         band_shift = self.ground_band_m - GROUND_BAND_M

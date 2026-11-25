@@ -157,6 +157,108 @@ def check_link_writer_atomic() -> None:
     print(f"atomic gvd_link writer: {stats['ok']} matched reads, 0 mismatch OK")
 
 
+def check_link_writer_replace_retries() -> None:
+    """Pin _write_link_atomic's bounded PermissionError retry (LINK_REPLACE_ATTEMPTS=50).
+
+    Monkeypatches os.replace (and records time.sleep without waiting) so the check
+    is deterministic: one PermissionError then success publishes the payload; a
+    permanent PermissionError is re-raised after exactly 50 attempts and 49 sleeps
+    of 1 ms; any other error propagates on the first attempt. A 1 s join cap plus
+    an attempt ceiling in the hook stops an unbounded retry from hanging the suite.
+    """
+    import threading
+
+    import test_m6_retail
+    from python.runtime import paths as gvd_paths
+
+    assert test_m6_retail.LINK_REPLACE_ATTEMPTS == 50
+    attempts_cap = test_m6_retail.LINK_REPLACE_ATTEMPTS
+
+    def _run(folder: Path, payload: str, replace_fn, *, join_s: float = 1.0):
+        """Call _write_link_atomic with patched replace/sleep. Returns (exc_or_None, n_calls, sleeps)."""
+        calls = {"n": 0}
+        sleeps: list[float] = []
+        caught: list[BaseException | None] = []
+        real_replace = os.replace
+        real_sleep = time.sleep
+
+        def counting_replace(src, dst, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > attempts_cap:
+                # Deterministic stop for an unbounded retry that only catches PermissionError.
+                raise RuntimeError(f"link replace continued past {attempts_cap} attempts")
+            return replace_fn(calls["n"], src, dst, *args, **kwargs)
+
+        def record_sleep(s):
+            sleeps.append(s)
+
+        def target() -> None:
+            os.replace = counting_replace  # type: ignore[method-assign]
+            time.sleep = record_sleep  # type: ignore[assignment]
+            try:
+                test_m6_retail._write_link_atomic(folder, payload)
+                caught.append(None)
+            except BaseException as exc:
+                caught.append(exc)
+            finally:
+                os.replace = real_replace  # type: ignore[method-assign]
+                time.sleep = real_sleep  # type: ignore[assignment]
+
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join(join_s)
+        assert not thread.is_alive(), (
+            f"unbounded link-replace retry: still running after {join_s} s cap "
+            f"({calls['n']} os.replace calls)"
+        )
+        assert caught, "writer thread finished without recording a result"
+        return caught[0], calls["n"], sleeps
+
+    with isolated_home(prefix="gvd-default-"):
+        pin = gvd_paths.predicted_gvd_docs_path()
+        pin.mkdir(parents=True, exist_ok=True)
+        target = pin / "gvd_link.json"
+        payload = json.dumps({"lua_bus": str(pin.resolve()), "probe": "retry"})
+        real_replace = os.replace
+
+        # (a) first replace raises PermissionError, second succeeds: payload is published.
+        def pe_once(n, src, dst, *args, **kwargs):
+            if n == 1:
+                raise PermissionError("simulated lock")
+            return real_replace(src, dst, *args, **kwargs)
+
+        if target.exists():
+            target.unlink()
+        exc, n, sleeps = _run(pin, payload, pe_once)
+        assert exc is None, exc
+        assert n == 2, n
+        assert sleeps == [0.001], sleeps
+        assert target.read_text(encoding="utf-8") == payload, target.read_text(encoding="utf-8")
+
+        # (b) every replace raises PermissionError: re-raised after exactly 50 attempts.
+        def always_pe(n, src, dst, *args, **kwargs):
+            raise PermissionError("simulated lock")
+
+        exc, n, sleeps = _run(pin, payload, always_pe)
+        assert isinstance(exc, PermissionError), exc
+        assert n == attempts_cap, n
+        assert sleeps == [0.001] * (attempts_cap - 1), (len(sleeps), sleeps[:3], sleeps[-3:])
+
+        # (c) a non-PermissionError propagates immediately (no retry).
+        def boom(n, src, dst, *args, **kwargs):
+            raise OSError("not a permission error")
+
+        exc, n, sleeps = _run(pin, payload, boom)
+        assert isinstance(exc, OSError) and not isinstance(exc, PermissionError), exc
+        assert n == 1, n
+        assert sleeps == [], sleeps
+
+    print(
+        f"atomic gvd_link retry: 1 PermissionError then publish, "
+        f"{attempts_cap} exhausted re-raise, other OSError on attempt 1 OK"
+    )
+
+
 def run_supervisor(extra: list[str], seconds: float = 2.0, echo: bool = False) -> tuple[str, list[dict]]:
     """Run the stub supervisor for ``seconds`` after its first command; stdout and sampled states.
 
@@ -244,6 +346,7 @@ def check_run_seconds() -> None:
 def main() -> None:
     check_observes_cmd_after_child_exit()
     check_link_writer_atomic()
+    check_link_writer_replace_retries()
     check_default_emits_nothing()
     check_no_engage()
     check_run_seconds()

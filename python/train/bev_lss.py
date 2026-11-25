@@ -740,19 +740,17 @@ def viewshed_blocked(tops: Any, dest_z: Any, T: Any, margin: float = SIGHTLINE_M
     # centre line and every point of it within 0.125 m (along) of a range sample: the tops are first
     # max-pooled over 3 x 3 occluder cells (0.25 m), so a cell the line clips by a corner, or a one-cell
     # gap between two hit placements, is not skipped; then one nearest sample per polar bin.
-    src = tops
-    if bottoms is not None:
-        # Floating occluders: one whose lowest bottom (min-pooled over the same 3 x 3 block) is above
-        # every camera of the rig and the highest ground ``dest_z`` passes over every sight line to the
-        # ground and is dropped. An occluder starting lower always counts.
-        b_min = -F.max_pool2d(-bottoms, 3, stride=1, padding=1)
-        g_max = dest_z.to(dtype).reshape(b, -1).amax(dim=1)
-        lim = torch.maximum(cz.view(b, ncam).amax(dim=1), g_max).view(b, 1, 1, 1)
-        src = torch.where(b_min > lim, torch.full_like(tops, -100.0), tops)
-    src = F.max_pool2d(src + 100.0, 3, stride=1, padding=1)
-    # every camera's polar samples in one call (cameras stacked along the output rows)
-    top_p = F.grid_sample(src, grid.view(b, ncam * na, nr, 2), mode="nearest", padding_mode="zeros", align_corners=False)
+    gv = grid.view(b, ncam * na, nr, 2)  # every camera's polar samples in one call (stacked along rows)
+    src = F.max_pool2d(tops + 100.0, 3, stride=1, padding=1)
+    top_p = F.grid_sample(src, gv, mode="nearest", padding_mode="zeros", align_corners=False)
     slope = (top_p.view(b * ncam, na, nr) - 100.0 - cz) / rr.view(1, 1, nr)
+    if bottoms is not None:
+        # lowest bottom over the same 3 x 3 block (off-grid: 100, no occluder)
+        bsrc = F.max_pool2d(100.0 - bottoms.clamp(min=-100.0, max=100.0), 3, stride=1, padding=1)
+        bot_p = 100.0 - F.grid_sample(bsrc, gv, mode="nearest", padding_mode="zeros", align_corners=False).view(b * ncam, na, nr)
+        g_max = dest_z.to(dtype).reshape(b, -1).amax(dim=1).view(b, 1).expand(b, ncam).reshape(b * ncam, 1, 1)
+        h_lim = torch.where(g_max <= cz, cz - (cz - g_max) * rr.view(1, 1, nr) / float(VIEWSHED_RANGE_M), g_max.expand_as(cz))
+        slope = torch.where(bot_p > h_lim, torch.full_like(slope, -1.0e4), slope)
     run = slope
     shift = 1
     while shift < nr:

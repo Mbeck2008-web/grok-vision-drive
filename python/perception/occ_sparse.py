@@ -689,6 +689,7 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
         minres = sliding_window_view(
             np.pad(res, w, constant_values=np.inf), (2 * w + 1, 2 * w + 1)
         ).min(axis=(-1, -2))
+        minres = np.maximum(0.98 * minres, -0.56)
         with np.errstate(invalid="ignore"):
             lb = pl + minres
         floor2d = np.where(np.isfinite(lb), np.maximum(env2d, lb), env2d)
@@ -698,10 +699,8 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     env = np.full(n_col, np.inf)
     env[used] = env2d[tix[used], tiy[used]]
     gfloor = env.copy()
-    gplane = np.full(n_col, np.nan)
     if vs.size:
         gfloor[used] = floor2d[tix[used], tiy[used]]
-        gplane[used] = pl[tix[used], tiy[used]]
     # Envelope votes are absolute so a hotter car cannot silence the
     # road. Plane inliers still use a relative p vote, so far-uphill
     # columns whose ground was clipped (only a 0.05-weaker below cell
@@ -735,12 +734,8 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     # level that passes is the column's ground.
     has_env_layer = np.zeros(n_col, dtype=bool)
     gnd_lvl = np.full(n_col, np.iinfo(np.int64).max)
-    # Buried ground lies between the grade-following floor and half a
-    # layer above the structure-free plane: a first wall layer that matches
-    # the uphill ground at its level is not ground.
-    gceil = np.where(np.isfinite(gplane), gplane + 0.5, np.inf)
     cand = (finite_env[col] & (lvl < raw[col]) & (lvl >= env_lvl[col])
-            & (lvl >= gfloor[col] - 1e-6) & (lvl <= gceil[col] + 1e-6))
+            & (lvl >= gfloor[col] - 1e-6))
     if cand.any() and vs.size:
         ci = np.flatnonzero(cand)
         # One cell per voxel: a duplicate weaker cell at the same column and
@@ -775,7 +770,7 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
         # clips a wall) one level holds the fill under one column's ground
         # next to another column's ground under a wall; mixing them would
         # average a real 0 gap with 0.05.
-        depth = (lvl[ci] - lo_all[col[ci]]).astype(np.int64)
+        depth = np.minimum(lvl[ci] - lo_all[col[ci]], 0).astype(np.int64)
         kinds, ki = np.unique(np.stack([li_c, depth], 1), axis=0, return_inverse=True)
         ki = ki.reshape(-1)
         nk = kinds.shape[0]
@@ -832,7 +827,7 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
         target[ins] = np.rint(fit_z[ins]).astype(np.int64)
     # A seed below the envelope must not become the band (P8). With the
     # lower bound removed, a weak hole fill at env-1 would snap here.
-    snap_low = valid & ok & (raw.astype(np.float64) >= env) & (
+    snap_low = valid & ok & vote_inlier & (raw.astype(np.float64) >= env) & (
         raw.astype(np.float64) <= env + 1.0
     ) & (raw.astype(np.float64) < expected - 0.5)
     target[snap_low] = raw[snap_low]

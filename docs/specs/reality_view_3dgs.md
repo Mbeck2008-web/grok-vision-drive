@@ -113,10 +113,13 @@ with it). Offline C prototypes and unit tests may use OpenCV in a **test
 process**, not inside `run_vision.py`. The renderer is read-only to
 control: no back-channel. Bounded shared memory or binary IPC,
 non-blocking, stale-frame tagged; the 60 kB UDP scene message stays for
-lanes / tracks / HUD only. Supervisor work, if any, is a non-blocking
-copy *after* `actuator.apply` and must drop on backpressure. Never block
-a camera grab or the heartbeat stamp. Sort and rasterize only in the viz
-process.
+lanes / tracks / HUD only. After `actuator.apply`, supervisor work
+is a non-blocking **memcpy / handoff only** (already-packed splat or
+billboard block, or a pointer to a slot the infer process already wrote)
+and must drop on backpressure. Unproject and splat / billboard packing
+happen in the **infer process or the viz process**, never in the
+supervisor. Never block a camera grab or the heartbeat stamp. Sort and
+rasterize only in the viz process.
 
 **Degrade / disable.** Flag default OFF: `viz.reality_view_enabled: false`
 (literal true only) or `--reality-view`. Flag off = today's placeholder,
@@ -127,7 +130,7 @@ C becomes a live degrade only after a live depth source exists on main
 and C itself has passed the isolation and budget gates.
 
 **Determinism (offline).** Same stub / recorded frames, K, pose, and
-depth tensor → bit-identical RGB (and optional depth) on CPU. No wall
+depth tensor → bit-identical RGB and rendered depth on CPU. No wall
 clock, no RNG, no sim GT unless the test is named GT.
 
 **Honesty.** Unobserved or unknown space is never painted as a verified
@@ -197,18 +200,24 @@ odometry or sim pose as a live input. Predicted depth / splat parameters
 absent, so the live path does not start a renderer. Capture backends stay
 `beamngpy` | `window` | `stub`.
 
-**Outputs:** an RGB image for the left GVD VISION pane (and optional
-rendered depth). Chase / drone camera is the product viewpoint; a
-recording-only `chase_camera` already exists in `cameras.yaml` for
-offline supervision, and is not a live sensor.
+**Outputs:** an RGB image for the left GVD VISION pane, **and a rendered
+depth buffer** at the same pose and resolution as that RGB. The on-screen
+live view may show RGB only (displaying depth is optional). The depth
+buffer is **required** whenever the renderer runs, including step 8 and
+graduation: AbsRel and δ < 1.25 are scored from this buffer against sim
+GT (offline, recorded frames). Chase / drone camera is the product
+viewpoint; a recording-only `chase_camera` already exists in
+`cameras.yaml` for offline supervision, and is not a live sensor.
 
 **Plug-in:** `viz.reality_view_enabled` / `--reality-view`, default **OFF**.
 `viz.main_view` stays `reality` (placeholder) regardless. Live process
-boundary: the supervisor writes a double-buffered splat or billboard
-block to shared memory (non-blocking, after `actuator.apply`); a
-**separate** `gvd_viz` process maps the newest complete slot and
-composites over the existing vector / ego layers. No in-process live
-renderer.
+boundary: the infer process or the viz process unprojects and packs the
+splat or billboard block into a double-buffered shared-memory slot. After
+`actuator.apply`, the supervisor only memcpy / handoffs that slot
+(non-blocking, drop on backpressure). A **separate** `gvd_viz` process
+maps the newest complete slot and composites over the existing vector /
+ego layers. No in-process live renderer, and no unproject or packing on
+the supervisor.
 
 ## Feasibility plan
 
@@ -220,13 +229,17 @@ Desktop-IQU45. Tests for 4 and 7 are written first and skip (or assert
 
 0. **Live depth source gate.** A live predicted-depth tensor must exist
    on main: named, exported on the live net, not train-only `aux_depth`,
-   not sim GT. **Test first:** `check_live_depth_source_on_main` — fails
-   on `8f4a163` (`bev_lss.py` missing, `aux_depth` not a live export);
-   passes only when a documented live tensor is present. **Go:** the
-   check passes. **No-go (current):** live RV stays the #242 placeholder;
-   A and C stay stub / recording-only; no live graduate of A or C. If
-   #241 never lands and no later depth-head spec is accepted, this no-go
-   stands and the live A/C path is killed.
+   not sim GT. **Test first:** `check_live_depth_source_on_main` — a
+   **graduation gate**, not a default-suite check. It is expected to
+   fail on `8f4a163` (`bev_lss.py` missing, `aux_depth` not a live
+   export) and passes only when a documented live tensor is present.
+   It is **not run in the default offline suite on main** (so that
+   expected fail cannot show up as a suite red). It runs only in the
+   Reality View graduation-gate job (step 0 / step 8 graduate). **Go:**
+   the gate-job check passes. **No-go (current):** live RV stays the
+   #242 placeholder; A and C stay stub / recording-only; no live
+   graduate of A or C. If #241 never lands and no later depth-head spec
+   is accepted, this no-go stands and the live A/C path is killed.
 1. **Contract and flag pin.** Schema for inputs / outputs / SHM slot;
    flag default OFF; placeholder bit-identical to `8f4a163`; no
    safety-path imports; live path is a separate process only.
@@ -242,16 +255,23 @@ Desktop-IQU45. Tests for 4 and 7 are written first and skip (or assert
    `check_unknown_not_free`, `check_no_sim_gt_on_live_path`. **Go:** those
    pass, plus a deterministic PNG pin. **No-go:** GT used on a live path,
    a new dependency, or the prototype linked into the supervisor.
-3. **Isolation harness.** A deliberately slow renderer in a **child
-   process** cannot move a stub control-loop period outside the 5% gate;
-   killing or crashing that child leaves heartbeat / AEB / engage and
-   the supervisor itself running. **Test first:**
-   `check_safety_loop_latency_unchanged`,
-   `check_renderer_crash_degrades` (SIGKILL / abort the viz child; assert
-   the supervisor process is still alive, heartbeat stamps continue, AEB
-   / engage state is unchanged, and the main view degrades to the
-   placeholder). **Go:** both pass; the tests fail if any renderer is on
-   the supervisor thread. **No-go:** any stall or supervisor death.
+3. **Isolation harness.** A deliberately slow renderer **or generator**
+   (unproject / splat packing) in a **child** infer or viz process cannot
+   move a stub control-loop period outside the 5% gate; killing or
+   crashing that child leaves heartbeat / AEB / engage and the
+   supervisor itself running. **Test first:**
+   `check_safety_loop_latency_unchanged` (slow child generator and slow
+   child renderer),
+   `check_renderer_crash_degrades` (SIGKILL / abort the viz or infer
+   child; assert the supervisor process is still alive, heartbeat stamps
+   continue, AEB / engage state is unchanged, and the main view degrades
+   to the placeholder),
+   `check_supervisor_after_apply_is_copy_only` (after `actuator.apply`,
+   the supervisor path is memcpy / handoff only: unproject and splat
+   packing are not called in the supervisor; the post-apply cost is the
+   copy, not generation). **Go:** all three pass; the tests fail if any
+   renderer or generator is on the supervisor thread. **No-go:** any
+   stall, supervisor death, or packing on the supervisor.
 4. **Rasterizer prove (IQU45, GVD-scheduled).** Build/smoke gsplat 0.1.12
    and INRIA with `TORCH_CUDA_ARCH_LIST=6.1` on Windows (offline only);
    record GL version via `gvd_viz --info`. **Test first:**
@@ -297,32 +317,52 @@ Desktop-IQU45. Tests for 4 and 7 are written first and skip (or assert
    floor when it applied). **Go:** all three pass. **No-go:** apply the
    row-by-row fallbacks in the budget table; a safety-loop miss kills
    live RV (placeholder).
-8. **Kill or graduate (quality rubric).** Run `check_useful_view_metrics`
-   and `check_useful_view_checklist` (below) on canned recorded / stub
-   frames, sim GT only in these named tests, chase or held-out camera.
-   **Go:** both pass, step 0 has passed, and step 7 has passed → graduate
-   the live path that met the budgets (A, or C if A failed a budget).
-   **No-go:** if C-from-GT fails the rubric, kill the photoreal claim and
-   keep the placeholder + classic. If C-from-GT passes but A-from-predicted
-   fails, do not graduate A; wait for a better depth source or ship C
-   only after step 0. If step 0 is still a no-go, nothing graduates live.
+8. **Kill or graduate (quality rubric).** Two offline runs on canned
+   recorded / stub frames, chase or held-out camera, scored against sim
+   GT (these tests are named GT). Both use the same thresholds below
+   and require the renderer's depth buffer (see Outputs).
+   (1) **Precondition / kill:** `check_useful_view_metrics` and
+   `check_useful_view_checklist` on **C-from-GT** (sim GT depth as the
+   unprojection source). If this fails, kill the photoreal claim and
+   keep the placeholder + classic.
+   (2) **Graduation gate (separate run):**
+   `check_useful_view_metrics_live_depth` and
+   `check_useful_view_checklist_live_depth` feed the **live
+   predicted-depth source** (not sim GT, not `aux_depth`) to C and/or A
+   and score the render against sim GT. Passing C-from-GT alone does
+   **not** graduate a live path.
+   **Go:** (1) and (2) both pass for the candidate path, step 0 has
+   passed, and step 7 has passed → graduate that path (A if A-from-live-
+   depth passed; else C if C-from-live-depth passed).
+   **No-go:** (1) fails → kill the photoreal claim. (1) passes but (2)
+   fails for A → do not graduate A; try C-from-live-depth at the same
+   thresholds. (2) fails for both → stay on the placeholder even if
+   C-from-GT passed. If step 0 is still a no-go, nothing graduates live.
    If isolation (step 3 or 7) failed, Reality View stays a placeholder.
 
 ## Step 8 quality rubric (proposed, unmeasured)
 
-Numeric gates in `check_useful_view_metrics`, computed only on valid GT
-pixels (finite depth, 0.5–80 m unless noted), canned clip, offline:
+Numeric gates in `check_useful_view_metrics` (C-from-GT) and
+`check_useful_view_metrics_live_depth` (graduation; live predicted
+depth as the unprojection source). The same thresholds apply to both.
+Computed only on valid GT pixels (finite sim-GT depth, 0.5–80 m unless
+noted), canned clip, offline. AbsRel and δ < 1.25 compare the
+**required rendered-depth buffer** (Outputs) to sim GT at the chase or
+held-out pose. A run that does not emit that buffer fails these two
+metrics (it does not skip them).
 
 | Metric | Proposed pass | Notes |
 | --- | --- | --- |
-| AbsRel on rendered depth vs GT, 0.5–80 m | ≤ **0.20** | Standard relative depth error; **proposed**, not a measured baseline. |
-| δ < 1.25 (fraction of those pixels with max(d/d\*, d\*/d) < 1.25) | ≥ **0.70** | **Proposed.** |
+| AbsRel on the required rendered-depth buffer vs sim GT, 0.5–80 m | ≤ **0.20** | Standard relative depth error; **proposed**, not a measured baseline. Same gate for C-from-GT and the live-depth graduation run. |
+| δ < 1.25 (fraction of those pixels with max(d/d\*, d\*/d) < 1.25) | ≥ **0.70** | **Proposed.** Same source: rendered-depth buffer vs sim GT. |
 | Coverage: fraction of chase-view pixels with valid GT depth in 0.5–40 m that have a splat/billboard with opacity ≥ 0.1 | ≥ **50%** | Holes are allowed; a spray that misses half the near scene fails. **Proposed.** |
 | Held-out view PSNR / SSIM vs that camera's GT RGB (chase or a held-out rig cam on the same tick) | PSNR ≥ **16 dB**, SSIM ≥ **0.45** | Modest on purpose for a first small-stem / billboard render; not photoreal. **Proposed.** |
 | Rate / age (only required to graduate *live*, via step 7) | update ≥ 10 Hz or a documented fallback in the rate row; p95 sort+render < 33 ms; stale indicator if age > 200 ms | Offline CPU fps is not this gate. |
 
-Written yes/no checklist in `check_useful_view_checklist`. **All must be
-yes** on the same canned clip (human or scripted asserts where noted):
+Written yes/no checklist in `check_useful_view_checklist` (C-from-GT)
+and `check_useful_view_checklist_live_depth` (graduation). **All must be
+yes** on the same canned clip for that run (human or scripted asserts
+where noted):
 
 - Road surface is recognizable as a surface in the chase view, not only
   an unstructured point spray.
@@ -340,9 +380,12 @@ yes** on the same canned clip (human or scripted asserts where noted):
 
 Fail-first offline tests (box CPU) before any IQU45 run:
 
-- `check_live_depth_source_on_main`: live predicted depth exists on main
-  (step 0). On `8f4a163` this **fails**, which is the intended pin;
-  live graduate stays blocked until it passes.
+- `check_live_depth_source_on_main`: graduation gate (step 0), **not**
+  part of the default offline suite on main. It runs only in the Reality
+  View graduation-gate job. On `8f4a163` that job is expected to fail
+  (no live predicted depth); that expected no-go is not a default-suite
+  red and does not block main CI. Live graduate stays blocked until the
+  gate job passes.
 - `check_flag_off_is_placeholder`: flag off matches `8f4a163` placeholder
   pixels on a pinned stub state.
 - `check_live_path_is_separate_process`: the live flag path only starts
@@ -355,16 +398,26 @@ Fail-first offline tests (box CPU) before any IQU45 run:
 - `check_deterministic_cpu`: two runs on the same stub frames are equal.
 - `check_n_cap`: a generator or map cannot exceed N_max.
 - `check_safety_loop_latency_unchanged`: stub loop Hz and a stand-in
-  `infer_ms` p95 move < 5% with a slow or 300k-load renderer in a child
-  process; a blocked renderer is dropped, not waited on.
-- `check_renderer_crash_degrades`: SIGKILL or abort of the viz **child**
-  leaves the supervisor process alive, heartbeat stamps continuing, AEB
-  / engage unchanged, and the main view on the placeholder.
+  `infer_ms` p95 move < 5% with a slow or 300k-load renderer **or
+  generator** (unproject / packing) in a child infer or viz process; a
+  blocked child is dropped, not waited on.
+- `check_renderer_crash_degrades`: SIGKILL or abort of the viz or infer
+  **child** leaves the supervisor process alive, heartbeat stamps
+  continuing, AEB / engage unchanged, and the main view on the
+  placeholder.
+- `check_supervisor_after_apply_is_copy_only`: after `actuator.apply`,
+  the supervisor only memcpy / handoffs; unproject and splat packing are
+  not on the supervisor path.
 - `check_no_ghost_rolling_map`: the step 6 thresholds (duplicate-surface
   ≤ 5%, median depth residual ≤ 0.50 m under pose noise + 80 ms skew,
   no leftover dynamic splat after 1.0 s).
-- `check_useful_view_metrics` / `check_useful_view_checklist`: the step 8
-  rubric.
+- `check_useful_view_metrics` / `check_useful_view_checklist`: step 8
+  precondition / kill, C-from-GT, same numeric thresholds and checklist.
+- `check_useful_view_metrics_live_depth` /
+  `check_useful_view_checklist_live_depth`: step 8 graduation gate; the
+  same thresholds, but the unprojection source is the live predicted-
+  depth tensor, scored against sim GT on recorded frames. Required to
+  graduate live C or A; C-from-GT alone is not enough.
 - `check_vram_rss_hooks`: the same counters as `scripts/test_vram_cap.py`
   and `rss_mb` still apply; flag-on does not raise the 4 GB cap. Numeric
   VRAM / RSS / BeamNG / sort+render gates are asserted by
@@ -395,7 +448,9 @@ the safety-loop or renderer-crash test fails; INRIA / a non-commercial
 rasterizer is required at runtime; or a heavy feed-forward net is the
 only way to pass step 8. Missing the soft 1 GB generation slice alone is
 **not** a kill if the 4 GB hard cap still holds. **Kill** the photoreal
-claim (keep placeholder + classic) if step 8's rubric fails on C-from-GT.
+claim (keep placeholder + classic) if step 8's C-from-GT rubric fails.
+Failing the live-depth graduation run does not by itself kill the
+photoreal claim, but it blocks live graduate of that path.
 
 ---
 

@@ -473,6 +473,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mask-clip-qc",
+        action="store_true",
+        help=(
+            "Apply automatic clip-QC driving-target masks (5s post-teleport, 20s map warmup, "
+            "stoplight/stop/yield intersections, uturn, abrupt_turn, stuck, over_line_corner)."
+        ),
+    )
+    parser.add_argument(
+        "--clip-qc-drop",
+        action="store_true",
+        help="When --mask-clip-qc is set, drop masked rows before holdout instead of target-level masking.",
+    )
+    parser.add_argument(
         "--mask-files",
         default="",
         help=(
@@ -2419,6 +2432,8 @@ def train_directory(
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
     mask_files: str = "",
+    mask_clip_qc: bool = False,
+    clip_qc_drop: bool = False,
     drop_wrong_way: bool = False,
     road_dump: str = "",
     max_road_clip: float = -1.0,
@@ -2593,6 +2608,19 @@ def train_directory(
         rows, mask_sources = apply_mask_files_multi(strip_roots, rows, mask_files)
     elif mask_sources:
         rows = drop_masked(rows, set().union(*(source["ids"] for source in mask_sources)))
+    if mask_clip_qc:
+        from python.train.clip_qc import apply_clip_qc_masks
+        from python.train.scene_loader import recompute_dt
+
+        qc_stats = apply_clip_qc_masks(state_rows, rows, root=root, road_dump=road_dump or None)
+        print(
+            f"[GVD] clip-qc: masked={qc_stats['masked_rows']}/{qc_stats['total_rows']} "
+            f"reasons={ {k: v for k, v in qc_stats['reason_counts'].items() if v} }",
+            flush=True,
+        )
+        if clip_qc_drop and qc_stats["masked_ids"]:
+            rows = [r for r in rows if not r.get("clip_qc_masked")]
+            rows = recompute_dt(rows)
     if drop_wrong_way or float(max_road_clip) >= 0.0:
         from python.train.frame_quality import (
             ROAD_CLIP_SIDECAR,
@@ -4263,6 +4291,8 @@ def main(argv: list[str] | None = None) -> None:
                 backbone_lr_mult=float(args.backbone_lr_mult),
                 mask_events=bool(args.mask_events),
                 mask_files=str(args.mask_files or ""),
+                mask_clip_qc=bool(getattr(args, "mask_clip_qc", False)),
+                clip_qc_drop=bool(getattr(args, "clip_qc_drop", False)),
                 drop_wrong_way=drop_wrong_way,
                 road_dump=road_dump,
                 max_road_clip=max_road_clip,

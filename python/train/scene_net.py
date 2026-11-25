@@ -939,6 +939,12 @@ def labels_for_row(
     if "ctl" in row and "ctl_valid" in row:
         labels["ctl"] = np.asarray(row["ctl"], dtype=np.float32).reshape(3, CTL_K)
         labels["ctl_valid"] = np.asarray(row["ctl_valid"], dtype=np.float32).reshape(3, CTL_K)
+    qc_masked = bool(row.get("clip_qc_masked")) or bool(row.get("driving_target_masked"))
+    labels["driving_target_valid"] = np.float32(0.0 if qc_masked else 1.0)
+    if qc_masked:
+        labels["lane_gt_valid"] = np.zeros_like(labels["lane_gt_valid"])
+        if "ctl_valid" in labels:
+            labels["ctl_valid"] = np.zeros_like(labels["ctl_valid"])
     # Separate road-edge capability only when the head is requested. Not paint.
     if road_edge:
         record: dict[str, Any] = {}
@@ -1248,7 +1254,12 @@ def _lane_gt_parts(
     goal = target["lane_gt"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     mask = target["lane_gt_valid"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     conf = pred_v[:, -1].clamp(1e-6, 1.0 - 1e-6)
-    bce = functional.binary_cross_entropy(conf, goal[:, -1])
+    if "driving_target_valid" in target:
+        drive_valid = target["driving_target_valid"].to(device=device, dtype=dtype).reshape(-1)
+        bce_per = functional.binary_cross_entropy(conf, goal[:, -1], reduction="none") * drive_valid
+        bce = bce_per.sum() / drive_valid.sum().clamp(min=1.0)
+    else:
+        bce = functional.binary_cross_entropy(conf, goal[:, -1])
     values = torch.nan_to_num(pred_v[:, :-1], nan=0.0)
     goal_v = torch.nan_to_num(goal[:, :-1], nan=0.0)
     value_mask = mask[:, :-1]

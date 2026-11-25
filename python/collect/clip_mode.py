@@ -74,6 +74,7 @@ CUT_IN_AHEAD_M = 25.0
 # Quality thresholds (quick check, not a training filter).
 MIN_MAIN_HZ = 5.0            # half the 10 Hz plan
 MIN_MOVING_MPS = 2.0         # median ego speed
+CLIP_CLASSES = ("train", "pretrain_only", "reject")
 SHARP_CURVE_PER_M = 1.0 / 50.0   # |yaw_rate| / speed: a 50 m radius or tighter
 SHARP_CURVE_MIN_MPS = 5.0
 NIGHT_MAX_LUMA = 60.0        # mean main-camera luma on sampled frames
@@ -436,8 +437,10 @@ def quality_check(clip: Path | str, plan: ClipPlan, *, exit_code: int) -> dict[s
     observed, note = _observe(plan, clip, rows, gt, placed)
     if observed is False:
         reasons.append(f"edge case not observed ({note})")
+    clip_class = "train" if not reasons else ("reject" if (len(rows) == 0 or lossy or undecodable) else "pretrain_only")
     return {
         "quality": "pretrain_only" if reasons else "train",
+        "clip_class": clip_class,
         "reasons": reasons,
         "rows": len(rows),
         "span_s": round(span, 3),

@@ -154,12 +154,20 @@ RAISED_OCC_M = 0.3
 OCC_WINDOW_CELLS = 3
 SIGHTLINE_STEPS = 12
 SIGHTLINE_CLEARANCE_M = 0.05
+CELL_MAX_K1 = 10.0
+CELL_MAX_K2 = 100.0
+OCC_PASS_TOL_M = 0.3
+# Slack over a GROUND_SLOPE_CAP grade before a row-to-row rise counts as a face (bin snap noise).
+RISE_TOL_M = 0.05
+PASS_GAP_BINS = 3
+PASS_GAP_M = 1.0
 # Occluders closer to the destination than this are ignored, so a dilated
 # wall does not close the last open cell in front of it, and a constant-depth
 # fixture wall whose high and low hits sit in neighbouring cells does not
 # self-occlude. A 0.6 m barrier's front-face hits still sit far enough in
 # front of the hidden cells to close the umbra.
 SIGHTLINE_MARGIN_M = 1.5
+SIGHTLINE_NEAR_M = (0.5, 0.75, 1.0, 1.25, 1.5)
 
 # Categorical depth (audit item 9: 40 log bins, 1-48 m).
 DEPTH_BINS = 40
@@ -471,51 +479,160 @@ def ray_crossed_raised(idx: Any, ok: Any, raised: Any) -> Any:
     return prior.to(raised.dtype)
 
 
+def face_rows(surf: Any, ray_w: Any) -> Any:
+    """B x Ncam x 1 x h x w: 1 where the ray one feature row above lands no farther (same or a nearer
+    depth bin), so the surface keeps rising between the two rays: a near-vertical face (wall, barrier,
+    car side). Ground-independent, so it still holds where the face fills the ground window."""
+    k = surf.argmax(dim=2)  # B N h w
+    has = ray_w.squeeze(2) > 0
+    k_up = torch.cat([k[..., :1, :], k[..., :-1, :]], dim=2)
+    has_up = torch.cat([torch.zeros_like(has[..., :1, :]), has[..., :-1, :]], dim=2)
+    return (has & has_up & (k_up <= k)).to(surf.dtype).unsqueeze(2)
+
+
+def rise_rows(surf: Any, ray_w: Any, pts: Any, T: Any, tol: float = RISE_TOL_M) -> Any:
+    """B x Ncam x 1 x h x w: 1 where the surface hit rises from the hit one feature row below by more
+    than a ``GROUND_SLOPE_CAP`` grade over their horizontal gap plus ``tol``. Catches the top edge of a
+    face whose only hit sits under ``RAISED_OCC_M`` (a wide camera sees a 0.8 m wall at 6 m with one
+    feature row at ~0.29 m and the row above clears it), which ``face_rows`` misses because the row
+    above lands farther. Ground on a grade under the cap never rises that steeply. The gap is the
+    change in horizontal range from the camera (``T`` B x Ncam x 4 x 4), not the point-to-point distance,
+    since neighbouring rows' rays do not share an azimuth off-axis."""
+    s = (surf.unsqueeze(-1) * pts).sum(dim=2)  # B N h w 3, the surface point
+    has = ray_w.squeeze(2) > 0
+    s_dn = torch.cat([s[..., 1:, :, :], s[..., -1:, :, :]], dim=2)
+    has_dn = torch.cat([has[..., 1:, :], torch.zeros_like(has[..., -1:, :])], dim=2)
+    cam = T[..., :2, 3].to(s.dtype).view(T.shape[0], T.shape[1], 1, 1, 2)
+    rng = torch.sqrt(((s[..., :2] - cam) ** 2).sum(dim=-1))
+    rng_dn = torch.sqrt(((s_dn[..., :2] - cam) ** 2).sum(dim=-1))
+    gap = (rng - rng_dn).abs()
+    rise = (s[..., 2] - s_dn[..., 2]) > GROUND_SLOPE_CAP * gap + tol
+    return (has & has_dn & rise).to(surf.dtype).unsqueeze(2)
+
+
+def cell_max(vals: Any, idx: Any, mask: Any, k1: float = CELL_MAX_K1, k2: float = CELL_MAX_K2) -> tuple[Any, Any, Any]:
+    """Per-cell max of point values (B x P) as B x 1 x N x N, a 0/1 mask and the point count.
+
+    ONNX opset 17 has no scatter-max, so this is a two-pass log-sum-exp on ``splat``: a coarse bound
+    ``c >= max`` (k1, taken against BEV_Z_MAX_M so the exponent stays in float32 range), then
+    ``c + log(sum exp(k2 (v - c))) / k2``, which lies in [max, max + log(count) / k2]: never below
+    the true max (about 0.05 m above it for 100 points at k2 = 100 / m).
+    """
+    b = vals.shape[0]
+    m = mask.to(vals.dtype)
+    s1 = splat(torch.stack([torch.exp(k1 * (vals.clamp(max=BEV_Z_MAX_M) - BEV_Z_MAX_M)) * m, m], dim=-1), idx, mask)
+    has = (s1[:, 1:2] > 0) & (s1[:, 0:1] > 0)
+    c = torch.where(has, BEV_Z_MAX_M + torch.log(torch.where(has, s1[:, 0:1], torch.ones_like(s1[:, 0:1]))) / k1, torch.zeros_like(s1[:, :1]))
+    c_at = c.reshape(b, -1).gather(1, idx.clamp(min=0, max=BEV_N * BEV_N - 1))
+    s2 = splat((torch.exp(k2 * (vals - c_at).clamp(max=0.0)) * m).unsqueeze(-1), idx, mask)
+    out = torch.where(has, c + torch.log(torch.where(has, s2, torch.ones_like(s2))) / k2, torch.zeros_like(c))
+    return out, has.to(vals.dtype), s1[:, 1:2]
+
+
+def occluder_top(high: Any, z: Any, idx: Any) -> tuple[Any, Any]:
+    """Per-cell upper bound on the top of the 2.5D occluders (B x 1 x N x N), and a 0/1 mask.
+
+    ``high`` / ``z`` / ``idx`` are B x Ncam x D x h x w (``high`` is the one-hot surface bin of a ray
+    whose surface is an occluder). A ray that lands on an occluder only says the surface reaches *at
+    least* its hit height; the ray one feature row above it, at the same depth bin, went over the top
+    or hit the face higher up, so its height there bounds the top from above. Per camera the cell keeps
+    the highest bound over its rays (the top of the face it saw, ``cell_max``). Every camera's bound is
+    a true upper bound, so the cell keeps the lowest one over the cameras that saw an occluder there.
+    The top feature row has no row above and is extrapolated by one row spacing.
+    """
+    b, n, d, h, w = z.shape
+    z_up = torch.cat([2.0 * z[..., :1, :] - z[..., 1:2, :], z[..., :-1, :]], dim=3)
+    k = high.argmax(dim=2, keepdim=True)  # B N 1 h w, the surface bin (one-hot)
+    has_r = high.amax(dim=2) > 0  # B N h w
+    top_r = z_up.gather(2, k).squeeze(2)
+    ids = idx.gather(2, k).squeeze(2)
+    z_occ = torch.full((b, 1, BEV_N, BEV_N), BEV_Z_MAX_M + 1.0, device=z.device, dtype=z.dtype)
+    for cam in range(n):
+        top_c, has_c, _ = cell_max(top_r[:, cam].reshape(b, -1), ids[:, cam].reshape(b, -1), has_r[:, cam].reshape(b, -1))
+        z_occ = torch.where(has_c > 0, torch.minimum(z_occ, top_c), z_occ)
+    has_occ = (z_occ <= BEV_Z_MAX_M).to(z.dtype)
+    return z_occ * has_occ, has_occ
+
+
+def lowest_pass(z: Any, idx: Any, ok: Any, reached: Any, ray_w: Any, depths: Any, k2: float = CELL_MAX_K2) -> tuple[Any, Any]:
+    """Per cell, an upper bound on the lowest height a ray passed through (B x 1 x N x N), and a mask.
+
+    Only ray points at least ``PASS_GAP_BINS`` depth bins and ``PASS_GAP_M`` before the ray's surface
+    count, so the open air just in front of a face (where the face's own hits are snapped to, up to
+    half a bin and a cell away) is never read as a pass through the face's cell. In 2.5D a ray that
+    passed a cell at height h proves that cell holds no solid column up to h (another camera saw
+    through it). The min is ``-cell_max(-z)`` plus its log(count) / k2 slack, so it never undershoots.
+    ``z`` / ``idx`` / ``ok`` / ``reached`` are B x Ncam x D x h x w, ``ray_w`` B x Ncam x 1 x h x w.
+    """
+    b, n, d, h, w = z.shape
+    ahead = torch.cat([reached[:, :, PASS_GAP_BINS:], torch.zeros_like(reached[:, :, :PASS_GAP_BINS])], dim=2)
+    surf_depth = (ray_surface(reached, dim=2)[0] * depths.view(1, 1, d, 1, 1)).sum(dim=2, keepdim=True)
+    far_enough = (surf_depth - depths.view(1, 1, d, 1, 1)) >= PASS_GAP_M
+    use = (ahead * far_enough.to(z.dtype) * ray_w * ok.to(z.dtype)) > 0
+    neg, has, count = cell_max(-z.reshape(b, -1), idx.reshape(b, -1), use.reshape(b, -1))
+    low = -neg + torch.log(count.clamp(min=1.0)) / k2
+    return low * has, has
+
+
+def _sample_map(z_map: Any, has_map: Any, sx: Any, sy: Any) -> tuple[Any, Any]:
+    """Nearest-cell lookup of B x 1 x N x N maps at ego xy samples B x Ncam x S x N x N."""
+    b, ncam, steps = sx.shape[:3]
+    grid = torch.stack([sx / BEV_HALF_M, -sy / BEV_HALF_M], dim=-1).reshape(b * ncam, steps, BEV_N * BEV_N, 2)
+    occ = z_map.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
+    has = has_map.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
+    z_s = F.grid_sample(occ, grid, mode="nearest", padding_mode="zeros", align_corners=False)
+    h_s = F.grid_sample(has, grid, mode="nearest", padding_mode="zeros", align_corners=False)
+    return z_s.view(b, ncam, steps, BEV_N, BEV_N), h_s.view(b, ncam, steps, BEV_N, BEV_N)
+
+
 def sightline_blocked(
     z_occ: Any,
     has_occ: Any,
     ground: Any,
     T: Any,
+    z_near: Any = None,
+    has_near: Any = None,
     n_steps: int = SIGHTLINE_STEPS,
     clearance: float = SIGHTLINE_CLEARANCE_M,
 ) -> Any:
     """Per-camera mask (B x Ncam x N x N): the camera-to-ground sight line hits a 2.5D occluder.
 
-    ``z_occ`` / ``has_occ`` are B x 1 x N x N absolute heights of raised surfaces
-    (dilated). ``ground`` is B x 1 x N x N, ``T`` is B x Ncam x 4 x 4 (cam-to-ego).
-    Sampled along the open segment from the camera origin to the cell centre at
-    the cell's ground height. A hit is an occluder whose top is more than
+    ``z_occ`` / ``has_occ`` are B x 1 x N x N occluder tops (dilated), ``ground`` B x 1 x N x N is the
+    destination height, ``T`` B x Ncam x 4 x 4 (cam-to-ego). The open segment from the camera origin to
+    the cell centre at its ground height is sampled at ``n_steps`` even steps on the dilated map, more
+    than ``SIGHTLINE_MARGIN_M`` before the cell (so the dilation does not shut the open cells just in
+    front of a wall). When the undilated map ``z_near`` / ``has_near`` is given, the last
+    ``SIGHTLINE_MARGIN_M`` before the cell is also sampled on it at ``SIGHTLINE_NEAR_M`` back from the
+    cell, so a barrier right in front of the cell still closes it. A hit is an occluder top more than
     ``clearance`` above the sight line.
     """
     b, ncam = T.shape[:2]
     dtype, device = z_occ.dtype, z_occ.device
-    ys = 32.0 - 0.5 * (torch.arange(BEV_N, device=device, dtype=dtype) + 0.5)
-    xs = -32.0 + 0.5 * (torch.arange(BEV_N, device=device, dtype=dtype) + 0.5)
-    grid_y = ys.view(1, 1, BEV_N, 1).expand(b, ncam, BEV_N, BEV_N)
-    grid_x = xs.view(1, 1, 1, BEV_N).expand(b, ncam, BEV_N, BEV_N)
-    cam_x = T[..., 0, 3].to(dtype).reshape(b, ncam, 1, 1)
-    cam_y = T[..., 1, 3].to(dtype).reshape(b, ncam, 1, 1)
-    cam_z = T[..., 2, 3].to(dtype).reshape(b, ncam, 1, 1)
-    dest_z = ground.to(dtype)
+    ys = BEV_HALF_M - BEV_CELL_M * (torch.arange(BEV_N, device=device, dtype=dtype) + 0.5)
+    xs = -BEV_HALF_M + BEV_CELL_M * (torch.arange(BEV_N, device=device, dtype=dtype) + 0.5)
+    grid_y = ys.view(1, 1, 1, BEV_N, 1)
+    grid_x = xs.view(1, 1, 1, 1, BEV_N)
+    cam_x = T[..., 0, 3].to(dtype).reshape(b, ncam, 1, 1, 1)
+    cam_y = T[..., 1, 3].to(dtype).reshape(b, ncam, 1, 1, 1)
+    cam_z = T[..., 2, 3].to(dtype).reshape(b, ncam, 1, 1, 1)
+    dest_z = ground.to(dtype).unsqueeze(1)  # B 1 1 N N
+    r_d = torch.sqrt((grid_x - cam_x) ** 2 + (grid_y - cam_y) ** 2)  # B Ncam 1 N N
+
+    def _hits(t: Any, z_map: Any, has_map: Any, keep: Any) -> Any:
+        sx = cam_x + t * (grid_x - cam_x)
+        sy = cam_y + t * (grid_y - cam_y)
+        sz = cam_z + t * (dest_z - cam_z)
+        z_s, h_s = _sample_map(z_map, has_map, sx.expand(b, ncam, -1, BEV_N, BEV_N), sy.expand(b, ncam, -1, BEV_N, BEV_N))
+        hit = (h_s > 0) & (z_s > sz + clearance) & keep
+        return hit.any(dim=2)
+
     t = torch.linspace(0, 1, n_steps + 2, device=device, dtype=dtype)[1:-1].view(1, 1, n_steps, 1, 1)
-    sx = cam_x.unsqueeze(2) + t * (grid_x.unsqueeze(2) - cam_x.unsqueeze(2))
-    sy = cam_y.unsqueeze(2) + t * (grid_y.unsqueeze(2) - cam_y.unsqueeze(2))
-    sz = cam_z.unsqueeze(2) + t * (dest_z.unsqueeze(2) - cam_z.unsqueeze(2))
-    grid = torch.stack([sx / 32.0, -sy / 32.0], dim=-1).reshape(b * ncam, n_steps, BEV_N * BEV_N, 2)
-    occ = z_occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
-    has = has_occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
-    z_s = F.grid_sample(occ, grid, mode="nearest", padding_mode="zeros", align_corners=False)
-    h_s = F.grid_sample(has, grid, mode="nearest", padding_mode="zeros", align_corners=False)
-    margin = float(SIGHTLINE_MARGIN_M)
-    dx_s, dy_s = sx - cam_x.unsqueeze(2), sy - cam_y.unsqueeze(2)
-    r_s = torch.sqrt(dx_s * dx_s + dy_s * dy_s)
-    dx_d, dy_d = grid_x - cam_x, grid_y - cam_y
-    r_d = torch.sqrt(dx_d * dx_d + dy_d * dy_d).unsqueeze(2)
-    in_front = r_s < (r_d - margin)
-    hit = (h_s > 0) & (z_s > sz.reshape(b * ncam, 1, n_steps, BEV_N * BEV_N) + clearance) & in_front.reshape(
-        b * ncam, 1, n_steps, BEV_N * BEV_N
-    )
-    return hit.any(dim=2).view(b, ncam, BEV_N, BEV_N).to(dtype)
+    blocked = _hits(t, z_occ, has_occ, t * r_d < r_d - SIGHTLINE_MARGIN_M)
+    if z_near is not None:
+        back = torch.tensor(SIGHTLINE_NEAR_M, device=device, dtype=dtype).view(1, 1, -1, 1, 1)
+        t_n = 1.0 - back / r_d.clamp(min=1e-3)
+        blocked = blocked | _hits(t_n.clamp(min=0.0), z_near, has_near, t_n > 0)
+    return blocked.to(dtype)
 
 
 def near_ground(z: Any, ground: Any, band_m: float = GROUND_BAND_M) -> Any:
@@ -703,17 +820,16 @@ class BevLssHead(nn.Module):
         # so a 1.5 m car roof is not an occluder.
         occ_m = self.ground_band_m - (GROUND_BAND_M - RAISED_OCC_M)
         high = surf * ray_w * ((z - g_at) >= occ_m) * ok.to(prob.dtype)
-        high_vals = torch.stack([high * z, high], dim=-1).reshape(b, n * d * h * w, 2)
-        high_sum = splat(high_vals, idx.reshape(b, -1), ok.reshape(b, -1))
-        has_occ = (high_sum[:, 1:2] > 0).to(prob.dtype)
-        z_occ = torch.where(
-            has_occ > 0,
-            high_sum[:, 0:1] / torch.where(has_occ > 0, high_sum[:, 1:2], torch.ones_like(has_occ)),
-            torch.zeros_like(has_occ),
-        )
-        has_occ = F.max_pool2d(has_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
-        z_occ = F.max_pool2d(z_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
-        blocked = sightline_blocked(z_occ, has_occ, g_wide, T)
+        high = torch.maximum(high, surf * ray_w * ok.to(prob.dtype) * torch.maximum(face_rows(surf, ray_w), rise_rows(surf, ray_w, pts.to(prob.dtype), T)))
+        z_occ, has_occ = occluder_top(high, z, idx)
+        # 2.5D consistency: a column another ray passed through low down is not solid up to the
+        # bound (cameras that see through it win); OCC_PASS_TOL_M keeps a ray that grazes the top and
+        # dips inside the same cell from shaving the top.
+        z_pass, has_pass = lowest_pass(z, idx, ok, reached, ray_w, self.depths.to(z.dtype))
+        z_occ = torch.where(has_pass > 0, torch.minimum(z_occ, z_pass + OCC_PASS_TOL_M), z_occ)
+        has_dil = F.max_pool2d(has_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
+        z_dil = F.max_pool2d(z_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
+        blocked = sightline_blocked(z_dil, has_dil, g_wide, T, z_near=z_occ, has_near=has_occ)
         ids_c = idx.reshape(b, n, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
         visible = (1.0 - blocked.reshape(b, n, BEV_N * BEV_N).gather(2, ids_c).view_as(idx)) * ok.to(prob.dtype)
 

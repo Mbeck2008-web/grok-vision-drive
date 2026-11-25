@@ -163,6 +163,8 @@ RAISED_OCC_M = 0.3
 # front of it cannot drag the ground up its own face. Lowering a ground
 # estimate only ever shrinks seen / free (G5), so the clamp is conservative.
 GROUND_SLOPE_CAP = 0.15
+# A one-row face hit more than this above both neighbouring rows' hits in its column is on an object (bump).
+BUMP_M = 0.1
 EGO_CONTACT_HALF_X_M = 0.8
 EGO_CONTACT_HALF_Y_M = 1.4
 # Trust range per camera (G5). A wall of DESIGN_WALL_M at range r has
@@ -576,10 +578,9 @@ def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float,
     l_n, r_n = at_hit(l_n), at_hit(r_n)
     l_f, r_f = nb_step(far)
     l_f, r_f = at_hit(l_f), at_hit(r_f)
-    top_row = torch.zeros(h, dtype=pts.dtype, device=pts.device)
-    if h >= 1:
-        top_row[0] = 1.0
-    no_up = top_row.view(1, 1, h, 1).expand(b, n, h, w) > 0
+    # top feature row: no row above it (a comparison, not a slice assignment: ONNX would export that as a
+    # ScatterND without reduction)
+    no_up = (torch.arange(h, device=pts.device) == 0).view(1, 1, h, 1).expand(b, n, h, w)
     # Bottom bound, per column from the bottom row up: a hit whose next row down hit the same object
     # (surface within one bin) takes that row's bound; else, if the row down got past the hit's bin
     # (its surface is farther, or it is sky), the object starts above that row's ray in the bin; else
@@ -608,11 +609,17 @@ def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float,
     bot_ray = torch.where(has_hit & (pb_ray > j_hit), torch.minimum(bot_ray, c_h[..., 2]), torch.full_like(bot_ray, -100.0))
     g_flat = ground.reshape(b, BEV_N * BEV_N)
     raised = None
+    lift = None  # highest reading of the hit above its local ground
     for p in (n_h, c_h, f_h):
-        i, ok = bev_flat_index(p)
+        i, ok = _flat_index(p)
         g = g_flat.gather(1, i.reshape(b, -1)).view_as(wr)
         r = (p[..., 2] - g >= occ_m).to(surf_w.dtype)
         raised = r if raised is None else torch.maximum(raised, r)
+        lift = p[..., 2] - g if lift is None else torch.maximum(lift, p[..., 2] - g)
+    # Riser and bump occluders track the configured band like ``occ_m`` does: at the default band
+    # (occ_m = RAISED_OCC_M) any height counts; a 2.0 m band (occ_m 1.8 m) makes a 1.5 m car a ground-like
+    # object again, so its faces are not occluders either.
+    tall = lift >= (occ_m - RAISED_OCC_M)
     # Riser (G5): a face too low to clear ``occ_m`` above the local ground (a 0.45 m wall at 12 m whose
     # only hits are under 0.3 m) still stands out from the row below it in the same column. The ground
     # rises at most GROUND_SLOPE_CAP per metre of range, so if even the least steep reading of the two
@@ -629,7 +636,17 @@ def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float,
         rng = lambda q: torch.sqrt((q[..., 0] - cam[..., 0]) ** 2 + (q[..., 1] - cam[..., 1]) ** 2)  # noqa: E731
         d_r = (rng(f_h) - rng(a_n)).clamp(min=0.0)
         riser = has_hit & has_a & ((f_h[..., 2] - a_n[..., 2]) > GROUND_SLOPE_CAP * d_r)
-        raised = torch.maximum(raised, riser.to(raised.dtype))
+        # Bump (G5): a face so low and far that only one row lands on it (a 0.3 m wall at 10-15 m: one row
+        # hits it 0.2 m up, the row below lands on the road short of it, the row above clears it and lands
+        # on the road behind). Its hit stands above both neighbouring rows' hits in the column; a road,
+        # whatever its grade, rises or falls monotonically between them and a crest bulges by
+        # centimetres over a row gap. So a hit more than BUMP_M above both neighbours is on an object.
+        def _shift_up(t: Any) -> Any:  # row r gets row r - 1 (the next row up)
+            return torch.cat([t[:, :, :1], t[:, :, :-1]], dim=2)
+        not_first = (torch.arange(h, device=pts.device) > 0).view(1, 1, h, 1)
+        has_u = (_shift_up(has_hit.to(pts.dtype)) > 0.5) & not_first
+        bump = has_hit & has_a & has_u & (c_h[..., 2] - torch.maximum(_shift_down(c_h)[..., 2], _shift_up(c_h)[..., 2]) > BUMP_M)
+        raised = torch.maximum(raised, ((riser | bump) & tall).to(raised.dtype))
     weight = wr * raised
     tops, bots, ws, ids = [], [], [], []
     m_r, m_l = TOP_RADIAL_SAMPLES, TOP_LATERAL_SAMPLES
@@ -645,7 +662,7 @@ def ray_top_bounds(pts: Any, pts_e: Any, surf_w: Any, ground: Any, occ_m: float,
             u = (c / (m_l - 1) - 0.5) if m_l > 1 else 0.0
             off = lft * (-u) if u < 0 else rgt * u
             q = base + off
-            i, ok = bev_flat_index(q, OCC_N)
+            i, ok = _flat_index(q, OCC_N)
             ids.append(i.reshape(b, -1))
             ws.append((weight * ok.to(surf_w.dtype)).reshape(b, -1))
             tops.append(bound.reshape(b, -1))
@@ -933,7 +950,7 @@ def trusted_band(pts: Any, T: Any, K: Any, z_rel: Any, band: float, occ_m: float
     trust = _trust_m(K, T, pts.dtype).view(b, n, 1, 1, 1)
     frac = (trust / r_h.clamp(min=1e-6)).clamp(max=1.0)
     q = cam + vec * frac.unsqueeze(-1)
-    idx_q, ok_q = bev_flat_index(q)
+    idx_q, ok_q = _flat_index(q)
     g_q = ground.reshape(b, BEV_N * BEV_N).gather(1, idx_q.reshape(b, -1)).view_as(r_h)
     h_q = q[..., 2] - g_q
     wall = DESIGN_WALL_M + (occ_m - RAISED_OCC_M)
@@ -957,7 +974,7 @@ def trusted_band(pts: Any, T: Any, K: Any, z_rel: Any, band: float, occ_m: float
     # its ground, else a row lands on its face above the cutoff (both bounds grow with range, so the
     # worst case is the farthest range r_o). Hidden depth is that top minus the sight line there.
     o = cam + vec * (r_o / r_h.clamp(min=1e-6)).unsqueeze(-1)
-    idx_o, ok_o = bev_flat_index(o)
+    idx_o, ok_o = _flat_index(o)
     g_o = ground.reshape(b, BEV_N * BEV_N).gather(1, idx_o.reshape(b, -1)).view_as(r_h)
     cz = cam[..., 2]
     elev = -torch.atan((cz - g_o - occ_m).clamp(min=0.0) / r_o.clamp(min=1e-3))
@@ -1027,7 +1044,13 @@ def _check_tau(name: str, value: float) -> float:
 
 def bev_flat_index(points: Any, n: int = BEV_N) -> tuple[Any, Any]:
     """Flat cell index (row * n + col) and a validity mask for ego xyz points (G2, G3). ``n`` cells span
-    the same 64 m square (``OCC_N`` for the finer occluder grid)."""
+    the same 64 m square (``OCC_N`` for the finer occluder grid). The lift calls this for the bin centres
+    and the bin edges; the visibility gate's derived points (hit placements, sight-line samples) use the
+    same arithmetic through ``_flat_index``."""
+    return _flat_index(points, n)
+
+
+def _flat_index(points: Any, n: int = BEV_N) -> tuple[Any, Any]:
     cell = 2.0 * BEV_HALF_M / n
     x, y, z = points[..., 0], points[..., 1], points[..., 2]
     row = torch.floor((BEV_HALF_M - y) / cell)
@@ -1158,7 +1181,7 @@ class BevLssHead(nn.Module):
             return torch.minimum(t[..., :-1], t[..., 1:])
 
         pts_m = (1.0 - frac) * pts[..., :-1, :] + frac * pts[..., 1:, :]
-        idx_m, ok_m = bev_flat_index(pts_m)
+        idx_m, ok_m = _flat_index(pts_m)
         ids = idx_m.reshape(b, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
         z_m = pts_m[..., 2].to(pass_r.dtype)
         z_rel_m = z_m - flat_g.gather(1, ids).view_as(z_m)

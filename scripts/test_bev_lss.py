@@ -1876,7 +1876,7 @@ def check_ground_band_pinned_and_plumbed() -> None:
     far = [
         (r, c)
         for r, c in _barrier_hidden(geoms_w, lo, hi)
-        if (32.0 - 0.5 * (r + 0.5)) > hi[1] + bl.SIGHTLINE_MARGIN_M
+        if (32.0 - 0.5 * (r + 0.5)) > hi[1] + 1.5  # 858b7ab's SIGHTLINE_MARGIN_M: the far set is not widened
     ]
     assert len(far) >= 1, len(far)
     n_far = sum(bool(free_w[r, c]) for r, c in far)

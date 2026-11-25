@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "python/train/ort_bench.py"
 
-# (id, what it breaks, old, new). ``old`` must occur exactly once.
+# (id, what it breaks, old, new[, target]). ``old`` must occur exactly once; target defaults to TARGET.
 MUTANTS = [
     ("tol_inverted", "tolerance comparison inverted (<= -> >)",
      "return bool(np.all(diff <= bound))", "return bool(np.all(diff > bound))"),
@@ -64,16 +64,30 @@ MUTANTS = [
      'MEMCPY_OPS = ("MemcpyToHost", "MemcpyFromHost")', 'MEMCPY_OPS = ("MemcpyToDevice", "MemcpyFromHost")'),
     ("bench_no_state", "bench tick does not feed state back",
      "        for k in (\"h\", \"tokens\", \"mask\"):\n            feed[k] = by[k]\n", "        pass\n"),
+    # Skeptic PR #247 @ 483541b survivors (M1-M6), now guarded.
+    ("bench_skip_tick", "timed loop does not run tick()",
+     "        t0 = time.perf_counter()\n        tick()\n", "        t0 = time.perf_counter()\n"),
+    ("bench_seconds", "latency reported in seconds, not ms",
+     "ms.append((time.perf_counter() - t0) * 1000.0)", "ms.append(time.perf_counter() - t0)"),
+    ("cuda_silent_fallback", "ep=cuda landing on CPU no longer raises",
+     "    if want not in got:\n        raise RuntimeError", "    if False:\n        raise RuntimeError"),
+    ("rss_gib", "Linux ru_maxrss KiB divided by 1024*1024 (GiB)",
+     "else float(kb) / 1024.0", "else float(kb) / (1024.0 * 1024.0)"),
+    ("vram_delta_inverted", "VRAM delta = baseline - peak",
+     "delta = self.peak_device_mb - self.baseline_mb", "delta = self.baseline_mb - self.peak_device_mb"),
+    ("cli_parity_exit_zero", "CLI returns 0 on parity failure",
+     "file=sys.stderr)\n        return 1", "file=sys.stderr)\n        return 0", "scripts/ort_bench.py"),
 ]
 
 
-def run_one(mutant: tuple[str, str, str, str], python: str) -> dict:
-    mid, desc, old, new = mutant
+def run_one(mutant: tuple, python: str) -> dict:
+    mid, desc, old, new = mutant[:4]
+    target_rel = mutant[4] if len(mutant) > 4 else TARGET
     with tempfile.TemporaryDirectory(prefix=f"gvd_mut_{mid}_") as name:
         root = Path(name)
         for sub in ("python", "scripts", "config"):
             shutil.copytree(ROOT / sub, root / sub, ignore=shutil.ignore_patterns("__pycache__"))
-        target = root / TARGET
+        target = root / target_rel
         src = target.read_text(encoding="utf-8")
         count = src.count(old)
         if count != 1:

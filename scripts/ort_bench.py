@@ -54,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     if workdir is None:
         tmp = tempfile.TemporaryDirectory(prefix="gvd_ort_bench_")
         workdir = Path(tmp.name)
+    workdir.mkdir(parents=True, exist_ok=True)
     try:
         if args.ort_only:
             report = ort_bench.run_ort_only(args.onnx, ep=args.ep, warmup=args.warmup, iters=args.iters,

@@ -248,6 +248,162 @@ def test_cli_parity_exit(tmp: Path) -> None:
     assert rep["model"]["opset"] == 17 and rep["ops"]["memcpy_total"] == 0
 
 
+class _CountingSession:
+    """Real CPU session whose run() is counted and takes at least ``sleep_s`` (proves what the timer wraps)."""
+
+    def __init__(self, sess, sleep_s: float) -> None:
+        self._sess, self._sleep_s, self.runs = sess, sleep_s, 0
+
+    def run(self, *a, **k):
+        import time
+
+        self.runs += 1
+        time.sleep(self._sleep_s)
+        return self._sess.run(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._sess, name)
+
+
+def test_bench_times_tick_in_ms(tmp: Path) -> None:
+    """Every timed iteration runs one tick, and latency is reported in milliseconds (not seconds)."""
+    from python.train import ort_bench as ob
+
+    _net, path = _model(tmp)
+    made: list = []
+    real = ob.make_session
+
+    def counting(p, ep="cpu", **kw):
+        made.append(_CountingSession(real(p, ep, **kw), 0.02))
+        return made[-1]
+
+    ob.make_session = counting
+    try:
+        out = ob.bench(path, None, ep="cpu", warmup=2, iters=5, threads=1)
+    finally:
+        ob.make_session = real
+    assert len(made) == 1, len(made)
+    assert made[0].runs == 2 + 5 + 1, f"warmup 2 + timed 5 + io_bytes 1 runs expected, got {made[0].runs}"
+    st = out["ort"]
+    assert st["n"] == 5 and 20.0 <= st["p50_ms"] < 5000.0, f"a 20 ms tick must time as >=20 ms: {st}"
+    print(f"bench timing: runs={made[0].runs} p50={st['p50_ms']:.1f} ms (>=20 ms sleep per tick)")
+
+
+def test_make_session_refuses_cuda_fallback() -> None:
+    """ep=cuda landing on CPU raises (no silent fallback); a session that has CUDA is returned."""
+    import onnxruntime as ort
+
+    from python.train import ort_bench as ob
+
+    class FakeSession:
+        providers: list = []
+
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        def get_providers(self):
+            return list(self.providers)
+
+    real = ort.InferenceSession
+    ort.InferenceSession = FakeSession
+    try:
+        FakeSession.providers = ["CPUExecutionProvider"]
+        try:
+            ob.make_session("unused.onnx", "cuda")
+        except RuntimeError as exc:
+            assert "CUDAExecutionProvider" in str(exc), exc
+        else:
+            raise AssertionError("make_session(ep=cuda) accepted a CPU-only session")
+        FakeSession.providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        assert isinstance(ob.make_session("unused.onnx", "cuda"), FakeSession)
+    finally:
+        ort.InferenceSession = real
+
+
+def test_peak_rss_is_mib(tmp: Path) -> None:
+    """With torch + ORT + the model loaded, peak RSS in MiB is well above 50 and below 1 TiB."""
+    from python.train import ort_bench as ob
+
+    _model(tmp)
+    rss = ob.peak_rss_mb()
+    assert rss is not None and 50.0 < rss < 1024.0 * 1024.0, f"peak_rss_mb={rss} is not a MiB value"
+
+
+def _vram_run(rows_pid: str) -> dict:
+    from python.train import ort_bench as ob
+
+    v = ob.VramSampler(period_s=0.001)
+    v.exe = "nvidia-smi"  # mocked: _query below never runs a process
+    dev = iter(["1000", "1500", "1800", "1600"])
+
+    def fake_query(args: list[str]) -> list[str]:
+        if any(a.startswith("--query-gpu") for a in args):
+            try:
+                return [next(dev)]
+            except StopIteration:
+                v._stop.set()
+                return ["1600"]
+        return ["123, 50", rows_pid.format(pid=v.pid)]
+
+    v._query = fake_query
+    with v:
+        v._thread.join(timeout=5)
+    return v.report()
+
+
+def test_vram_sampler_delta_and_wddm() -> None:
+    """Device delta = peak - baseline, this pid's row is picked, WDDM [N/A] gives None, budget is 4 GiB."""
+    rep = _vram_run("{pid}, 700")
+    assert rep["available"] and rep["device_baseline_mb"] == 1000.0 and rep["device_peak_mb"] == 1800.0, rep
+    assert rep["device_delta_mb"] == 800.0, rep
+    assert rep["pid_peak_mb"] == 700.0, rep
+    assert rep["budget_mb"] == 4096.0, rep
+    wddm = _vram_run("{pid}, [N/A]")
+    assert wddm["pid_peak_mb"] is None and wddm["device_delta_mb"] == 800.0, wddm
+
+
+def _cli_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("gvd_ort_bench_cli", ROOT / "scripts" / "ort_bench.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_cli_exits_1_on_parity_failure(tmp: Path) -> None:
+    from python.train import ort_bench as ob
+
+    fake = {"parity": {"ok": False, "failures": ["tick 0: output 'x' off"]},
+            "ops": {"memcpy_total": 0, "fallback_ops": {}},
+            "bench": {"session_providers": ["CPUExecutionProvider"],
+                      "ort": {"p50_ms": 1.0, "p90_ms": 1.0, "p99_ms": 1.0}}}
+    real = ob.run_all
+    ob.run_all = lambda *a, **k: fake
+    try:
+        rc = _cli_module().main(["--ep", "cpu", "--out", str(tmp / "fail.json")])
+    finally:
+        ob.run_all = real
+    assert rc == 1, f"parity failure must exit 1, got {rc}"
+
+
+def test_cli_ort_only_new_workdir(tmp: Path) -> None:
+    """--ort-only on an existing ONNX, into a workdir that does not exist yet, never imports torch."""
+    import json
+    import subprocess
+
+    _net, path = _model(tmp)
+    work = tmp / "fresh" / "nested"
+    out = tmp / "ort_only.json"
+    res = subprocess.run([sys.executable, str(ROOT / "scripts" / "ort_bench.py"), "--ep", "cpu", "--ort-only",
+                          "--onnx", str(path), "--workdir", str(work), "--warmup", "1", "--iters", "2",
+                          "--threads", "1", "--out", str(out)], capture_output=True, text=True, timeout=240)
+    assert res.returncode == 0, res.stderr[-2000:]
+    rep = json.loads(out.read_text(encoding="utf-8"))
+    assert rep["versions"]["torch_imported"] is False and rep["bench"]["torch_imported"] is False, rep["versions"]
+    assert (work / "optimized_cpu.onnx").is_file() and rep["ops"]["memcpy_total"] == 0
+
+
 def test_offline_only_never_live() -> None:
     """Nothing live imports the harness, and the harness reads no live/driving signal."""
     src = (ROOT / "python" / "train" / "ort_bench.py").read_text(encoding="utf-8").lower()
@@ -287,6 +443,12 @@ def main() -> None:
         test_memcpy_counts_synthetic()
         test_bench_smoke(tmp)
         test_cli_parity_exit(tmp)
+        test_bench_times_tick_in_ms(tmp)
+        test_make_session_refuses_cuda_fallback()
+        test_peak_rss_is_mib(tmp)
+        test_vram_sampler_delta_and_wddm()
+        test_cli_exits_1_on_parity_failure(tmp)
+        test_cli_ort_only_new_workdir(tmp)
     print("test_ort_bench: OK")
 
 

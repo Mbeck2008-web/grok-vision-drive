@@ -2,7 +2,7 @@
 
 Phase 0 decision D4: PyTorch trains, **ORT CUDA EP FP32** deploys. This harness
 measures that path for the **current** SceneNet (small preset, 8 cams,
-2,203,694 params). Offline only: nothing live imports it, it feeds nothing
+2,195,486 params). Offline only: nothing live imports it, it feeds nothing
 live (no odometry, no controls), and it never touches heartbeat / AEB / engage.
 
 | piece | file |
@@ -69,7 +69,7 @@ delta is clean.
 
 - **Q1 install + EP load (no model run):**
   ```bat
-  cd <repo> && git fetch && git checkout gvd/swarm2-ort-bench
+  cd <repo> && git fetch && git checkout gvd/ort-bench
   py -3.12 -m venv %USERPROFILE%\venv-ortgpu
   %USERPROFILE%\venv-ortgpu\Scripts\python -m pip install -r requirements-ort.txt numpy PyYAML opencv-python
   %USERPROFILE%\venv-ortgpu\Scripts\python -c "import onnxruntime as o; o.preload_dlls(); print(o.__version__, o.get_device(), o.get_available_providers())"

@@ -351,6 +351,7 @@ def op_report(path: Path | str, ep: str = "cpu", workdir: Path | None = None) ->
         own_tmp = tempfile.TemporaryDirectory(prefix="gvd_ort_ops_")
         workdir = Path(own_tmp.name)
     workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)  # ORT cannot write the optimized model / profile into a missing dir
     try:
         optimized = workdir / f"optimized_{ep}.onnx"
         sess = make_session(path, ep, profile_dir=workdir, optimized_path=optimized)
@@ -613,6 +614,8 @@ def run_ort_only(onnx_path: Path | str, ep: str = "cpu", warmup: int = 10, iters
     """Op report and bench of an existing ONNX without PyTorch (deploy-path RSS/VRAM)."""
     import onnxruntime as ort
 
+    if workdir is not None:
+        Path(workdir).mkdir(parents=True, exist_ok=True)
     ops = op_report(onnx_path, ep=ep, workdir=workdir)
     if ep == "cuda":
         with VramSampler() as vram:

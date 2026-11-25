@@ -1695,31 +1695,50 @@ def check_barrier_anywhere_hides_ground() -> None:
     print("barrier_anywhere_hides_ground")
 
 
+def _first_hits_box(cams, boxes, target: int) -> int:
+    """Full-resolution rays (every content pixel centre, not the feature grid) whose first hit is
+    ``boxes[target]`` (flat ground z = 0; axis-aligned boxes)."""
+    hits = 0
+    for g in bl.rig_geometry(cams, _cfg(), model=BASE_RIG_MODEL):
+        K, T = g.K.astype(np.float64), g.T.astype(np.float64)
+        nw, nh, x0, y0 = g.content
+        uu, vv = np.meshgrid(np.arange(x0, x0 + nw) + 0.5, np.arange(y0, y0 + nh) + 0.5)
+        d = np.stack([(uu - K[0, 2]) / K[0, 0], (vv - K[1, 2]) / K[1, 1], np.ones_like(uu)], -1).reshape(-1, 3) @ T[:3, :3].T
+        o = T[:3, 3]
+        t_first = np.where(d[:, 2] < 0, -o[2] / np.where(d[:, 2] < 0, d[:, 2], -1.0), np.inf)
+        t_box = []
+        for lo, hi in boxes:
+            lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ta, tb = (lo - o) / d, (hi - o) / d
+            t0 = np.nanmax(np.minimum(ta, tb), axis=1)
+            t1 = np.nanmin(np.maximum(ta, tb), axis=1)
+            t_box.append(np.where((t1 >= np.maximum(t0, 0.0)), np.maximum(t0, 0.0), np.inf))
+        others = np.minimum.reduce([t_first] + [t for i, t in enumerate(t_box) if i != target])
+        hits += int((t_box[target] < others).sum())
+    return hits
+
+
 def check_unobservable_leak_pinned() -> None:
-    """Named limitation (G5, room ruling): a barrier no valid feature ray of any camera touches is
-    invisible to the rig, so the ground behind it can read as seen. The probe's only such row is a 0.3 m
-    wall 15 m ahead on main alone (it sits between two rows). Pin that it is unobservable by ray geometry
-    (no valid main ray's first hit is on the box) and that its leak cannot grow past 102 cells."""
-    box = ((-6.0, 15.0, 0.0), (6.0, 15.3, 0.3))
-    g = bl.rig_geometry(["main"], _cfg(), model=BASE_RIG_MODEL)[0]
-    pv = bl.rig_tensors([g])["pixel_valid"].reshape(CROP_ROWS, CROP_COLS).numpy() > 0
-    K, T = g.K.astype(np.float64), g.T.astype(np.float64)
-    o = T[:3, 3]
-    lo, hi = np.array(box[0]), np.array(box[1])
-    on_box = 0
-    for r in range(CROP_ROWS):
-        for c in range(CROP_COLS):
-            if not pv[r, c]:
-                continue
-            d = T[:3, :3] @ np.array([((c + 0.5) * 8 - K[0, 2]) / K[0, 0], ((r + 0.5) * 8 - K[1, 2]) / K[1, 1], 1.0])
-            t_box = _ray_box(o, d, lo, hi)
-            t_gnd = -o[2] / d[2] if d[2] < 0 else np.inf
-            on_box += int(t_box is not None and t_box < t_gnd)
-    assert on_box == 0, on_box  # unobservable: a leak here is the named limitation, not a gate bug
-    hidden, _, free_ok, seen = _leaks(["main"], [box])
-    leak = int((hidden & (free_ok | seen)).sum())
-    print(f"  0.3 m @15 main (unobservable): hidden {int(hidden.sum())} leak {leak}")
-    assert hidden.sum() >= 1 and leak <= 102, leak
+    """Named limitation (G5, referee ruling 2026-11-25): a barrier no camera ray touches at full input
+    resolution is invisible to the rig. The referee's unobservable rows are of two kinds: out of every
+    camera's view (rear / side / under-nose blind spots, lateral offsets) and fully behind a taller
+    occluder. Pin two of them on narrow + main + wide: each target is first-hit by no full-resolution ray,
+    and no hidden cell leaks (the gate must not do worse than the rig's own blindness)."""
+    cams = ["narrow", "main", "wide"]
+    rows = {
+        # occl_behind_tall_y10_h0.6_c3: 20 m x 1.8 m wall at 6 m, 8 m x 0.6 m target at 10 m
+        "behind_tall": [((-10.0, 6.0, 0.0), (10.0, 6.3, 1.8)), ((-4.0, 10.0, 0.0), (4.0, 10.3, 0.6))],
+        # rear_y-6_h0.8_c3: 12 m x 0.8 m wall 6 m behind the ego, no rear camera
+        "rear_blind": [((-6.0, -6.0, 0.0), (6.0, -5.7, 0.8))],
+    }
+    for name, boxes in rows.items():
+        on_target = _first_hits_box(cams, boxes, len(boxes) - 1)
+        assert on_target == 0, (name, on_target)
+        hidden, _, free_ok, seen = _leaks(cams, boxes)
+        leak = int((hidden & (free_ok | seen)).sum())
+        print(f"  {name} (unobservable): hidden {int(hidden.sum())} leak {leak}")
+        assert leak == 0, (name, leak)
     print("unobservable_leak_pinned")
 
 

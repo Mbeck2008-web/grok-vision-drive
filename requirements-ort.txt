@@ -1,0 +1,27 @@
+# OPTIONAL: SceneNet ONNX Runtime CUDA EP bench / deploy candidate (docs/ort_bench.md).
+# Not a live dependency. Nothing in the live supervisor imports onnxruntime-gpu today.
+#
+# ALL PINS UNVERIFIED until docs/ort_bench.md Q1-Q3 run on Desktop-IQU45 (GTX 1080 Ti, sm_61).
+#
+# Install in its OWN venv (or after `pip uninstall onnxruntime`): onnxruntime and
+# onnxruntime-gpu both install the `onnxruntime` module and must not be mixed.
+#
+# Why these versions (sources in docs/ort_bench.md "Pins"):
+# - CUDA 13 dropped Pascal (sm_61). onnxruntime-gpu on PyPI is built with CUDA 13 from 1.27.0,
+#   so 1.26.x is the last PyPI onnxruntime-gpu built with CUDA 12.8.
+# - cuDNN dropped pre-Turing after 9.10.x; onnxruntime-gpu's [cudnn] extra only asks for
+#   nvidia-cudnn-cu12~=9.0 (would pull a Pascal-less 9.1x/9.2x), so cuDNN is pinned to
+#   9.10.2.21, the same cuDNN torch 2.14.1+cu126 depends on.
+# - Driver: CUDA 12.8 runtime needs an R570+ driver (minor-version compat from R525 may
+#   work for most kernels; UNVERIFIED on IQU45).
+onnxruntime-gpu==1.26.0
+nvidia-cuda-runtime-cu12==12.8.*
+nvidia-cublas-cu12==12.8.*
+nvidia-cufft-cu12==11.3.*
+nvidia-curand-cu12==10.3.*
+nvidia-cuda-nvrtc-cu12==12.8.*
+nvidia-cudnn-cu12==9.10.2.21
+onnx==1.23.2
+# Training stays on the dev PC's existing torch (run_offline_suite TORCH_PINS):
+#   pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu126
+# cu126 is the only torch 2.14 CUDA build with Pascal kernels; 2.14 is the last release with it.

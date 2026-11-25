@@ -25,6 +25,139 @@ from gvd_test_env import isolated_home  # noqa: E402
 CAM_AGE_KEYS = ("cam_ages", "stale_ego_n")
 
 
+def _touch_bus() -> None:
+    """Keep a lua_bus handshake at the predicted pin (same write as 8f4a163)."""
+    from python.runtime import paths as gvd_paths
+
+    pin = gvd_paths.predicted_gvd_docs_path()
+    pin.mkdir(parents=True, exist_ok=True)
+    (pin / "gvd_link.json").write_text(json.dumps({"lua_bus": str(pin.resolve())}), encoding="utf-8")
+
+
+def _observe_supervisor(
+    proc: object,
+    *,
+    seconds: float,
+    echo,
+    cmd,
+    state,
+    startup_s: float = 30.0,
+) -> tuple[float | None, list[dict]]:
+    """Sample cmd/state until ``seconds`` after the first command, or the child exits.
+
+    8f4a163 behavior: break as soon as poll() is not None, before exists().
+    """
+    states: list[dict] = []
+    first: float | None = None
+    next_echo, echo_seq = 0.0, 0
+    end = time.time() + float(startup_s)
+    while time.time() < end:
+        if proc.poll() is not None:
+            break
+        _touch_bus()
+        if echo is not None and time.monotonic() >= next_echo:
+            next_echo = time.monotonic() + echo.FAKE_ECHO_PERIOD_S
+            echo_seq += 1
+            echo._write_ego(_cmd_seq(cmd()), speed=0.0, echo_seq=echo_seq)
+        if first is None and cmd().exists():
+            first = time.time()
+            end = first + float(seconds)
+        if first is not None and state().exists():
+            try:
+                states.append(json.loads(state().read_text(encoding="utf-8")))
+            except (ValueError, OSError):
+                pass
+        time.sleep(0.05)
+    return first, states
+
+
+class _ExitedProc:
+    """A child that has already exited. Forces the poll-before-observe interleaving."""
+
+    def poll(self):
+        return 0
+
+    def kill(self) -> None:
+        return None
+
+    def wait(self, timeout=None) -> int:
+        return 0
+
+
+def check_observes_cmd_after_child_exit() -> None:
+    """If the child writes gvd_cmd.json and exits before the first poll, first is still set."""
+    from python.control.actuate import cmd_path
+    from python.runtime import paths as gvd_paths
+    from python.runtime.state_io import state_path
+
+    with isolated_home(prefix="gvd-default-"):
+        pin = gvd_paths.predicted_gvd_docs_path()
+        pin.mkdir(parents=True, exist_ok=True)
+        _touch_bus()
+        cmd_path().write_text(json.dumps({"seq": 1}), encoding="utf-8")
+        first, _states = _observe_supervisor(
+            _ExitedProc(), seconds=0.0, echo=None, cmd=cmd_path, state=state_path, startup_s=1.0
+        )
+        assert first is not None, "missed gvd_cmd.json because the child had already exited"
+        assert cmd_path().exists()
+    print("observe after child exit: first command still seen OK")
+
+
+def check_link_writer_atomic() -> None:
+    """_touch_bus publishes gvd_link.json via os.replace; a concurrent reader never sees a tear."""
+    import threading
+
+    from python.runtime import paths as gvd_paths
+
+    with isolated_home(prefix="gvd-default-"):
+        pin = gvd_paths.predicted_gvd_docs_path()
+        pin.mkdir(parents=True, exist_ok=True)
+        _touch_bus()
+        replaces: list[tuple[str, str]] = []
+        real_replace = os.replace
+
+        def wrapped_replace(src, dst, *args, **kwargs):
+            replaces.append((Path(src).name, Path(dst).name))
+            return real_replace(src, dst, *args, **kwargs)
+
+        os.replace = wrapped_replace  # type: ignore[method-assign]
+        try:
+            _touch_bus()
+        finally:
+            os.replace = real_replace  # type: ignore[method-assign]
+        assert replaces, "gvd_link.json was not published via os.replace"
+        assert any(dst == "gvd_link.json" for _src, dst in replaces), replaces
+
+        stop = threading.Event()
+        stats = {"ok": 0, "mismatch": 0}
+
+        def writer() -> None:
+            while not stop.is_set():
+                _touch_bus()
+
+        def reader() -> None:
+            while not stop.is_set():
+                ident = gvd_paths.bus_identity()
+                if ident.matched:
+                    stats["ok"] += 1
+                else:
+                    stats["mismatch"] += 1
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for t in threads:
+            t.start()
+        time.sleep(0.4)
+        stop.set()
+        for t in threads:
+            t.join()
+        total = stats["ok"] + stats["mismatch"]
+        assert total > 0, "no bus_identity reads"
+        assert stats["mismatch"] == 0, (
+            f"torn or stale lua_bus during atomic writes: mismatch={stats['mismatch']}/{total}"
+        )
+    print(f"atomic gvd_link writer: {stats['ok']} matched reads, 0 mismatch OK")
+
+
 def run_supervisor(extra: list[str], seconds: float = 2.0, echo: bool = False) -> tuple[str, list[dict]]:
     """Run the stub supervisor for ``seconds`` after its first command; stdout and sampled states.
 
@@ -35,42 +168,20 @@ def run_supervisor(extra: list[str], seconds: float = 2.0, echo: bool = False) -
     from python.runtime import paths as gvd_paths
     from python.runtime.state_io import state_path
 
-    states: list[dict] = []
     with isolated_home(prefix="gvd-default-") as home:
         pin = gvd_paths.predicted_gvd_docs_path()
         pin.mkdir(parents=True, exist_ok=True)
-
-        def touch_bus() -> None:
-            (pin / "gvd_link.json").write_text(json.dumps({"lua_bus": str(pin.resolve())}), encoding="utf-8")
-
-        touch_bus()
+        _touch_bus()
         m6 = _m6() if echo else None
-        next_echo, echo_seq = 0.0, 0
         out_path = Path(home) / "stdout.txt"
         env = dict(os.environ, PYTHONPATH=str(ROOT))
         args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
         with out_path.open("w", encoding="utf-8") as out:
             proc = subprocess.Popen(args, cwd=str(ROOT), env=env, stdout=out, stderr=subprocess.STDOUT)
-            first = None
             try:
-                end = time.time() + 30.0
-                while time.time() < end:
-                    if proc.poll() is not None:
-                        break
-                    touch_bus()
-                    if m6 is not None and time.monotonic() >= next_echo:
-                        next_echo = time.monotonic() + m6.FAKE_ECHO_PERIOD_S
-                        echo_seq += 1
-                        m6._write_ego(_cmd_seq(cmd_path()), speed=0.0, echo_seq=echo_seq)
-                    if first is None and cmd_path().exists():
-                        first = time.time()
-                        end = first + float(seconds)
-                    if first is not None and state_path().exists():
-                        try:
-                            states.append(json.loads(state_path().read_text(encoding="utf-8")))
-                        except (ValueError, OSError):
-                            pass
-                    time.sleep(0.05)
+                first, states = _observe_supervisor(
+                    proc, seconds=seconds, echo=m6, cmd=cmd_path, state=state_path
+                )
             finally:
                 if proc.poll() is None:
                     proc.kill()
@@ -135,6 +246,8 @@ def check_run_seconds() -> None:
 
 
 def main() -> None:
+    check_observes_cmd_after_child_exit()
+    check_link_writer_atomic()
     check_default_emits_nothing()
     check_no_engage()
     check_run_seconds()

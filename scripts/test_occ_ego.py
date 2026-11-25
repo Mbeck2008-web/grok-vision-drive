@@ -544,27 +544,27 @@ def check_vo_observed_region_cost() -> None:
     try:
         occ_odometry(k0, c0, k1, c1, grid=G, cams=[cam], occl=occl)
         assert calls["n"] == 1, (calls["n"], "observed region must be built once per tick")
-        calls["n"] = 0
-        cam_times = []
-        for _ in range(3):
-            t1 = time.perf_counter()
-            occ_odometry(k0, c0, k1, c1, grid=G, cams=[cam], occl=occl)
-            cam_times.append((time.perf_counter() - t1) * 1e3)
-        ms_cams = float(np.median(cam_times))
-        assert calls["n"] == 3, (calls["n"], "one observed-region build per tick")
     finally:
         ego_mod._observed_bev_keys = orig
-    times = []
-    for _ in range(3):
+    # Interleave the two paths and take the min of N so a shared-box load
+    # spike cannot inflate only one side. The 6x cap is unchanged.
+    n_rep = 9
+    cam_times, nocam_times = [], []
+    for _ in range(n_rep):
+        t1 = time.perf_counter()
+        occ_odometry(k0, c0, k1, c1, grid=G, cams=[cam], occl=occl)
+        cam_times.append((time.perf_counter() - t1) * 1e3)
         t1 = time.perf_counter()
         occ_odometry(k0, c0, k1, c1, grid=G)
-        times.append((time.perf_counter() - t1) * 1e3)
-    ms_nocams = float(np.median(times))
+        nocam_times.append((time.perf_counter() - t1) * 1e3)
+    ms_cams = float(min(cam_times))
+    ms_nocams = float(min(nocam_times))
     # The v4 baseline is ~23 ms with no observed-region work. Stay within
     # 6x of the no-cams path so an 8x regression cannot pass.
-    assert ms_cams <= 6.0 * ms_nocams, (ms_cams, ms_nocams)
+    assert ms_cams <= 6.0 * ms_nocams, (ms_cams, ms_nocams, cam_times, nocam_times)
     print(f"VO cost: observed-region builds=1, "
-          f"with cams {ms_cams:.0f} ms, no cams {ms_nocams:.0f} ms OK")
+          f"with cams {ms_cams:.0f} ms (min of {n_rep}), "
+          f"no cams {ms_nocams:.0f} ms (min of {n_rep}) OK")
 
 
 def check_vo_prev_obs_update() -> None:

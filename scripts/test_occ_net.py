@@ -41,6 +41,64 @@ from synthetic_occ import SEM_CLASSES, render  # noqa: E402
 CFG = yaml.safe_load((ROOT / "config" / "cameras.yaml").read_text(encoding="utf-8"))
 G = DEFAULT_GRID
 
+# f=4 uphill: replace the max_below proxy (Skeptic pr237v9 (b)).
+# Tight floors are the measured v9 values; b91b957 fails the building
+# column counts (184/208 at +10% noise-free). These are strictly stronger
+# than the old 88/138/44/85/66 caps, not a numeric widening of them.
+F4_UPHILL_TRUTH = {
+    (0.10, 0.0):  dict(road_ok=880, road_n=880, bld_ok=208, bld_n=208, wall_min=176, wall_eq=True),
+    (0.15, 0.0):  dict(road_ok=640, road_n=664, bld_ok=128, bld_n=136, wall_min=120, wall_eq=True),
+    (0.10, 0.01): dict(road_ok=868, road_n=880, bld_ok=197, bld_n=208, wall_min=170, wall_eq=False),
+    (0.15, 0.01): dict(road_ok=637, road_n=664, bld_ok=120, bld_n=136, wall_min=115, wall_eq=False),
+    (0.10, 0.02): dict(road_ok=798, road_n=880, bld_ok=188, bld_n=208, wall_min=169, wall_eq=False),
+    (0.15, 0.02): dict(road_ok=602, road_n=664, bld_ok=107, bld_n=136, wall_min=115, wall_eq=False),
+}
+
+
+def _assert_f4_uphill_truth(name, hot, ph, lab, idx, cap, cm, want) -> None:
+    """Per-column band vs true ground, walls kept, leftover-only below pool."""
+    lvl = np.floor((hot[:, 2] - G.z_min) / cm + 1e-6).astype(np.int64)
+    ix = np.floor(hot[:, 0] / cm + 1e-6).astype(np.int64)
+    iy = np.floor(hot[:, 1] / cm + 1e-6).astype(np.int64)
+    ix0, iy0 = ix - int(ix.min()), iy - int(iy.min())
+    col = ix0 * (int(iy0.max()) + 1) + iy0
+    gl = _column_ground_lvl(col, lvl, ph, ix0, iy0, cm)[col]
+    in_bld = (np.abs(hot[:, 0]) > 8) & (np.abs(hot[:, 0]) < 14) & (hot[:, 1] > 0) & (hot[:, 1] < 45)
+    tg: dict[int, int] = {}
+    is_bld: dict[int, bool] = {}
+    for c, l, lb, b in zip(col, lvl, lab, in_bld):
+        c = int(c)
+        if lb == "ground":
+            tg[c] = int(l)
+        if b:
+            is_bld[c] = True
+    gl_c = {int(c): int(g) for c, g in zip(col, gl)}
+    road = [c for c in tg if not is_bld.get(c, False)]
+    bld = [c for c in tg if is_bld.get(c, False)]
+    road_ok = sum(gl_c[c] == tg[c] for c in road)
+    bld_ok = sum(gl_c[c] == tg[c] for c in bld)
+    assert len(road) == want["road_n"] and len(bld) == want["bld_n"], (
+        name, "column totals", len(road), len(bld), want)
+    assert road_ok >= want["road_ok"], (name, "road band", road_ok, want["road_ok"], len(road))
+    assert bld_ok >= want["bld_ok"], (name, "building band", bld_ok, want["bld_ok"], len(bld))
+    n_wall_tot = int((lab == "wall").sum())
+    n_wall_kept = int((lab[idx] == "wall").sum())
+    assert n_wall_kept >= want["wall_min"], (name, "walls kept", n_wall_kept, want["wall_min"])
+    if want["wall_eq"]:
+        assert n_wall_kept == n_wall_tot, (name, "all walls must be kept", n_wall_kept, n_wall_tot)
+    wall_below = int(((lab == "wall") & (lvl < gl)).sum())
+    assert wall_below == 0, (name, "true wall in below pool", wall_below)
+    kept_band = int((lvl[idx] == gl[idx]).sum())
+    kept_struct = int((lab[idx] == "wall").sum())
+    kept_below_pool = int((lvl[idx] < gl[idx]).sum())
+    leftover = cap - kept_band - kept_struct
+    assert kept_below_pool <= leftover, (
+        name, "below pool exceeds leftover", kept_below_pool, leftover,
+        kept_band, kept_struct, cap)
+    print(f"capped_hot {name} truth: road {road_ok}/{len(road)} "
+          f"building {bld_ok}/{len(bld)} walls {n_wall_kept}/{n_wall_tot} "
+          f"below-pool {kept_below_pool} leftover {leftover} OK")
+
 
 def check_projection() -> None:
     cams = [c.scaled(64) for c in rig_cams(CFG)]
@@ -515,7 +573,7 @@ def check_capped_hot_grade_and_onelayer() -> None:
         z = zfun(X[m], Y[m])
         return np.stack([X[m], Y[m], zc(z, cm)], 1)
 
-    def run_parts(name, parts, cap, cm, min_counts, max_below=0):
+    def run_parts(name, parts, cap, cm, min_counts, max_below=0, truth=None):
         hot = np.concatenate([p[0] for p in parts])
         ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float32)
         lab = np.concatenate([np.full(len(p[0]), p[2]) for p in parts])
@@ -525,8 +583,11 @@ def check_capped_hot_grade_and_onelayer() -> None:
         kept = {str(k): int(v) for k, v in zip(*np.unique(lab[idx], return_counts=True))}
         for k, nmin in min_counts.items():
             assert int(kept.get(k, 0)) >= nmin, (name, k, kept, nmin)
-        n_bel = int(kept.get("below", 0))
-        assert n_bel <= max_below, (name, n_bel, max_below, kept)
+        if truth is not None:
+            _assert_f4_uphill_truth(name, hot, ph, lab, idx, cap, cm, truth)
+        else:
+            n_bel = int(kept.get("below", 0))
+            assert n_bel <= max_below, (name, n_bel, max_below, kept)
         print(f"capped_hot {name}: {kept} OK")
         return kept
 
@@ -534,8 +595,7 @@ def check_capped_hot_grade_and_onelayer() -> None:
     for f, cap, want in (
         (2, 2048, {"up10_wall": 900, "up15_wall": 650, "car": 150, "rail": 64,
                     "up10_below": 128, "up15_below": 140}),
-        (4, 512, {"up10_wall": 176, "up15_wall": 120, "car": 40, "rail": 32,
-                    "up10_below": 88, "up15_below": 138}),
+        (4, 512, {"up10_wall": 176, "up15_wall": 120, "car": 40, "rail": 32}),
     ):
         cm = G.voxel_m * f
         X, Y = grid_xy(cm)
@@ -564,13 +624,15 @@ def check_capped_hot_grade_and_onelayer() -> None:
         )
         for g, wkey, bkey in ((0.10, "up10_wall", "up10_below"), (0.15, "up15_wall", "up15_below")):
             gz = lambda x, y, g=g: 0.2 + g * np.maximum(y, 0)
+            extra = ({"truth": F4_UPHILL_TRUTH[(g, 0.0)]} if f == 4
+                     else {"max_below": want[bkey]})
             run_parts(
                 f"f={f} uphill {g * 100:+.0f}%",
                 [(lay(X, Y, gz, ALL, cm), 0.95, "ground"),
                  (lay(X, Y, lambda x, y, g=g: gz(x, y) - cm, ALL, cm), 0.9, "below")]
                 + [(lay(X, Y, lambda x, y, k=k, g=g: gz(x, y) + k * cm, bld, cm), 0.95, "wall") for k in (1, 2, 3)],
                 cap, cm, {"wall": want[wkey]},
-                max_below=want[bkey],
+                **extra,
             )
 
     # --- P4: >=20 m-wide building, no ground under it ---
@@ -736,7 +798,7 @@ def check_capped_hot_p_margin_and_robust_env() -> None:
     print(f"robust-env two-fill sigma 0.01: {n0}/{t.size} columns at level 0 OK")
 
     # --- Major 1: p noise on the f=2 / f=4 floors; cold-ground wall near v6 ---
-    def run_parts(name, parts, cap, cm, min_counts, max_below=0, sig=0.0, seed=1):
+    def run_parts(name, parts, cap, cm, min_counts, max_below=0, sig=0.0, seed=1, truth=None):
         rng = np.random.default_rng(seed)
         hot = np.concatenate([p[0] for p in parts])
         ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float64)
@@ -750,8 +812,11 @@ def check_capped_hot_p_margin_and_robust_env() -> None:
         kept = {str(k): int(v) for k, v in zip(*np.unique(lab[idx], return_counts=True))}
         for k, nmin in min_counts.items():
             assert int(kept.get(k, 0)) >= nmin, (name, k, kept, nmin)
-        n_bel = int(kept.get("below", 0))
-        assert n_bel <= max_below, (name, n_bel, max_below, kept)
+        if truth is not None:
+            _assert_f4_uphill_truth(name, hot, ph, lab, idx, cap, cm, truth)
+        else:
+            n_bel = int(kept.get("below", 0))
+            assert n_bel <= max_below, (name, n_bel, max_below, kept)
         print(f"capped_hot {name}: {kept} OK")
         return kept
 
@@ -777,8 +842,8 @@ def check_capped_hot_p_margin_and_robust_env() -> None:
                     0.01: {"up10_wall": 963, "up15_wall": 744, "up10_below": 129, "up15_below": 124},
                     0.02: {"up10_wall": 808, "up15_wall": 693, "up10_below": 130, "up15_below": 149}}),
         (4, 512, {"car": 40, "rail": 32, "cold_wall": 256,
-                   0.01: {"up10_wall": 170, "up15_wall": 115, "up10_below": 44, "up15_below": 85},
-                   0.02: {"up10_wall": 169, "up15_wall": 115, "up10_below": 33, "up15_below": 66}}),
+                   0.01: {"up10_wall": 170, "up15_wall": 115},
+                   0.02: {"up10_wall": 169, "up15_wall": 115}}),
     ):
         cm = G.voxel_m * f
         X, Y = grid_xy(cm)
@@ -808,12 +873,14 @@ def check_capped_hot_p_margin_and_robust_env() -> None:
             uw = want[sig]
             for g, wkey, bkey in ((0.10, "up10_wall", "up10_below"), (0.15, "up15_wall", "up15_below")):
                 gz = lambda x, y, g=g: 0.2 + g * np.maximum(y, 0)
+                extra = ({"truth": F4_UPHILL_TRUTH[(g, sig)]} if f == 4
+                         else {"max_below": uw[bkey]})
                 run_parts(
                     f"{tag} uphill {g * 100:+.0f}%",
                     [(lay(X, Y, gz, ALL, cm), 0.95, "ground"),
                      (lay(X, Y, lambda x, y, g=g: gz(x, y) - cm, ALL, cm), 0.9, "below")]
                     + [(lay(X, Y, lambda x, y, k=k, g=g: gz(x, y) + k * cm, bld, cm), 0.95, "wall") for k in (1, 2, 3)],
-                    cap, cm, {"wall": uw[wkey]}, max_below=uw[bkey], sig=sig,
+                    cap, cm, {"wall": uw[wkey]}, sig=sig, **extra,
                 )
             # cold-ground wall must stay near the v6 level (~1022 of 1024 at f=2)
             run_parts(
@@ -970,6 +1037,108 @@ def check_capped_hot_exposed_ground() -> None:
           f"{', '.join(f'{x:.1f}' for x in peaks)} MiB OK")
 
 
+def check_capped_hot_inherit_and_vote_edges() -> None:
+    """Kill inherit/vote-floor mutants X8, X9, X10, X13 (Skeptic pr237v9).
+
+    These pass on the current head. They pin correct leftover inherit and
+    a vote floor of 0.65, not the open low-p-grade bugs (those live in
+    scripts/occ_sparse_open_failures.py, which is not in the default suite).
+    """
+    def levels_on(n, cell, layers):
+        ix, iy = [a.ravel() for a in np.meshgrid(np.arange(n), np.arange(n), indexing="ij")]
+        col, lv, pp = [], [], []
+        for mask, lvl, p in layers:
+            m = mask(ix, iy)
+            col.append(ix[m] * n + iy[m])
+            lv.append(np.full(int(m.sum()), lvl) if np.isscalar(lvl) else lvl(ix[m], iy[m]))
+            pp.append(np.full(int(m.sum()), p))
+        col = np.concatenate(col)
+        lvl = np.concatenate(lv).astype(np.int64)
+        p = np.concatenate(pp).astype(np.float32)
+        return _column_ground_lvl(col, lvl, p, col // n, col % n, cell), ix, iy, n
+
+    # X13: P8-shaped hole whose fill is p=0.63, inside (0.60, 0.65].
+    # 0.65 leaves the fill silent (hole inherits ground). 0.62 lets it vote.
+    f, cap, cm = 2, 2048, G.voxel_m * 2
+    xs = G.x_min + cm * (np.arange(int(51.2 / cm)) + 0.5)
+    ys = G.y_min + cm * (np.arange(int(64 / cm)) + 0.5)
+    X, Y = [a.ravel() for a in np.meshgrid(xs, ys, indexing="ij")]
+    def zc(z):
+        return G.z_min + cm * (np.floor((z - G.z_min) / cm) + 0.5)
+    def lay(z, m):
+        return np.stack([X[m], Y[m], np.full(int(m.sum()), zc(z))], 1)
+    ALL = np.ones_like(X, bool)
+    hole = (np.abs(X) < 3.0) & (Y > 10.0) & (Y < 22.0)
+    ground = ALL & ~hole
+    bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
+    parts = (
+        [(lay(0.2, ground), 0.95, "ground"),
+         (lay(0.2 - cm, hole), 0.63, "holefill"),
+         (lay(0.2 - cm, ground), 0.90, "below")]
+        + [(lay(0.2 + k * cm, bld), 0.95, "wall") for k in (1, 2, 3)]
+    )
+    hot = np.concatenate([p[0] for p in parts])
+    ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float32)
+    lab = np.concatenate([np.full(len(p[0]), p[2]) for p in parts])
+    keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
+    hot, ph, lab = hot[keep], ph[keep], lab[keep]
+    lvl = np.floor((hot[:, 2] - G.z_min) / cm + 1e-6).astype(np.int64)
+    ix = np.floor(hot[:, 0] / cm + 1e-6).astype(np.int64)
+    iy = np.floor(hot[:, 1] / cm + 1e-6).astype(np.int64)
+    ix0, iy0 = ix - int(ix.min()), iy - int(iy.min())
+    col = ix0 * (int(iy0.max()) + 1) + iy0
+    gl = _column_ground_lvl(col, lvl, ph, ix0, iy0, cm)
+    hole_cols = np.unique(col[lab == "holefill"])
+    ground_lvl = int(np.median(lvl[lab == "ground"]))
+    fill_lvl = int(np.median(lvl[lab == "holefill"]))
+    assert fill_lvl < ground_lvl
+    assert hole_cols.size >= 8
+    assert np.all(gl[hole_cols] == ground_lvl), (
+        "X13: p=0.63 hole fill became the band",
+        int((gl[hole_cols] == fill_lvl).sum()), int(hole_cols.size), fill_lvl, ground_lvl,
+    )
+    print(f"capped_hot X13 vote floor: {hole_cols.size} hole cols inherit ground "
+          f"{ground_lvl}, not p=0.63 fill {fill_lvl} OK")
+
+    # X8 / X10: a low-y ground strip, a high-y hole of weak fill more than
+    # 12 m away. Leftover inherit must walk in +y (X8 drops that pass) and
+    # must not fall back to the hole's own fill seed (X10).
+    n, cell = 64, 0.8
+    band, ix, iy, n = levels_on(n, cell, [
+        (lambda x, y: y <= 40, 4, 0.95),
+        (lambda x, y: y > 40, 3, 0.60),
+    ])
+    hole = iy > 40
+    hcols = ix[hole] * n + iy[hole]
+    assert np.all(band[hcols] == 4), (
+        "X8/X10: high-y hole did not inherit the low-y ground",
+        int((band[hcols] == 3).sum()), int(hcols.size),
+    )
+    print(f"capped_hot X8/X10 +y inherit: {int(hcols.size)} hole cols inherit "
+          f"ground 4, not fill 3 OK")
+
+    # X9: leftover inherit of a slightly high plane uses floor(z+0.25), not
+    # +0.5, so a 0.6-layer error cannot jump a layer (same bias as the inlier
+    # snap). Voters at x<5 step from level 4 (y<32) to 5 (y>=32); leftover
+    # x>=40 is >12 m away and has cells at both 4 and 5. At the first 8
+    # leftover rows after the step, +0.25 stays on 4 and +0.5 jumps to 5.
+    band, ix, iy, n = levels_on(n, cell, [
+        (lambda x, y: (x < 5) & (y < 32), 4, 0.95),
+        (lambda x, y: (x < 5) & (y >= 32), 5, 0.95),
+        (lambda x, y: x >= 40, 4, 0.50),
+        (lambda x, y: x >= 40, 5, 0.50),
+    ])
+    edge = (ix >= 40) & (iy >= 32) & (iy <= 39)
+    ecols = ix[edge] * n + iy[edge]
+    assert ecols.size == 8 * 24, ecols.size  # 8 y * 24 leftover x
+    assert np.all(band[ecols] == 4), (
+        "X9: leftover inherit used +0.5 and jumped a layer at the step",
+        int((band[ecols] == 5).sum()), int(ecols.size),
+    )
+    print(f"capped_hot X9 inherit floor(z+0.25): {int(ecols.size)} leftover "
+          f"cols at the 4/5 step stay on 4 OK")
+
+
 def check_class_balance() -> None:
     """_class_balance splits evenly across classes; a 99:1 pool must not stay 99:1."""
     rng = np.random.default_rng(0)
@@ -1037,6 +1206,7 @@ def main() -> int:
     check_capped_hot_grade_and_onelayer()
     check_capped_hot_p_margin_and_robust_env()
     check_capped_hot_exposed_ground()
+    check_capped_hot_inherit_and_vote_edges()
     check_class_balance()
     check_unoccupied_not_occluded_structure()
     check_queries()

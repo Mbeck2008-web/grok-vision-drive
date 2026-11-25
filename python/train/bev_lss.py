@@ -137,10 +137,6 @@ GROUND_WIDE_WINDOW_CELLS = 21
 # above the road (a roof) weighs exp(-15) as much as the road; the exponent
 # stays in [-60, 0] over the z band, well inside float32.
 GROUND_SOFTMIN_K = 10.0
-# How steeply a cell's ground may rise above the wide-scale mean, as a grade.
-# Surfaces steeper than this relative to the wide-scale ground are not used
-# as local ground (the band itself, GROUND_BAND_M, is the height cutoff).
-GROUND_SLOPE_CAP = 0.15
 # A surface this far above the local ground is a 2.5D occluder for the
 # camera-to-ground sight line. 0.3 m is below GROUND_BAND_M (so a 0.6 m
 # wall's front-face hits, which sit at ~0.35-0.45 m and never become
@@ -152,6 +148,10 @@ RAISED_OCC_M = 0.3
 # Sight line is tested at this step count with this clearance under the
 # occluder top (Skeptic's hidden test uses 0.1 m).
 OCC_WINDOW_CELLS = 3
+# z_occ is a soft maximum of a cell's occluder hits (log-sum-exp at this
+# sharpness, 1 / m): at least the highest hit, at most log(n) / 30 above it
+# (0.1 m for 20 hits), so it is the wall top as sampled, never the face mean.
+OCC_TOP_K = 30.0
 SIGHTLINE_STEPS = 12
 SIGHTLINE_CLEARANCE_M = 0.05
 # Occluders closer to the destination than this are ignored, so a dilated
@@ -160,6 +160,26 @@ SIGHTLINE_CLEARANCE_M = 0.05
 # self-occlude. A 0.6 m barrier's front-face hits still sit far enough in
 # front of the hidden cells to close the umbra.
 SIGHTLINE_MARGIN_M = 1.5
+
+# Shadow-map gate (``shadow_blocked``): a ray whose surface stands at least
+# the occluder threshold above the reference ground is an occluder at the near
+# edge of its depth bin (bin snapping never moves it behind what it hides). A
+# cell's ground is also tested SHADOW_LIFT_M higher, so a ground estimate that
+# is low by up to that much (a +6 % grade's soft-min runs 0.15-0.19 m low)
+# still lands on the occluder's rows. OCC_FAR_M marks "no occluder".
+SHADOW_LIFT_M = 0.25
+# Occluder threshold: 0.15 m above the ground where the local (+-3 m) and wide
+# (+-5 m) soft-min grounds agree (flat road; the estimate is good to ~0.06 m
+# there), plus 1.5x their disagreement (on a grade the local soft-min runs about
+# 1.5x that low: 0.18 m vs 0.12 m at 6 %), capped at RAISED_OCC_M. A wall's
+# topmost hit sits within one ray pitch of its top, so 0.15 m instead of 0.3 m
+# resolves a 0.55 m wall out to where the pitch is 0.4 m (main: 15.7 m).
+SHADOW_OCC_MIN_M = 0.15
+SHADOW_OCC_GAIN = 1.5
+OCC_FAR_M = 1.0e4
+# Cameras mounted this close share a sight line (the windshield cluster's
+# narrow / main / wide sit within 0.03 m), so the finest one decides for all.
+SHADOW_COLOC_M = 0.1
 
 # Categorical depth (audit item 9: 40 log bins, 1-48 m).
 DEPTH_BINS = 40
@@ -432,8 +452,8 @@ def two_scale_ground(
     exists). The local soft-min then runs on the kept surfaces only, so a
     barrier wider than the local window cannot become the ground behind it.
     Surfaces at least ``near_m`` above the wide-scale ground are returned
-    as a raised-surface mask. ``GROUND_SLOPE_CAP`` documents the allowed
-    grade; ``near_m`` is the height cutoff.
+    as a raised-surface mask. ``near_m`` is the height cutoff (6 % over the
+    5 m wide half-window is 0.30 m, inside it).
     """
     g_wide, has_wide = ground_height(z_sum, w_sum, window=wide_window, k=k)
     cell_has = w_sum > 0
@@ -516,6 +536,98 @@ def sightline_blocked(
         b * ncam, 1, n_steps, BEV_N * BEV_N
     )
     return hit.any(dim=2).view(b, ncam, BEV_N, BEV_N).to(dtype)
+
+
+def shadow_blocked(
+    d_occ: Any,
+    d_far: Any,
+    ground: Any,
+    K: Any,
+    T: Any,
+    pixel_valid: Any = None,
+    time_offset_s: Any = None,
+    ego_speed_mps: Any = None,
+    stride: int = FEAT_STRIDE,
+    lift_m: float = SHADOW_LIFT_M,
+    coloc_m: float = SHADOW_COLOC_M,
+) -> Any:
+    """Per-camera mask (B x Ncam x N x N): the cell's ground is not provably in this camera's view.
+
+    A shadow-map (z-buffer) test in the camera's own image, so it never needs an occluder height.
+    Each cell's ground point (``ground``, B x 1 x N x N; tested there and ``lift_m`` higher, so a
+    ground estimate that is low by up to that much still lands on the occluder's rows) is
+    projected into the camera, and judged against the rays that bracket the projection: the true
+    top or side edge of an occluder lies somewhere between two sampled rays, so the ray on either
+    side of an edge decides, never one aggregated height.
+
+    - ``d_occ`` (B x Ncam x h x w): per ray, the near edge of its surface bin when that surface is
+      an occluder (stands at least the occluder threshold above the local ground), else large.
+      Blocked when any of the 2 x 2 bracketing rays has an occluder nearer than the point.
+    - ``d_far`` (B x Ncam x h x w): per ray, the far edge of its surface bin for ANY surface (sky =
+      large). On planar ground a ray above a point's sight line lands beyond the point, so when a
+      ray of the row just above the point has a surface nearer than it, something stands in front
+      of that ground. No height test, so it holds when the local ground has collapsed onto a wall.
+    - Points behind the camera, outside the image or on an invalid (letterbox) pixel are blocked:
+      a camera that cannot see the ground cannot clear it.
+    - Cameras mounted within ``coloc_m`` of each other share one sight line, so a point one of them
+      sees blocked (in its view) is blocked for all of them; the finest camera resolves the edge.
+    Resolution limit (stated, not hidden): an occluder edge that falls between two rays of every
+    camera that sees the cell, with no hit above the threshold, leaves a depth map identical to open
+    road there; no gate can tell those apart (scripts/test_bev_lss.py, sub-pitch wall check).
+    """
+    b, ncam, h, w = d_occ.shape
+    dtype, device = d_occ.dtype, d_occ.device
+    occ_pad = F.pad(d_occ.reshape(b * ncam, 1, h, w), (1, 1, 1, 1), value=OCC_FAR_M)
+    nearest = -F.max_pool2d(-occ_pad, 2, stride=1).reshape(b, ncam, (h + 1) * (w + 1))
+    far_pad = F.pad(d_far.reshape(b * ncam, 1, h, w), (1, 1, 1, 1), value=OCC_FAR_M)
+    upper = -F.max_pool2d(-far_pad, (1, 2), stride=1)[:, :, : h + 1].reshape(b, ncam, (h + 1) * (w + 1))
+    if pixel_valid is None:
+        pv = torch.ones(1, ncam, h, w, dtype=dtype, device=device)
+    else:
+        pv = pixel_valid.to(dtype).reshape(-1, ncam, h, w)
+    pv_pad = F.pad(pv.reshape(-1, 1, h, w), (1, 1, 1, 1))
+    valid2 = (-F.max_pool2d(-pv_pad, 2, stride=1)).reshape(pv.shape[0], ncam, (h + 1) * (w + 1)).expand(b, -1, -1)
+    ys = BEV_HALF_M - BEV_CELL_M * (torch.arange(BEV_N, device=device, dtype=dtype) + 0.5)
+    xs = -BEV_HALF_M + BEV_CELL_M * (torch.arange(BEV_N, device=device, dtype=dtype) + 0.5)
+    rot = T[..., :3, :3].to(dtype)
+    trans = T[..., :3, 3].to(dtype)
+    shift = torch.zeros(b, ncam, dtype=dtype, device=device)
+    if time_offset_s is not None and ego_speed_mps is not None:
+        shift = ego_speed_mps.to(dtype).view(-1, 1) * time_offset_s.to(dtype)
+    # ego point at the camera's capture time (ego compensation inverted), relative to the camera
+    px = (xs.view(1, 1, 1, BEV_N) - trans[..., 0].view(b, ncam, 1, 1)).expand(b, ncam, BEV_N, BEV_N).reshape(b, ncam, -1)
+    py = (ys.view(1, 1, BEV_N, 1) - shift.view(b, ncam, 1, 1) - trans[..., 1].view(b, ncam, 1, 1)).expand(b, ncam, BEV_N, BEV_N).reshape(b, ncam, -1)
+    fx, fy = K[..., 0, 0].to(dtype)[..., None], K[..., 1, 1].to(dtype)[..., None]
+    cx, cy = K[..., 0, 2].to(dtype)[..., None], K[..., 1, 2].to(dtype)[..., None]
+    seen_any = torch.zeros(b, ncam, BEV_N * BEV_N, dtype=torch.bool, device=device)
+    hit_any = torch.zeros_like(seen_any)
+    for lift in (0.0, float(lift_m)):
+        pz = (ground.to(dtype) + lift).reshape(b, 1, -1) - trans[..., 2:3]
+        cam_x = rot[..., 0, 0, None] * px + rot[..., 1, 0, None] * py + rot[..., 2, 0, None] * pz
+        cam_y = rot[..., 0, 1, None] * px + rot[..., 1, 1, None] * py + rot[..., 2, 1, None] * pz
+        depth = rot[..., 0, 2, None] * px + rot[..., 1, 2, None] * py + rot[..., 2, 2, None] * pz
+        front = depth > 1e-3
+        safe = torch.where(front, depth, torch.ones_like(depth))
+        fu = (fx * cam_x / safe + cx) / stride - 0.5
+        fv = (fy * cam_y / safe + cy) / stride - 0.5
+        inside = front & (fu >= -0.5) & (fu < w - 0.5) & (fv >= -0.5) & (fv < h - 0.5)
+        iu = torch.floor(fu.clamp(-1.0, float(w - 1))).long() + 1
+        iv = torch.floor(fv.clamp(-1.0, float(h - 1))).long() + 1
+        flat = torch.where(inside, iv * (w + 1) + iu, torch.zeros_like(iu))
+        in_view = inside & (valid2.gather(2, flat) > 0)
+        hit = nearest.gather(2, flat) < depth
+        if lift > 0.0:
+            # the row-above test runs only at the lifted point, which sits above the true ground
+            # whenever the estimate is low by less than lift_m (a ray above it lands beyond it)
+            hit = hit | (upper.gather(2, flat) < depth)
+        seen_any = seen_any | in_view
+        hit_any = hit_any | (in_view & hit)
+    own = ~seen_any | hit_any
+    shared = hit_any
+    dist = torch.cdist(trans, trans)
+    coloc = (dist <= coloc_m).to(dtype)
+    shared_any = torch.bmm(coloc, shared.to(dtype)) > 0
+    return (own | shared_any).to(dtype).view(b, ncam, BEV_N, BEV_N)
 
 
 def near_ground(z: Any, ground: Any, band_m: float = GROUND_BAND_M) -> Any:
@@ -638,6 +750,9 @@ class BevLssHead(nn.Module):
         self.ground_band_m = _check_band(ground_band_m)
         self.register_buffer("depths", torch.from_numpy(depth_bin_centers(depth_bins)), persistent=False)
         self.register_buffer("edges", torch.from_numpy(depth_bin_inner_edges(depth_bins)), persistent=False)
+        edges = np.geomspace(DEPTH_MIN_M, DEPTH_MAX_M, depth_bins + 1)
+        # Near edge of a bin over its centre (log bins: the same ratio for every bin).
+        self.near_frac = float(edges[0] / (0.5 * (edges[0] + edges[1])))
 
     @staticmethod
     def camera_features(K: Any, T: Any) -> Any:
@@ -706,14 +821,49 @@ class BevLssHead(nn.Module):
         high_vals = torch.stack([high * z, high], dim=-1).reshape(b, n * d * h * w, 2)
         high_sum = splat(high_vals, idx.reshape(b, -1), ok.reshape(b, -1))
         has_occ = (high_sum[:, 1:2] > 0).to(prob.dtype)
-        z_occ = torch.where(
+        z_mean = torch.where(
             has_occ > 0,
             high_sum[:, 0:1] / torch.where(has_occ > 0, high_sum[:, 1:2], torch.ones_like(has_occ)),
+            torch.zeros_like(has_occ),
+        )
+        # Occluder top, not the mean of its face hits: log-sum-exp relative to the cell mean, never
+        # below the highest hit and at most log(n) / OCC_TOP_K above it.
+        mean_at = z_mean.reshape(b, BEV_N * BEV_N).gather(1, idx.reshape(b, -1)).view_as(z)
+        rel = torch.where(high > 0, z - mean_at, torch.zeros_like(z))
+        top_vals = (high * torch.exp(OCC_TOP_K * rel)).reshape(b, n * d * h * w, 1)
+        top_sum = splat(top_vals, idx.reshape(b, -1), ok.reshape(b, -1))
+        z_occ = torch.where(
+            has_occ > 0,
+            z_mean + torch.log(torch.where(has_occ > 0, top_sum, torch.ones_like(top_sum))) / OCC_TOP_K,
             torch.zeros_like(has_occ),
         )
         has_occ = F.max_pool2d(has_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
         z_occ = F.max_pool2d(z_occ, OCC_WINDOW_CELLS, stride=1, padding=OCC_WINDOW_CELLS // 2)
         blocked = sightline_blocked(z_occ, has_occ, g_wide, T)
+        # Shadow map: per ray, the near edge of its surface bin when that surface is an occluder.
+        # Shadow map (``shadow_blocked``). Reference ground: the local ground, unless it sits more than
+        # occ_m above the wide-scale ground (it has collapsed onto a near wall's face); then the wide one.
+        g_ref = torch.where((has_ground > 0) & (ground - g_wide <= occ_m), ground, g_wide)
+        # A wider band (objects under it may be passed over) lifts both thresholds by the same amount.
+        band_shift = self.ground_band_m - GROUND_BAND_M
+        # Occluder threshold per cell: SHADOW_OCC_MIN_M where the local and wide grounds agree (flat
+        # road), rising with their disagreement up to RAISED_OCC_M, so road on a grade (whose soft-min
+        # local ground runs ~1.5x that disagreement low) never counts as an occluder.
+        occ_t = (SHADOW_OCC_MIN_M + SHADOW_OCC_GAIN * (ground - g_wide).abs()).clamp(max=RAISED_OCC_M) + band_shift
+        ref_at = g_ref.reshape(b, BEV_N * BEV_N).gather(1, idx.reshape(b, -1)).view_as(z)
+        t_at = occ_t.reshape(b, BEV_N * BEV_N).gather(1, idx.reshape(b, -1)).view_as(z)
+        okf = ok.to(prob.dtype)
+        occ_ray = (surf * ((z - ref_at) >= t_at) * okf).sum(dim=2) * ray_w.squeeze(2)
+        d_surf = (surf * self.depths.to(prob.dtype).view(1, 1, -1, 1, 1)).sum(dim=2)
+        d_occ = torch.where(occ_ray > 0, d_surf * self.near_frac, torch.full_like(d_surf, OCC_FAR_M))
+        # The row-above test takes any surface (it needs no ground estimate), except surfaces a wider
+        # band declares passable.
+        far_ray = has_surf.squeeze(2) * weight.squeeze(2)
+        if band_shift > 0:
+            far_ray = far_ray * (surf * ((z - ref_at) >= band_shift) * okf).sum(dim=2)
+        d_far = torch.where(far_ray > 0, d_surf / self.near_frac, torch.full_like(d_surf, OCC_FAR_M))
+        shadow = shadow_blocked(d_occ, d_far, g_ref, K, T, pixel_valid, time_offset_s, ego_speed_mps)
+        blocked = torch.maximum(blocked, shadow)
         ids_c = idx.reshape(b, n, -1).clamp(min=0, max=BEV_N * BEV_N - 1)
         visible = (1.0 - blocked.reshape(b, n, BEV_N * BEV_N).gather(2, ids_c).view_as(idx)) * ok.to(prob.dtype)
 

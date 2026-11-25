@@ -1654,7 +1654,9 @@ def check_ground_band_pinned_and_plumbed() -> None:
     reaches the head through the config."""
     assert bl.GROUND_BAND_M == 0.5, bl.GROUND_BAND_M
     assert bl.GROUND_WINDOW_CELLS == 13 and bl.GROUND_SOFTMIN_K == 10.0
-    assert bl.GROUND_WIDE_WINDOW_CELLS == 21 and bl.GROUND_SLOPE_CAP == 0.15
+    assert bl.GROUND_WIDE_WINDOW_CELLS == 21 and not hasattr(bl, "GROUND_SLOPE_CAP")  # dead constant removed
+    assert bl.SHADOW_LIFT_M == 0.25 and bl.SHADOW_OCC_MIN_M == 0.15 and bl.SHADOW_OCC_GAIN == 1.5
+    assert bl.SHADOW_COLOC_M == 0.1 and bl.OCC_TOP_K == 30.0 and bl.OCC_FAR_M > 10 * bl.DEPTH_MAX_M
     assert bl.RAISED_OCC_M == 0.3 and bl.OCC_WINDOW_CELLS == 3 and bl.SIGHTLINE_STEPS == 12 and bl.SIGHTLINE_CLEARANCE_M == 0.05 and bl.SIGHTLINE_MARGIN_M == 1.5
     assert bl.BevLssHead().ground_band_m == 0.5
     span = bl.BEV_Z_MAX_M - bl.BEV_Z_MIN_M

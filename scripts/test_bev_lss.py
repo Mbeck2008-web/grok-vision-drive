@@ -1557,6 +1557,172 @@ def check_wide_low_barrier_hides_ground() -> None:
             )
 
 
+def _seg_hits_box(o: np.ndarray, tgt: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """Vectorised slab test: does the open segment o -> tgt[i] (i over rows of tgt) pass through the box?"""
+    d = tgt - o
+    t0 = np.zeros(len(tgt))
+    t1 = np.full(len(tgt), 0.999)
+    for a in range(3):
+        da = d[:, a]
+        small = np.abs(da) < 1e-12
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ta = np.where(small, -np.inf, (lo[a] - o[a]) / np.where(small, 1.0, da))
+            tb = np.where(small, np.inf, (hi[a] - o[a]) / np.where(small, 1.0, da))
+        out = small & ((o[a] < lo[a]) | (o[a] > hi[a]))
+        t0 = np.maximum(t0, np.minimum(ta, tb))
+        t1 = np.minimum(t1, np.maximum(ta, tb))
+        t1 = np.where(out, -1.0, t1)
+    return t1 >= t0
+
+
+def _hidden_visible(geoms, boxes, grade: float = 0.0, z0: float = 0.0, below_top: float = 0.1, inset: float = 0.3):
+    """Hand-computed ground truth on the BEV grid for axis-aligned boxes on the plane z = grade * y + z0.
+
+    hidden: every in-view camera's sight line to the cell's ground centre passes through some box shrunk
+    ``below_top`` under its top and ``inset`` in from both ends along x (Skeptic wall_leak); cells within
+    0.25 m of a footprint are left out. visible: some in-view camera's sight line clears every box grown
+    ``below_top`` over its top (and under its bottom if it floats), ``inset`` along x and 0.1 m along y;
+    cells within 0.5 m of a footprint are left out. Returns two 128 x 128 bool arrays.
+    """
+    rows, cols = np.meshgrid(np.arange(bl.BEV_N), np.arange(bl.BEV_N), indexing="ij")
+    X = -bl.BEV_HALF_M + bl.BEV_CELL_M * (cols + 0.5)
+    Y = bl.BEV_HALF_M - bl.BEV_CELL_M * (rows + 0.5)
+    tgt = np.stack([X, Y, grade * Y + z0], -1).reshape(-1, 3)
+    near25 = np.zeros(len(tgt), bool)
+    near50 = np.zeros(len(tgt), bool)
+    for lo, hi in boxes:
+        for m, arr in ((0.25, near25), (0.5, near50)):
+            arr |= (tgt[:, 0] >= lo[0] - m) & (tgt[:, 0] <= hi[0] + m) & (tgt[:, 1] >= lo[1] - m) & (tgt[:, 1] <= hi[1] + m)
+    inview = np.zeros(len(tgt), bool)
+    seen_s = np.zeros(len(tgt), bool)
+    seen_g = np.zeros(len(tgt), bool)
+    for g in geoms:
+        Ti = np.linalg.inv(g.T.astype(np.float64))
+        cam = (Ti[:3, :3] @ tgt.T).T + Ti[:3, 3]
+        ok = cam[:, 2] > 0
+        zc = np.where(ok, cam[:, 2], 1.0)
+        u = g.K[0, 0] * cam[:, 0] / zc + g.K[0, 2]
+        v = g.K[1, 1] * cam[:, 1] / zc + g.K[1, 2]
+        nw, nh, x0, y0 = g.content
+        ok &= (x0 <= u) & (u < x0 + nw) & (y0 <= v) & (v < y0 + nh)
+        inview |= ok
+        o = g.T[:3, 3].astype(np.float64)
+        blk_s = np.zeros(len(tgt), bool)
+        blk_g = np.zeros(len(tgt), bool)
+        for lo, hi in boxes:
+            lo, hi = np.array(lo, np.float64), np.array(hi, np.float64)
+            ls, hs = lo + [inset, 0.0, 0.0], hi - [inset, 0.0, below_top]
+            if hs[0] > ls[0] and hs[2] > ls[2]:
+                blk_s |= _seg_hits_box(o, tgt, ls, hs)
+            lg = lo - [inset, 0.1, below_top if lo[2] > grade * lo[1] + z0 + 0.05 else 0.0]
+            blk_g |= _seg_hits_box(o, tgt, lg, hi + [inset, 0.1, below_top])
+        seen_s |= ok & ~blk_s
+        seen_g |= ok & ~blk_g
+    hidden = (inview & ~seen_s & ~near25).reshape(bl.BEV_N, bl.BEV_N)
+    visible = (seen_g & ~near50).reshape(bl.BEV_N, bl.BEV_N)
+    return hidden, visible
+
+
+def _leaks(cams, boxes, grade: float = 0.0, z0: float = 0.0):
+    out, geoms = _scene_run(cams, boxes, grade=grade, z0=z0)
+    lg = out["logits"][0]
+    free_ok = (lg[bl.CH_FREE] != -bl.FORCE_LOGIT).numpy()
+    seen = (lg[bl.CH_UNKNOWN] != bl.FORCE_LOGIT).numpy()
+    hidden, visible = _hidden_visible(geoms, boxes, grade=grade, z0=z0)
+    return hidden, visible, free_ok, seen
+
+
+def _cams8() -> list[str]:
+    ids = [c["id"] for c in _cfg()["cameras"]]
+    assert len(ids) == 8, ids
+    return ids
+
+
+def _main_grazing_height(y_wall: float, above: float = 0.6) -> float:
+    """Height at the wall plane y_wall of the lowest main-camera centre-column feature row that passes
+    more than ``above`` + 1 cm over the road there, minus 1 cm: a wall that tall (>= ``above``) is missed
+    by that row by 1 cm and its top sits between two rows (the grazing top edge)."""
+    g = bl.rig_geometry(["main"], _cfg(), model=BASE_RIG_MODEL)[0]
+    K, T = g.K.astype(np.float64), g.T.astype(np.float64)
+    o = T[:3, 3]
+    hs = []
+    for r in range(24):
+        d = T[:3, :3] @ np.array([(16 * 8 - K[0, 2]) / K[0, 0], ((r + 0.5) * 8 - K[1, 2]) / K[1, 1], 1.0])
+        t = (y_wall - o[1]) / d[1]
+        if t > 0:
+            hs.append(o[2] + t * d[2])
+    return min(h for h in hs if h > above + 0.01) - 0.01
+
+
+def check_barrier_anywhere_hides_ground() -> None:
+    """G5 (858b7ab Major): hidden ground behind a >= 0.6 m barrier is never free-eligible or seen, at any
+    range, ego-origin height, grade, width or camera count, and when the wall top sits between two feature
+    rows (grazing top edge). Hidden = sight line to the ground centre >= 0.1 m under the top and >= 0.3 m
+    in from the ends for every in-view camera. Leaks on 858b7ab (z_occ = mean of face hits)."""
+    c8 = _cams8()
+    W = lambda y, h, x0=-6.0, x1=6.0, zb=0.0: ((x0, y, zb), (x1, y + 0.3, zb + h))  # noqa: E731
+    cases = [
+        ("0.6 m @10 z0=-0.23 main", ["main"], [W(10.0, 0.6, zb=-0.23)], 0.0, -0.23),
+        ("0.6 m @10 z0=-0.23 8cam", c8, [W(10.0, 0.6, zb=-0.23)], 0.0, -0.23),
+        ("0.6 m @8 8cam", c8, [W(8.0, 0.6)], 0.0, 0.0),
+        ("0.6 m @8 main", ["main"], [W(8.0, 0.6)], 0.0, 0.0),
+        ("0.6 m @4 8cam", c8, [W(4.0, 0.6)], 0.0, 0.0),
+        ("0.6 m @5 8cam", c8, [W(5.0, 0.6)], 0.0, 0.0),
+        ("0.8 m @3 main", ["main"], [W(3.0, 0.8)], 0.0, 0.0),
+        ("0.6 m @3 8cam", c8, [W(3.0, 0.6)], 0.0, 0.0),
+        ("half 0.6 m @10 main", ["main"], [W(10.0, 0.6, x0=-6.0, x1=0.0)], 0.0, 0.0),
+        ("4 m 0.6 m @10 main", ["main"], [W(10.0, 0.6, x0=-2.0, x1=2.0)], 0.0, 0.0),
+        ("gap 0.6 m @10 main", ["main"], [W(10.0, 0.6, x0=-8.0, x1=-1.0), W(10.0, 0.6, x0=1.0, x1=8.0)], 0.0, 0.0),
+        ("0.6 m @10 grade -6% main", ["main"], [W(10.0, 0.6, zb=-0.06 * 10.15)], -0.06, 0.0),
+        ("1.5 m @8 8cam", c8, [W(8.0, 1.5)], 0.0, 0.0),
+    ]
+    for y, above in ((6.0, 0.6), (10.0, 0.6), (14.0, 0.6), (10.0, 0.9)):
+        h = _main_grazing_height(y + 0.15, above)
+        cases.append((f"grazing {h:.3f} m @{y:g} main", ["main"], [W(y, h)], 0.0, 0.0))
+        cases.append((f"grazing {h:.3f} m @{y:g} 8cam", c8, [W(y, h)], 0.0, 0.0))
+    bad = []
+    for name, cams, boxes, grade, z0 in cases:
+        hidden, _, free_ok, seen = _leaks(cams, boxes, grade=grade, z0=z0)
+        assert hidden.sum() >= 1, (name, int(hidden.sum()))
+        nf, ns = int((hidden & free_ok).sum()), int((hidden & seen).sum())
+        print(f"  {name}: hidden {int(hidden.sum())} free {nf} seen {ns}", flush=True)
+        if nf or ns:
+            bad.append(f"{name}: hidden {int(hidden.sum())} free {nf} seen {ns}")
+    assert not bad, "; ".join(bad)
+    print("barrier_anywhere_hides_ground")
+
+
+def check_thin_occluders_keep_visible_road() -> None:
+    """Over-hide check: a thin pole or a sign in one cell must not shadow the visible road around and
+    behind it. On main and on narrow + main + wide, of the road cells observed with no occluder that are
+    still visible (hand-computed: some camera's sight line clears the occluder grown 0.1 m / 0.3 m), at
+    least 97 % stay observed, and the open road beside a centred pole or sign (|x| 2-4 m, 12-20 m ahead)
+    stays observed exactly as on empty road."""
+    pole = ((-0.1, 10.0, 0.0), (0.1, 10.2, 3.0))
+    sign = [((-0.04, 10.0, 0.0), (0.04, 10.08, 2.3)), ((-0.225, 10.0, 1.5), (0.225, 10.05, 2.3))]
+    pole2 = ((2.9, 8.0, 0.0), (3.05, 8.15, 2.5))
+    side = np.zeros((bl.BEV_N, bl.BEV_N), bool)
+    for r in range(bl.BEV_N):
+        y = bl.BEV_HALF_M - bl.BEV_CELL_M * (r + 0.5)
+        for c in range(bl.BEV_N):
+            x = -bl.BEV_HALF_M + bl.BEV_CELL_M * (c + 0.5)
+            side[r, c] = 12.0 <= y <= 20.0 and 2.0 <= abs(x) <= 4.0
+    for cams in (["main"], ["narrow", "main", "wide"]):
+        _, _, _, seen0 = _leaks(cams, [])
+        for name, boxes in (("pole", [pole]), ("sign", sign), ("pole x=3", [pole2])):
+            hidden, visible, free_ok, seen = _leaks(cams, boxes)
+            base = visible & seen0
+            kept = int((base & seen).sum())
+            assert base.sum() >= 200, (name, cams, int(base.sum()))
+            frac = kept / int(base.sum())
+            print(f"  {name} cams={len(cams)}: visible&observed-on-empty {int(base.sum())} kept {kept} ({frac:.3f})", flush=True)
+            assert frac >= 0.97, f"{name} {cams}: visible road observed {kept}/{int(base.sum())} = {frac:.3f}"
+            if name != "pole x=3":
+                s2 = side & base
+                assert int(s2.sum()) >= 10 and bool(seen[s2].all()), (name, cams, int(s2.sum()), int((s2 & ~seen).sum()))
+    print("thin_occluders_keep_visible_road")
+
+
 def check_empty_road_on_grade_and_pitch() -> None:
     """G5: the band follows the road, not the ego frame. Empty road on main and on narrow + main + wide
     at +-1 deg ego pitch (ground z = tan(+-1 deg) y), a +3 % grade and the ground 0.23 m below the ego
@@ -1655,7 +1821,10 @@ def check_ground_band_pinned_and_plumbed() -> None:
     assert bl.GROUND_BAND_M == 0.5, bl.GROUND_BAND_M
     assert bl.GROUND_WINDOW_CELLS == 13 and bl.GROUND_SOFTMIN_K == 10.0
     assert bl.GROUND_WIDE_WINDOW_CELLS == 21 and bl.GROUND_SLOPE_CAP == 0.15
-    assert bl.RAISED_OCC_M == 0.3 and bl.OCC_WINDOW_CELLS == 3 and bl.SIGHTLINE_STEPS == 12 and bl.SIGHTLINE_CLEARANCE_M == 0.05 and bl.SIGHTLINE_MARGIN_M == 1.5
+    assert bl.RAISED_OCC_M == 0.3 and bl.SIGHTLINE_MARGIN_M == 0.5 and bl.SEEN_TIGHT_M == 0.1 and bl.DESIGN_WALL_M == 0.6
+    assert bl.VIEWSHED_AZ_BINS == 720 and bl.VIEWSHED_RANGE_STEP_M == 0.25 and bl.VIEWSHED_RANGE_M == 48.0
+    assert bl.TOP_RADIAL_SAMPLES == 13 and bl.TOP_LATERAL_SAMPLES == 13 and bl.OCC_N == 2 * bl.BEV_N and bl.TOP_LSE_K == (5.0, 40.0, 300.0, 2000.0)
+    assert bl.EGO_CONTACT_HALF_X_M == 0.8 and bl.EGO_CONTACT_HALF_Y_M == 1.4 and bl.EGO_GROUND_DROP_M == 0.5
     assert bl.BevLssHead().ground_band_m == 0.5
     span = bl.BEV_Z_MAX_M - bl.BEV_Z_MIN_M
     for bad in (0.0, -0.5, span + 0.1, float("nan")):
@@ -1760,6 +1929,8 @@ def main() -> None:
     check_sky_rays_never_free()
     check_low_occluder_hides_ground()
     check_wide_low_barrier_hides_ground()
+    check_barrier_anywhere_hides_ground()
+    check_thin_occluders_keep_visible_road()
     check_pass_mass_is_survival()
     check_zero_valid_cameras_no_nan()
     check_gradients_reach_stem_and_depth()

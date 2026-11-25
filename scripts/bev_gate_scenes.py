@@ -90,6 +90,23 @@ def scene_zdepth(g, boxes: Sequence[Box], grade: float = 0.0, z0: float = 0.0) -
     return np.where(np.isfinite(t), t, 60.0)
 
 
+def face_hits(geoms, boxes: Sequence[Box], grade: float = 0.0, z0: float = 0.0) -> np.ndarray:
+    """Ground-truth observability, from scene geometry only (never from the gate): per camera x box, the
+    number of valid feature rays (letterbox excluded, first surface within DEPTH_MAX_M) whose FIRST
+    surface is that box's face, at any height."""
+    valid = bl.pixel_valid_mask(list(geoms))
+    out = np.zeros((len(geoms), len(boxes)), dtype=np.int64)
+    for i, g in enumerate(geoms):
+        o = g.T[:3, 3].astype(np.float64)
+        d = ray_dirs(g)
+        first = scene_zdepth(g, boxes, grade, z0)
+        for j, b in enumerate(boxes):
+            tb = segment_hits_box(o, d, b, grade, z0, t_max=np.inf)
+            mine = np.isfinite(tb) & (tb <= first + 1e-9) & (tb <= bl.DEPTH_MAX_M) & (valid[i] > 0)
+            out[i, j] = int(mine.sum())
+    return out
+
+
 def depth_prob(geoms, boxes: Sequence[Box], grade: float = 0.0, z0: float = 0.0, p_true: float = 0.95) -> torch.Tensor:
     """N x D x 24 x 32 fixed depth head for the scene (nearest log bin; beyond DEPTH_MAX_M -> last bin)."""
     log_c = np.log(bl.depth_bin_centers())
@@ -270,6 +287,7 @@ def leaks(geoms, boxes, grade=0.0, z0=0.0, p_true=0.95, head=None, **gt_kw) -> d
         "sub_pitch": int(gt["sub_pitch"].sum()),
         "vis": rc["visible"],
         "vis_kept": rc["kept"],
+        "face_hits": face_hits(geoms, boxes, grade, z0) if boxes else np.zeros((len(geoms), 0), dtype=np.int64),
         "sub_pitch_free": int((lab["free"] & gt["sub_pitch"]).sum()),
         "out": out,
     }

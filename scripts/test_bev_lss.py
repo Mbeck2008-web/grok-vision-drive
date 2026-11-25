@@ -1782,6 +1782,22 @@ def check_gate_regression_scenes() -> None:
         # the pole's true shadow (>= 0.1 m under its top, 0.02 m inset) is still closed on main at 5 m
         r = S.leaks(geo(["main"]), [(0.25, 5.25, 0.0, 0.15, 0.15, 3.0)], head=head, foot_pad=0.36)
         assert r["hidden"] > 0 and r["free"] == 0, (r["hidden"], r["free"])
+        # Identical-input pair (stated limitation, not a pass): a 12 m x 0.6 m wall at 8 m (A) and the same
+        # wall cut to 5.5 m (B) give main + wide bit-identical depth input (no wide ray hits A at all; main
+        # sees only its middle), so the gate's labels are identical. 16 cells hidden in A are visible with
+        # margin in B, where I4 keeps them seen: no deterministic gate can label them right in both.
+        # The leak count in A is pinned so it cannot grow (40 of 288 hidden, 16 of them forced).
+        g2 = geo(["main", "wide"])
+        wall_a, wall_b = (0.0, 8.15, 0.0, 12.0, 0.3, 0.6), (0.0, 8.15, 0.0, 5.5, 0.3, 0.6)
+        assert torch.equal(S.depth_prob(g2, [wall_a]), S.depth_prob(g2, [wall_b]))
+        ra = S.leaks(g2, [wall_a], head=head, **skeptic)
+        rb = S.leaks(g2, [wall_b], head=head, **skeptic)
+        assert torch.equal(ra["out"]["logits"], rb["out"]["logits"])
+        forced = S.ground_truth(g2, [wall_a], **{k: v for k, v in skeptic.items()})["hidden"] & S.ground_visible(g2, [wall_b])
+        n_a = max(ra["free"], ra["seen"], ra["through"], ra["clear"])
+        assert int(forced.sum()) == 16 and n_a <= 40, (int(forced.sum()), n_a, ra["hidden"])
+        rcb = S.recall(g2, [wall_b], head=head)
+        assert rcb["kept"] == rcb["visible"], (rcb["kept"], rcb["visible"])
         # rear camera on a 6 % rise behind the car: the road it sees 3-5 m back stays seen, and no seen
         # cell is lost against 858b7ab (134 seen there)
         out = S.run_scene(geo(["rear"]), [], -0.06, 0.0, head=head)

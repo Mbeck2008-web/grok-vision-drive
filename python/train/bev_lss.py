@@ -519,21 +519,23 @@ def sightline_blocked(
     cam_z = T[..., 2, 3].to(dtype).reshape(b, ncam, 1, 1)
     dest_z = ground.to(dtype)
     t = torch.linspace(0, 1, n_steps + 2, device=device, dtype=dtype)[1:-1].view(1, 1, n_steps, 1, 1)
-    sx = cam_x.unsqueeze(2) + t * (grid_x.unsqueeze(2) - cam_x.unsqueeze(2))
-    sy = cam_y.unsqueeze(2) + t * (grid_y.unsqueeze(2) - cam_y.unsqueeze(2))
-    sz = cam_z.unsqueeze(2) + t * (dest_z.unsqueeze(2) - cam_z.unsqueeze(2))
-    grid = torch.stack([sx / 32.0, -sy / 32.0], dim=-1).reshape(b * ncam, n_steps, BEV_N * BEV_N, 2)
+    # Samples at fraction t of the segment camera -> cell, built in one step each (grid_sample's
+    # normalised x = x / 32, y = -y / 32), and the sight-line height already lifted by the clearance.
+    start = torch.stack([cam_x / 32.0, -cam_y / 32.0], dim=-1).unsqueeze(2)  # B Ncam 1 1 1 2
+    delta = torch.stack([(grid_x - cam_x) / 32.0, -(grid_y - cam_y) / 32.0], dim=-1).unsqueeze(2)
+    grid = torch.addcmul(start, t.unsqueeze(-1), delta).reshape(b * ncam, n_steps, BEV_N * BEV_N, 2)
+    sz = torch.addcmul((cam_z + clearance).unsqueeze(2), t, (dest_z - cam_z).unsqueeze(2))
     occ = z_occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
     has = has_occ.expand(b, ncam, BEV_N, BEV_N).reshape(b * ncam, 1, BEV_N, BEV_N)
     z_s = F.grid_sample(occ, grid, mode="nearest", padding_mode="zeros", align_corners=False)
     h_s = F.grid_sample(has, grid, mode="nearest", padding_mode="zeros", align_corners=False)
     margin = float(SIGHTLINE_MARGIN_M)
-    dx_s, dy_s = sx - cam_x.unsqueeze(2), sy - cam_y.unsqueeze(2)
-    r_s = torch.sqrt(dx_s * dx_s + dy_s * dy_s)
     dx_d, dy_d = grid_x - cam_x, grid_y - cam_y
     r_d = torch.sqrt(dx_d * dx_d + dy_d * dy_d).unsqueeze(2)
-    in_front = r_s < (r_d - margin)
-    hit = (h_s > 0) & (z_s > sz.reshape(b * ncam, 1, n_steps, BEV_N * BEV_N) + clearance) & in_front.reshape(
+    # a sample at fraction t lies t * r_d from the camera (horizontally): "more than margin in front
+    # of the cell" needs no per-sample distance
+    in_front = t * r_d < (r_d - margin)
+    hit = (h_s > 0) & (z_s > sz.reshape(b * ncam, 1, n_steps, BEV_N * BEV_N)) & in_front.reshape(
         b * ncam, 1, n_steps, BEV_N * BEV_N
     )
     return hit.any(dim=2).view(b, ncam, BEV_N, BEV_N).to(dtype)
@@ -595,8 +597,13 @@ def shadow_blocked(
     # ego point at the camera's capture time (ego compensation inverted), relative to the camera
     px = (xs.view(1, 1, 1, BEV_N) - trans[..., 0].view(b, ncam, 1, 1)).expand(b, ncam, BEV_N, BEV_N).reshape(b, ncam, -1)
     py = (ys.view(1, 1, BEV_N, 1) - shift.view(b, ncam, 1, 1) - trans[..., 1].view(b, ncam, 1, 1)).expand(b, ncam, BEV_N, BEV_N).reshape(b, ncam, -1)
-    fx, fy = K[..., 0, 0].to(dtype)[..., None], K[..., 1, 1].to(dtype)[..., None]
-    cx, cy = K[..., 0, 2].to(dtype)[..., None], K[..., 1, 2].to(dtype)[..., None]
+    # camera-frame coordinates are linear in the tested height: base (z = camera height) + column * pz
+    base = [torch.addcmul(rot[..., 0, k, None] * px, rot[..., 1, k, None], py) for k in range(3)]
+    col = [rot[..., 2, k, None] for k in range(3)]
+    fxs = K[..., 0, 0].to(dtype)[..., None] / stride
+    fys = K[..., 1, 1].to(dtype)[..., None] / stride
+    cxs = K[..., 0, 2].to(dtype)[..., None] / stride - 0.5
+    cys = K[..., 1, 2].to(dtype)[..., None] / stride - 0.5
     seen_any = torch.zeros(b, ncam, BEV_N * BEV_N, dtype=torch.bool, device=device)
     hit_any = torch.zeros_like(seen_any)
     # Lowest plausible road under the cell: the ego road plane (z = 0 at the ego origin) rising at
@@ -608,24 +615,24 @@ def shadow_blocked(
     for lift in (0.0, float(lift_m), None):
         gz = floor if lift is None else gz0 + lift
         pz = gz - trans[..., 2:3]
-        cam_x = rot[..., 0, 0, None] * px + rot[..., 1, 0, None] * py + rot[..., 2, 0, None] * pz
-        cam_y = rot[..., 0, 1, None] * px + rot[..., 1, 1, None] * py + rot[..., 2, 1, None] * pz
-        depth = rot[..., 0, 2, None] * px + rot[..., 1, 2, None] * py + rot[..., 2, 2, None] * pz
+        depth = torch.addcmul(base[2], col[2], pz)
         front = depth > 1e-3
-        safe = torch.where(front, depth, torch.ones_like(depth))
-        fu = (fx * cam_x / safe + cx) / stride - 0.5
-        fv = (fy * cam_y / safe + cy) / stride - 0.5
+        inv = depth.clamp(min=1e-3).reciprocal()
+        xn = torch.addcmul(base[0], col[0], pz) * inv
+        yn = torch.addcmul(base[1], col[1], pz) * inv
+        fu = torch.addcmul(cxs, fxs, xn)
+        fv = torch.addcmul(cys, fys, yn)
         # A cell whose centre lies just outside the image (within its half-diagonal) still has ground
-        # in view; it is judged at the nearest border position by the border rays.
-        # (an off-axis cell also spans depth, which moves its image by |x / depth| per metre)
-        mu = fx * CELL_HALF_DIAG_M * (1.0 + (cam_x / safe).abs()) / (safe * stride)
-        mv = fy * CELL_HALF_DIAG_M * (1.0 + (cam_y / safe).abs()) / (safe * stride)
-        inside = front & (fu >= -0.5 - mu) & (fu < w - 0.5 + mu) & (fv >= -0.5 - mv) & (fv < h - 0.5 + mv)
-        fu = fu.clamp(-0.5, w - 0.5 - 1e-3)
-        fv = fv.clamp(-0.5, h - 0.5 - 1e-3)
-        iu = torch.floor(fu.clamp(-1.0, float(w - 1))).long() + 1
-        iv = torch.floor(fv.clamp(-1.0, float(h - 1))).long() + 1
-        flat = torch.where(inside, iv * (w + 1) + iu, torch.zeros_like(iu))
+        # in view; it is judged at the nearest border position by the border rays. (An off-axis cell
+        # also spans depth, which moves its image by |x / depth| per metre.)
+        mu = xn.abs().add_(1.0).mul_(inv).mul_(fxs * CELL_HALF_DIAG_M)
+        mv = yn.abs().add_(1.0).mul_(inv).mul_(fys * CELL_HALF_DIAG_M)
+        inside = front & ((fu + mu) >= -0.5) & ((fu - mu) < w - 0.5) & ((fv + mv) >= -0.5) & ((fv - mv) < h - 0.5)
+        # bracket index: floor of the position clamped to the image, +1 for the pad row / column
+        # (formed in float, exact for these small integers, then one integer cast)
+        iu = fu.clamp_(-0.5, w - 0.5 - 1e-3).floor_()
+        iv = fv.clamp_(-0.5, h - 0.5 - 1e-3).floor_()
+        flat = torch.where(inside, iv.mul_(w + 1).add_(iu).add_(w + 2), torch.zeros((), dtype=dtype, device=device)).long()
         in_view = inside & (valid2.gather(2, flat) > 0)
         hit = nearest.gather(2, flat) < depth
         if lift is None:
@@ -856,8 +863,7 @@ class BevLssHead(nn.Module):
         # Its ground estimate leaves out surfaces in the first depth bin: a surface nearer than that bin
         # is clamped onto it, so its height there runs low (a low-mounted camera's own near road would
         # drag the reference under the road it sees further out, which then reads as an occluder).
-        far_bin = torch.ones(1, 1, d, 1, 1, dtype=prob.dtype, device=prob.device)
-        far_bin[:, :, 0] = 0.0
+        far_bin = (torch.arange(d, device=prob.device) > 0).to(prob.dtype).view(1, 1, d, 1, 1)
         s_sum = splat((g_vals * far_bin.unsqueeze(-1)).reshape(b, n * d * h * w, 2), idx.reshape(b, -1), ok.reshape(b, -1))
         s_ground, s_has, _, s_wide = two_scale_ground(s_sum[:, 0:1], s_sum[:, 1:2])
         s_ground = torch.where(s_has > 0, s_ground, ground)

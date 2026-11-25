@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -849,7 +849,7 @@
+             mine_ok = (snap_own | snap_low)[ok]
+             exp2d[tix[ok], tiy[ok]] = np.where(mine_ok, target[ok], expected[ok])
+         exp2d = _nearest_finite(exp2d)
+-        fill = leftover & np.isfinite(exp2d[tix, tiy])
++        fill = leftover & False
+         target[fill] = np.floor(exp2d[tix[fill], tiy[fill]] + 0.25).astype(np.int64)
+         # No trusted voter within 12 m: the inherited height is only a lower
+         # bound. A column whose own lowest strong layer is higher keeps it

@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -746,7 +746,7 @@
+         keep = np.ones(ci.size, dtype=bool)
+         keep[1:] = (col[ci][1:] != col[ci][:-1]) | (lvl[ci][1:] != lvl[ci][:-1])
+         ci = np.sort(ci[keep])
+-        seed_cell = (lvl == raw[col]) & vote[col]
++        seed_cell = (lvl == raw[col])
+         si = np.flatnonzero(seed_cell)
+         levels = np.unique(lvl[ci])
+         nl = levels.size

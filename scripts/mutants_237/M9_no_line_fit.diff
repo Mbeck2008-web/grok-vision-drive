@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -451,7 +451,7 @@
+         line_x = (sz - (n * szx - sx * sz) / vx * sx) / n
+     a = np.where((n >= 3) & (np.abs(det) > 1e-9), a, np.nan)
+     line = np.where(vy > vx, line_y, line_x)
+-    line = np.where((n >= 2) & (np.maximum(vx, vy) > 1e-9), line, np.nan)
++    line = np.full_like(line, np.nan)
+     return np.where(np.isfinite(a), a, np.where(np.isfinite(line), line, np.where(n > 0, mean, np.nan)))
+ 
+ 

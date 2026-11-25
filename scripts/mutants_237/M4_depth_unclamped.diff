@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -770,7 +770,7 @@
+         # clips a wall) one level holds the fill under one column's ground
+         # next to another column's ground under a wall; mixing them would
+         # average a real 0 gap with 0.05.
+-        depth = np.minimum(lvl[ci] - lo_all[col[ci]], 0).astype(np.int64)
++        depth = (lvl[ci] - lo_all[col[ci]]).astype(np.int64)
+         kinds, ki = np.unique(np.stack([li_c, depth], 1), axis=0, return_inverse=True)
+         ki = ki.reshape(-1)
+         nk = kinds.shape[0]

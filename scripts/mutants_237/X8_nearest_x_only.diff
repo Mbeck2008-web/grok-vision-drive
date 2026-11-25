@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -479,7 +479,7 @@
+     nx, ny = val.shape
+     big = float(nx + ny + 1)
+     dist = np.where(finite, 0.0, big)
+-    for j in range(1, ny):
++    for j in range(1, 1):
+         sl = dist[:, j] > dist[:, j - 1] + 1.0
+         if sl.any():
+             dist[sl, j] = dist[sl, j - 1] + 1.0

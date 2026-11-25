@@ -41,13 +41,17 @@ from synthetic_occ import SEM_CLASSES, render  # noqa: E402
 CFG = yaml.safe_load((ROOT / "config" / "cameras.yaml").read_text(encoding="utf-8"))
 G = DEFAULT_GRID
 
-# f=4 uphill: replace the max_below proxy (Skeptic pr237v9 (b)).
-# Tight floors are the measured v9 values; b91b957 fails the building
-# column counts (184/208 at +10% noise-free). These are strictly stronger
-# than the old 88/138/44/85/66 caps, not a numeric widening of them.
+# f=4 uphill, noise-free: per-column truth vs the true ground band.
+# b91b957 fails the building counts (184/208 at +10%). Strictly stronger
+# than the old 88/138 max_below caps, not a numeric widening of them.
 F4_UPHILL_TRUTH = {
     (0.10, 0.0):  dict(road_ok=880, road_n=880, bld_ok=208, bld_n=208, wall_min=176, wall_eq=True),
     (0.15, 0.0):  dict(road_ok=640, road_n=664, bld_ok=128, bld_n=136, wall_min=120, wall_eq=True),
+}
+# Noisy f=4 uphill floors measured on v9. These are regression floors,
+# not independent truth (they come from the code under test at v9).
+# Kept unchanged; b91b957 still fails them. Not used as "truth".
+F4_UPHILL_MEASURED = {
     (0.10, 0.01): dict(road_ok=868, road_n=880, bld_ok=197, bld_n=208, wall_min=170, wall_eq=False),
     (0.15, 0.01): dict(road_ok=637, road_n=664, bld_ok=120, bld_n=136, wall_min=115, wall_eq=False),
     (0.10, 0.02): dict(road_ok=798, road_n=880, bld_ok=188, bld_n=208, wall_min=169, wall_eq=False),
@@ -55,7 +59,7 @@ F4_UPHILL_TRUTH = {
 }
 
 
-def _assert_f4_uphill_truth(name, hot, ph, lab, idx, cap, cm, want) -> None:
+def _assert_f4_uphill_truth(name, hot, ph, lab, idx, cap, cm, want, *, kind="truth") -> None:
     """Per-column band vs true ground, walls kept, leftover-only below pool."""
     lvl = np.floor((hot[:, 2] - G.z_min) / cm + 1e-6).astype(np.int64)
     ix = np.floor(hot[:, 0] / cm + 1e-6).astype(np.int64)
@@ -95,7 +99,7 @@ def _assert_f4_uphill_truth(name, hot, ph, lab, idx, cap, cm, want) -> None:
     assert kept_below_pool <= leftover, (
         name, "below pool exceeds leftover", kept_below_pool, leftover,
         kept_band, kept_struct, cap)
-    print(f"capped_hot {name} truth: road {road_ok}/{len(road)} "
+    print(f"capped_hot {name} {kind}: road {road_ok}/{len(road)} "
           f"building {bld_ok}/{len(bld)} walls {n_wall_kept}/{n_wall_tot} "
           f"below-pool {kept_below_pool} leftover {leftover} OK")
 
@@ -798,7 +802,7 @@ def check_capped_hot_p_margin_and_robust_env() -> None:
     print(f"robust-env two-fill sigma 0.01: {n0}/{t.size} columns at level 0 OK")
 
     # --- Major 1: p noise on the f=2 / f=4 floors; cold-ground wall near v6 ---
-    def run_parts(name, parts, cap, cm, min_counts, max_below=0, sig=0.0, seed=1, truth=None):
+    def run_parts(name, parts, cap, cm, min_counts, max_below=0, sig=0.0, seed=1, truth=None, floors=None):
         rng = np.random.default_rng(seed)
         hot = np.concatenate([p[0] for p in parts])
         ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float64)
@@ -814,6 +818,8 @@ def check_capped_hot_p_margin_and_robust_env() -> None:
             assert int(kept.get(k, 0)) >= nmin, (name, k, kept, nmin)
         if truth is not None:
             _assert_f4_uphill_truth(name, hot, ph, lab, idx, cap, cm, truth)
+        elif floors is not None:
+            _assert_f4_uphill_truth(name, hot, ph, lab, idx, cap, cm, floors, kind="measured-floors")
         else:
             n_bel = int(kept.get("below", 0))
             assert n_bel <= max_below, (name, n_bel, max_below, kept)
@@ -873,7 +879,7 @@ def check_capped_hot_p_margin_and_robust_env() -> None:
             uw = want[sig]
             for g, wkey, bkey in ((0.10, "up10_wall", "up10_below"), (0.15, "up15_wall", "up15_below")):
                 gz = lambda x, y, g=g: 0.2 + g * np.maximum(y, 0)
-                extra = ({"truth": F4_UPHILL_TRUTH[(g, sig)]} if f == 4
+                extra = ({"floors": F4_UPHILL_MEASURED[(g, sig)]} if f == 4
                          else {"max_below": uw[bkey]})
                 run_parts(
                     f"{tag} uphill {g * 100:+.0f}%",
@@ -1295,7 +1301,105 @@ def check_capped_hot_low_p_grade_and_saturated_fill() -> None:
             print(f"Minor 6 f=4 +{int(g*100)}% sigma={sig}: {high}/{len(bld_cs)} building cols high OK")
 
 
+def check_capped_hot_onecell_and_gceil() -> None:
+    """Kill M3_no_onecell (duplicate voxel pooling) and M8_restore_gceil."""
+
+    def column_band(hot, ph, cm):
+        lvl = np.floor((hot[:, 2] - G.z_min) / cm + 1e-6).astype(np.int64)
+        ix = np.floor(hot[:, 0] / cm + 1e-6).astype(np.int64)
+        iy = np.floor(hot[:, 1] / cm + 1e-6).astype(np.int64)
+        ix0, iy0 = ix - int(ix.min()), iy - int(iy.min())
+        col = ix0 * (int(iy0.max()) + 1) + iy0
+        gl = _column_ground_lvl(col, lvl, ph, ix0, iy0, cm)
+        return col, lvl, gl
+
+    # M3: 8 duplicate weaker cells at one col+lvl must not pool a 0.05 gap
+    # into neighbours' buried road (the reason for the unique-voxel keep).
+    n, cell, K, lot = 32, 0.8, 8, 7
+    ix, iy = [a.ravel() for a in np.meshgrid(np.arange(n), np.arange(n), indexing="ij")]
+    cx = cy = n // 2
+    half = lot // 2
+    in_lot = (np.abs(ix - cx) <= half) & (np.abs(iy - cy) <= half)
+    polluter = (ix == cx) & (iy == cy)
+    road, cars = ~in_lot, in_lot & ~polluter
+    col, lvl, p = [], [], []
+
+    def add(mask, lv, pr):
+        col.append(ix[mask] * n + iy[mask])
+        lvl.append(np.full(int(mask.sum()), lv, np.int64))
+        p.append(np.full(int(mask.sum()), pr, np.float32))
+
+    add(road, 4, 0.95)
+    add(cars, 5, 0.95)
+    add(cars, 4, 0.95)
+    add(polluter, 5, 0.95)
+    add(polluter, 4, 0.95)
+    pc = int(cx * n + cy)
+    for _ in range(K):
+        col.append(np.array([pc], np.int64))
+        lvl.append(np.array([4], np.int64))
+        p.append(np.array([0.90], np.float32))
+    col = np.concatenate(col)
+    lvl = np.concatenate(lvl)
+    p = np.concatenate(p)
+    band = _column_ground_lvl(col, lvl, p, col // n, col % n, cell)
+    car_cols = ix[cars] * n + iy[cars]
+    n_ok = int((band[car_cols] == 4).sum())
+    assert n_ok == int(car_cols.size), (
+        "M3: duplicate weaker cells pooled a 0.05 gap into neighbours' buried road",
+        n_ok, int(car_cols.size), int((band[car_cols] == 5).sum()),
+    )
+    print(f"capped_hot M3 one-cell-per-voxel: {n_ok}/{int(car_cols.size)} "
+          f"car cols keep the buried road, not the car layer OK")
+
+    # M8: restoring a gplane+0.5 buried-candidate ceiling drops 14 building
+    # columns one layer low on f=2 +10% noise-free (y=26). Good code has
+    # zero building columns below true ground on this fixture.
+    f, cm = 2, G.voxel_m * 2
+    xs = G.x_min + cm * (np.arange(int(51.2 / cm)) + 0.5)
+    ys = G.y_min + cm * (np.arange(int(64 / cm)) + 0.5)
+    X, Y = [a.ravel() for a in np.meshgrid(xs, ys, indexing="ij")]
+
+    def zc(z):
+        return G.z_min + cm * (np.floor((z - G.z_min) / cm) + 0.5)
+
+    def lay(zfun, m):
+        return np.stack([X[m], Y[m], zc(zfun(X[m], Y[m]))], 1)
+
+    gz = lambda x, y: 0.2 + 0.10 * np.maximum(y, 0)
+    ALL = np.ones_like(X, bool)
+    bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
+    parts = (
+        [(lay(gz, ALL), 0.95, "ground"),
+         (lay(lambda x, y: gz(x, y) - cm, ALL), 0.9, "below")]
+        + [(lay(lambda x, y, k=k: gz(x, y) + k * cm, bld), 0.95, "wall") for k in (1, 2, 3)]
+    )
+    hot = np.concatenate([p[0] for p in parts])
+    ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float32)
+    lab = np.concatenate([np.full(len(p[0]), p[2]) for p in parts])
+    keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
+    hot, ph, lab = hot[keep], ph[keep], lab[keep]
+    col, lvl, gl = column_band(hot, ph, cm)
+    in_bld = (np.abs(hot[:, 0]) > 8) & (np.abs(hot[:, 0]) < 14) & (hot[:, 1] > 0) & (hot[:, 1] < 45)
+    tg, is_bld = {}, {}
+    for c, l, lb, b in zip(col, lvl, lab, in_bld):
+        c = int(c)
+        if lb == "ground":
+            tg[c] = int(l)
+        if b:
+            is_bld[c] = True
+    bld_cs = [c for c in tg if is_bld.get(c, False)]
+    bld_low = sum(int(gl[c]) < tg[c] for c in bld_cs)
+    assert bld_low == 0, (
+        "M8: gplane+0.5 ceiling dropped building columns below true ground",
+        bld_low, len(bld_cs),
+    )
+    print(f"capped_hot M8 no gceil: {bld_low}/{len(bld_cs)} building cols "
+          f"one layer below true ground on f=2 +10% OK")
+
+
 def check_class_balance() -> None:
+
     """_class_balance splits evenly across classes; a 99:1 pool must not stay 99:1."""
     rng = np.random.default_rng(0)
     cls = np.concatenate([np.zeros(990, np.int64), np.ones(10, np.int64)])
@@ -1364,6 +1468,7 @@ def main() -> int:
     check_capped_hot_exposed_ground()
     check_capped_hot_inherit_and_vote_edges()
     check_capped_hot_low_p_grade_and_saturated_fill()
+    check_capped_hot_onecell_and_gceil()
     check_class_balance()
     check_unoccupied_not_occluded_structure()
     check_queries()

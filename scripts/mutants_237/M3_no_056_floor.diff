@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -689,7 +689,7 @@
+         minres = sliding_window_view(
+             np.pad(res, w, constant_values=np.inf), (2 * w + 1, 2 * w + 1)
+         ).min(axis=(-1, -2))
+-        minres = np.maximum(0.98 * minres, -0.56)
++        minres = 0.98 * minres
+         with np.errstate(invalid="ignore"):
+             lb = pl + minres
+         floor2d = np.where(np.isfinite(lb), np.maximum(env2d, lb), env2d)

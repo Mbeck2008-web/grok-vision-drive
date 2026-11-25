@@ -1,0 +1,11 @@
+--- a/python/perception/occ_sparse.py
++++ b/python/perception/occ_sparse.py
+@@ -827,7 +827,7 @@
+         target[ins] = np.rint(fit_z[ins]).astype(np.int64)
+     # A seed below the envelope must not become the band (P8). With the
+     # lower bound removed, a weak hole fill at env-1 would snap here.
+-    snap_low = valid & ok & vote_inlier & (raw.astype(np.float64) >= env) & (
++    snap_low = valid & ok & (raw.astype(np.float64) >= env) & (
+         raw.astype(np.float64) <= env + 1.0
+     ) & (raw.astype(np.float64) < expected - 0.5)
+     target[snap_low] = raw[snap_low]

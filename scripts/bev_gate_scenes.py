@@ -39,18 +39,19 @@ def segment_hits_box(o: np.ndarray, d: np.ndarray, box: Box, grade: float, z0: f
     ``shrink_xy`` insets the four side faces, ``shrink_top`` lowers the top (a "robustly inside" box).
     """
     centre, R, half = box_frame(box, grade, z0)
-    half = half.copy()
-    half[0] -= shrink_xy
-    half[1] -= shrink_xy if shrink_thick is None else shrink_thick
-    lo_z = -half[2]
-    hi_z = half[2] - shrink_top
     o = np.broadcast_to(np.asarray(o, dtype=np.float64), np.shape(d))
     lo_l = (o - centre) @ R  # ego -> box frame (R orthonormal: v @ R == R.T v)
     dl = np.asarray(d, dtype=np.float64) @ R
-    lo = np.array([-half[0], -half[1], lo_z])
-    hi = np.array([half[0], half[1], hi_z])
-    if np.any(hi <= lo):
-        return np.full(dl.shape[:-1], np.inf)
+    shape = dl.shape[:-1]
+    st = shrink_xy if shrink_thick is None else shrink_thick
+    hx = np.broadcast_to(half[0] - np.asarray(shrink_xy, dtype=np.float64), shape)
+    hy = np.broadcast_to(half[1] - np.asarray(st, dtype=np.float64), shape)
+    hz = np.broadcast_to(half[2] - np.asarray(shrink_top, dtype=np.float64), shape)
+    # shrink_top < 0 grows the top; the base also drops by the same growth (nothing below the road)
+    lz = np.broadcast_to(-half[2] - np.maximum(-np.asarray(shrink_top, dtype=np.float64), 0.0), shape)
+    lo = np.stack([-hx, -hy, lz], -1)
+    hi = np.stack([hx, hy, hz], -1)
+    empty = np.any(hi <= lo, axis=-1)
     with np.errstate(divide="ignore", invalid="ignore"):
         ta = (lo - lo_l) / dl
         tb = (hi - lo_l) / dl
@@ -62,7 +63,7 @@ def segment_hits_box(o: np.ndarray, d: np.ndarray, box: Box, grade: float, z0: f
     t1 = np.where(par, np.where(inside, np.inf, -np.inf), t1)
     tn = t0.max(axis=-1)
     tf = t1.min(axis=-1)
-    hit = (tf >= tn) & (tf > 0) & (tn < t_max)
+    hit = (tf >= tn) & (tf > 0) & (tn < t_max) & ~empty
     return np.where(hit, np.maximum(tn, 0.0), np.inf)
 
 
@@ -196,6 +197,48 @@ def ground_truth(geoms, boxes: Sequence[Box], grade: float = 0.0, z0: float = 0.
 RESOLVE_MARGIN_M = 0.3
 
 
+VIS_BASE_M = 0.3
+VIS_DEPTH_FRAC = 0.12
+
+
+def ground_visible(geoms, boxes, grade=0.0, z0=0.0, base=VIS_BASE_M, frac=VIS_DEPTH_FRAC) -> np.ndarray:
+    """Cells whose ground centre some camera sees with margin: in its content rect and the sight line
+    misses every box grown by ``base + max(frac, ray pitch) * z-depth`` on every side and the top.
+    ``frac`` = 0.12 covers one depth bin (x1.104) of snapping in front of an occluder; the ray pitch
+    covers the one-ray bracket at its edges. This is the occluder's true shadow plus that margin."""
+    X, Y = cell_centres()
+    G = np.stack([X, Y, grade * Y + z0], -1)
+    out = np.zeros(X.shape, dtype=bool)
+    for g in geoms:
+        Ti = np.linalg.inv(g.T.astype(np.float64))
+        cam = G @ Ti[:3, :3].T + Ti[:3, 3]
+        zc = cam[..., 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = g.K[0, 0] * cam[..., 0] / zc + g.K[0, 2]
+            v = g.K[1, 1] * cam[..., 1] / zc + g.K[1, 2]
+        nw, nh, x0, y0 = g.content
+        vis = (zc > 0) & (u >= x0) & (u < x0 + nw) & (v >= y0) & (v < y0 + nh)
+        o = g.T[:3, 3].astype(np.float64)
+        m = base + max(frac, bl.FEAT_STRIDE / float(g.K[1, 1])) * np.maximum(zc, 0.0)
+        clear = np.ones(X.shape, dtype=bool)
+        for b in boxes:
+            clear &= ~np.isfinite(segment_hits_box(o, G - o, b, grade, z0, shrink_xy=-m, shrink_top=-m, t_max=1.0))
+            clear &= ~in_footprint(b, X, Y, pad=0.36)
+        out |= vis & clear
+    return out
+
+
+def recall(geoms, boxes, grade=0.0, z0=0.0, head=None, out=None, empty_seen=None) -> dict:
+    """Observed-cell recall on visible road: of the cells ``ground_visible`` with margin AND seen on the
+    same rig's empty road (so range / ray sparsity is not charged to the occluder), how many stay seen."""
+    out = out if out is not None else run_scene(geoms, boxes, grade, z0, head=head)
+    if empty_seen is None:
+        empty_seen = labels(run_scene(geoms, [], grade, z0, head=head))["seen"]
+    vis = ground_visible(geoms, boxes, grade, z0) & empty_seen
+    seen = labels(out)["seen"]
+    return {"visible": int(vis.sum()), "kept": int((vis & seen).sum()), "lost_cells": np.argwhere(vis & ~seen)}
+
+
 def labels(out: dict) -> dict:
     lg = out["logits"][0]
     return {
@@ -209,9 +252,11 @@ def labels(out: dict) -> dict:
 
 def leaks(geoms, boxes, grade=0.0, z0=0.0, p_true=0.95, head=None, **gt_kw) -> dict:
     """Counts of hidden cells that the gate opens (free-eligible / seen / through / clear)."""
+    want_recall = gt_kw.pop("with_recall", False)
     out = run_scene(geoms, boxes, grade, z0, p_true, head)
     lab = labels(out)
     gt = ground_truth(geoms, boxes, grade, z0, **gt_kw)
+    rc = recall(geoms, boxes, grade, z0, head=head, out=out) if want_recall else {"visible": 0, "kept": 0}
     h = gt["hidden"]
     return {
         "hidden": int(h.sum()),
@@ -223,6 +268,8 @@ def leaks(geoms, boxes, grade=0.0, z0=0.0, p_true=0.95, head=None, **gt_kw) -> d
         "finite": lab["finite"],
         "free_cells": np.argwhere(lab["free"] & h),
         "sub_pitch": int(gt["sub_pitch"].sum()),
+        "vis": rc["visible"],
+        "vis_kept": rc["kept"],
         "sub_pitch_free": int((lab["free"] & gt["sub_pitch"]).sum()),
         "out": out,
     }

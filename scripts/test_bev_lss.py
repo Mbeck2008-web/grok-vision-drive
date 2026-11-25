@@ -1656,7 +1656,7 @@ def check_ground_band_pinned_and_plumbed() -> None:
     assert bl.GROUND_WINDOW_CELLS == 13 and bl.GROUND_SOFTMIN_K == 10.0
     assert bl.GROUND_WIDE_WINDOW_CELLS == 21 and not hasattr(bl, "GROUND_SLOPE_CAP")  # dead constant removed
     assert bl.SHADOW_LIFT_M == 0.25 and bl.SHADOW_OCC_MIN_M == 0.15 and bl.SHADOW_OCC_GAIN == 1.5
-    assert bl.SHADOW_COLOC_M == 0.1 and bl.OCC_TOP_K == 30.0 and bl.OCC_FAR_M > 10 * bl.DEPTH_MAX_M
+    assert bl.OCC_TOP_K == 30.0 and bl.OCC_FAR_M > 10 * bl.DEPTH_MAX_M
     assert bl.RAISED_OCC_M == 0.3 and bl.OCC_WINDOW_CELLS == 3 and bl.SIGHTLINE_STEPS == 12 and bl.SIGHTLINE_CLEARANCE_M == 0.05 and bl.SIGHTLINE_MARGIN_M == 1.5
     assert bl.BevLssHead().ground_band_m == 0.5
     span = bl.BEV_Z_MAX_M - bl.BEV_Z_MIN_M
@@ -1737,6 +1737,61 @@ def check_v6_gate_factors_pinned() -> None:
     print("v6_gate_factors_pinned")
 
 
+def check_gate_regression_scenes() -> None:
+    """Breaker (swarm-4) counterexamples and the over-hiding guard, on ray-cast scenes (bev_gate_scenes).
+
+    Leaks: a hidden cell (sight line from every in-view camera >= 0.1 m under the occluder top, 0.3 m in
+    from its ends) is never free-eligible, seen, through or clear:
+      H1  hypothesis-shrunk 2 x 0.5 x 1.0 m box 3 m ahead of main (local ground collapsed onto its top);
+      S16 12 m x 0.6 m wall at 10 m on a -6 % grade (``dest_z = 0`` mutant leaks here).
+    Recall (I4): a cell some camera sees past every occluder grown by its true-shadow margin
+    (``ground_visible``) and that the rig sees on the empty road stays seen:
+      P1  a 3 m pole / 4 m sign post inside one cell (main, 3 cams, all 8; flat, +6 %, z0 = -0.23);
+      the S16 wall and H1 box; and the rear camera on a 6 % rise (its own near road below the first depth
+      bin must not drag the reference ground under the road it sees).
+    """
+    import bev_gate_scenes as S
+
+    cfg = _cfg()
+    cams8 = [c["id"] for c in cfg["cameras"]]
+    head = bl.BevLssHead().eval()
+    geo = lambda cams: bl.rig_geometry(cams, cfg, model="etk800")  # noqa: E731
+    skeptic = dict(below_top=0.1, inset=0.3, inset_thick=0.0, foot_pad=0.36)
+    wall = (0.0, 10.15, 0.0, 12.0, 0.3, 0.6)
+    leak_cases = (
+        ("H1", ["main"], [(0.0, 3.0, 0.0, 2.0, 0.5, 1.0)], 0.0, 0.0),
+        ("S16", ["main"], [wall], -0.06, 0.0),
+    )
+    recall_cases = leak_cases + (
+        ("P1 main 5", ["main"], [(0.25, 5.25, 0.0, 0.15, 0.15, 3.0)], 0.0, 0.0),
+        ("P1 main 10", ["main"], [(0.25, 10.25, 0.0, 0.15, 0.15, 3.0)], 0.0, 0.0),
+        ("P1 main +6%", ["main"], [(0.25, 12.25, 0.0, 0.15, 0.15, 3.0)], 0.06, 0.0),
+        ("P1 3 cams z0", ["narrow", "main", "wide"], [(-1.25, 7.25, 0.0, 0.2, 0.2, 2.5)], 0.0, -0.23),
+        ("P1 all 8", cams8, [(0.25, 8.25, 0.0, 0.2, 0.2, 4.0)], 0.0, 0.0),
+    )
+    with torch.no_grad():
+        for name, cams, boxes, grade, z0 in leak_cases:
+            r = S.leaks(geo(cams), boxes, grade, z0, head=head, **skeptic)
+            assert r["hidden"] > 0, (name, r["hidden"])
+            opened = (r["free"], r["seen"], r["through"], r["clear"])
+            assert opened == (0, 0, 0, 0), f"{name}: hidden {r['hidden']} free/seen/through/clear {opened}"
+        for name, cams, boxes, grade, z0 in recall_cases:
+            rc = S.recall(geo(cams), boxes, grade, z0, head=head)
+            assert rc["visible"] > 0 or name == "H1", (name, rc["visible"])
+            assert rc["kept"] == rc["visible"], f"{name}: visible road lost {rc['visible'] - rc['kept']}/{rc['visible']} {rc['lost_cells'][:6].tolist()}"
+        # the pole's true shadow (>= 0.1 m under its top, 0.02 m inset) is still closed on main at 5 m
+        r = S.leaks(geo(["main"]), [(0.25, 5.25, 0.0, 0.15, 0.15, 3.0)], head=head, foot_pad=0.36)
+        assert r["hidden"] > 0 and r["free"] == 0, (r["hidden"], r["free"])
+        # rear camera on a 6 % rise behind the car: the road it sees 3-5 m back stays seen, and no seen
+        # cell is lost against 858b7ab (134 seen there)
+        out = S.run_scene(geo(["rear"]), [], -0.06, 0.0, head=head)
+        seen = S.labels(out)["seen"]
+        rows = [int((32 + back) / 0.5) for back in (3.0, 4.0, 5.0)]
+        assert all(bool(seen[r, 64]) for r in rows), [bool(seen[r, 64]) for r in rows]
+        assert int(seen.sum()) >= 134, int(seen.sum())
+    print("gate_regression_scenes")
+
+
 def main() -> None:
     check_intrinsics_from_fov()
     check_extrinsics_axes()
@@ -1762,6 +1817,7 @@ def main() -> None:
     check_sky_rays_never_free()
     check_low_occluder_hides_ground()
     check_wide_low_barrier_hides_ground()
+    check_gate_regression_scenes()
     check_pass_mass_is_survival()
     check_zero_valid_cameras_no_nan()
     check_gradients_reach_stem_and_depth()

@@ -11,6 +11,10 @@ Invariants (synthetic ray-cast scenes, scripts/bev_gate_scenes.py; depth head p_
       ego pitch / grade +-6 %, a car box, and walls whose top edge a camera ray grazes exactly.
   I2  A cell wholly inside an occluder footprint is never free-eligible.
   I3  Logits are finite, forced values are exactly +-FORCE_LOGIT, and the gate is deterministic.
+  I4  (no over-hiding) A ground cell that some in-view camera sees along a sight line clear of every
+      occluder grown by its true-shadow margin (bev_gate_scenes.ground_visible: 0.3 m + max(12 % of
+      depth, one ray pitch)) and that the same rig sees on the empty road stays seen. Same scenes,
+      plus a tall pole / sign post inside one cell (P1).
 Every failure is shrunk by hypothesis and printed as a minimal scene.
 """
 from __future__ import annotations
@@ -20,9 +24,12 @@ import math
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+import os
+
+# GVD_GATE_ROOT=<checkout> runs these scenes against another checkout's gate (baselines).
+ROOT = Path(os.environ.get("GVD_GATE_ROOT") or Path(__file__).resolve().parents[1])
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -106,6 +113,8 @@ def check_scene(scene, below_top=0.02, inset=0.02, inset_thick=None, resolve=Fal
     whole = np.zeros_like(h)
     for b in boxes:
         whole |= S.in_footprint(b, X, Y, pad=-0.36)
+    rc = S.recall(gm, boxes, scene["grade"], scene["z0"], out=out, head=HEAD,
+                  empty_seen=S.labels(S.run_scene(gm, [], scene["grade"], scene["z0"], scene["p_true"], head=HEAD))["seen"])
     lg = out["logits"][0]
     forced_ok = bool(((lg[bl.CH_FREE] == -bl.FORCE_LOGIT) | (lg[bl.CH_FREE].abs() < bl.FORCE_LOGIT)).all())
     return {
@@ -119,6 +128,9 @@ def check_scene(scene, below_top=0.02, inset=0.02, inset_thick=None, resolve=Fal
         "sub_pitch": int(sp.sum()),
         "sub_pitch_free": int((lab["free"] & sp).sum()),
         "finite": lab["finite"] and forced_ok,
+        "vis": rc["visible"],
+        "vis_kept": rc["kept"],
+        "lost": [(round(float(X[r, c]), 2), round(float(Y[r, c]), 2)) for r, c in rc["lost_cells"][:6]],
         "cells": [(round(float(X[r, c]), 2), round(float(Y[r, c]), 2)) for r, c in np.argwhere(lab["free"] & h)[:6]],
     }
 
@@ -134,19 +146,35 @@ MODES = {
     "strict": {"below_top": 0.02, "inset": 0.02},
 }
 TOL = dict(MODES["resolved"])
-STATS = {"runs": 0, "hidden": 0, "sub_pitch": 0, "sub_pitch_free": 0, "leak_free": 0}
+STATS = {"runs": 0, "hidden": 0, "sub_pitch": 0, "sub_pitch_free": 0, "leak_free": 0, "leak_any": 0, "vis": 0, "vis_kept": 0}
 
 
 def prop_hidden_never_free(scene) -> None:
     r = check_scene(scene, **TOL)
-    for k in ("hidden", "sub_pitch", "sub_pitch_free", "leak_free"):
+    for k in ("hidden", "sub_pitch", "sub_pitch_free", "leak_free", "vis", "vis_kept"):
         STATS[k] += r[k]
+    STATS["leak_any"] += max(r["leak_free"], r["leak_seen"], r["leak_through"], r["leak_clear"])
     STATS["runs"] += 1
     note(f"scene={scene!r} boxes={r['boxes']!r} result={ {k: v for k, v in r.items() if k != 'boxes'} }")
     msg = f"scene={ {k: v for k, v in scene.items() if k != 'walls'} } boxes={r['boxes']} -> " + str({k: v for k, v in r.items() if k != "boxes"})
     assert r["finite"], msg
     assert r["leak_free"] == 0 and r["leak_seen"] == 0 and r["leak_through"] == 0 and r["leak_clear"] == 0, msg
     assert r["foot_free"] == 0, msg
+    assert r["vis_kept"] == r["vis"], "I4 over-hide: " + msg
+
+
+poles = st.fixed_dictionaries(
+    {
+        "cams": cam_sets,
+        # a post (0.1-0.25 m square, 1.5-4 m tall) placed inside one cell, or a sign on a post
+        "walls": st.tuples(r2(-6, 6), r2(3, 20), st.just(0.0), r2(0.1, 0.25), r2(0.1, 0.25), r2(1.5, 4.0)).map(lambda p: [p]),
+        "car": st.none(),
+        "grade": st.one_of(st.just(0.0), r2(-0.06, 0.06)),
+        "z0": st.one_of(st.just(0.0), st.just(-0.23), r2(-0.3, 0.05)),
+        "p_true": st.one_of(st.just(0.95), r2(0.6, 0.99)),
+        "graze": st.none(),
+    }
+)
 
 
 def prop_deterministic(scene) -> None:
@@ -203,8 +231,10 @@ def main() -> int:
                    suppress_health_check=list(HealthCheck), print_blob=True,
                    phases=[Phase.explicit, Phase.generate, Phase.shrink])
     fails = 0
-    for name, prop, n in (("I1/I2/I3 hidden_never_free", prop_hidden_never_free, args.examples), ("I3 deterministic", prop_deterministic, 5)):
-        test = seed(args.seed)(settings(cfg, max_examples=n)(given(scenes)(prop)))
+    for name, prop, n, strat in (("I1/I2/I3/I4 walls+car", prop_hidden_never_free, args.examples, scenes),
+                                 ("I1/I2/I4 P1 pole in one cell", prop_hidden_never_free, max(args.examples // 3, 10), poles),
+                                 ("I3 deterministic", prop_deterministic, 5, scenes)):
+        test = seed(args.seed)(settings(cfg, max_examples=n)(given(strat)(prop)))
         try:
             test()
             print(f"PASS {name}: {n} examples")
@@ -212,6 +242,8 @@ def main() -> int:
             fails += 1
             print(f"FAIL {name}: {str(e)[:2000]}")
     print(f"stats over every scene hypothesis ran (incl. shrinking): {STATS}")
+    rec = STATS["vis_kept"] / max(STATS["vis"], 1)
+    print(f"TOTAL leak cells {STATS['leak_any']} / hidden {STATS['hidden']} | recall visible-road {STATS['vis_kept']}/{STATS['vis']} = {rec:.4f} | runs {STATS['runs']}")
     print("prop_bev_lss_gate:", "OK" if not fails else f"{fails} FAILED")
     return 1 if fails else 0
 

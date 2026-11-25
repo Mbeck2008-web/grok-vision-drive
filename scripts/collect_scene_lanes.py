@@ -2062,12 +2062,19 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         clock = new_clock()
         from python.collect.liveness import (
             ImpactWatch,
+            LEVEL_SETTLE_HOLD_S,
+            LEVEL_SETTLE_MIN_HZ,
+            LEVEL_SETTLE_TIMEOUT_S,
             Liveness,
             SETTLE_S,
             SettleWindow,
+            TELEPORT_RATE_HOLD_S,
+            TELEPORT_SETTLE_MAX_S,
+            TELEPORT_SETTLE_S,
             TIP_DIR_Z_LIVE,
             YieldGuard,
             car_is_driving,
+            wait_for_stable_rate,
         )
         from python.collect.excursion import JUNCTION_AHEAD_M, fork_ahead_m
 
@@ -2249,11 +2256,126 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         smoke_ok = done_s > 0.0 or float(args.smoke_s) <= 0.0
         session_faults = 0
 
+        last_probe_frames: dict[str, Any] = {}
+
+        def _cam_rate_probe() -> bool:
+            nonlocal session_faults, last_error, cam_reasons
+            if not cams:
+                return True
+            try:
+                frames, _stamps, cam_reasons = _poll_cameras(cams)
+                session_faults = 0
+            except Exception as exc:
+                if not is_session_error(exc):
+                    raise
+                last_error = session_text(exc)
+                _publish(None, speed, waypoint)
+                _write_collect_crash(status_root, last_error, {})
+                print(f"collect session {last_error}", flush=True)
+                session_faults += 1
+                return False
+            last_probe_frames.clear()
+            last_probe_frames.update(frames)
+            return attached_frames_ready(cams, frames)
+
+        def _wait_for_level_settle(label: str) -> int | None:
+            nonlocal last_error
+            if not cams:
+                return None
+            hold_s = LEVEL_SETTLE_HOLD_S if SETTLE_S > 0.0 else 0.0
+
+            def _probe() -> bool:
+                if session_faults >= 3:
+                    return False
+                return _cam_rate_probe()
+
+            def _step(elapsed: float) -> float:
+                if session_faults >= 3:
+                    return 0.0
+                return float(tick_sleep_s(elapsed, 0.1) or 0.0)
+
+            ok, elapsed_s, hz, _t0, polls, ready_ever = wait_for_stable_rate(
+                _probe,
+                now=time.monotonic,
+                sleep=time.sleep,
+                step_sleep=_step,
+                min_hz=LEVEL_SETTLE_MIN_HZ,
+                hold_s=hold_s,
+                timeout_s=LEVEL_SETTLE_TIMEOUT_S,
+                cam_ready_timeout_s=ALL_CAM_STALE_S,
+            )
+            if session_faults >= 3:
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                run.stop("session_faults", f"3 camera polls in a row failed: {last_error}")
+                return 2
+            if ok:
+                print(
+                    f"collect level_settle {label} elapsed={elapsed_s:.2f}s hz={hz:.2f} polls={polls}",
+                    flush=True,
+                )
+                return None
+            if not ready_ever:
+                waiting = ", ".join(cid for cid in cams if cid not in last_probe_frames) or "none"
+                message = f"cameras did not all render within {ALL_CAM_STALE_S:.0f}s ({waiting})"
+                last_error = message
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                _publish(None, speed, waypoint)
+                _write_collect_crash(status_root, message, {})
+                print(f"collect stop reason=camera_warmup {message}", flush=True)
+                run.stop("camera_warmup", message)
+                return 4
+            message = (
+                f"{label} frame rate did not settle ({hz:.2f} Hz < {LEVEL_SETTLE_MIN_HZ:.1f} Hz "
+                f"after {elapsed_s:.1f}s)"
+            )
+            last_error = message
+            _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+            _publish(None, speed, waypoint)
+            _write_collect_crash(status_root, message, {})
+            print(f"collect stop reason=level_settle_timeout {message}", flush=True)
+            run.stop("level_settle_timeout", message)
+            return 4
+
+        def _settle_after_teleport(source: str) -> tuple[float, float, float]:
+            nonlocal impact_respawn_due
+            impact_respawn_due = False
+            min_wait = TELEPORT_SETTLE_S if SETTLE_S > 0.0 else 0.0
+            hold_s = TELEPORT_RATE_HOLD_S if SETTLE_S > 0.0 else 0.0
+            if not cams:
+                t0 = float(time.monotonic())
+                if min_wait > 0.0:
+                    time.sleep(min_wait)
+                t1 = float(time.monotonic())
+                return t0, t1, 0.0
+            ok, elapsed_s, hz, t0, polls, _ready = wait_for_stable_rate(
+                _cam_rate_probe,
+                now=time.monotonic,
+                sleep=time.sleep,
+                step_sleep=lambda elapsed: float(tick_sleep_s(elapsed, 0.1) or 0.0),
+                min_hz=LEVEL_SETTLE_MIN_HZ,
+                hold_s=hold_s,
+                min_wait_s=min_wait,
+                timeout_s=TELEPORT_SETTLE_MAX_S,
+            )
+            t1 = float(time.monotonic())
+            print(
+                f"collect teleport_settle {segment_id} source={source} wait={elapsed_s:.2f}s "
+                f"hz={hz:.2f} polls={polls} settled={ok}",
+                flush=True,
+            )
+            return t0, t1, hz
+
+        if not map_names and args.reload_level and cams:
+            settle_code = _wait_for_level_settle(str(args.reload_level))
+            if settle_code is not None:
+                return settle_code
+            settle.start(done_s, source="level_load", segment=str(args.reload_level), wall_t=time.time())
+
         def _abort(reason: str) -> int | None:
             """Respawn once. A second hard abort ends the segment and continues."""
             nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos, spawn_seq
             nonlocal segment_open, follow, label_hit, mark_recover, done_s, recover_lost_s
-            nonlocal schedule_cut, last_end_done, stuck_ends, loaded_index
+            nonlocal schedule_cut, last_end_done, stuck_ends, loaded_index, spawn_mark, recheck_mark
             segment_aborts += 1
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
@@ -2348,8 +2470,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         f"collect recover {segment_id} ({moved[0]:.1f},{moved[1]:.1f},{moved[2]:.1f})",
                         flush=True,
                     )
-                    time.sleep(SETTLE_S)
-                    recover_lost_s += stall_s + float(SETTLE_S)
+                    wait_t0, wait_t1, settled_hz = _settle_after_teleport("recover")
+                    recover_lost_s += stall_s + max(0.0, wait_t1 - wait_t0)
                     live.reset()
                     clock = place_excursion_clock(clock, persist=gap_persist, fresh=new_clock)
                     last_ai = None
@@ -2361,12 +2483,22 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     label_hit = None
                     segment_open = False
                     spawn_pos = moved
+                    spawn_mark = done_s
+                    recheck_mark = done_s
                     spawn_seq += 1
                     _reset_gt_gate()
                     mark_recover = True
                     impact.reset()
                     yield_guard.reset()
                     settle.start(done_s)
+                    settle.note_meta(
+                        source="recover",
+                        segment=segment_id,
+                        wall_t=time.time(),
+                        wait_t0=wait_t0,
+                        wait_t1=wait_t1,
+                        settled_hz=settled_hz,
+                    )
                     since_spawn[0] = 0.0
                     return None
             last_error = message
@@ -2497,24 +2629,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if source == "spawn":
                     return f"{map_name}: legal spawn pose could not be placed: {shift}"
                 return None
-            spawn_kind = picked.kind
-            spawn_cov = picked.paint_cov
-            spawn_road = str(picked.road_id)
-            spawn_mark = done_s
-            recheck_mark = done_s
-            spawn_pos = picked.pos
-            spawn_seq += 1
-            _reset_gt_gate()
-            lane_track.reset()
-            impact.reset()
-            yield_guard.reset()
-            settle.start(done_s)
-            since_spawn[0] = 0.0
-            speed_span[0] = _speed_range(picked.kind, (float(picked.speed[0]), float(picked.speed[1])), "spawn_type")
-            speed = speed_at(done_s, tuple(speed_span[0]))
-            last_ai = None
-            live.reset()
-            segment_open = False
             count = traffic_count(args.traffic, map_name)
             ge = getattr(bng, "queue_lua_command", None)
             slots, notes = [], []
@@ -2539,6 +2653,35 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 f"select_ms={spawn_deck.last_ms:.0f}",
                 flush=True,
             )
+            wait_t0, wait_t1, settled_hz = _settle_after_teleport(source)
+            spawn_kind = picked.kind
+            spawn_cov = picked.paint_cov
+            spawn_road = str(picked.road_id)
+            spawn_mark = done_s
+            recheck_mark = done_s
+            spawn_pos = picked.pos
+            spawn_seq += 1
+            prev_dir = None
+            prev_dir_t = None
+            _reset_gt_gate()
+            lane_track.reset()
+            impact.reset()
+            yield_guard.reset()
+            settle.start(done_s)
+            settle.note_meta(
+                source=source,
+                segment=segment_id,
+                wall_t=time.time(),
+                wait_t0=wait_t0,
+                wait_t1=wait_t1,
+                settled_hz=settled_hz,
+            )
+            since_spawn[0] = 0.0
+            speed_span[0] = _speed_range(picked.kind, (float(picked.speed[0]), float(picked.speed[1])), "spawn_type")
+            speed = speed_at(done_s, tuple(speed_span[0]))
+            last_ai = None
+            live.reset()
+            segment_open = False
 
         def _can_stall_respawn() -> bool:
             return (
@@ -2636,6 +2779,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if yield_guard.enabled:
                 extra["live_yield"] = yield_guard.summary()
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
+            windows = settle.summary()
+            if windows:
+                extra["settle_windows"] = windows
             extra["speed_ranges"] = {k: list(v) for k, v in speed_ranges.items()}
             extra["weave_stats"] = weave_stats.summary()
             # Held segment-switch seconds carried over, and how many are not yet repaid.
@@ -2848,6 +2994,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 segment_aborts = 0
                 if reloaded:
                     cams_ready = False
+                    settle_code = _wait_for_level_settle(segment_id)
+                    if settle_code is not None:
+                        return settle_code
                 segment_open = False
                 follow = RoadFollow()
                 lane_track.reset()
@@ -2864,6 +3013,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 impact.reset()
                 yield_guard.reset()
                 settle.start(done_s)
+                settle.note_meta(source="segment", segment=segment_id, wall_t=time.time())
                 since_spawn[0] = 0.0
                 line_left_m = None
                 if vary_env:
@@ -3137,7 +3287,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     continue
             # A crash shows as a speed drop between two ticks. Stop the move now
             # and respawn if the car stays stopped, instead of the 10 s stall.
-            impact_decel = impact.update(tick_dt, speed_mps_f)
+            impact_decel = impact.update(tick_dt, speed_mps_f, settling=settle.active(done_s))
             impact_event: dict[str, Any] | None = None
             if impact_decel is not None:
                 pre_t, pre_i = impact.pre_window()
@@ -3471,8 +3621,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if not why:
                     _impact_end("impact_respawn", now)
                     if _impact_respawn(now):
-                        _tick_sleep(tick_mark)
-                        tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                        tick_dt = 0.1
                         continue
                     why = "impact"
             if (
@@ -3482,8 +3631,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             ):
                 _impact_end("stall_respawn", now)
                 if _stall_respawn(now):
-                    _tick_sleep(tick_mark)
-                    tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                    tick_dt = 0.1
                     continue
                 why = "stationary"
             if not why and impact.should_respawn():
@@ -3508,8 +3656,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 code = _abort(why)
                 if code is not None:
                     return code
-                _tick_sleep(tick_mark)
-                tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                tick_dt = 0.1
                 continue
             tags = {
                 "segment": segment_id,
@@ -3522,8 +3669,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if mark_recover:
                 tags["recover"] = True
                 mark_recover = False
-            if settle.active(done_s):
-                tags["settle"] = True
+            settle_on = settle.active(done_s)
             if live.slow_s > 0.0:
                 tags["stall"] = True
                 tags["stall_s"] = round(float(live.slow_s), 2)
@@ -3549,6 +3695,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     print(f"collect WARNING camera rig calibrated on {camera_rig}, ego model is {model_now}: "
                           "config/cameras.yaml mounts are unproven on this car", flush=True)
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
+            if settle_on and due:
+                settle.stamp(tags, done_s, now, row_i)
             q_before = writer.stats()
             submit_mark = time.monotonic()
             queued = False
@@ -3704,6 +3852,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         f"{yield_guard.min_yield:.2f}",
                         flush=True,
                     )
+                if plan == "respawn":
+                    tick_dt = 0.1
+                    continue
             elif (
                 queued
                 and recheck_due(recheck_s, done_s, recheck_mark)
@@ -3757,6 +3908,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         new_road_type=new_type,
                     ),
                 )
+                if plan == "respawn":
+                    tick_dt = 0.1
+                    continue
             _tick_sleep(tick_mark)
             tick_dt = max(1e-3, time.monotonic() - tick_mark)
             done_s += tick_dt

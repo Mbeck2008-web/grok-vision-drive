@@ -1861,7 +1861,7 @@ def _wall_face_ray_hits(geoms, boxes, z_probe: float = 0.45) -> int:
             rc = np.concatenate([rc, np.ones((24, 32, 1))], -1)
             d = rc @ T[:3, :3].T
             P = o + d[..., None, :] * ts[:, None]
-            hit = np.zeros(P.shape[:2], dtype=bool)
+            hit = np.zeros(P.shape[:-1], dtype=bool)  # (24, 32, n_t); then any over t
             for lo, hi in boxes:
                 x, y, z = P[..., 0], P[..., 1], P[..., 2]
                 hit |= (x >= lo[0]) & (x <= hi[0]) & (y >= lo[1]) & (y <= hi[1]) & (z >= lo[2]) & (z <= hi[2])

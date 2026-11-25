@@ -28,6 +28,7 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 CTL_FIELDS = ("steer_ai", "throttle_ai", "brake_ai")
+EXCLUDED_TARGET_FIELDS = ("turnsignal", "blinker", "blinkers")
 CTL_HORIZONS_S = (0, 1, 2, 3, 4, 5)
 CTL_OUTPUT_FIELDS = ("ctl_steer", "ctl_throttle", "ctl_brake")
 K = len(CTL_HORIZONS_S)
@@ -285,8 +286,11 @@ def build_ctl(
 
     full = [row for row in full_rows if isinstance(row, Mapping)]
     events, _counts = event_mask(full, list(impacts))
-    dirty = [bool(ev) or bool(row.get("recover")) or _reverse(row) or _pbrake(row) for ev, row in zip(events, full)]
-    event_row = [bool(ev) or bool(row.get("recover")) for ev, row in zip(events, full)]
+    def _qc_masked(r: Mapping[str, Any]) -> bool:
+        return bool(r.get("clip_qc_masked")) or bool(r.get("driving_target_masked"))
+
+    dirty = [bool(ev) or bool(row.get("recover")) or _qc_masked(row) or _reverse(row) or _pbrake(row) for ev, row in zip(events, full)]
+    event_row = [bool(ev) or bool(row.get("recover")) or _qc_masked(row) for ev, row in zip(events, full)]
     controls = [row_controls(row) for row in full]
     sims = [row_sim_t(row) for row in full]
     pos: dict[int, int] = {}
@@ -312,7 +316,7 @@ def build_ctl(
         if reason is not None:
             counts[reason] += 1
             continue
-        if (k is not None and event_row[k]) or bool(row.get("settle")) or bool(row.get("stall")) or bool(row.get("recover")):
+        if (k is not None and event_row[k]) or bool(row.get("settle")) or bool(row.get("stall")) or bool(row.get("recover")) or _qc_masked(row):
             counts["events"] += 1
             continue
         if rid in warm:

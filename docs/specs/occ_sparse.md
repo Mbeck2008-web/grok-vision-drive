@@ -486,18 +486,34 @@ a raw window min, and not relative to the 12 m p max). Inliers up to a
 Far ground on a hill stays the band. A one-layer car or guardrail that
 sits on real ground — including when its p is slightly above the road —
 and a wall or roof (or a building with no ground under it), stay in the
-above-ground pool. A column has real ground at the envelope when a cell
-there is within a p margin just under the near-max margin, so a 0.05-weaker
-below-ground fill is not treated as the band when the envelope lags a
-grade. ``test_occ_net`` also pins p-noise at sigma 0.01 / 0.02 on the
-f=2 / f=4 floors (cold-ground wall stays at the cap share) and the
-hot-car / low-outlier fixtures. A below-ground fill that ties or is slightly hotter
+above-ground pool. A column has real ground below its seed when a cell
+between the 12 m envelope and the seed matches the *exposed* ground at
+that level: the mean p of voting seeds at the same level within 12 m. A
+road under a car matches the road around it (whatever the car's p, so a
+dense lot of p 1.0 cars on a .95 road keeps the road band); a fill under
+a grade, plateau or terrace is weaker than the ground seeds at its level.
+The gap is pooled over a 5x5 among cells of the same level and offset
+from their column's lowest near-max layer (sigma 0.01 noise averages to
+~0.003) and must be at most 0.01; there is no margin to the column max.
+Limit: a fill within 0.01 of the exposed ground on a grade cannot be told
+from a road under a car and is taken as ground. ``test_occ_net`` pins
++10% fill .92 / .93 (walls 988 / 176), the .90 fill at sigma 0.005 /
+0.01 / 0.02 per column (24 / 28 / 91 / 340 of 4352 ground columns one
+layer low, b91b957: 112 / 1018 / 1080 / 951), noisy crest / terrace /
+kink walls near noise-free, the dense hot lot, p-noise at sigma 0.01 /
+0.02 on the f=2 / f=4 floors (cold-ground wall stays at the cap share)
+and the hot-car / low-outlier fixtures. VOTE_P_MIN = 0.65 is pinned at
+both edges (a far road at p 0.66 and 0.80 votes; the P8 0.60 fill does
+not). Columns with no voter within 12 m inherit the nearest band by a
+linear two-pass fill (16384 low-p columns: ~5 MiB, b91b957: 1517 MiB).
+A below-ground fill that ties or is slightly hotter
 does not win. Limit: where flat road turns into a +10% / +15% uphill inside
 the 12 m window, the plane fit lags the kink and some below-ground fill
-still reaches the cap (0.8 m: walls 924 / 662, below 128 / 140 of 2048;
-1.6 m: walls 176 / 120, below 88 / 138 of 512). `test_occ_net` pins these
-as floors on walls and ceilings on below; a kinked -10% / -15% downhill
-keeps 18 / 12 below at 0.8 m (2 / 2 at 1.6 m), unpinned. Grades above 15%
+still reaches the cap (0.8 m: walls 1000 / 722, below 128 / 124 of 2048;
+1.6 m: walls 176 / 120, below 112 / 152 of 512, where the below count is
+the leftover budget once every wall is kept plus 32 / 48 fill-only
+columns whose ground is above z_max). A kinked -15% downhill keeps 0 below
+at both cells, unpinned. Grades above 15%
 are not covered. Below and above are relative to that column's ground, so a downhill
 or height-offset road stays the band instead of a fixed z=0 slab. At most
 half the cap goes to the band; above-ground structure is filled next, then

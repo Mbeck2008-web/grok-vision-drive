@@ -446,6 +446,53 @@ def _local_plane(h: np.ndarray, w: int) -> np.ndarray:
     return np.where(np.isfinite(a), a, np.where(n > 0, mean, np.nan))
 
 
+
+def _box_sum_xy(a: np.ndarray, r: int) -> np.ndarray:
+    """Sum over a ``(2r+1)^2`` xy window for each trailing slice (prefix sums)."""
+    nx, ny = a.shape[:2]
+    k = 2 * r + 1
+    c = np.zeros((nx + k, ny + k) + a.shape[2:])
+    c[1:, 1:] = np.pad(a, ((r, r), (r, r)) + ((0, 0),) * (a.ndim - 2)).cumsum(0).cumsum(1)
+    return c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+
+
+def _nearest_finite(val: np.ndarray) -> np.ndarray:
+    """Replace non-finite entries with the Manhattan-nearest finite value.
+
+    Two axial passes, O(nx * ny), no ``q×g`` matrix. A column with no
+    seed in the 12 m window inherits the closest band without a
+    quadratic copy (grid-growth / low-p scenes stay a few MiB).
+    """
+    finite = np.isfinite(val)
+    if finite.all() or not finite.any():
+        return val
+    out = val.copy()
+    nx, ny = val.shape
+    big = float(nx + ny + 1)
+    dist = np.where(finite, 0.0, big)
+    for j in range(1, ny):
+        sl = dist[:, j] > dist[:, j - 1] + 1.0
+        if sl.any():
+            dist[sl, j] = dist[sl, j - 1] + 1.0
+            out[sl, j] = out[sl, j - 1]
+    for j in range(ny - 2, -1, -1):
+        sl = dist[:, j] > dist[:, j + 1] + 1.0
+        if sl.any():
+            dist[sl, j] = dist[sl, j + 1] + 1.0
+            out[sl, j] = out[sl, j + 1]
+    for i in range(1, nx):
+        sl = dist[i] > dist[i - 1] + 1.0
+        if sl.any():
+            dist[i, sl] = dist[i - 1, sl] + 1.0
+            out[i, sl] = out[i - 1, sl]
+    for i in range(nx - 2, -1, -1):
+        sl = dist[i] > dist[i + 1] + 1.0
+        if sl.any():
+            dist[i, sl] = dist[i + 1, sl] + 1.0
+            out[i, sl] = out[i + 1, sl]
+    return out
+
+
 def _column_ground_lvl(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarray,
                        ix0: np.ndarray, iy0: np.ndarray, cell_m: float) -> np.ndarray:
     """Ground layer index per xy column id (see ``_column_ground_lvl_compact``).
@@ -470,26 +517,38 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     The seed is the highest near-max layer (within ``BAND_MARGIN`` of the
     column max) in a three-layer window starting at the lowest near-max
     layer: the surface of a fill+ground stack, including when a cold
-    fill leaves a gap. Seeds with p at least ``VOTE_P_MIN`` vote (an
-    absolute threshold, not relative to the 12 m p max). A robust 12 m
-    lower envelope — a small-neighbourhood median of votes, then the
-    min of seeds on that surface, not a raw window min — rejects roofs,
-    a lone low outlier, and sparse hole fills; remaining inliers (up
-    to a 15% grade over that radius) fit a local ground plane. The
-    band is the plane's height, so far ground on a hill stays the
-    band, a one-layer car or guardrail on real ground goes to the
-    above-ground pool even when its p is slightly above the road, and
-    a column with no cell at the plane (a building with no ground)
-    has no band, so every structure layer stays in the above-ground
-    pool.
+    fill leaves a gap. Seeds with p >= ``VOTE_P_MIN`` vote (a hotter car
+    cannot silence the road; a weak hole fill does not vote). A robust
+    12 m lower envelope (a 5x5 median of votes, then the min of seeds not
+    a full layer below it, not a raw window min) rejects roofs, a lone
+    low outlier, and sparse hole fills; inliers up to a 15% grade over
+    that radius fit a local ground plane. A column holds real ground
+    below its seed when a cell between the envelope and the seed matches
+    the exposed ground at that level (the mean p of voting seeds there
+    within 12 m), pooled over a 5x5 of same-kind cells: a road under a
+    car matches, a fill under a grade or plateau is weaker. The band is
+    the plane's height, so far ground on a hill stays the band, a
+    one-layer car or guardrail on real ground goes to the above-ground
+    pool whatever its p, and a column with no cell at the plane (a
+    building with no ground) has no band, so every structure layer
+    stays in the above-ground pool. Missing tiles inherit the nearest
+    finite band in linear time, never a q×g matrix.
     """
     BAND_MARGIN = 0.05
-    # Just under BAND_MARGIN: a car 0.001-0.049 hotter than the road
-    # still leaves the road in the margin, but a 0.05-weaker below-ground
-    # fill is not treated as ground when the envelope lags a grade.
-    HAS_ENV_MARGIN = 0.049
+    # Absolute vote floor, pinned by road p=0.66 and p=0.80 fixtures
+    # (and by P8, whose 0.60 hole fill must not vote). Not a p-gap
+    # margin: it is the minimum p at which a seed is trusted to mark
+    # ground, so a 6x12 m hole of weaker fill cannot become the
+    # envelope. Columns below this inherit the nearest trusted band
+    # in linear time.
     VOTE_P_MIN = 0.65
     MEDIAN_R = 2  # 5x5 median of tile seeds before the 12 m envelope
+    # Pooled (5x5) gap between a buried cell and the exposed ground seeds
+    # at its level. A road under a car is ~0; fills the tests use sit
+    # 0.02-0.05 under the ground. Pooling makes it a mean, not a per-cell
+    # margin (sigma 0.01 -> ~0.003). A fill within 0.01 of the exposed
+    # ground is indistinguishable from a road under a car (documented).
+    EXPOSED_GAP = 0.01
     from numpy.lib.stride_tricks import sliding_window_view
     SEED_SPAN = 2  # window is lo_near .. lo_near + SEED_SPAN (3 layers)
     n_col = int(col.max()) + 1
@@ -500,6 +559,7 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     near = p_hot >= (pmax[col] - BAND_MARGIN)
 
     raw = np.full(n_col, np.iinfo(np.int64).min)
+    lo_all = np.zeros(n_col, np.int64)
     near_idx = np.flatnonzero(near)
     if near_idx.size:
         c_n, l_n = col[near_idx], lvl[near_idx]
@@ -508,6 +568,7 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
         _, first = np.unique(c_s, return_index=True)
         lo = np.full(n_col, np.iinfo(np.int64).max)
         lo[c_s[first]] = l_s[first]
+        lo_all = lo
         in_win = l_s <= (lo[c_s] + SEED_SPAN)
         if in_win.any():
             np.maximum.at(raw, c_s, np.where(in_win, l_s, np.iinfo(np.int64).min))
@@ -536,14 +597,15 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     ntx = (nx - 1) // s_t + 1
     nty = (ny - 1) // s_t + 1
     w = max(1, int(np.ceil(radius_m / (float(cell_m) * s_t))))
-    # Absolute p threshold, not relative to the 12 m p max, so a
-    # sparse hotter car cannot stop the road from voting. Tile seeds
-    # are median-filtered on a 5x5, then the 12 m envelope is the min
-    # of seeds not a full layer below that median. A lone low outlier
-    # or a sparse hole fill cannot drag ~1000 neighbours down a layer,
-    # and the envelope stays the downhill min on a grade. The sliding
-    # min is a view, so memory stays flat as the grid grows
-    # (check_grid_growth).
+    # Seeds with p at least VOTE_P_MIN vote, so a sparse hotter car
+    # cannot stop a 0.65-0.80 road from voting (relative p-max vote
+    # would). A 0.60 hole fill does not vote (P8). Tile
+    # seeds are median-filtered on a 5x5, then the 12 m envelope is
+    # the min of seeds not a full layer below that median. A lone low
+    # outlier or a sparse hole fill cannot drag ~1000 neighbours down
+    # a layer, and the envelope stays the downhill min on a grade.
+    # The sliding min is a view, so memory stays flat as the grid
+    # grows (check_grid_growth / check_ground_band_growth).
     vote = np.zeros(n_col, dtype=bool)
     if cs.size:
         vote[cs] = pmax[cs] >= VOTE_P_MIN
@@ -604,37 +666,71 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
     # higher than that and stay out of the plane fit.
     GRADE = 0.15
     max_rise = GRADE * radius_m / float(cell_m)  # in layers
-    has_env_layer = np.zeros(n_col, dtype=bool)
-    env_lvl = np.full(n_col, np.iinfo(np.int64).min)
     finite_env = np.isfinite(env)
+    env_lvl = np.full(n_col, np.iinfo(np.int64).min)
     env_lvl[finite_env] = np.rint(env[finite_env]).astype(np.int64)
-    # A cell at the envelope counts as real ground if it is within
-    # HAS_ENV_MARGIN of the column max. An absolute p threshold here would
-    # also match a below-ground fill when the envelope lags a kink
-    # (breaking the 3% downhill and +10% uphill floors). Cars slightly
-    # hotter than the road (p 0.901-0.949 vs 0.90) still match this
-    # margin; a car more than BAND_MARGIN hotter is kept off the band
-    # by the local-median inlier cap below.
-    at = finite_env[col] & (lvl == env_lvl[col]) & (p_hot >= pmax[col] - HAS_ENV_MARGIN)
-    if at.any():
-        has_env_layer[col[at]] = True
+    # Does the column hold real ground below its seed (a road under a
+    # one-layer car, a wall's footing) or only a weaker fill? Geometry
+    # alone cannot tell: a packed car row and a +1-layer plateau (or the
+    # downhill-lagged 12 m envelope on a grade) are the same 1-layer
+    # step. The test is the buried cell against the SAME level's exposed
+    # ground: the mean p of voting seeds at that level within 12 m. A road
+    # under a car matches the road around it (gap ~0, whatever the car's
+    # p); a fill under a grade or plateau is weaker than the ground seeds
+    # at its level. The gap is pooled over the 5x5 at that level, so
+    # sigma=0.01 cell noise averages to ~0.003; no column-max margin.
+    # Candidates sit between the 12 m envelope and the seed; the lowest
+    # level that passes is the column's ground.
+    has_env_layer = np.zeros(n_col, dtype=bool)
+    gnd_lvl = np.full(n_col, np.iinfo(np.int64).max)
+    cand = finite_env[col] & (lvl < raw[col]) & (lvl >= env_lvl[col])
+    if cand.any() and vs.size:
+        ci = np.flatnonzero(cand)
+        seed_cell = (lvl == raw[col]) & vote[col]
+        si = np.flatnonzero(seed_cell)
+        levels = np.unique(lvl[ci])
+        nl = levels.size
+        li_c = np.searchsorted(levels, lvl[ci])
+        li_s = np.searchsorted(levels, lvl[si])
+        ok_s = (li_s < nl) & (levels[np.minimum(li_s, nl - 1)] == lvl[si])
+        si, li_s = si[ok_s], li_s[ok_s]
+        ref_s = np.zeros((ntx, nty, nl))
+        ref_n = np.zeros((ntx, nty, nl))
+        if si.size:
+            np.add.at(ref_s, (tix[col[si]], tiy[col[si]], li_s), p_hot[si].astype(np.float64))
+            np.add.at(ref_n, (tix[col[si]], tiy[col[si]], li_s), 1.0)
+        ref_s, ref_n = _box_sum_xy(ref_s, w), _box_sum_xy(ref_n, w)
+        tc, tcy = tix[col[ci]], tiy[col[ci]]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ref = ref_s[tc, tcy, li_c] / ref_n[tc, tcy, li_c]
+        gap = ref - p_hot[ci].astype(np.float64)
+        fin = np.isfinite(gap)
+        # Pool cells of the same kind: same level AND same offset from
+        # their column's lowest near-max layer. On a grade (or where z_max
+        # clips a wall) one level holds the fill under one column's ground
+        # next to another column's ground under a wall; mixing them would
+        # average a real 0 gap with 0.05.
+        depth = (lvl[ci] - lo_all[col[ci]]).astype(np.int64)
+        kinds, ki = np.unique(np.stack([li_c, depth], 1), axis=0, return_inverse=True)
+        ki = ki.reshape(-1)
+        nk = kinds.shape[0]
+        g_s = np.zeros((ntx, nty, nk))
+        g_n = np.zeros((ntx, nty, nk))
+        np.add.at(g_s, (tc[fin], tcy[fin], ki[fin]), gap[fin])
+        np.add.at(g_n, (tc[fin], tcy[fin], ki[fin]), 1.0)
+        g_s, g_n = _box_sum_xy(g_s, int(MEDIAN_R)), _box_sum_xy(g_n, int(MEDIAN_R))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            pooled = g_s[tc, tcy, ki] / g_n[tc, tcy, ki]
+        good = fin & (pooled <= EXPOSED_GAP)
+        if good.any():
+            gc = col[ci[good]]
+            np.minimum.at(gnd_lvl, gc, lvl[ci[good]])
+            has_env_layer[gc] = True
     fit_z = raw.astype(np.float64).copy()
-    fit_z[has_env_layer] = env[has_env_layer]
-    # A seed a full layer above the local (5x5) median is an object
-    # (a car hotter than the road by more than BAND_MARGIN), not far
-    # ground on a hill. The cap is just under 1 layer so a 15% grade
-    # over the 5x5 (~0.75 layer) still matches, while a one-layer car
-    # does not.
+    fit_z[has_env_layer] = gnd_lvl[has_env_layer].astype(np.float64)
     near_local = ~np.isfinite(local_med) | (
         raw.astype(np.float64) < local_med + 1.0
     )
-    # When has_env_layer, fit_z is already the envelope, so these
-    # inliers contribute ground height to the plane (a 1-layer car
-    # does not lift it). The OBJ_RISE cap is not applied here: it
-    # dropped wall columns under a lagging envelope and shifted the
-    # +15% 1.6 m floor (below 138 -> 144). Cars without has_env_layer
-    # (p more than HAS_ENV_MARGIN above the road) are kept off by
-    # near_local.
     inlier = vote_inlier & finite_env & near_local & (
         (has_env_layer & (raw.astype(np.float64) >= env))
         | (
@@ -675,16 +771,19 @@ def _column_ground_lvl_compact(col: np.ndarray, lvl: np.ndarray, p_hot: np.ndarr
         raw.astype(np.float64) <= env + 1.0
     ) & (raw.astype(np.float64) < expected - 0.5)
     target[snap_low] = raw[snap_low]
-    gcs = np.flatnonzero(ok)
-    q = np.flatnonzero(used & ~ok)
-    if q.size and gcs.size:
-        gx, gy, glv = col_ix[gcs], col_iy[gcs], target[gcs]
-        qx, qy = col_ix[q], col_iy[q]
-        d2 = (qx[:, None] - gx[None, :]).astype(np.int64) ** 2 + (
-            qy[:, None] - gy[None, :]).astype(np.int64) ** 2
-        target[q] = glv[d2.argmin(axis=1)]
-    elif q.size and not gcs.size:
-        target[q] = raw[q]
+    leftover = used & ~ok
+    if leftover.any():
+        # Inherit the nearest finite expected height (tile grid, O(tiles)),
+        # never a q×g distance matrix.
+        exp2d = np.full((ntx, nty), np.nan)
+        if ok.any():
+            exp2d[tix[ok], tiy[ok]] = expected[ok]
+        exp2d = _nearest_finite(exp2d)
+        fill = leftover & np.isfinite(exp2d[tix, tiy])
+        target[fill] = np.floor(exp2d[tix[fill], tiy[fill]] + 0.25).astype(np.int64)
+        still = leftover & ~fill
+        if still.any():
+            target[still] = raw[still]
     return target
 
 
@@ -694,18 +793,18 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
     The ground band is chosen from the bottom of each xy column, not the
     top. The seed is the highest near-max layer in a three-layer window
     starting at the lowest near-max layer (the surface of a fill+ground
-    stack). Seeds above an absolute p threshold vote on a robust 12 m
-    lower envelope (a small-neighbourhood median, then the min of seeds
-    on that surface, not a raw window min of every seed);
-    inliers up to a 15% grade over that radius fit a local ground
-    plane, which is the band. Far ground on a hill stays the band; a
-    one-layer car or guardrail on real ground (including when its p is
-    slightly above the road), and a wall or roof (or a building with
-    no ground under it), stay in the above-ground pool. On flat, offset and
+    stack). Seeds at p >= VOTE_P_MIN vote on a robust 12 m lower
+    envelope; a local plane on the inliers is the band, and buried
+    ground is the cell that matches the exposed ground at its level
+    (see ``_column_ground_lvl_compact``). Far ground on a hill stays the
+    band; a one-layer car or guardrail on real ground (including when
+    its p is above the road, or in a dense hotter lot), and a wall or
+    roof (or a building with no ground under it), stay in the above-ground
+    pool. On flat, offset and
     3% downhill roads the below-ground pool is empty; where a grade
     starts inside the 12 m window some below-ground fill still reaches
-    the cap (0.8 m: 128 / 140 at +10% / +15%, 18 / 12 at -10% / -15%;
-    the uphill maxima are pinned in test_occ_net). Below and above are relative to that column's
+    the cap (0.8 m: 128 / 124 at +10% / +15%; the uphill maxima are
+    pinned in test_occ_net). Below and above are relative to that column's
     ground, so a downhill or height-offset road stays the band instead
     of a fixed z=0 slab. A thinner or holed ground layer still wins its
     columns when it is within the margin of the strongest layer there,

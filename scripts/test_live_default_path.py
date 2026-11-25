@@ -12,7 +12,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -26,12 +25,10 @@ CAM_AGE_KEYS = ("cam_ages", "stale_ego_n")
 
 
 def _touch_bus() -> None:
-    """Keep a lua_bus handshake at the predicted pin (same write as 8f4a163)."""
-    from python.runtime import paths as gvd_paths
+    """Publish a fresh lua_bus handshake via tmp + os.replace (test_m6_retail)."""
+    import test_m6_retail
 
-    pin = gvd_paths.predicted_gvd_docs_path()
-    pin.mkdir(parents=True, exist_ok=True)
-    (pin / "gvd_link.json").write_text(json.dumps({"lua_bus": str(pin.resolve())}), encoding="utf-8")
+    test_m6_retail._touch_lua_bus()
 
 
 def _observe_supervisor(
@@ -45,15 +42,15 @@ def _observe_supervisor(
 ) -> tuple[float | None, list[dict]]:
     """Sample cmd/state until ``seconds`` after the first command, or the child exits.
 
-    8f4a163 behavior: break as soon as poll() is not None, before exists().
+    Observe artifacts on the same iteration that first sees a finished child, so a
+    ``--run-seconds`` exit cannot drop a command that was already written.
     """
     states: list[dict] = []
     first: float | None = None
     next_echo, echo_seq = 0.0, 0
     end = time.time() + float(startup_s)
-    while time.time() < end:
-        if proc.poll() is not None:
-            break
+    while True:
+        dead = proc.poll() is not None
         _touch_bus()
         if echo is not None and time.monotonic() >= next_echo:
             next_echo = time.monotonic() + echo.FAKE_ECHO_PERIOD_S
@@ -67,6 +64,8 @@ def _observe_supervisor(
                 states.append(json.loads(state().read_text(encoding="utf-8")))
             except (ValueError, OSError):
                 pass
+        if dead or time.time() >= end:
+            break
         time.sleep(0.05)
     return first, states
 
@@ -165,12 +164,9 @@ def run_supervisor(extra: list[str], seconds: float = 2.0, echo: bool = False) -
     engaging needs a fresh session echo (#125).
     """
     from python.control.actuate import cmd_path
-    from python.runtime import paths as gvd_paths
     from python.runtime.state_io import state_path
 
     with isolated_home(prefix="gvd-default-") as home:
-        pin = gvd_paths.predicted_gvd_docs_path()
-        pin.mkdir(parents=True, exist_ok=True)
         _touch_bus()
         m6 = _m6() if echo else None
         out_path = Path(home) / "stdout.txt"

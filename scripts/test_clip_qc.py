@@ -584,6 +584,49 @@ def test_liveness_tipped_stationary_damage_and_settle_i0_none() -> None:
         assert "settle_5s" in by_i[24]["reasons"]  # t=104.8
         assert "settle_5s" not in by_i[25]["reasons"]  # t=105.0
 
+    # (e) live == "damage" is looked up by row['i'] and is not the local 0.05 dmg_spike
+    from unittest.mock import patch
+
+    dmg_rows = [
+        _make_row(i, 100.0 + k * 0.2, 0.0, k * 2.0, speed=5.0, damage=0.0, dt_s=0.2)
+        for k, i in enumerate(range(10, 20))
+    ]
+    with patch("python.train.clip_qc.bad_row_reasons", lambda _rows: {15: "damage"}):
+        dmg_res = analyze_rows(dmg_rows, warmup_s=0.0, settle_s=0.0)
+    dmg_by_i = {r["i"]: r for r in dmg_res["rows"]}
+    assert "impact" in dmg_by_i[15]["reasons"]
+    assert "impact" not in dmg_by_i[14]["reasons"]
+    assert "impact" not in dmg_by_i[16]["reasons"]
+
+    # (f) i0 is the row['i'] id, not the list index (i starts at 10)
+    with tempfile.TemporaryDirectory() as td:
+        clip = Path(td) / "clip_settle_i0_id"
+        clip.mkdir()
+        rows = [_make_row(i, 100.0 + k * 0.2, 0.0, k * 2.0, dt_s=0.2) for k, i in enumerate(range(10, 50))]
+        _write_jsonl(clip / "state.jsonl", rows)
+        (clip / "collect.json").write_text(
+            json.dumps({"settle_windows": [{"seq": 0, "source": "spawn", "t0": 100.0, "i0": 10, "wait_s": 5.0}]}),
+            encoding="utf-8",
+        )
+        res = analyze_clip(clip, check_images=False, warmup_s=0.0, settle_s=5.0)
+        settle_rows = [r for r in res["rows"] if "settle_5s" in r["reasons"]]
+        assert len(settle_rows) == 25, len(settle_rows)
+        by_i = {r["i"]: r for r in res["rows"]}
+        assert "settle_5s" in by_i[10]["reasons"]
+        assert "settle_5s" in by_i[34]["reasons"]  # t=104.8
+        assert "settle_5s" not in by_i[35]["reasons"]  # t=105.0
+
+    # (g) missing t is not treated as 0.0 when matching impact times (nit)
+    bare = _make_row(0, 100.0, 0.0, 0.0, speed=5.0, stall=True, dt_s=0.2)
+    bare["t"] = None
+    bare_res = analyze_rows(
+        [bare],
+        impacts=[{"kind": "impact", "t": 1.0}],
+        warmup_s=0.0,
+        settle_s=0.0,
+    )
+    assert "impact" not in bare_res["rows"][0]["reasons"]
+
 
 def test_train_directory_mask_clip_qc() -> None:
     from python.train.scene_net import torch_ready

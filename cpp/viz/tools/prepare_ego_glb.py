@@ -6,6 +6,12 @@ Source (do not ship model3_scene.glb): the car-only extract of
 Removes the embossed hood T badge, converts to the visualizer ego frame
 (X right, Y forward, Z up, length-centered, wheels on the ground), and
 writes vertex colours (body / glass / wheels / lamps) for the flat mesh shader.
+
+The rear T badge (trunk lid at the base of the glass) is stripped as a
+post-pass on the prepared GLB, with the T-shaped glass cutout filled and
+flattened; see cpp/viz/assets/ATTRIBUTION.txt. Re-running this tool on
+the car-only source would restore that rear badge; the post-pass must be
+applied again (do not ship a regenerated file without it).
 """
 from __future__ import annotations
 

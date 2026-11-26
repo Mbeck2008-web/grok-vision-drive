@@ -23,12 +23,21 @@ not further reconciled.
 
 Changes made (CC BY 4.0 requires that adaptations be indicated):
   - The embossed Tesla "T" badge on the hood was removed (307 triangles).
+  - The rear Tesla "T" badge on the trunk lid at the base of the glass
+    (~7 cm, 181 triangles) was also removed. The T-shaped cutout that
+    left in the rear glass was filled (84 triangles, glass colour) and
+    the hole-rim vertices were flattened onto the surrounding glass
+    band (max 6 mm) so the rear is closed and clean.
   - Axes were converted to the visualizer ego frame (X right, Y forward,
-    Z up), length-centered, with the wheels on the ground. The car is
-    4.354 m long.
+    Z up), length-centered, with the wheels on the ground. In this file
+    the bounding box is 4.354 m long (including mirrors).
+  - At load, python/viz/rv_ego_model.fit_to_ego applies a non-uniform
+    scale of x 0.946, y 1.084, z 1.060 (width, length, height) so the
+    fitted bounding box is 1.85 m wide x 4.72 m long x 1.44 m tall
+    (the x squash is wheel thickness only).
   - Vertex colours were assigned (body, glass, wheels, lamps) for the
     flat-shaded mesh shader; the original placeholder textures were dropped.
-  - No decimation or retopology. Triangle count after the badge removal:
-    26,635 (under 30,000).
+  - No decimation. Triangle count after both badge removals and the
+    rear-glass fill: 26,538 (under 30,000).
 
 Tesla is a trademark; the CC BY 4.0 license does not grant trademark rights.

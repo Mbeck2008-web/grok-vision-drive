@@ -99,9 +99,16 @@ def load_glb(path: str | Path) -> EgoMesh:
     if "JSON" not in chunks or "BIN" not in chunks:
         raise ValueError("GLB needs a JSON and a BIN chunk")
     gltf = json.loads(chunks["JSON"])
+    if not isinstance(gltf, dict):
+        raise ValueError("GLB JSON must be an object")
     blob = chunks["BIN"]
+    meshes = gltf.get("meshes", [])
+    if not isinstance(meshes, list):
+        raise ValueError("glTF meshes must be a list")
     verts_l, cols_l, faces_l, base = [], [], [], 0
-    for mesh in gltf.get("meshes", []):
+    for mesh in meshes:
+        if not isinstance(mesh, dict):
+            raise ValueError("glTF mesh entry must be an object")
         for prim in mesh.get("primitives", []):
             attrs = prim.get("attributes", {})
             if prim.get("mode", 4) != 4 or "indices" not in prim or "POSITION" not in attrs:
@@ -125,6 +132,8 @@ def load_glb(path: str | Path) -> EgoMesh:
     if not faces_l:
         raise ValueError("GLB has no mesh")
     verts, colors, faces = np.concatenate(verts_l), np.concatenate(cols_l), np.concatenate(faces_l)
+    if faces.shape[0] == 0:
+        raise ValueError("GLB has no triangles")
     if not np.isfinite(verts).all():
         raise ValueError("non-finite vertex")
     if faces.shape[0] > MAX_TRIANGLES:
@@ -159,7 +168,7 @@ def load_ego_mesh(path: str | Path | None = None) -> EgoMesh | None:
         return None
     try:
         return fit_to_ego(load_glb(p))
-    except (OSError, ValueError, KeyError, IndexError, json.JSONDecodeError, struct.error) as e:
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, json.JSONDecodeError, struct.error) as e:
         warnings.warn(f"ego mesh {p.name} unusable ({e}); drawing the wire box", RuntimeWarning, stacklevel=2)
         return None
 

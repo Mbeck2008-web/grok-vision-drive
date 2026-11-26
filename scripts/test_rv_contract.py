@@ -5,6 +5,10 @@ Spec: docs/specs/reality_view_3dgs.md (Step 1).
 Tests:
 - check_flag_off_is_placeholder
 - check_live_path_is_separate_process
+- check_rvclient_launch_args
+- check_preexec_ppid_race_exit
+- check_parent_watch_errno_discipline
+- check_orphan_cases
 - check_rv_input_schema
 - check_rv_output_schema
 - check_shm_slot_roundtrip_and_copy_only
@@ -108,22 +112,6 @@ def _wait_pid_exit(pid: int, timeout_s: float = 4.0) -> bool:
             return True
         time.sleep(0.05)
     return not _pid_alive(pid)
-
-
-def _readline_timeout(proc: subprocess.Popen[str], timeout_s: float = 5.0) -> str:
-    """Read one stdout line; fail with an assert rather than hang."""
-    lines: list[str] = []
-
-    def _read() -> None:
-        assert proc.stdout is not None
-        lines.append(proc.stdout.readline())
-
-    reader = threading.Thread(target=_read, daemon=True)
-    reader.start()
-    reader.join(timeout=timeout_s)
-    assert not reader.is_alive(), f"timed out waiting for child pid line after {timeout_s:.1f}s"
-    assert lines, "child produced no stdout line"
-    return lines[0].strip()
 
 
 def _hard_kill_proc(proc: subprocess.Popen[str]) -> None:
@@ -330,137 +318,6 @@ def check_live_path_is_separate_process() -> None:
         client.close()
     assert client.is_alive() is False
 
-    # 6. Intermediate parent hard-kill must not orphan the --serve stub.
-    # Runs on win32 (no skips). Windows liveness is GetExitCodeProcess, never signal.SIGKILL.
-    # IQU45 @ 551e602 fail-first: getppid() stays on the dead parent, so the ppid poll never
-    # fires and stdin EOF was late (~6 s); also cleanup crashed on signal.SIGKILL.
-
-    def _run_orphan_case(mode: str, parent: subprocess.Popen[str], stdin_hold: int | None = None) -> None:
-        stub_pid: int | None = None
-        try:
-            line = _readline_timeout(parent, timeout_s=5.0)
-            err = ""
-            if parent.stderr is not None and not line.isdigit():
-                try:
-                    err = parent.stderr.read()
-                except OSError:
-                    err = ""
-            assert line.isdigit(), f"{mode}: unexpected parent output {line!r} stderr={err!r}"
-            stub_pid = int(line)
-            assert _pid_alive(stub_pid), f"{mode}: stub_pid {stub_pid} not alive"
-            # Hard-kill the intermediate: Popen.kill() is TerminateProcess on Windows, SIGKILL on POSIX.
-            t0 = time.monotonic()
-            parent.kill()
-            try:
-                parent.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            exited = _wait_pid_exit(stub_pid, timeout_s=4.0)
-            elapsed = time.monotonic() - t0
-            print(f"orphan_check platform={sys.platform} mode={mode} exited_in={elapsed:.3f}s", flush=True)
-            assert exited, f"{mode}: stub_pid {stub_pid} orphaned after parent hard-kill ({elapsed:.3f}s)"
-        finally:
-            if stdin_hold is not None:
-                try:
-                    os.close(stdin_hold)
-                except OSError:
-                    pass
-            _hard_kill_proc(parent)
-            if stub_pid is not None and _pid_alive(stub_pid):
-                _force_kill_pid(stub_pid)
-
-    # Case A (always, including win32): intermediate parent uses RvClient.launch (stdin pipe held by it).
-    parent_a = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import time; "
-                "from python.viz.rv_contract import RvClient; "
-                "c = RvClient(); "
-                "pid = c.launch(); "
-                "print(pid, flush=True); "
-                "time.sleep(60)"
-            ),
-        ],
-        cwd=str(ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        close_fds=True,
-    )
-    _run_orphan_case("rvclient", parent_a)
-
-    # Case W (always, including win32): PDEATHSIG disabled via a private module attribute
-    # (not env/config). Grandparent holds the stdin write end so EOF cannot trigger;
-    # only the stub's parent-watch fallback can exit the child (WaitForSingleObject on
-    # win32, pidfd_open on Linux). close_fds so the stub is the only copy of the read end.
-    r_fd, w_fd = os.pipe()
-    os.set_inheritable(r_fd, True)
-    os.set_inheritable(w_fd, False)
-    intermediate_w = (
-        "import os, subprocess, sys, time\n"
-        "ppid = os.getpid()\n"
-        "child_src = ("
-        "\"import python.viz.rv_renderer_stub as _s; \" "
-        "\"_s._TEST_DISABLE_PDEATHSIG = True; \" "
-        "\"raise SystemExit(_s.main(['--serve', '--parent-pid', '%d']))\" % ppid)\n"
-        "p = subprocess.Popen([sys.executable, '-c', child_src], "
-        "stdin=sys.stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)\n"
-        "time.sleep(0.2)\n"  # arm parent-watch while this intermediate is still alive
-        "print(p.pid, flush=True)\n"
-        "time.sleep(60)\n"
-    )
-    parent_w = subprocess.Popen(
-        [sys.executable, "-c", intermediate_w],
-        cwd=str(ROOT),
-        stdin=r_fd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        close_fds=True,
-    )
-    try:
-        os.close(r_fd)
-    except OSError:
-        pass
-    else:
-        r_fd = -1
-    _run_orphan_case("fallback_parent_watch", parent_w, stdin_hold=w_fd)
-
-    # Case B (POSIX): production stub + pdeathsig_preexec, stdin kept open by grandparent.
-    if sys.platform != "win32":
-        r_fd_b, w_fd_b = os.pipe()
-        os.set_inheritable(r_fd_b, True)
-        os.set_inheritable(w_fd_b, False)
-        parent_b = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import os, subprocess, sys, time; "
-                    "from python.viz.rv_contract import RV_RENDERER_MODULE, pdeathsig_preexec; "
-                    "p = subprocess.Popen([sys.executable, '-m', RV_RENDERER_MODULE, '--serve', '--parent-pid', str(os.getpid())], "
-                    "stdin=sys.stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, "
-                    "close_fds=True, preexec_fn=pdeathsig_preexec()); "
-                    "time.sleep(0.2); "
-                    "print(p.pid, flush=True); "
-                    "time.sleep(60)"
-                ),
-            ],
-            cwd=str(ROOT),
-            stdin=r_fd_b,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            close_fds=True,
-        )
-        try:
-            os.close(r_fd_b)
-        except OSError:
-            pass
-        _run_orphan_case("pdeathsig_open_stdin", parent_b, stdin_hold=w_fd_b)
-
     # Case C (Linux): verify prctl PR_SET_PDEATHSIG(SIGTERM) is armed by both pdeathsig_preexec and stub._install_pdeathsig.
     if sys.platform.startswith("linux"):
         pdeath_probe = subprocess.run(
@@ -494,6 +351,423 @@ def check_live_path_is_separate_process() -> None:
         )
         assert pdeath_probe.returncode == 0, f"pdeathsig probe failed: {pdeath_probe.stdout} {pdeath_probe.stderr}"
         assert "PDEATHSIG_OK" in pdeath_probe.stdout
+
+
+
+_ARMED_PREFIX = "RV_WATCH_ARMED "
+_EXIT_PREFIX = "RV_STUB_EXIT "
+
+
+class _LineQueue:
+    """Background reader over a child's stdout so reads never hang the test."""
+
+    def __init__(self, proc: subprocess.Popen[str]) -> None:
+        import queue
+
+        self._q: "queue.Queue[str | None]" = queue.Queue()
+        self.seen: list[str] = []
+        self._proc = proc
+
+        def _pump() -> None:
+            assert proc.stdout is not None
+            try:
+                for raw in proc.stdout:
+                    self._q.put(raw.strip())
+            except (OSError, ValueError):
+                pass
+            finally:
+                self._q.put(None)
+
+        threading.Thread(target=_pump, daemon=True).start()
+
+    def wait_for(self, pred, timeout_s: float, what: str) -> str:
+        import queue
+
+        for line in self.seen:
+            if pred(line):
+                return line
+        deadline = time.monotonic() + timeout_s
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise AssertionError(f"timed out after {timeout_s:.1f}s waiting for {what}; seen={self.seen!r}")
+            try:
+                line = self._q.get(timeout=left)
+            except queue.Empty:
+                continue
+            if line is None:
+                raise AssertionError(f"stdout closed while waiting for {what}; seen={self.seen!r}")
+            self.seen.append(line)
+            if pred(line):
+                return line
+
+
+def _kv(line: str, key: str) -> str:
+    for tok in line.split():
+        if tok.startswith(key + "="):
+            return tok.split("=", 1)[1]
+    return ""
+
+
+def _expected_native_watch_mode() -> str:
+    if sys.platform == "win32":
+        return "handle"
+    if hasattr(os, "pidfd_open"):
+        return "pidfd"
+    return "ppid"
+
+
+def _run_orphan_case(
+    mode: str,
+    parent: subprocess.Popen[str],
+    stdin_hold: int | None = None,
+    *,
+    expect_armed: str | None = None,
+    expect_reasons: tuple[str, ...] | None = None,
+    alive_probe_s: float = 0.0,
+    close_stdin_after_kill: bool = False,
+) -> None:
+    """Hard-kill an intermediate parent and require its --serve stub to exit.
+
+    With expect_armed, the stub's RV_WATCH_ARMED line is awaited BEFORE the kill
+    (armed handshake), so the case cannot pass via the 'parent already gone' path,
+    and the stub's RV_STUB_EXIT reason must be one of expect_reasons (stdin EOF
+    cannot satisfy a parent-watch case).
+    """
+    stub_pid: int | None = None
+    lq = _LineQueue(parent)
+    try:
+        try:
+            line = lq.wait_for(lambda ln: ln.isdigit(), 10.0, f"{mode} stub pid line")
+        except AssertionError as exc:
+            err = ""
+            if parent.poll() is not None and parent.stderr is not None:
+                try:
+                    err = parent.stderr.read()
+                except OSError:
+                    err = ""
+            raise AssertionError(f"{mode}: {exc} stderr={err!r}") from None
+        stub_pid = int(line)
+        armed = "-"
+        if expect_armed is not None:
+            armed_line = lq.wait_for(lambda ln: ln.startswith(_ARMED_PREFIX), 15.0, f"{mode} {_ARMED_PREFIX.strip()}")
+            armed = _kv(armed_line, "mode")
+            assert armed == expect_armed, f"{mode}: armed mode {armed!r} != {expect_armed!r} ({armed_line!r})"
+        assert _pid_alive(stub_pid), f"{mode}: stub_pid {stub_pid} not alive before parent kill; seen={lq.seen!r}"
+        if alive_probe_s > 0:
+            time.sleep(alive_probe_s)
+            assert parent.poll() is None, f"{mode}: intermediate parent died early"
+            assert _pid_alive(stub_pid), f"{mode}: stub exited while its parent is alive; seen={lq.seen!r}"
+        # Hard-kill the intermediate: Popen.kill() is TerminateProcess on Windows, SIGKILL on POSIX.
+        t0 = time.monotonic()
+        parent.kill()
+        try:
+            parent.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if close_stdin_after_kill and stdin_hold is not None:
+            os.close(stdin_hold)
+            stdin_hold = None
+        exited = _wait_pid_exit(stub_pid, timeout_s=4.0)
+        elapsed = time.monotonic() - t0
+        reason = "-"
+        if expect_reasons is not None and exited:
+            exit_line = lq.wait_for(lambda ln: ln.startswith(_EXIT_PREFIX), 3.0, f"{mode} {_EXIT_PREFIX.strip()}")
+            reason = _kv(exit_line, "reason")
+        print(
+            f"orphan_check platform={sys.platform} mode={mode} armed={armed} reason={reason} exited_in={elapsed:.3f}s",
+            flush=True,
+        )
+        assert exited, f"{mode}: stub_pid {stub_pid} orphaned after parent hard-kill ({elapsed:.3f}s)"
+        if expect_reasons is not None:
+            assert reason in expect_reasons, f"{mode}: exit reason {reason!r} not in {expect_reasons!r}"
+    finally:
+        if stdin_hold is not None:
+            try:
+                os.close(stdin_hold)
+            except OSError:
+                pass
+        _hard_kill_proc(parent)
+        if stub_pid is not None and _pid_alive(stub_pid):
+            _force_kill_pid(stub_pid)
+
+
+def _spawn_watch_intermediate(pre: str = "", post: str = "") -> tuple[subprocess.Popen[str], int]:
+    """Intermediate parent that launches the --serve stub with PDEATHSIG disabled.
+
+    The grandparent (this test) holds the stdin write end so EOF cannot trigger;
+    the stub shares the intermediate's stdout so its RV_WATCH_ARMED / RV_STUB_EXIT
+    lines reach the test. close_fds so the stub is the only copy of the read end.
+    ``pre`` runs before the stub import, ``post`` after it (fault injection only).
+    """
+    r_fd, w_fd = os.pipe()
+    os.set_inheritable(r_fd, True)
+    os.set_inheritable(w_fd, False)
+    child_tmpl = (
+        pre
+        + "import python.viz.rv_renderer_stub as _s\n"
+        + "_s._TEST_DISABLE_PDEATHSIG = True\n"
+        + post
+        + "raise SystemExit(_s.main(['--serve', '--parent-pid', '%d']))\n"
+    )
+    intermediate = (
+        "import os, subprocess, sys, time\n"
+        f"child_src = {child_tmpl!r} % os.getpid()\n"
+        "p = subprocess.Popen([sys.executable, '-c', child_src], "
+        "stdin=sys.stdin, stdout=sys.stdout, stderr=subprocess.DEVNULL, close_fds=True)\n"
+        "print(p.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", intermediate],
+        cwd=str(ROOT),
+        stdin=r_fd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        close_fds=True,
+    )
+    os.close(r_fd)
+    return parent, w_fd
+
+
+def check_orphan_cases() -> None:
+    """Intermediate parent hard-kill must not orphan the --serve stub.
+
+    Runs on win32 (no skips). Windows liveness is GetExitCodeProcess, never signal.SIGKILL.
+    IQU45 @ 551e602 fail-first: getppid() stays on the dead parent, so the ppid poll never
+    fires and stdin EOF was late (~6 s); also cleanup crashed on signal.SIGKILL.
+    Skeptic 9.1 @ 6567ec4: case W had no armed handshake (could pass via the
+    'parent already gone' startup path), so every stub-visible case now waits for
+    RV_WATCH_ARMED before the kill and checks RV_STUB_EXIT reason.
+    """
+    # Case A (always, including win32): intermediate parent uses production RvClient.launch
+    # (stdin pipe held by it, stub stdout is DEVNULL so no handshake is visible here).
+    parent_a = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import time; "
+                "from python.viz.rv_contract import RvClient; "
+                "c = RvClient(); "
+                "pid = c.launch(); "
+                "print(pid, flush=True); "
+                "time.sleep(60)"
+            ),
+        ],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        close_fds=True,
+    )
+    _run_orphan_case("rvclient", parent_a)
+
+    # Case W (always, including win32): PDEATHSIG disabled via a private module attribute
+    # (not env/config). Only the native parent watch can exit the child
+    # (WaitForSingleObject on win32, pidfd on Linux), and only after it armed.
+    parent_w, w_fd = _spawn_watch_intermediate()
+    _run_orphan_case(
+        "fallback_parent_watch",
+        parent_w,
+        stdin_hold=w_fd,
+        expect_armed=_expected_native_watch_mode(),
+        expect_reasons=("parent_exit",),
+        alive_probe_s=0.3,
+    )
+
+    # Case E (Linux with pidfd_open): pidfd_open fails with ENOSYS (old kernel / seccomp).
+    # The stub must NOT exit while its parent is alive; it falls back to the ppid poll
+    # and exits via the parent watch once the parent dies (reparent changes getppid).
+    if hasattr(os, "pidfd_open"):
+        prelude_e = (
+            "import errno as _e, os as _o\n"
+            "def _enosys(*_a, **_k):\n"
+            "    raise OSError(_e.ENOSYS, 'injected ENOSYS')\n"
+            "_o.pidfd_open = _enosys\n"
+        )
+        parent_e, w_fd_e = _spawn_watch_intermediate(pre=prelude_e)
+        _run_orphan_case(
+            "pidfd_enosys_ppid_poll",
+            parent_e,
+            stdin_hold=w_fd_e,
+            expect_armed="ppid",
+            expect_reasons=("parent_exit",),
+            alive_probe_s=0.5,
+        )
+
+    # Case D (win32): OpenProcess denied (ERROR_ACCESS_DENIED=5) must not exit the stub
+    # while its parent lives; it falls back to the ppid poll. Windows does not reparent,
+    # so after the parent dies the remaining exit path is stdin EOF (closed by the test).
+    if sys.platform == "win32":
+        parent_d, w_fd_d = _spawn_watch_intermediate(post="_s._win_open_process = lambda _pid: (None, 5)\n")
+        _run_orphan_case(
+            "win_open_denied_ppid_poll",
+            parent_d,
+            stdin_hold=w_fd_d,
+            expect_armed="ppid",
+            expect_reasons=("stdin_eof", "parent_exit"),
+            alive_probe_s=0.5,
+            close_stdin_after_kill=True,
+        )
+
+    # Case B (POSIX): production stub + pdeathsig_preexec, stdin kept open by grandparent.
+    if sys.platform != "win32":
+        r_fd_b, w_fd_b = os.pipe()
+        os.set_inheritable(r_fd_b, True)
+        os.set_inheritable(w_fd_b, False)
+        parent_b = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, subprocess, sys, time; "
+                    "from python.viz.rv_contract import RV_RENDERER_MODULE, pdeathsig_preexec; "
+                    "p = subprocess.Popen([sys.executable, '-m', RV_RENDERER_MODULE, '--serve', '--parent-pid', str(os.getpid())], "
+                    "stdin=sys.stdin, stdout=sys.stdout, stderr=subprocess.DEVNULL, "
+                    "close_fds=True, preexec_fn=pdeathsig_preexec()); "
+                    "print(p.pid, flush=True); "
+                    "time.sleep(60)"
+                ),
+            ],
+            cwd=str(ROOT),
+            stdin=r_fd_b,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            close_fds=True,
+        )
+        os.close(r_fd_b)
+        _run_orphan_case(
+            "pdeathsig_open_stdin",
+            parent_b,
+            stdin_hold=w_fd_b,
+            expect_armed=_expected_native_watch_mode(),
+            expect_reasons=("signal", "parent_exit"),
+            alive_probe_s=0.3,
+        )
+
+
+def check_parent_watch_errno_discipline() -> None:
+    """Only 'pid is gone' errors mean exit; any other open failure falls back to polling.
+
+    Linux pidfd_open: ESRCH -> gone; ENOSYS/EMFILE/ENFILE/EPERM/other -> ('ppid', pid).
+    Windows OpenProcess: ERROR_INVALID_PARAMETER (87) -> gone; other (e.g. 5) -> ('ppid', pid).
+    Both paths are exercised on every platform by injecting the failure.
+    """
+    import errno
+
+    import python.viz.rv_renderer_stub as stub
+
+    pid = os.getpid()
+    if hasattr(os, "pidfd_open"):
+        w = stub._open_parent_watch(pid)
+        try:
+            assert w is not None and w[0] == "pidfd", f"live parent must get a pidfd watch, got {w!r}"
+        finally:
+            stub._close_parent_watch(w)
+
+    real = getattr(os, "pidfd_open", None)
+
+    def _raiser(code: int):
+        def _f(*_a, **_k):
+            raise OSError(code, os.strerror(code))
+
+        return _f
+
+    # Off win32 go through the real dispatcher; on win32 call the pidfd opener directly.
+    open_pidfd = stub._open_parent_watch if sys.platform != "win32" else stub._open_pidfd_watch
+    try:
+        for code in (errno.ENOSYS, errno.EMFILE, errno.ENFILE, errno.EPERM, errno.EINVAL):
+            os.pidfd_open = _raiser(code)  # type: ignore[attr-defined]
+            w = open_pidfd(pid)
+            assert w == ("ppid", pid), f"pidfd_open {errno.errorcode[code]} must fall back to ppid poll, got {w!r}"
+        os.pidfd_open = _raiser(errno.ESRCH)  # type: ignore[attr-defined]
+        assert open_pidfd(pid) is None, "pidfd_open ESRCH means the parent is gone"
+    finally:
+        if real is None:
+            try:
+                del os.pidfd_open  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+        else:
+            os.pidfd_open = real  # type: ignore[attr-defined]
+
+    real_open = stub._win_open_process
+    try:
+        stub._win_open_process = lambda _pid: (None, 87)
+        assert stub._open_win_watch(pid) is None, "OpenProcess ERROR_INVALID_PARAMETER means the parent is gone"
+        for err in (5, 6, 0):
+            stub._win_open_process = lambda _pid, _e=err: (None, _e)
+            w = stub._open_win_watch(pid)
+            assert w == ("ppid", pid), f"OpenProcess error {err} must fall back to ppid poll, got {w!r}"
+        stub._win_open_process = lambda _pid: (1234, 0)
+        assert stub._open_win_watch(pid) == ("winhandle", 1234)
+    finally:
+        stub._win_open_process = real_open
+
+    # The ppid poll itself: a live expected parent is not 'exited'; a mismatched one is.
+    assert stub._parent_has_exited(("ppid", os.getppid())) is False, "ppid poll: live parent reported exited"
+    assert stub._parent_has_exited(("ppid", os.getppid() + 1_000_003)) is True, "ppid poll: changed getppid() not detected"
+
+
+def check_rvclient_launch_args() -> None:
+    """RvClient passes --parent-pid <own pid> and keeps close_fds on (fd hygiene)."""
+    import python.viz.rv_contract as rc
+
+    captured: dict = {}
+
+    class _FakeProc:
+        pid = 424242
+        stdin = None
+
+        def poll(self):
+            return 0
+
+    def _fake_popen(argv, **kw):
+        captured["argv"] = list(argv)
+        captured["kw"] = dict(kw)
+        return _FakeProc()
+
+    real = rc.subprocess.Popen
+    rc.subprocess.Popen = _fake_popen
+    try:
+        assert rc.RvClient().launch() == 424242
+    finally:
+        rc.subprocess.Popen = real
+    argv = captured["argv"]
+    assert "--serve" in argv, argv
+    assert "--parent-pid" in argv, f"RvClient must pass --parent-pid: {argv}"
+    assert argv[argv.index("--parent-pid") + 1] == str(os.getpid()), argv
+    assert captured["kw"].get("close_fds", True) is True, captured["kw"]
+
+
+def check_preexec_ppid_race_exit() -> None:
+    """pdeathsig_preexec exits the child if its parent already changed before prctl armed."""
+    if not sys.platform.startswith("linux"):
+        return
+    from python.viz.rv_contract import pdeathsig_preexec
+
+    good = subprocess.run(
+        [sys.executable, "-c", "print('RAN')"],
+        preexec_fn=pdeathsig_preexec(os.getpid()),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert good.returncode == 0 and "RAN" in good.stdout, (good.returncode, good.stdout, good.stderr)
+    # A parent pid that is not the forked child's parent simulates "parent died and the
+    # child was reparented between fork and prctl": the child must _exit(0) before exec.
+    raced = subprocess.run(
+        [sys.executable, "-c", "print('RAN')"],
+        preexec_fn=pdeathsig_preexec(os.getpid() + 1_000_003),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert raced.returncode == 0, (raced.returncode, raced.stderr)
+    assert "RAN" not in raced.stdout, "preexec must _exit(0) when getppid() != expected parent"
 
 
 def check_rv_input_schema() -> None:
@@ -1003,6 +1277,10 @@ def check_shm_slot_roundtrip_and_copy_only() -> None:
 def main() -> None:
     check_flag_off_is_placeholder()
     check_live_path_is_separate_process()
+    check_rvclient_launch_args()
+    check_preexec_ppid_race_exit()
+    check_parent_watch_errno_discipline()
+    check_orphan_cases()
     check_rv_input_schema()
     check_rv_output_schema()
     check_shm_slot_roundtrip_and_copy_only()

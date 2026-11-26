@@ -89,7 +89,7 @@ Windows. You do not need an administrator account. The full agent procedure (Tec
 | `cam_main` PIP | Small main-camera picture, top left, with a center cross. | on (VIZ `cam_main PIP`) | Offline smoke only |
 | View mode | Chase 3/4 bird view just behind the car, or a top-down BEV. Key `T` switches. | chase | Offline smoke only |
 
-GVD has no map widget in the supervisor. The "map" is the stage view above. The LIVE tab can print a `nav` GPS route-intent line on Tech (`python/sensors/route_intent.py`); it is display only and does not steer, stop, or pick a lane. A map-pin destination and turn-by-turn routing are not on main.
+GVD has no map widget in the supervisor. The "map" is the stage view above. The LIVE tab can print a `nav` GPS route-intent line on Tech (`python/sensors/route_intent.py`); it is display only and is not a steering, stopping, or lane-choice command. A map-pin destination and turn-by-turn routing are not on main.
 
 #### Nerd panel tabs
 
@@ -594,7 +594,7 @@ Before the first step the trainer measures free VRAM and shrinks the batch until
 - **Unpainted roads are not handled.** Labels need DecalRoad paint. Paint baked into the terrain texture gets no labels, so those roads are invalid slots.
 - **Lane keeping only, for the live driver.** Intersection labels and route-hindsight sidecars exist for training. Route intent on the LIVE tab is display only. `--route-cond` is an opt-in training input. There is no live turn-at-junction controller, and no map-pin or turn-by-turn router on main.
 - **Do not treat a model as proven off west_coast_usa.** Collection can use a map pool (default west_coast_usa, italy, east_coast_usa). The stratified spawn deck is west_coast_usa only. No holdout on file shows a model working on the other maps.
-- **Reality View is not a finished live view.** The live pane is still a placeholder. Offline previews have holes, and side/rear geometry is still being fixed. A fill model has not been built. Reality View is viz only; it does not drive.
+- **Reality View is not a finished live view.** The live pane is still a placeholder. Offline previews have holes, and side/rear geometry is still being fixed. A fill model has not been built. Reality View is viz only; it is not on the control path (AEB, engage, heartbeat, or the planner).
 - **Vision-only toy, not a driver aid.** LiDAR, radar and IMU extras are for display and are ignored by the planner.
 - **Not every collision is caught.** The collector writes `impacts.jsonl` and respawns after a logged impact, but it does not catch every collision. The supervisor infers crashes from vehicle damage jumps and stuck detection, which miss light contacts.
 - Retail BeamNG.drive is one window capture, not eight cameras.

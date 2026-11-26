@@ -3974,7 +3974,11 @@ def _default_ssl_stage(args: Any, strip_roots: Any, holdout_root: Path, cam_name
         source_meta,
         holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
     )
-    net = SceneNet(cams=cam_names, scale=float(args.scale), **net_kw).train()
+    import torch
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = SceneNet(cams=cam_names, scale=float(args.scale), **net_kw).to(device).train()
+    print(f"[GVD] ssl-pretrain: {len(train_rows)} train rows, device={device.type}", flush=True)
 
     def _ssl_image(row):
         loaded = _frame_row(

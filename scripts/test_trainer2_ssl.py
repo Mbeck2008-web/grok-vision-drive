@@ -205,6 +205,26 @@ def check_ssl_rows_train_only() -> None:
     print(f"ssl rows: {len(rows)} train rows (holdout + 4 s purge excluded), 12 evenly spaced used, key reuse, old stems kept OK")
 
 
+def check_ssl_reads_numpy_frames() -> None:
+    """``_frame_row`` returns a uint8 HWC numpy canvas. On main 8ce34d5 ``run_ssl_pretrain`` passed it
+    straight to ``_encode`` (it has ``.shape``), so SSL on real recordings crashed. It must be converted."""
+    torch = _torch()
+    if torch is None:
+        skip_check("check_ssl_reads_numpy_frames", "torch not installed")
+        return
+    from python.train.exp_ssl import run_ssl_pretrain
+    from python.train.scene_net import SceneNet
+
+    net = SceneNet(cams=("main",), scale=SCALE)
+    frames = [(f[0].permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+              for f in _fixture_frames(int(net.canvas_h), int(net.canvas_w), 3)]
+    with tempfile.TemporaryDirectory() as tmp:
+        stats = run_ssl_pretrain(net, [{"i": i, "kind": "train"} for i in range(3)], image_fn=lambda r: frames[int(r["i"])],
+                                 out_path=Path(tmp) / "stem.npz", lr=1e-3, seed=0)
+        assert int(stats["n"]) == 3 and (Path(tmp) / "stem.npz").is_file(), stats
+    print("ssl numpy: uint8 HWC canvases from _frame_row are converted (crashed on main) OK")
+
+
 def check_recipe_off_is_bit_identical() -> None:
     torch = _torch()
     if torch is None:
@@ -223,7 +243,8 @@ def check_recipe_off_is_bit_identical() -> None:
 
 
 def main() -> int:
-    checks = (check_ssl_default_on, check_ssl_ema_no_collapse, check_ssl_rows_train_only, check_recipe_off_is_bit_identical)
+    checks = (check_ssl_default_on, check_ssl_ema_no_collapse, check_ssl_rows_train_only, check_ssl_reads_numpy_frames,
+              check_recipe_off_is_bit_identical)
     failed = 0
     for check in checks:
         try:

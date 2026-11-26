@@ -194,6 +194,7 @@ def run_ssl_pretrain(
     collected = list(rows)
     if not collected:
         raise SslError("no train frames after the #187 split")
+    device = next(net.stem.parameters()).device
     opt = torch.optim.AdamW(net.stem.parameters(), lr=float(lr))
     rng = np.random.RandomState(int(seed))
     target = make_ema_target(net)
@@ -220,8 +221,9 @@ def run_ssl_pretrain(
             image = image_fn(row)
             if image is None:
                 continue
-            if not hasattr(image, "shape"):
+            if not hasattr(image, "shape") or not torch.is_tensor(image):
                 image = frame_to_nchw(image, net)
+            image = image.to(device)
             if epoch == 0 and init_net is not None and len(probe) < PROBE_N:
                 probe.append(image.detach().clone())
                 if len(probe) >= PROBE_N:

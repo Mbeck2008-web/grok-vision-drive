@@ -18,9 +18,14 @@ S7 ground clamp: a camera cannot see below the road. Depth farther than the down
    ground-plane hit (wide cam 88.7 deg vFOV, pitch -8, 1.24 m up) is capped there (x margin);
    true road, nearer surfaces (hood, walls) and rays at/above the horizon are untouched.
 S9 road is flat: net-labelled road pixels (>= 4 px inside the label, downward ray hitting within
-   25 m) are placed exactly on the ground plane, whatever the coarse net depth says, so the near road
+   25 m, not > 0.30 m above the plane by the net's own depth, S11) are placed exactly on the ground plane, so the near road
    cannot bend down/up and two cameras' road meets; road label edges, road beyond 25 m, non-road and
    upward rays are left alone.
+S11 snap rejection (runtime, no GT): a road-labelled px whose net depth puts it > 0.30 m above the road
+   plane is not snapped (wall labelled road stays put; pole/car under a 12x16 road label keeps height).
+S12 road snap runs only on ROAD_SNAP_CAMS (wide).
+S7b ground_clamp caps +inf on a downward ray at the ground hit; NaN stays NaN.
+S3b CamDepthFilter does not push on/above-road input below the road plane.
 S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
    (narrow 250, main/wide 250, 100 m cams 99.5); non-sky pixels beyond the cap or +inf are
    drawn AT the cap (kept, not dropped); sky stays sky; nearer depth is untouched.
@@ -269,8 +274,10 @@ def check_road_snap() -> None:
     assert sf.ROAD_SNAP_MAX_M == 25.0
     R = 20.0  # this small fixture's horizon is only ~60 m out, so test the range gate at 20 m
     out, m = sf.road_snap(cam, raw, road, max_hit_m=R)
-    core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= R)
+    above = (cam.pos[2] + raw * dz) > sf.ROAD_SNAP_MAX_ABOVE_M   # net already puts it > 0.30 m up: not road (S11)
+    core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= R) & ~above
     assert m.tolist() == core.tolist() and core.sum() > 1000
+    assert (sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (hit <= R) & above).any(), "fixture must have a too-near band"
     z = cam.pos[2] + out * dz
     assert np.max(np.abs(z[m])) < 1e-9, "snapped road must lie on the ground plane"
     zr = cam.pos[2] + raw * dz
@@ -313,6 +320,93 @@ def check_ownership() -> None:
         return sf.compose(chase, pts, col, np.full(len(pts), 3.0), sky_rgb=None, ground_rgb=None, fill=False).rgb
     red = lambda im: int(((im[..., 0] > 200) & (im[..., 1] < 50)).sum())
     assert red(draw(False)) > S and red(draw(True)) == 0
+
+
+def _flat_scene(cid, pos, pitch, fov, w=160, h=90):
+    cam = camera_from_angles(cid, pos, 0.0, pitch, fov, w, h, near_m=0.05, far_m=300.0)
+    ys, xs = np.mgrid[0:h, 0:w]
+    dz = sf._pixel_rays(cam)[..., 2]
+    down = dz < -1e-6
+    hit = np.where(down, cam.pos[2] / np.where(down, -dz, 1.0), np.inf)
+    return cam, ys, xs, dz, down, hit
+
+
+def check_snap_rejects_above_road() -> None:
+    """S11 (Skeptic/GVD): runtime-only snap rejection, no GT. A road-labelled px whose net depth puts it
+    more than ROAD_SNAP_MAX_ABOVE_M (0.30 m) above the road plane (net depth much shorter than its
+    ground-ray hit) is not snapped: a wall labelled road stays put, a pole/car labelled road at the
+    12x16 class grid keeps its height through road_snap + ground_clamp; true road still snaps."""
+    assert sf.ROAD_SNAP_MAX_ABOVE_M == 0.30
+    # wall labelled road: a vertical face 6 m ahead filling the lower image, the whole frame labelled road
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    wall = np.full(hit.shape, 6.0)
+    z = cam.pos[2] + wall * dz
+    face = down & (z > 0.31)
+    assert face.sum() > 500
+    out, m = sf.road_snap(cam, wall, np.ones(hit.shape, bool))
+    assert not m[face].any() and np.array_equal(out[face], wall[face]), "wall labelled road was snapped"
+    road_part = down & (z < 0.0)             # wall depth lies past the ground there: true under-road dip, snap it
+    assert m[road_part & sf._erode(np.ones(hit.shape, bool), sf.ROAD_SNAP_ERODE_PX) & (hit <= sf.ROAD_SNAP_MAX_M)].all()
+    # pole / car on exact road, road label at the 12x16 class grid (majority per cell)
+    for cid, pos, pitch, fov in (("wide", (0.0, 1.2, 1.24), -8.0, 88.7), ("main", (0.0, 1.2, 1.26), -6.0, 34.0)):
+        cam, ys, xs, dz, down, hit = _flat_scene(cid, pos, pitch, fov)
+        H, W = hit.shape
+        D = 8.0
+        zobj = cam.pos[2] + D * dz
+        obj = (xs >= 70) & (xs < 82) & down & (hit > D) & (zobj < 1.5)
+        assert obj.sum() > 30, (cid, obj.sum())
+        depth = np.where(obj, D, np.where(down, hit, 80.0))
+        cell = np.zeros((12, 16)); cnt = np.zeros((12, 16))
+        cy, cx = ys * 12 // H, xs * 16 // W
+        np.add.at(cell, (cy, cx), (~obj).astype(float)); np.add.at(cnt, (cy, cx), 1.0)
+        road = (cell / cnt > 0.5)[cy, cx] & down
+        assert road[obj].any(), "fixture: the coarse label must cover part of the object"
+        out, m = sf.road_snap(cam, depth, road)
+        out, cl = sf.ground_clamp(cam, out, margin=1.0)
+        hi = obj & (zobj > sf.ROAD_SNAP_MAX_ABOVE_M)
+        zo = cam.pos[2] + out * dz
+        assert np.max(np.abs(zo[hi] - zobj[hi])) < 1e-9, f"{cid}: object px above 0.30 m lost height"
+        assert m[road & ~obj & sf._erode(road, sf.ROAD_SNAP_ERODE_PX)].any(), "true road must still snap"
+
+
+def check_snap_cams() -> None:
+    """S12: road snap runs only on ROAD_SNAP_CAMS (wide): main/narrow net depth beats the flat z=0
+    plane at 10-15 m on clip015 (f40/f160 gate, f100/f200 held-out)."""
+    assert tuple(sf.ROAD_SNAP_CAMS) == ("wide",), sf.ROAD_SNAP_CAMS
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    raw = np.where(down, hit * 1.5, 80.0)
+    road = down.copy()
+    o, m = sf.snap_road_for_cam("wide", cam, raw, road)
+    assert m.any()
+    for cid in ("main", "narrow", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+        o, m = sf.snap_road_for_cam(cid, cam, raw, road)
+        assert not m.any() and np.array_equal(o, raw), cid
+
+
+def check_clamp_inf() -> None:
+    """S7b: +inf on a downward ray is under the road too: ground_clamp caps it at the ground hit
+    (Breaker: far_to_cap otherwise drew it at the cap, z=-274 m). Up rays keep +inf (far_to_cap's job)."""
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    d = np.full(hit.shape, np.inf)
+    out, m = sf.ground_clamp(cam, d, margin=1.0)
+    assert m[down].all() and np.allclose(out[down], hit[down])
+    assert np.isposinf(out[~down]).all() and not m[~down].any()
+    nan = np.full(hit.shape, np.nan)
+    out, m = sf.ground_clamp(cam, nan, margin=1.0)
+    assert np.isnan(out).all() and not m.any(), "NaN stays invalid"
+
+
+def check_filter_keeps_ground() -> None:
+    """S3b (Breaker F): CamDepthFilter never puts a pixel below the road plane that its input had on or
+    above it (the floor-lookup blend of a neighbouring ray's carried point dipped snapped road 5 cm)."""
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (-0.03, 1.2, 1.24), -8.0, 88.7, 320, 180)
+    depth = np.where(down, hit, 300.0)
+    valid = down & (hit < 60.0)
+    F = sf.CamDepthFilter()
+    for k in range(3):
+        d, _ = F.update(cam, depth, valid, (0.0, 1.0 * k, 0.0), 0.1 * k)
+    z = cam.pos[2] + d * dz
+    assert np.min(z[valid]) >= -1e-6, float(np.min(z[valid]))
 
 
 def check_flag_and_deps() -> None:
@@ -364,6 +458,22 @@ def test_road_snap() -> None:
     check_ownership()
 
 
+def test_snap_rejects_above_road() -> None:
+    check_snap_rejects_above_road()
+
+
+def test_snap_cams() -> None:
+    check_snap_cams()
+
+
+def test_clamp_inf() -> None:
+    check_clamp_inf()
+
+
+def test_filter_keeps_ground() -> None:
+    check_filter_keeps_ground()
+
+
 def test_flag_and_deps() -> None:
     check_flag_and_deps()
 
@@ -371,7 +481,8 @@ def test_flag_and_deps() -> None:
 if __name__ == "__main__":
     for fn in (check_metrics, check_damped_view_less_jitter, check_damped_follows_turn,
                check_depth_filter_flicker_and_reset, check_compose_explains_every_pixel,
-               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership, check_flag_and_deps):
+               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership,
+               check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_filter_keeps_ground, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

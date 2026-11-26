@@ -93,18 +93,23 @@ def cam_frame(cam, idx):
     clamp_frac = 0.0
     snapped = np.zeros((ph, pw), bool)
     if a.road_snap and a.depth_src != "gt":
-        depth, snapped = S.road_snap(CAM_POSE[cam], depth, road & ~sky, max_hit_m=a.road_snap_max_m or S.ROAD_SNAP_MAX_M)
+        depth, snapped = S.snap_road_for_cam(cam, CAM_POSE[cam], depth, road & ~sky, max_hit_m=a.road_snap_max_m or S.ROAD_SNAP_MAX_M)
     SNAP_STATS.setdefault(cam, []).append(float(np.mean(snapped)))
-    if a.ground_clamp and a.depth_src != "gt":
-        depth, cl = S.ground_clamp(CAM_POSE[cam], depth, margin=a.clamp_margin)
-        clamp_frac = float(np.mean(cl & ~sky))
-    CLAMP_STATS.setdefault(cam, []).append(clamp_frac)
     # depth edges: re-place edge pixels on the far side (local max), so no sheet joins fg and bg
     inv = 1.0 / np.maximum(depth, 1e-3)
     gy, gx = np.gradient(inv)
     cut = np.hypot(gx, gy) > 0.12 * inv
     far_side = cv2.dilate(depth.astype(np.float32), np.ones((5, 5), np.uint8))
-    depth = np.where(cut & ~sky & ~snapped, far_side, depth)
+    # ... but never under the road: where the far side is past the pixel's own ground hit (a thin pole or the road
+    # in front of a face would be pushed under the road, Breaker: -1.02 m at 29.9 m), keep the pixel's own depth
+    cp_ = CAM_POSE[cam]; rz = S._pixel_rays(cp_)[..., 2]; dn = rz < -1e-6
+    ghit = np.where(dn, float(cp_.pos[2]) / np.where(dn, -rz, 1.0), np.inf) * (a.clamp_margin if a.ground_clamp else 1.0)
+    depth = np.where(cut & ~sky & ~snapped & (far_side <= ghit), far_side, depth)
+    # and clamp after the cut, so nothing the cut touched can end up below the road
+    if a.ground_clamp and a.depth_src != "gt":
+        depth, cl = S.ground_clamp(CAM_POSE[cam], depth, margin=a.clamp_margin)
+        clamp_frac = float(np.mean(cl & ~sky))
+    CLAMP_STATS.setdefault(cam, []).append(clamp_frac)
     if a.max_depth == "cap":
         cap = S.depth_cap_m(c["far_m"])
         depth, farm = S.far_to_cap(depth, sky, cap)

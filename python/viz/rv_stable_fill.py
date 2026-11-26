@@ -294,6 +294,15 @@ class CamDepthFilter:
                     out_l[cy, cx] = (ww * lw + cc * cur[cy, cx]) / (ww + cc)
                     out_w[cy, cx] = np.minimum(ww + cc, self.max_weight)
         depth_f = np.where(val, np.exp(out_l), d)
+        # the blend uses a neighbouring ray's carried point (floor lookup): never let it push a pixel below the
+        # road plane that its own input had on or above it (snapped/clamped road stayed flat before the filter)
+        rz = _pixel_rays(cam)[..., 2]
+        hcam = float(cam.pos[2])
+        if hcam > 0:
+            dn = rz < -1e-6
+            hit = np.where(dn, hcam / np.where(dn, -rz, 1.0), np.inf)
+            keep = val & dn & (d <= hit * (1 + 1e-9)) & (depth_f > hit)
+            depth_f = np.where(keep, hit, depth_f)
         self.depth = np.where(val, depth_f, 1.0)
         self.w = out_w
         self.valid = val
@@ -345,13 +354,23 @@ def ground_clamp(cam: CameraPose, depth: np.ndarray, *, ground_z: float = 0.0, m
     dz = rays[..., 2]
     down = dz < -1e-6
     zmax = np.where(down, h / np.where(down, -dz, 1.0), np.inf) * float(margin)  # planar depth of the ground hit
-    clamp = down & np.isfinite(d) & (d > zmax)
+    clamp = down & ~np.isnan(d) & (d > zmax)        # +inf on a downward ray is under the road too
     return np.where(clamp, zmax, d), clamp
 
 
 ROAD_CLASS_IDS: tuple[int, ...] = (2,)   # net semantic id for drivable road (clip015: GT/ground-hit 0.86-1.04)
 ROAD_SNAP_MAX_M: float = 25.0           # GT road rises 0.4-1.1 deg off ego z=0 (clip015); beyond ~25 m pinning to z=0 is worse than net depth (f40 15-25 m: -0.55 m at 60 vs +0.15 m at 25)
 ROAD_SNAP_ERODE_PX: int = 4             # stay this many px inside the road class (12x16 class grid edges are blocky)
+# Runtime snap rejection (no GT): a road-labelled px whose net depth already puts it this far ABOVE the road
+# plane (net depth much shorter than the ground-ray hit) is a wall/car/pole/curb top under the coarse 12x16
+# label, not road; snapping it would throw it down and outward onto the plane (Tracer: 37% of snapped px on
+# clip015 f40 pillarR had GT z > 0.3 m, landing +5-7 m outward). Px below the plane (the dips) still snap.
+ROAD_SNAP_MAX_ABOVE_M: float = 0.30
+# Cams whose road is snapped. clip015 road |z err| vs GT, frozen code, median m (scratch/stable/bins5.py): main/narrow
+# lose to snap at 10-15 m (f40 main 0.19 -> 0.33, narrow 0.19 -> 0.34; GT road rises ~0.8 deg off the flat z=0 plane
+# and their net depth follows it); wide with the 0.30 m rejection gains at 0-5 m (f160 0.11 -> 0.07, held-out f100
+# 0.20 -> 0.06) and is unchanged at 5-15 m (its too-near road floats > 0.30 m and is rejected) -> wide only.
+ROAD_SNAP_CAMS: tuple[str, ...] = ("wide",)
 
 
 def _erode(mask: np.ndarray, r: int) -> np.ndarray:
@@ -372,14 +391,16 @@ def _erode(mask: np.ndarray, r: int) -> np.ndarray:
 
 
 def road_snap(cam: CameraPose, depth: np.ndarray, road: np.ndarray, *, ground_z: float = 0.0,
-              max_hit_m: float = ROAD_SNAP_MAX_M, erode_px: int = ROAD_SNAP_ERODE_PX) -> tuple[np.ndarray, np.ndarray]:
+              max_hit_m: float = ROAD_SNAP_MAX_M, erode_px: int = ROAD_SNAP_ERODE_PX,
+              max_above_m: float = ROAD_SNAP_MAX_ABOVE_M) -> tuple[np.ndarray, np.ndarray]:
     """Road pixels lie on the road: replace their depth with the exact ground-plane hit.
 
     The net's depth is a 12x16 grid per crop, upsampled; across the near road the true depth changes
     by ~10x over a few grid rows, so the upsampled road bends (below the road near the car, above it
     farther out) and the main/wide seams on the road do not meet. For pixels the net labels road, the
     camera mount already gives the answer at full resolution. Only pixels ``erode_px`` inside the
-    road label, with a downward ray hitting within ``max_hit_m``, are snapped. Returns (depth, mask).
+    road label, with a downward ray hitting within ``max_hit_m``, and not already more than ``max_above_m``
+    above the plane by the net's own depth (wall/car/pole under a coarse label), are snapped. Returns (depth, mask).
     """
     d = np.asarray(depth, np.float64)
     rd = np.asarray(road, bool)
@@ -391,8 +412,20 @@ def road_snap(cam: CameraPose, depth: np.ndarray, road: np.ndarray, *, ground_z:
     dz = _pixel_rays(cam)[..., 2]
     down = dz < -1e-6
     hit = np.where(down, h / np.where(down, -dz, 1.0), np.inf)
-    snap = _erode(rd, int(erode_px)) & down & (hit <= float(max_hit_m))
+    with np.errstate(invalid="ignore"):
+        above = np.isfinite(d) & (h + d * dz > float(max_above_m))   # net puts it > max_above_m over the plane
+    snap = _erode(rd, int(erode_px)) & down & (hit <= float(max_hit_m)) & ~above
     return np.where(snap, hit, d), snap
+
+
+def snap_road_for_cam(cam_id: str, cam: CameraPose, depth: np.ndarray, road: np.ndarray, **kw) -> tuple[np.ndarray, np.ndarray]:
+    """``road_snap`` for ROAD_SNAP_CAMS; other cams come back unchanged with an empty mask."""
+    d = np.asarray(depth, np.float64)
+    if cam_id in ROAD_SNAP_CAMS:
+        return road_snap(cam, d, road, **kw)
+    if d.shape != (cam.height, cam.width) or np.shape(road) != d.shape:
+        raise ValueError(f"depth {d.shape} / road {np.shape(road)} must be the camera shape {(cam.height, cam.width)}")
+    return d.copy(), np.zeros(d.shape, bool)
 
 
 def yield_mask(cam: CameraPose, better: Sequence[CameraPose], *, margin_px: float = 4.0, probe_m: float = 200.0) -> np.ndarray:

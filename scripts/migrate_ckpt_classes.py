@@ -2,7 +2,11 @@
 """Opt-in migration of a pre-v2 epoch checkpoint (96 object-class outputs) to the
 current 80-output head. Run it by hand; nothing in python/ calls it.
 
-    python scripts/migrate_ckpt_classes.py OLD.npz NEW.npz [--force]
+    python scripts/migrate_ckpt_classes.py OLD.npz [NEW.npz] [--min-free-gb N]
+
+The output is create-only: any existing path (a model file, an earlier migrated file,
+anything) is refused with exit 2 and left untouched. There is no overwrite switch.
+An unreadable or corrupt input is refused the same way (exit 2, no traceback).
 
 Why 96 and 80
 -------------
@@ -43,9 +47,12 @@ trained with the people class removed, so treat its class logits accordingly.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
+import io
 import os
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -185,24 +192,39 @@ def migrate_file(
     src: Path | str,
     dst: Path | str,
     *,
-    force: bool = False,
+    min_free_bytes: int | None = None,
     old_classes: Sequence[str] = OLD_CLASSES,
     old_classes_source: Mapping[str, Any] = OLD_CLASSES_SOURCE,
 ) -> dict[str, Any]:
-    """Write a migrated copy of ``src`` at ``dst``. ``src`` is never modified."""
-    from python.train.epoch_ckpt import load_epoch_ckpt, serialise
+    """Write a migrated copy of ``src`` at ``dst``. ``src`` is never modified; ``dst`` must not exist.
 
+    Every refusal is ``MigrationRefused`` (or ``MappingError`` for a class-list problem). ``min_free_bytes``
+    defaults to the trainer's epoch-checkpoint floor (``DEFAULT_MIN_FREE_GB``).
+    """
+    from python.train.epoch_ckpt import DEFAULT_MIN_FREE_GB, GB, EpochCkptRefused, ensure_free_space, load_epoch_ckpt, serialise
+
+    floor = int(DEFAULT_MIN_FREE_GB * GB) if min_free_bytes is None else int(min_free_bytes)
     src, dst = Path(src), Path(dst)
     if not src.is_file():
         raise MigrationRefused(f"input {src} is not a file")
-    if dst.exists() and src.exists() and os.path.samefile(src, dst):
-        raise MigrationRefused(f"output is the input file ({src}); the input is never overwritten")
-    if dst.exists() and not force:
-        raise MigrationRefused(f"output {dst} already exists (pass --force to replace it)")
+    if os.path.lexists(dst):
+        try:
+            same = os.path.samefile(src, dst)
+        except OSError:  # e.g. a dangling symlink: still an existing path, still refused below
+            same = False
+        if same:
+            raise MigrationRefused(f"output is the input file ({src}); the input is never overwritten")
+        raise MigrationRefused(f"output {dst} already exists; refusing to replace it (choose a new path)")
     new_classes, n_objects = _current_classes()
     mapping = build_mapping(old_classes, new_classes)  # unknown names fail here, before any file is written
-    src_bytes = src.read_bytes()
-    loaded = load_epoch_ckpt(src)
+    try:
+        src_bytes = src.read_bytes()  # read once: hashed and loaded from these same bytes
+    except OSError as exc:
+        raise MigrationRefused(f"cannot read input {src}: {exc}") from exc
+    try:
+        loaded = load_epoch_ckpt(src, data=src_bytes)
+    except (OSError, ValueError, KeyError, IndexError, EOFError, zipfile.BadZipFile) as exc:
+        raise MigrationRefused(f"input {src} is not a readable gvd-epoch-ckpt-1 file: {type(exc).__name__}: {str(exc)[:200]}") from exc
     meta = dict(loaded["meta"])
     if "migration" in meta:
         raise MigrationRefused(f"{src.name} was already migrated (meta.migration present)")
@@ -226,23 +248,29 @@ def migrate_file(
     meta.pop("format", None)  # serialise() re-stamps it
     meta.pop("weight_names", None)
     blob = serialise(new_weights, meta)
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_free_space(dst.parent, len(blob), floor)  # the same low-disk floor write_epoch_ckpt applies
+    except EpochCkptRefused as exc:
+        raise MigrationRefused(str(exc)) from exc
     tmp = dst.with_name(dst.name + f".partial-{os.getpid()}")
     try:
-        with open(tmp, "xb") as handle:
-            handle.write(blob)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if force:
-            os.replace(tmp, dst)
-        else:
-            os.link(tmp, dst)  # create-only: fails if dst appeared meanwhile
-            os.unlink(tmp)
-    except FileExistsError as exc:
-        raise MigrationRefused(f"output {dst} already exists") from exc
+        try:
+            with open(tmp, "xb") as handle:
+                handle.write(blob)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(tmp, dst)  # create-only: fails if dst appeared after the checks above
+        except FileExistsError as exc:
+            raise MigrationRefused(f"output {dst} already exists; refusing to replace it") from exc
+        except OSError as exc:
+            reason = "this filesystem cannot create-only link" if exc.errno in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP) else "write failed"
+            raise MigrationRefused(f"cannot create {dst} ({reason}): {exc}") from exc
     finally:
-        if tmp.exists():
-            tmp.unlink()
+        try:
+            if os.path.lexists(tmp):
+                tmp.unlink()
+        except OSError:
+            pass
     return {
         "input": str(src),
         "input_sha256": _sha256_bytes(src_bytes),
@@ -273,8 +301,15 @@ def format_summary(info: Mapping[str, Any]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Opt-in: migrate a pre-v2 (96-output) epoch checkpoint to the 80-output object-class head.")
     p.add_argument("input", help="gvd-epoch-ckpt-1 .npz with 96 object_class outputs (never modified)")
-    p.add_argument("output", nargs="?", help="new .npz (default: <input>.migrated5.npz); refused if it exists")
-    p.add_argument("--force", action="store_true", help="replace an existing OUTPUT (never the input)")
+    p.add_argument("output", nargs="?", help="new .npz (default: <input>.migrated5.npz); any existing path is refused (exit 2), never replaced")
+    from python.train.epoch_ckpt import DEFAULT_MIN_FREE_GB
+
+    p.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MIN_FREE_GB,
+        help=f"refuse if the write would leave less than this many GB free on the output volume (default {DEFAULT_MIN_FREE_GB:g}, the trainer's epoch-ckpt floor)",
+    )
     return p
 
 
@@ -282,7 +317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     out = Path(args.output) if args.output else default_output_path(args.input)
     try:
-        info = migrate_file(args.input, out, force=args.force)
+        info = migrate_file(args.input, out, min_free_bytes=int(args.min_free_gb * 1_000_000_000))
     except (MigrationRefused, MappingError) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

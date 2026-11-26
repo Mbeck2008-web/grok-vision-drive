@@ -103,6 +103,31 @@ def serialise(weights: Mapping[str, Any], meta: Mapping[str, Any]) -> bytes:
     return buffer.getvalue()
 
 
+def ensure_free_space(
+    parent: Path | str,
+    size: int,
+    min_free_bytes: int,
+    disk_free: Callable[[Path], int] | None = None,
+) -> int:
+    """Create ``parent`` if needed; refuse when writing ``size`` bytes would leave less than the floor.
+
+    Returns the free bytes before the write. Shared by every checkpoint writer.
+    """
+    parent = Path(parent)
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        probe = disk_free or (lambda p: int(shutil.disk_usage(p).free))
+        free = int(probe(parent))
+    except OSError as exc:
+        raise EpochCkptRefused(f"cannot check free space at {parent}: {exc}") from exc
+    if free - size < int(min_free_bytes):
+        raise EpochCkptRefused(
+            f"low space: {parent} has {free / GB:.2f} GB free; this {size / 1e6:.1f} MB checkpoint "
+            f"would leave {(free - size) / GB:.2f} GB < floor {int(min_free_bytes) / GB:.2f} GB"
+        )
+    return free
+
+
 def write_epoch_ckpt(
     path: Path | str,
     weights: Mapping[str, Any],
@@ -127,17 +152,7 @@ def write_epoch_ckpt(
         raise EpochCkptRefused(f"{path} already exists (create-only)")
     blob = serialise(weights, meta)
     size = len(blob)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        probe = disk_free or (lambda p: int(shutil.disk_usage(p).free))
-        free = int(probe(path.parent))
-    except OSError as exc:
-        raise EpochCkptRefused(f"cannot check free space at {path.parent}: {exc}") from exc
-    if free - size < int(min_free_bytes):
-        raise EpochCkptRefused(
-            f"low space: {path.parent} has {free / GB:.2f} GB free; this {size / 1e6:.1f} MB checkpoint "
-            f"would leave {(free - size) / GB:.2f} GB < floor {int(min_free_bytes) / GB:.2f} GB"
-        )
+    free = ensure_free_space(path.parent, size, min_free_bytes, disk_free)
     try:
         handle = open(path, "xb")
     except FileExistsError as exc:
@@ -171,10 +186,14 @@ def sha256_file(path: Path | str) -> str:
     return digest.hexdigest()
 
 
-def load_epoch_ckpt(path: Path | str) -> dict[str, Any]:
-    """``{"meta": {...}, "weights": {name: ndarray}}``. Checks the embedded step/epoch against the name."""
+def load_epoch_ckpt(path: Path | str, data: bytes | None = None) -> dict[str, Any]:
+    """``{"meta": {...}, "weights": {name: ndarray}}``. Checks the embedded step/epoch against the name.
+
+    ``data`` (optional) is the file's bytes already in memory: they are parsed instead of re-reading ``path``,
+    which is then only used for the name check.
+    """
     path = Path(path)
-    with np.load(path, allow_pickle=False) as blob:
+    with np.load(io.BytesIO(data) if data is not None else path, allow_pickle=False) as blob:
         meta = json.loads(str(blob["meta"].item() if blob["meta"].shape == () else blob["meta"]))
         if meta.get("format") != FORMAT:
             raise ValueError(f"{path.name}: not a {FORMAT} file")

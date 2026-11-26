@@ -491,8 +491,15 @@ class RvClient:
     and performs only non-blocking copy-only slot handoff (no in-process render).
     """
 
-    def __init__(self, slot_bytes: int = RV_DEFAULT_SLOT_BYTES, *, module: str = RV_RENDERER_MODULE) -> None:
+    def __init__(
+        self,
+        slot_bytes: int = RV_DEFAULT_SLOT_BYTES,
+        *,
+        module: str = RV_RENDERER_MODULE,
+        extra_args: tuple[str, ...] = (),
+    ) -> None:
         self.module = str(module)
+        self.extra_args = tuple(str(a) for a in extra_args)
         self._ring = DoubleBufferSlotLayout(slot_bytes=slot_bytes)
         self._proc: subprocess.Popen[bytes] | None = None
         self.note: str = ""
@@ -513,7 +520,7 @@ class RvClient:
             if preexec is not None:
                 popen_kw["preexec_fn"] = preexec
             self._proc = subprocess.Popen(
-                [sys.executable, "-m", self.module, "--serve", "--parent-pid", str(os.getpid())],
+                [sys.executable, "-m", self.module, "--serve", "--parent-pid", str(os.getpid()), *self.extra_args],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

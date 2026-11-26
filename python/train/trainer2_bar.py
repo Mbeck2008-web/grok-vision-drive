@@ -36,7 +36,9 @@ refused. Where the spec gives no number the entry is marked PROPOSAL (its
 ``basis``) instead of passing as spec: the limit then is the strictest
 reading ("every event handled" = 1.0, "0 contacts" = 0) and waits for Michael.
 
-Iteration bar: no regression vs the baseline in the table's direction. **2.0 bar:
+Iteration bar: every ``labelable_today`` slice in ``SLICE_RULES`` must be on both cards,
+and there is no regression vs the baseline in the table's direction. A stop-score slice
+must include ``missed`` (it is not defaulted to 0). **2.0 bar:
 every required slice in ``SLICE_RULES`` must be on the card and itself pass its
 table limit** (a missing slice, a ``None``/NaN value, or a value past the limit
 fails; "no worse than the previous model" entries pass through the iteration
@@ -201,7 +203,11 @@ def _meets_limit(direction: str, value: float | None, limit: float | None) -> bo
 
 
 def iteration_bar(new: Mapping[str, Any], prev: Mapping[str, Any]) -> dict[str, Any]:
-    """Per-iteration merge bar of ``new`` against the previous shipped/best ``prev``."""
+    """Per-iteration merge bar of ``new`` against the previous shipped/best ``prev``.
+
+    Every ``labelable_today`` slice in ``SLICE_RULES`` must be on both cards; a stop-score
+    slice (``stop_side_angle``, ``red_light``) must include ``missed`` (not defaulted to 0).
+    """
     _require_card(new, "new")
     _require_card(prev, "baseline")
     fail: list[str] = []
@@ -215,7 +221,9 @@ def iteration_bar(new: Mapping[str, Any], prev: Mapping[str, Any]) -> dict[str, 
         rec = (stop.get("slices") or {}).get(name)
         if rec is None:
             fail.append(f"{name}: slice missing from the stop scores")
-        elif int(rec.get("missed", 0)) != 0:
+        elif not isinstance(rec, Mapping) or "missed" not in rec or rec.get("missed") is None:
+            fail.append(f"{name}: missed not reported")
+        elif int(rec["missed"]) != 0:
             fail.append(name)
     for key, label in (("false_brakes_per_km", "false_brake_rate"), ("green_false_brakes_per_km", "green_false_brake_rate")):
         got, base = _num(stop.get(key)), _num(prev["stop"].get(key))
@@ -228,9 +236,20 @@ def iteration_bar(new: Mapping[str, Any], prev: Mapping[str, Any]) -> dict[str, 
     new_slices = _slices(new, "new")
     prev_slices = _slices(prev, "baseline")
     no_baseline = sorted(set(new_slices) - set(prev_slices))
+    # Iteration bar: every labelable-today slice in the table must be on both cards (a
+    # pair of empty slice maps is not "no regression"). Unlabelable slices may be absent.
+    for name, rule in SLICE_RULES.items():
+        if not rule["labelable_today"]:
+            continue
+        if name not in prev_slices or name not in new_slices:
+            key = f"slice:{name}"
+            if key not in fail:
+                fail.append(key)
     for name, (base, direction, _limit) in sorted(prev_slices.items()):
         if name not in new_slices:
-            fail.append(f"slice:{name}")
+            key = f"slice:{name}"
+            if key not in fail:
+                fail.append(key)
         elif _worse(direction, new_slices[name][0], base):
             fail.append(f"slice:{name}")
     return {"pass": not fail, "fail": fail, "lane_rms_gain": gain, "no_baseline": no_baseline,

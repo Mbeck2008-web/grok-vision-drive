@@ -5,6 +5,7 @@ Checks: check_iteration_bar_thresholds, check_2_0_bar_not_claimed_without_iqu45_
 check_intervention_tally, check_slice_direction, check_2_0_requires_every_slice_to_pass,
 check_slice_rules_table_pins_what_a_card_may_claim, check_slice_rules_table_matches_spec,
 check_unlabelable_slices_config_proposal_pending_michael,
+check_iteration_bar_requires_labelable_slices_and_missed, check_slice_rules_are_frozen,
 check_unmeasured_is_not_passing, check_unknown_intervention_kind_raises,
 check_backstop_config_proposal_pending_michael (AEB and hand-rule activations count as
 interventions: GVD call 2026-11-25, a PROPOSAL pending Michael), check_drive_record_gates.
@@ -92,9 +93,10 @@ def check_iteration_bar_thresholds() -> None:
         assert not res["pass"] and key in res["fail"], (kw, res)
     same_fb = iteration_bar(_card(0.15, fb_km=0.5, green_fb_km=0.1), prev)  # "no worse" includes equal
     assert same_fb["pass"], same_fb
-    thin_prev = _card(0.20, slices=_slices(**{"yield": None, "fog": None}))
-    new_slice = iteration_bar(_card(0.15, slices=_slices(**{"yield": _s(0.5, HI, 1.0)})), thin_prev)
-    assert new_slice["pass"] and new_slice["no_baseline"] == ["fog", "yield"], new_slice
+    # An unlabelable slice may appear on the new card only: listed under no_baseline, not a fail.
+    thin_prev = _card(0.20, slices=_slices(**{"fog": None}))
+    new_slice = iteration_bar(_card(0.15, slices=_slices()), thin_prev)
+    assert new_slice["pass"] and new_slice["no_baseline"] == ["fog"], new_slice
     bad = copy.deepcopy(prev)
     del bad["ssl_pretrain"]
     try:
@@ -474,9 +476,90 @@ def check_drive_record_gates() -> None:
     print("drive records: camera_only must be True, live_vram_gb must be present and <= 4.0 GB OK")
 
 
+
+def check_iteration_bar_requires_labelable_slices_and_missed() -> None:
+    """P8: empty slice maps on both cards fail. P10: a stop slice without 'missed' fails (not default 0)."""
+    from python.train.trainer2_bar import SLICE_RULES, iteration_bar
+
+    assert iteration_bar(_card(0.15), _card(0.20))["pass"]
+    # P8
+    res = iteration_bar(_card(0.15, slices={}), _card(0.20, slices={}))
+    labelable = [n for n, r in SLICE_RULES.items() if r["labelable_today"]]
+    unlabelable = [n for n, r in SLICE_RULES.items() if not r["labelable_today"]]
+    assert not res["pass"], res
+    for name in labelable:
+        assert f"slice:{name}" in res["fail"], (name, res)
+    for name in unlabelable:
+        assert f"slice:{name}" not in res["fail"], (name, res)
+    # Unlabelable slices may be absent from both cards; the rest of the bar still passes.
+    dropped = {n: None for n in unlabelable}
+    assert iteration_bar(_card(0.15, slices=_slices(**dropped)), _card(0.20, slices=_slices(**dropped)))["pass"]
+    # Missing from the baseline only (yield is labelable).
+    res = iteration_bar(_card(0.15), _card(0.20, slices=_slices(**{"yield": None})))
+    assert not res["pass"] and "slice:yield" in res["fail"], res
+    # P10: stop slice present but 'missed' omitted is not a 0-miss pass.
+    for gone in ("stop_side_angle", "red_light"):
+        card = _card(0.15)
+        rec = dict(card["stop"]["slices"][gone])
+        rec.pop("missed")
+        card["stop"]["slices"][gone] = rec
+        res = iteration_bar(card, _card(0.20))
+        assert not res["pass"] and f"{gone}: missed not reported" in res["fail"], (gone, res)
+    # An explicit missed=0 still passes; missed=None does not.
+    card = _card(0.15)
+    card["stop"]["slices"]["stop_side_angle"] = {"events": 4, "missed": 0}
+    assert iteration_bar(card, _card(0.20))["pass"]
+    card = _card(0.15)
+    card["stop"]["slices"]["red_light"] = {"events": 6, "missed": None}
+    res = iteration_bar(card, _card(0.20))
+    assert not res["pass"] and "red_light: missed not reported" in res["fail"], res
+    print("iteration bar: every labelable slice required on both cards (empty maps fail); stop 'missed' is required OK")
+
+
+def check_slice_rules_are_frozen() -> None:
+    """X23: SLICE_RULES is immutable, including each nested rule (MappingProxyType or equivalent)."""
+    from python.train.trainer2_bar import SLICE_RULES
+
+    rule = SLICE_RULES["yield"]
+    try:
+        SLICE_RULES["yield"] = dict(rule)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("SLICE_RULES accepted an item assignment (not frozen)")
+    try:
+        del SLICE_RULES["yield"]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("SLICE_RULES accepted a deletion (not frozen)")
+    try:
+        SLICE_RULES.update({})  # type: ignore[attr-defined]
+    except (TypeError, AttributeError):
+        pass
+    else:
+        raise AssertionError("SLICE_RULES.update succeeded")
+    try:
+        SLICE_RULES["yield"]["limit"] = 0.1
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("a nested SLICE_RULES entry accepted an item assignment (not frozen)")
+    try:
+        SLICE_RULES["yield"]["direction"] = "lower_is_better"
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("a nested SLICE_RULES entry accepted a direction change")
+    assert SLICE_RULES["yield"]["limit"] == 1.0 and SLICE_RULES["yield"] is rule
+    print("slice rules table: SLICE_RULES and each nested rule are frozen OK")
+
+
 def main() -> int:
     checks = (
         check_iteration_bar_thresholds,
+        check_iteration_bar_requires_labelable_slices_and_missed,
+        check_slice_rules_are_frozen,
         check_intervention_tally,
         check_2_0_bar_not_claimed_without_iqu45_drive,
         check_slice_direction,

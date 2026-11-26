@@ -1,5 +1,8 @@
 """Edge-case clip mode: many 30-60 s lossless clips per session, each in its own new folder.
 
+Optional ``--long-clips N`` mixes N 3-5 minute highway/arterial clips through the batch
+(default 0, so current behaviour is unchanged).
+
     py -3 scripts\\collect_clips.py --clips 5 --out E:\\GVD_data\\clips_v2 \\
         --maps west_coast_usa,italy,east_coast_usa --max-traffic 6 --seed 1 --chase-cam
 
@@ -24,7 +27,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.collect.clip_mode import EDGE_CASES, GFX, MAX_CLIP_S, MIN_CLIP_S, run_clips  # noqa: E402
+from python.collect.clip_mode import (  # noqa: E402
+    DEFAULT_LONG_CLIP_MAX_S,
+    DEFAULT_LONG_CLIP_MIN_S,
+    DEFAULT_LONG_CLIPS,
+    EDGE_CASES,
+    GFX,
+    MAX_CLIP_S,
+    MIN_CLIP_S,
+    run_clips,
+)
 from python.collect.tech_watchdog import (  # noqa: E402
     DEFAULT_TECH_FAIL_RELAUNCH,
     DEFAULT_TECH_RELAUNCH_CAP,
@@ -43,6 +55,19 @@ def _maps(text: str) -> tuple[str, ...]:
     return out
 
 
+def _long_clip_s(text: str) -> tuple[float, float]:
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("--long-clip-s needs MIN,MAX")
+    try:
+        lo, hi = float(parts[0]), float(parts[1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--long-clip-s needs MIN,MAX as numbers") from exc
+    if not (lo > 0.0 and hi >= lo):
+        raise argparse.ArgumentTypeError("--long-clip-s needs 0 < MIN <= MAX")
+    return lo, hi
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", type=Path, required=True, help="Root folder; a new clips_<stamp> session goes under it.")
@@ -52,6 +77,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-traffic", type=int, default=6, help="Most companion cars per clip (heavy_traffic uses all).")
     parser.add_argument("--min-s", type=float, default=MIN_CLIP_S, help="Shortest clip, seconds (>= 30).")
     parser.add_argument("--max-s", type=float, default=MAX_CLIP_S, help="Longest clip, seconds (<= 60).")
+    parser.add_argument(
+        "--long-clips",
+        type=int,
+        default=DEFAULT_LONG_CLIPS,
+        metavar="N",
+        help=(
+            "How many clips in this batch are long highway/arterial runs "
+            f"(default {DEFAULT_LONG_CLIPS}: off, same as today). "
+            "They are spread through the batch by --seed, use a highway spawn "
+            "at highway target speed (20-30 m/s), and are tagged long_highway."
+        ),
+    )
+    parser.add_argument(
+        "--long-clip-s",
+        type=_long_clip_s,
+        default=_long_clip_s(f"{DEFAULT_LONG_CLIP_MIN_S:g},{DEFAULT_LONG_CLIP_MAX_S:g}"),
+        metavar="MIN,MAX",
+        help=(
+            "Duration range in seconds for --long-clips "
+            f"(default {DEFAULT_LONG_CLIP_MIN_S:g},{DEFAULT_LONG_CLIP_MAX_S:g})."
+        ),
+    )
     parser.add_argument("--edge-cases", default="", help=f"Comma-separated subset of {','.join(EDGE_CASES)}.")
     parser.add_argument("--chase-cam", action="store_true", help="Also record the recording-only chase camera.")
     parser.add_argument(
@@ -99,6 +146,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"unknown arguments {extra}; pass collector arguments after --")
     if args.clips < 1:
         parser.error("--clips must be at least 1")
+    if args.long_clips < 0:
+        parser.error("--long-clips must be 0 or more")
+    if args.long_clips > args.clips:
+        parser.error("--long-clips cannot exceed --clips")
     if args.max_traffic < 0:
         parser.error("--max-traffic must be 0 or more")
     if not (MIN_CLIP_S <= args.min_s <= args.max_s <= MAX_CLIP_S):
@@ -158,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
         gfx=args.gfx,
         after_clip=after_clip,
         stop_file=args.stop_file,
+        long_clips=args.long_clips,
+        long_min_s=args.long_clip_s[0],
+        long_max_s=args.long_clip_s[1],
     )
     print(f"session {session}")
     if watchdog.halt_reason:

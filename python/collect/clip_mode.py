@@ -34,11 +34,12 @@ import json
 import math
 import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from python.collect.auto_mode import hour_to_beamng_tod
+from python.collect.spawn_mix import HIGHWAY, SPEED
 from python.sensors.tech import TECH_GFX
 
 EDGE_CASES: tuple[str, ...] = (
@@ -69,6 +70,12 @@ EGO_MODEL = "sbr"
 GFX = TECH_GFX
 MIN_CLIP_S = 30.0
 MAX_CLIP_S = 60.0
+# Long highway/arterial clips (opt-in via collect_clips --long-clips).
+DEFAULT_LONG_CLIPS = 0
+DEFAULT_LONG_CLIP_MIN_S = 180.0
+DEFAULT_LONG_CLIP_MAX_S = 300.0
+LONG_HIGHWAY_TAG = "long_highway"
+HIGHWAY_SPEED_MIN, HIGHWAY_SPEED_MAX = SPEED[HIGHWAY]
 SPAWN_KIND = {"merge": "ramp", "cut_in": "highway", "heavy_traffic": "highway", "sharp_curve": "city", "junction": "city"}
 CUT_IN_AHEAD_M = 25.0
 # Quality thresholds (quick check, not a training filter).
@@ -106,6 +113,10 @@ class ClipPlan:
     traffic_ahead_m: float | None
     ego_model: str = EGO_MODEL
     notes: list[str] = field(default_factory=list)
+    long_highway: bool = False
+    speed_min: float | None = None
+    speed_max: float | None = None
+    tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -113,6 +124,54 @@ class ClipPlan:
 
 def clip_rng(seed: int, index: int) -> random.Random:
     return random.Random(f"gvd-clip:{int(seed)}:{int(index)}")
+
+
+def long_clip_indices(clips: int, long_clips: int, seed: int) -> tuple[int, ...]:
+    """Spread ``long_clips`` indices through ``[0, clips)`` using ``seed``.
+
+    Deterministic. One index is drawn in each equal-sized bucket so the
+    long clips are mixed through the batch, not packed at the end.
+    """
+    clips = int(clips)
+    n = int(long_clips)
+    if n < 0:
+        raise ValueError(f"long_clips must be 0 or more, not {n}")
+    if n == 0 or clips <= 0:
+        return ()
+    if n > clips:
+        raise ValueError(f"long_clips {n} exceeds clips {clips}")
+    rng = random.Random(f"gvd-long-clips:{int(seed)}:{clips}:{n}")
+    picked = []
+    for i in range(n):
+        lo = i * clips // n
+        hi = (i + 1) * clips // n
+        picked.append(rng.randrange(lo, hi))
+    return tuple(picked)
+
+
+def apply_long_highway(plan: ClipPlan, *, min_s: float, max_s: float) -> ClipPlan:
+    """Turn one planned clip into a long highway/arterial run at highway speed."""
+    if float(min_s) <= 0.0 or float(max_s) < float(min_s):
+        raise ValueError(f"long clip length range {min_s}-{max_s} s is empty")
+    rng = random.Random(f"gvd-long-clip:{int(plan.seed)}:{int(plan.index)}")
+    duration = round(rng.uniform(float(min_s), float(max_s)), 3)
+    tags = list(plan.tags)
+    if LONG_HIGHWAY_TAG not in tags:
+        tags.append(LONG_HIGHWAY_TAG)
+    notes = list(plan.notes)
+    if LONG_HIGHWAY_TAG not in notes:
+        notes.append(LONG_HIGHWAY_TAG)
+    return replace(
+        plan,
+        duration_s=duration,
+        spawn_kind=HIGHWAY,
+        long_highway=True,
+        speed_min=HIGHWAY_SPEED_MIN,
+        speed_max=HIGHWAY_SPEED_MAX,
+        min_paint_cov=None,
+        tags=tags,
+        notes=notes,
+    )
 
 
 def plan_clip(
@@ -216,6 +275,10 @@ def clip_argv(plan: ClipPlan, out_dir: Path, *, chase: bool = False, extra: Iter
         argv += ["--min-paint-cov", f"{plan.min_paint_cov:g}"]
     if plan.traffic_ahead_m is not None:
         argv += ["--traffic-ahead-m", f"{plan.traffic_ahead_m:g}"]
+    if plan.speed_min is not None:
+        argv += ["--speed-min", repr(float(plan.speed_min))]
+    if plan.speed_max is not None:
+        argv += ["--speed-max", repr(float(plan.speed_max))]
     if chase:
         argv.append("--chase-cam")
     argv += [str(x) for x in extra]
@@ -436,7 +499,9 @@ def quality_check(clip: Path | str, plan: ClipPlan, *, exit_code: int) -> dict[s
         names = {str(c.get("name")) for c in (r.get("traffic") or []) if isinstance(c, dict)}
         placed = max(placed, sum(1 for n in names if n.startswith("gvd_traffic_")))
     observed, note = _observe(plan, clip, rows, gt, placed)
-    if observed is False:
+    if plan.long_highway:
+        observed, note = None, f"{LONG_HIGHWAY_TAG}: edge-case observation skipped; long highway/arterial run"
+    elif observed is False:
         reasons.append(f"edge case not observed ({note})")
     clip_class = "train" if not reasons else ("reject" if (len(rows) == 0 or lossy or undecodable) else "pretrain_only")
     return {
@@ -480,6 +545,8 @@ def write_tags(
         "edge_case_note": qc.get("edge_case_note"),
         "qc": dict(qc),
         "plan_notes": list(plan.notes),
+        "tags": list(plan.tags),
+        "long_highway": bool(plan.long_highway),
         **dict(extra or {}),
     }
     with open(path, "x", encoding="utf-8") as fh:
@@ -504,6 +571,9 @@ def run_clips(
     gfx: str = GFX,
     after_clip: Callable[..., str | None] | None = None,
     stop_file: Path | str | None = None,
+    long_clips: int = DEFAULT_LONG_CLIPS,
+    long_min_s: float = DEFAULT_LONG_CLIP_MIN_S,
+    long_max_s: float = DEFAULT_LONG_CLIP_MAX_S,
 ) -> Path:
     """Record ``clips`` clips into a new session folder. ``runner(argv)`` runs the collector.
 
@@ -536,6 +606,9 @@ def run_clips(
             "chase_cam": bool(chase),
             "ego_model": EGO_MODEL,
             "gfx": gfx,
+            "long_clips": int(long_clips),
+            "long_min_s": float(long_min_s),
+            "long_max_s": float(long_max_s),
             "results": results,
         }
         if stop_reason:
@@ -544,6 +617,7 @@ def run_clips(
         tmp.replace(manifest)
 
     _save()
+    long_at = set(long_clip_indices(int(clips), int(long_clips), int(seed)))
     for index in range(int(clips)):
         if stop_file is not None and Path(stop_file).exists():
             stop_reason = STOP_FILE_REASON
@@ -551,6 +625,8 @@ def run_clips(
             _save()
             break
         plan = plan_clip(index, seed, maps, max_traffic, min_s=min_s, max_s=max_s, edge_cases=cases)
+        if index in long_at:
+            plan = apply_long_highway(plan, min_s=long_min_s, max_s=long_max_s)
         clip = new_clip_dir(session, plan)
         argv = clip_argv(plan, clip, chase=chase, extra=extra)
         log(f"clip {index + 1}/{clips} {clip.name}: {plan.edge_case} map={plan.map} traffic={plan.traffic} "

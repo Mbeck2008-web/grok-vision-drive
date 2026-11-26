@@ -664,6 +664,24 @@ def check_supervisor_after_apply_is_copy_only() -> None:
             fh.write(struct.pack("<Q", seq_now + 2))
             fh.flush()
 
+        # Writer starts a new write while the supervisor is copying (seq changes under the copy):
+        # simulated with a destination whose slice-assign bumps the slot seq after copying.
+        class _RacingDst(bytearray):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                cur = struct.unpack_from("<Q", writer._mm, 0)[0]
+                struct.pack_into("<Q", writer._mm, 0, cur + 1)
+
+        assert writer.write(_valid_rv_slot(12))
+        racing = _RacingDst(host.slot_capacity)
+        n_r, _ = writer.try_copy_into(racing, 0)
+        assert n_r < 0, "copy raced by a concurrent writer (seq changed under the copy) was not dropped"
+        cur = struct.unpack_from("<Q", writer._mm, 0)[0]
+        struct.pack_into("<Q", writer._mm, 0, cur + 1)  # writer finishes: seq even again
+        assert host.after_apply(None, seq=5) is True  # host applies the finished slot
+        raw = _valid_rv_slot(12)
+        assert host.view_bytes() == raw, "finished slot after a raced copy was not applied"
+
         # Bad magic -> rejected by the header validate, previous view kept.
         bad_hdr = bytearray(_valid_rv_slot(8))
         bad_hdr[0:8] = b"BADMAGIC"
@@ -719,9 +737,18 @@ def check_supervisor_after_apply_is_copy_only() -> None:
             assert not any(s in m.lower() for s in forbidden_sub), f"{rel} imports forbidden safety symbol {m}"
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    """Run all three checks (default, as run_offline_suite does) or ``--only NAME ...``."""
+    import argparse
+
+    checks = (check_safety_loop_latency_unchanged, check_renderer_crash_degrades, check_supervisor_after_apply_is_copy_only)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--only", nargs="*", default=None, choices=[c.__name__ for c in checks])
+    args = ap.parse_args(argv)
     failures = []
-    for fn in (check_safety_loop_latency_unchanged, check_renderer_crash_degrades, check_supervisor_after_apply_is_copy_only):
+    for fn in checks:
+        if args.only is not None and fn.__name__ not in args.only:
+            continue
         t0 = time.perf_counter()
         try:
             fn()

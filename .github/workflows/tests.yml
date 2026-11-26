@@ -113,3 +113,6 @@ jobs:
 
       - name: Reality View contract tests
         run: python scripts/test_rv_contract.py
+
+      - name: Reality View isolation harness tests (step 3)
+        run: python scripts/test_rv_isolation.py

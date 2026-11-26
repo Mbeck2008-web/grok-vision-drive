@@ -37,7 +37,7 @@ SHADOW_BGR = (48, 32, 220)  # warm red, BGR
 
 
 class SceneCkptInputError(ValueError):
-    """Main-camera shape/channel mismatch, or a checkpoint this runtime refuses."""
+    """A camera picture with the wrong shape/channels, or a checkpoint this runtime refuses."""
 
 
 def overlay_bgr(kind: str) -> tuple[int, int, int]:
@@ -82,6 +82,9 @@ def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float 
         return "shadow"
     from python.train.scene_lane_runtime import scene_lane_decision, straight_lane_path
 
+    # A camera the model needs is absent this tick: its sector is black, so no steering from it.
+    if pred is not None and getattr(pred, "missing_cams", ()):
+        pred = None
     lane_x = None if pred is None else getattr(pred, "lane_x", None)
     try:
         conf = 0.0 if pred is None else float(getattr(pred, "confidence", 0.0) or 0.0)
@@ -370,7 +373,7 @@ def scene_ckpt_as_state(
     if pred is not None and hasattr(pred, "as_state"):
         out = dict(pred.as_state())
     else:
-        out = {"lane_x": None, "confidence": 0.0, "canvas": None}
+        out = {"lane_x": None, "confidence": 0.0, "canvas": None, "missing_cams": []}
     out["source"] = "scene_ckpt"
     out["shadow"] = not bool(drive)
     out["drive"] = bool(drive)
@@ -388,6 +391,10 @@ class SceneCkptPred:
     confidence: float = 0.0
     heading_err_rad: float | None = None
     canvas_shape: tuple[int, ...] | None = None
+    # Cameras the checkpoint needs that this tick's frame dict lacks (absent or 0-size). compose_strip
+    # paints them black; the prediction is still computed (shadow draws it) but it is flagged, and
+    # --scene-ckpt-drive treats a flagged tick as no prediction.
+    missing_cams: tuple[str, ...] = ()
 
     @classmethod
     def empty(cls) -> "SceneCkptPred":
@@ -403,6 +410,7 @@ class SceneCkptPred:
             "centers": centers,
             "caption": scene_ckpt_caption(self.confidence),
             "canvas": list(self.canvas_shape) if self.canvas_shape else None,
+            "missing_cams": list(self.missing_cams),
         }
         if self.heading_err_rad is not None:
             out["heading_err_rad"] = float(self.heading_err_rad)
@@ -547,6 +555,7 @@ class SceneCkptRuntime:
         self.canvas_w = int(getattr(self.net, "canvas_w", 256))
         self.aux_sensors = bool(getattr(self.net, "aux_sensors", False))
         self.state = self.net.initial_state(device="cpu")
+        self._last_missing: tuple[str, ...] = ()
 
     @property
     def wants_route(self) -> bool:
@@ -559,8 +568,10 @@ class SceneCkptRuntime:
         makes, so every camera in the dict (wide included) lands in its sector.
         """
         pics = _require_frames(frames)
+        missing = _missing_cams(frames if isinstance(frames, Mapping) else None, self.cams)
+        self._note_missing(missing)
         if pics is None:
-            return SceneCkptPred.empty()
+            return SceneCkptPred(missing_cams=missing)
         canvas = _main_canvas(pics, self.cams, self.canvas_h, self.canvas_w, float(getattr(self.net, "scale", 1.0) or 1.0))
         import torch
 
@@ -573,7 +584,7 @@ class SceneCkptRuntime:
                 pred, self.state = self.net.forward(canvas, 0.0 if dt_s is None else float(dt_s), self.state)
         raw = getattr(pred, "lane_gt", None)
         if raw is None:
-            return SceneCkptPred(canvas_shape=tuple(int(x) for x in canvas.shape))
+            return SceneCkptPred(canvas_shape=tuple(int(x) for x in canvas.shape), missing_cams=missing)
         vec = raw.detach().float().cpu().numpy().reshape(-1).astype(np.float32)
         heading = None
         if vec.size >= 2:
@@ -586,7 +597,37 @@ class SceneCkptRuntime:
             confidence=confidence_from_vector(vec),
             heading_err_rad=heading,
             canvas_shape=tuple(int(x) for x in canvas.shape),
+            missing_cams=missing,
         )
+
+    def _note_missing(self, missing: tuple[str, ...]) -> None:
+        """Print the set of missing cameras once each time it changes (not every tick)."""
+        if missing == self._last_missing:
+            return
+        self._last_missing = missing
+        if missing:
+            print(
+                f"[GVD] scene-ckpt cams missing: {','.join(missing)} "
+                "(black sector this tick; --scene-ckpt-drive treats it as no prediction)",
+                flush=True,
+            )
+        else:
+            print("[GVD] scene-ckpt cams missing: none (all cameras present)", flush=True)
+
+
+def _missing_cams(frames: Mapping[str, Any] | None, cams: tuple[str, ...]) -> tuple[str, ...]:
+    """The checkpoint's cameras (strip order) that are absent or 0-size in ``frames``.
+
+    ``cam_main`` counts as ``main`` (compose_strip accepts either). ``None`` means nothing was grabbed.
+    """
+    out = []
+    for cam in (cams or ("main",)):
+        img = None if frames is None else frames.get(cam)
+        if img is None and cam == "main" and frames is not None:
+            img = frames.get("cam_main")
+        if img is None or np.asarray(img).size == 0:
+            out.append(cam)
+    return tuple(out)
 
 
 def _require_frames(frames: Any) -> Mapping[str, Any] | None:

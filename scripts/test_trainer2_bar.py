@@ -3,6 +3,8 @@
 
 Checks: check_iteration_bar_thresholds, check_2_0_bar_not_claimed_without_iqu45_drive,
 check_intervention_tally, check_slice_direction, check_2_0_requires_every_slice_to_pass,
+check_slice_rules_table_pins_what_a_card_may_claim, check_slice_rules_table_matches_spec,
+check_unlabelable_slices_config_proposal_pending_michael,
 check_unmeasured_is_not_passing, check_unknown_intervention_kind_raises,
 check_backstop_config_proposal_pending_michael (AEB and hand-rule activations count as
 interventions: GVD call 2026-11-25, a PROPOSAL pending Michael), check_drive_record_gates.
@@ -30,12 +32,19 @@ def _s(value, direction=HI, limit=None):
 
 
 def _slices(**over):
+    """Every slice in SLICE_RULES at a passing value; ``over`` replaces (or, with None, drops) entries."""
     base = {
-        "lead_brake": _s(1.0, HI, 1.0),
-        "cut_in": _s(1.0, HI, 1.0),
-        "sharp_curve": _s(0.9, HI, 0.8),
+        "lead_vehicle_collisions": _s(0, LO, 0),
+        "lead_brake_light_reaction": _s(1.0, HI, 1.0),
         "cut_in_collisions": _s(0, LO, 0),
-        "cut_in_false_brakes_per_km": _s(0.5, LO, 1.0),
+        "cut_in_false_brakes_per_km": _s(0.5, LO),
+        "cone_contacts": _s(0, LO, 0),
+        "yield": _s(1.0, HI, 1.0),
+        "railroad_crossing": _s(1.0, HI, 1.0),
+        "sharp_curve": _s(1.0, HI, 1.0),
+        "night": _s(1.0, HI, 1.0),
+        "rain": _s(1.0, HI, 1.0),
+        "fog": _s(1.0, HI, 1.0),
     }
     base.update(over)
     return {k: v for k, v in base.items() if v is not None}
@@ -76,15 +85,16 @@ def check_iteration_bar_thresholds() -> None:
         ({"red_missed": 1}, "red_light"),
         ({"fb_km": 0.51}, "false_brake_rate"),
         ({"green_fb_km": 0.11}, "green_false_brake_rate"),
-        ({"slices": _slices(cut_in=_s(0.99, HI, 1.0))}, "slice:cut_in"),
-        ({"slices": _slices(cut_in=None)}, "slice:cut_in"),
+        ({"slices": _slices(**{"yield": _s(0.99, HI, 1.0)})}, "slice:yield"),
+        ({"slices": _slices(**{"yield": None})}, "slice:yield"),
     ):
         res = iteration_bar(_card(0.15, **kw), prev)
         assert not res["pass"] and key in res["fail"], (kw, res)
     same_fb = iteration_bar(_card(0.15, fb_km=0.5, green_fb_km=0.1), prev)  # "no worse" includes equal
     assert same_fb["pass"], same_fb
-    new_slice = iteration_bar(_card(0.15, slices=_slices(**{"yield": _s(0.5, HI, 1.0)})), prev)
-    assert new_slice["pass"] and new_slice["no_baseline"] == ["yield"], new_slice
+    thin_prev = _card(0.20, slices=_slices(**{"yield": None, "fog": None}))
+    new_slice = iteration_bar(_card(0.15, slices=_slices(**{"yield": _s(0.5, HI, 1.0)})), thin_prev)
+    assert new_slice["pass"] and new_slice["no_baseline"] == ["fog", "yield"], new_slice
     bad = copy.deepcopy(prev)
     del bad["ssl_pretrain"]
     try:
@@ -155,27 +165,25 @@ def check_slice_direction() -> None:
 
     prev = _card(0.20)
     for over, key in (
-        ({"cut_in_false_brakes_per_km": _s(4.0, LO, 1.0)}, "slice:cut_in_false_brakes_per_km"),  # 0.5 -> 4.0 /km
+        ({"cut_in_false_brakes_per_km": _s(4.0, LO)}, "slice:cut_in_false_brakes_per_km"),  # 0.5 -> 4.0 /km
         ({"cut_in_collisions": _s(3, LO, 0)}, "slice:cut_in_collisions"),  # 0 -> 3
-        ({"cut_in_false_brakes_per_km": _s(0.5000001, LO, 1.0)}, "slice:cut_in_false_brakes_per_km"),
-        ({"lead_brake": _s(0.99, HI, 1.0)}, "slice:lead_brake"),
-        ({"lead_brake": _s(float("nan"), HI, 1.0)}, "slice:lead_brake"),
+        ({"cut_in_false_brakes_per_km": _s(0.5000001, LO)}, "slice:cut_in_false_brakes_per_km"),
+        ({"lead_brake_light_reaction": _s(0.99, HI, 1.0)}, "slice:lead_brake_light_reaction"),
+        ({"lead_brake_light_reaction": _s(float("nan"), HI, 1.0)}, "slice:lead_brake_light_reaction"),
         ({"cut_in_collisions": _s(float("nan"), LO, 0)}, "slice:cut_in_collisions"),
         ({"cut_in_collisions": _s(None, LO, 0)}, "slice:cut_in_collisions"),
         ({"cut_in_collisions": _s(float("inf"), LO, 0)}, "slice:cut_in_collisions"),
-        ({"lead_brake": _s(True, HI, 1.0)}, "slice:lead_brake"),  # a bool is not a measurement
+        ({"lead_brake_light_reaction": _s(True, HI, 1.0)}, "slice:lead_brake_light_reaction"),  # a bool is not a measurement
     ):
         res = iteration_bar(_card(0.15, slices=_slices(**over)), prev)
         assert not res["pass"] and key in res["fail"], (over, res)
     better = iteration_bar(_card(0.15, slices=_slices(
-        cut_in_false_brakes_per_km=_s(0.2, LO, 1.0), lead_brake=_s(1.0, HI, 1.0))), prev)
+        cut_in_false_brakes_per_km=_s(0.2, LO), lead_brake_light_reaction=_s(1.0, HI, 1.0))), prev)
     assert better["pass"], better  # lower-is-better improving, higher-is-better equal
-    equal = iteration_bar(_card(0.15, slices=_slices(cut_in_false_brakes_per_km=_s(0.5, LO, 1.0))), prev)
+    equal = iteration_bar(_card(0.15, slices=_slices(cut_in_false_brakes_per_km=_s(0.5, LO))), prev)
     assert equal["pass"], equal
-    flipped = iteration_bar(_card(0.15, slices=_slices(cut_in_false_brakes_per_km=_s(0.1, HI, 1.0))), prev)
-    assert not flipped["pass"] and any("direction" in f for f in flipped["fail"]), flipped
     assert math.isfinite(better["lane_rms_gain"])
-    for bad in ({"lead_brake": 1.0}, {"lead_brake": {"value": 1.0}}, {"lead_brake": {"value": 1.0, "direction": "up"}}):
+    for bad in ({"lead_brake_light_reaction": 1.0}, {"lead_brake_light_reaction": {"value": 1.0}}, {"lead_brake_light_reaction": {"value": 1.0, "direction": "up"}}):
         for which in ("new", "baseline"):
             cards = (_card(0.15, slices=_slices(**bad)), prev) if which == "new" else (_card(0.15), _card(0.20, slices=_slices(**bad)))
             try:
@@ -186,41 +194,162 @@ def check_slice_direction() -> None:
     print("slice direction: cut-in false brakes 0.5->4.0/km and collisions 0->3 fail; lower-is-better improvement passes OK")
 
 
-def check_2_0_requires_every_slice_to_pass() -> None:
-    """Spec: "every scenario slice from the addenda also passes". No regression is not the same as passing."""
+def _name(new_slices, prev_slices=None, **kw):
     from python.train.trainer2_bar import naming_bar
 
-    split = {"heldout_map": "utah"}
-    drives = [_drive("day"), _drive("night")]
-    new, prev = _card(0.15), _card(0.20)
-    assert naming_bar(new, prev, split_manifest=split, drives=drives)["name"] == "2.0"
-    # Same value on both cards: no regression, still not passing (yield pass-rate 0.2 vs limit 1.0).
-    weak = _slices(**{"yield_pass_rate": _s(0.2, HI, 1.0)})
-    res = naming_bar(_card(0.15, slices=weak), _card(0.20, slices=weak), split_manifest=split, drives=drives)
+    prev_slices = new_slices if prev_slices is None else prev_slices
+    return naming_bar(_card(0.15, slices=new_slices), _card(0.20, slices=prev_slices),
+                      split_manifest={"heldout_map": "utah"}, drives=[_drive("day"), _drive("night")], **kw)
+
+
+def check_2_0_requires_every_slice_to_pass() -> None:
+    """Spec: "every scenario slice from the addenda also passes". No regression is not the same as passing."""
+    assert _name(_slices())["name"] == "2.0"
+    # Same value on both cards: no regression, still not passing (yield 0.2 vs the table's 1.0).
+    weak = _slices(**{"yield": _s(0.2, HI, 1.0)})
+    res = _name(weak)
     assert res["name"] == "1.x" and res["iteration"]["pass"], res
-    assert any(f.startswith("slices_pass: yield_pass_rate") for f in res["fail"]), res
+    assert any(f.startswith("slices_pass: yield 0.2") for f in res["fail"]), res
+    # The limit may be left off the card: the table's applies (0.2 fails, 1.0 passes).
+    res = _name(_slices(**{"yield": _s(0.2, HI)}))
+    assert res["name"] == "1.x" and any(f.startswith("slices_pass: yield") for f in res["fail"]), res
+    assert _name(_slices(**{"yield": _s(1.0, HI)}))["name"] == "2.0"
     # A lower-is-better slice that did not regress but is over its limit (1 collision vs limit 0).
     hot = _slices(cut_in_collisions=_s(1, LO, 0))
-    res = naming_bar(_card(0.15, slices=hot), _card(0.20, slices=hot), split_manifest=split, drives=drives)
+    res = _name(hot)
     assert res["name"] == "1.x" and any(f.startswith("slices_pass: cut_in_collisions") for f in res["fail"]), res
-    # Exactly at the limit passes (higher and lower).
-    edge = _slices(**{"yield_pass_rate": _s(1.0, HI, 1.0), "cut_in_collisions": _s(0, LO, 0)})
-    assert naming_bar(_card(0.15, slices=edge), _card(0.20, slices=edge), split_manifest=split, drives=drives)["name"] == "2.0"
-    # One failing slice among passing ones is enough.
-    one = _slices(**{"yield_pass_rate": _s(0.99, HI, 1.0)})
-    res = naming_bar(_card(0.15, slices=one), _card(0.20, slices=one), split_manifest=split, drives=drives)
+    # Exactly at the limit passes (higher and lower, see _slices); one slice under it is enough to fail.
+    one = _slices(**{"sharp_curve": _s(0.99, HI, 1.0)})
+    res = _name(one)
     assert res["name"] == "1.x" and sum(f.startswith("slices_pass") for f in res["fail"]) == 1, res
-    # A slice with no limit cannot be shown to pass; no slice at all is not "every slice passes".
-    nolimit = _slices(**{"yield_pass_rate": _s(1.0, HI)})
-    res = naming_bar(_card(0.15, slices=nolimit), _card(0.20, slices=nolimit), split_manifest=split, drives=drives)
-    assert res["name"] == "1.x" and "slices_pass: yield_pass_rate has no pass limit" in res["fail"], res
-    res = naming_bar(_card(0.15, slices={}), _card(0.20, slices={}), split_manifest=split, drives=drives)
-    assert res["name"] == "1.x" and "slices_pass: no scenario slice reported" in res["fail"], res
-    # NaN slice value fails its limit as well.
-    nan = _slices(cut_in_collisions=_s(float("nan"), LO, 0))
-    res = naming_bar(_card(0.15, slices=nan), _card(0.20, slices=nan), split_manifest=split, drives=drives)
-    assert res["name"] == "1.x" and any(f.startswith("slices_pass: cut_in_collisions") for f in res["fail"]), res
-    print("2.0 bar: every slice must meet its own limit (yield 0.2 with no regression is 1.x), at-limit passes OK")
+    # NaN / None slice values fail their limit; the no-regression slice must still be measured.
+    for bad in (float("nan"), None, float("inf")):
+        res = _name(_slices(cut_in_collisions=_s(bad, LO, 0)))
+        assert res["name"] == "1.x" and any(f.startswith("slices_pass: cut_in_collisions") for f in res["fail"]), (bad, res)
+    res = _name(_slices(cut_in_false_brakes_per_km=_s(None, LO)))
+    assert res["name"] == "1.x" and "slices_pass: cut_in_false_brakes_per_km not measured" in res["fail"], res
+    # The no-regression slice passes the 2.0 bar only while it has not regressed (the iteration bar says so).
+    res = _name(_slices(cut_in_false_brakes_per_km=_s(0.9, LO)), _slices(cut_in_false_brakes_per_km=_s(0.5, LO)))
+    assert res["name"] == "1.x" and "iteration_bar" in res["fail"], res
+    print("2.0 bar: every slice must meet the table's limit (yield 0.2 with no regression is 1.x), at-limit passes OK")
+
+
+def check_slice_rules_table_pins_what_a_card_may_claim() -> None:
+    """Skeptic 2's three probes: a card picks neither its slices, its directions nor its limits."""
+    from python.train.trainer2_bar import HIGHER, LOWER, NO_REGRESSION, SLICE_RULES, iteration_bar
+
+    # P5: yield 0.2 with a self-set lax limit of 0.1 (table: 1.0) is refused, not scored against 0.1.
+    try:
+        _name(_slices(**{"yield": _s(0.2, HI, 0.1)}))
+    except ValueError as exc:
+        assert "'yield'" in str(exc) and "limit" in str(exc), exc
+    else:
+        raise AssertionError("a card's self-set yield limit 0.1 reached the bar")
+    # P6: 3 collisions labelled higher_is_better (table: lower_is_better) on both cards.
+    flipped = _slices(lead_vehicle_collisions=_s(3, HI, 0), cut_in_collisions=_s(3, HI, 0))
+    for prev_slices in (_slices(), flipped):  # flipped on the new card only, then on both cards
+        try:
+            _name(flipped, prev_slices)
+        except ValueError as exc:
+            assert "direction" in str(exc) and "disagrees with the table" in str(exc), exc
+        else:
+            raise AssertionError("collisions labelled higher_is_better reached the bar")
+    try:
+        iteration_bar(_card(0.15, slices=flipped), _card(0.20, slices=flipped))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("the iteration bar accepted a flipped collision direction")
+    # P7: a card with only one slice is 1.x, and every missing required slice is listed.
+    only = {"sharp_curve": _s(1.0, HI, 1.0)}
+    res = _name(only)
+    missing = [f for f in res["fail"] if f.endswith("required slice missing")]
+    assert res["name"] == "1.x" and len(missing) == len(SLICE_RULES) - 1, res
+    assert not any("sharp_curve" in f for f in missing)
+    # Nothing at all.
+    res = _name({})
+    assert res["name"] == "1.x" and sum(f.endswith("required slice missing") for f in res["fail"]) == len(SLICE_RULES), res
+    # A stated limit that equals the table's is fine; a different one, or one on a no-regression slice, is not.
+    assert _name(_slices(**{"yield": _s(1.0, HI, 1.0)}))["name"] == "2.0"
+    for bad in (_slices(**{"yield": _s(1.0, HI, 0.9)}), _slices(cut_in_false_brakes_per_km=_s(0.5, LO, 1.0)),
+                _slices(cone_contacts=_s(0, LO, 1)), _slices(**{"yield": {"value": 1.0, "direction": HI, "limit": float("nan")}})):
+        try:
+            _name(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"a card limit that disagrees with the table was accepted: {bad!r}")
+    # An unknown slice name raises (a typo must not drop a slice silently), on either card.
+    for typo in ("yeild", "collisions", "Yield"):
+        for which in ("new", "baseline"):
+            args = (_slices(**{typo: _s(1.0, HI, 1.0)}), None) if which == "new" else (_slices(), _slices(**{typo: _s(1.0, HI, 1.0)}))
+            try:
+                _name(*args)
+            except ValueError as exc:
+                assert "not in the slice rules table" in str(exc), exc
+            else:
+                raise AssertionError(f"unknown slice {typo!r} accepted on the {which} card")
+    # The table itself: every slice has a valid direction, a numeric limit or no-regression, and a stated basis.
+    assert set(SLICE_RULES) == {
+        "lead_vehicle_collisions", "lead_brake_light_reaction", "cut_in_collisions", "cut_in_false_brakes_per_km",
+        "cone_contacts", "yield", "railroad_crossing", "sharp_curve", "night", "rain", "fog"}
+    for name, rule in SLICE_RULES.items():
+        assert rule["direction"] in (HIGHER, LOWER) and rule["basis"] in ("spec", "PROPOSAL"), (name, dict(rule))
+        assert rule["limit"] == NO_REGRESSION or isinstance(rule["limit"], (int, float)), (name, dict(rule))
+    assert SLICE_RULES["lead_vehicle_collisions"]["direction"] == LOWER and SLICE_RULES["lead_vehicle_collisions"]["limit"] == 0
+    assert SLICE_RULES["cut_in_false_brakes_per_km"]["limit"] == NO_REGRESSION
+    print("slice rules table: yield limit 0.1, collisions as higher_is_better, one-slice card, typos all refused or 1.x OK")
+
+
+def check_slice_rules_table_matches_spec() -> None:
+    """The table in code equals the "Slice rules table" in docs/specs/trainer_2.md (no silent drift either way)."""
+    from python.train.trainer2_bar import HIGHER, LOWER, NO_REGRESSION, SLICE_RULES
+
+    text = (ROOT / "docs" / "specs" / "trainer_2.md").read_text(encoding="utf-8")
+    head = "### Slice rules table"
+    assert head in text, "the spec has no 'Slice rules table' section"
+    block = text[text.index(head):].split("\n## ", 1)[0]
+    rows = {}
+    for line in block.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) == 6 and cells[0].startswith("`") and cells[0].endswith("`"):
+            rows[cells[0].strip("`")] = cells
+    assert set(rows) == set(SLICE_RULES), (sorted(set(rows) ^ set(SLICE_RULES)))
+    for name, (key, row, direction, limit, basis, labelable) in rows.items():
+        rule = SLICE_RULES[name]
+        assert direction == rule["direction"] and direction in (HIGHER, LOWER), (name, direction)
+        want = rule["limit"]
+        assert (limit == NO_REGRESSION) if want == NO_REGRESSION else (float(limit) == float(want)), (name, limit, want)
+        assert basis == rule["basis"], (name, basis, rule["basis"])
+        assert (labelable == "yes") == rule["labelable_today"], (name, labelable)
+        assert int(row) == rule["spec_row"], (name, row)
+    assert "`REQUIRE_UNLABELABLE_SLICES_FOR_2_0`" in text and "PROPOSAL pending Michael" in text
+    print(f"slice rules table: {len(rows)} spec rows == SLICE_RULES (name, direction, limit, basis, labelable, row) OK")
+
+
+def check_unlabelable_slices_config_proposal_pending_michael() -> None:
+    """PROPOSAL pending Michael: are cones / railroad / rain / fog required for the 2.0 name before they can be labelled?"""
+    from python.train import trainer2_bar as bar
+
+    assert bar.REQUIRE_UNLABELABLE_SLICES_FOR_2_0 is True  # PROPOSAL pending Michael
+    unlabelable = [n for n, r in bar.SLICE_RULES.items() if not r["labelable_today"]]
+    assert sorted(unlabelable) == ["cone_contacts", "fog", "railroad_crossing", "rain"]
+    card = _slices(**{n: None for n in unlabelable})
+    saved = bar.REQUIRE_UNLABELABLE_SLICES_FOR_2_0
+    try:
+        strict = _name(card)
+        bar.REQUIRE_UNLABELABLE_SLICES_FOR_2_0 = False
+        lax = _name(card)
+        # Even when not required, a reported unlabelable slice is still checked against its limit.
+        lax_fail = _name(_slices(cone_contacts=_s(1, LO, 0), rain=None, fog=None, railroad_crossing=None))
+        lax_no_labelable = _name(_slices(**{"yield": None}))
+    finally:
+        bar.REQUIRE_UNLABELABLE_SLICES_FOR_2_0 = saved
+    assert strict["name"] == "1.x" and sum(f.endswith("required slice missing") for f in strict["fail"]) == 4, strict
+    assert lax["name"] == "2.0", lax
+    assert lax_fail["name"] == "1.x" and any(f.startswith("slices_pass: cone_contacts") for f in lax_fail["fail"]), lax_fail
+    assert lax_no_labelable["name"] == "1.x" and "slices_pass: yield required slice missing" in lax_no_labelable["fail"]
+    print("unlabelable slices: required by default (1.x without them); False lets them be absent but a reported one must pass (PROPOSAL pending Michael) OK")
 
 
 def check_unmeasured_is_not_passing() -> None:
@@ -352,6 +481,9 @@ def main() -> int:
         check_2_0_bar_not_claimed_without_iqu45_drive,
         check_slice_direction,
         check_2_0_requires_every_slice_to_pass,
+        check_slice_rules_table_pins_what_a_card_may_claim,
+        check_slice_rules_table_matches_spec,
+        check_unlabelable_slices_config_proposal_pending_michael,
         check_unmeasured_is_not_passing,
         check_unknown_intervention_kind_raises,
         check_backstop_config_proposal_pending_michael,

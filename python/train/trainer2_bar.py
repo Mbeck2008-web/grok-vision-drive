@@ -26,14 +26,26 @@ are still tallied and reported under ``backstop`` but do not count toward
 Scenario slices
 ---------------
 A slice is ``{"value": number, "direction": "higher_is_better" |
-"lower_is_better", "limit": number}``. The direction is required (a bare number
-is refused: assuming "higher is better" let a cut-in false-brake rate rise
-0.5 -> 4.0/km and collisions 0 -> 3 pass). ``limit`` is the slice's own pass
-criterion (higher: ``value >= limit``; lower: ``value <= limit``, e.g. collisions
-``<= 0``). Iteration bar: no regression vs the baseline in the slice's
-direction. **2.0 bar: every slice on the card must itself pass its ``limit``**
-(a slice with no limit, or none reported at all, fails it), on top of the
-iteration bar.
+"lower_is_better"[, "limit": number]}``. **The slice set, each slice's direction
+and its 2.0 limit are pinned in ``SLICE_RULES`` below, taken from the spec's
+"Scenario slices" table (docs/specs/trainer_2.md, "Slice rules table"); a run card
+does not choose them.** A card slice whose name is not in the table, whose
+direction differs from the table, or whose ``limit`` (when it states one)
+differs from the table raises ``ValueError``; a bare number (no direction) is
+refused. Where the spec gives no number the entry is marked PROPOSAL (its
+``basis``) instead of passing as spec: the limit then is the strictest
+reading ("every event handled" = 1.0, "0 contacts" = 0) and waits for Michael.
+
+Iteration bar: no regression vs the baseline in the table's direction. **2.0 bar:
+every required slice in ``SLICE_RULES`` must be on the card and itself pass its
+table limit** (a missing slice, a ``None``/NaN value, or a value past the limit
+fails; "no worse than the previous model" entries pass through the iteration
+bar's no-regression check). The slices Dependencies 2, 3 and 4 cannot label yet
+(cones, railroad, rain, fog) are required too while
+``REQUIRE_UNLABELABLE_SLICES_FOR_2_0`` is True (the spec's "every scenario slice
+from the addenda also passes"; PROPOSAL pending Michael on that reading): the 2.0
+name then waits for their sidecars; with False they may be absent, but one that is
+reported must still pass.
 
 Not measured is not passing: a ``None`` or non-finite (NaN/inf) lane RMS,
 false-brake rate, slice value, drive length or VRAM fails its check. ``None``
@@ -45,6 +57,7 @@ Pure Python. Training/eval only; nothing on a live path imports it.
 from __future__ import annotations
 
 import math
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 ITER_RMS_GAIN = 0.10
@@ -63,6 +76,38 @@ HIGHER = "higher_is_better"
 LOWER = "lower_is_better"
 DIRECTIONS = (HIGHER, LOWER)
 _TOL = 1e-12
+NO_REGRESSION = "no_regression"  # the limit is "no worse than the previous model" (the iteration bar's check)
+# PROPOSAL pending Michael: "every scenario slice from the addenda also passes" read literally, a slice that
+# cannot be labelled today (cones, railroad, rain, fog) still has to be on the card and pass. False = only the
+# labelable-today slices gate the 2.0 name.
+REQUIRE_UNLABELABLE_SLICES_FOR_2_0 = True
+
+
+def _rule(direction: str, limit: Any, basis: str, labelable_today: bool, spec_row: int) -> Mapping[str, Any]:
+    return MappingProxyType(
+        {"direction": direction, "limit": limit, "basis": basis, "labelable_today": labelable_today, "spec_row": spec_row}
+    )
+
+
+# Slice rules table: docs/specs/trainer_2.md "Slice rules table" (test: check_slice_rules_table_matches_spec).
+# ``basis`` "spec" = the number is in the spec's slice table; "PROPOSAL" = the spec gives no number (or only a
+# measurable proxy) and the limit here is the strictest reading, pending Michael. The key names are this
+# module's own (the spec numbers its rows 1-8 and does not name them).
+SLICE_RULES: Mapping[str, Mapping[str, Any]] = MappingProxyType(
+    {
+        "lead_vehicle_collisions": _rule(LOWER, 0, "spec", True, 1),
+        "lead_brake_light_reaction": _rule(HIGHER, 1.0, "PROPOSAL", True, 1),
+        "cut_in_collisions": _rule(LOWER, 0, "spec", True, 2),
+        "cut_in_false_brakes_per_km": _rule(LOWER, NO_REGRESSION, "spec", True, 2),
+        "cone_contacts": _rule(LOWER, 0, "spec", False, 3),
+        "yield": _rule(HIGHER, 1.0, "PROPOSAL", True, 4),
+        "railroad_crossing": _rule(HIGHER, 1.0, "PROPOSAL", False, 5),
+        "sharp_curve": _rule(HIGHER, 1.0, "PROPOSAL", True, 6),
+        "night": _rule(HIGHER, 1.0, "PROPOSAL", True, 7),
+        "rain": _rule(HIGHER, 1.0, "PROPOSAL", False, 7),
+        "fog": _rule(HIGHER, 1.0, "PROPOSAL", False, 7),
+    }
+)
 
 __all__ = [
     "BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS",
@@ -76,6 +121,9 @@ __all__ = [
     "ITER_RMS_GAIN",
     "MAX_LIVE_VRAM_GB",
     "NAME_RMS_GAIN",
+    "NO_REGRESSION",
+    "REQUIRE_UNLABELABLE_SLICES_FOR_2_0",
+    "SLICE_RULES",
     "iteration_bar",
     "naming_bar",
     "tally_interventions",
@@ -108,19 +156,34 @@ def _require_card(card: Mapping[str, Any], what: str) -> None:
             raise ValueError(f"{what} run card has no {key!r} (the card must state SSL on/off)")
 
 
-def _slices(card: Mapping[str, Any], what: str) -> dict[str, tuple[float | None, str, float | None]]:
-    """``{name: (value, direction, limit)}``; a slice without a direction is refused."""
-    out: dict[str, tuple[float | None, str, float | None]] = {}
+def _slices(card: Mapping[str, Any], what: str) -> dict[str, tuple[float | None, str, Any]]:
+    """``{name: (value, direction, limit)}`` with direction and limit taken from ``SLICE_RULES``.
+
+    Raises for a name not in the table, a bare number, a direction that differs
+    from the table, or a stated ``limit`` that differs from the table (a card
+    cannot pick its own).
+    """
+    out: dict[str, tuple[float | None, str, Any]] = {}
     for name, rec in dict(card["slices"] or {}).items():
+        name = str(name)
+        rule = SLICE_RULES.get(name)
+        if rule is None:
+            raise ValueError(f"{what} slice {name!r} is not in the slice rules table {sorted(SLICE_RULES)}")
         if not isinstance(rec, Mapping):
             raise ValueError(
                 f"{what} slice {name!r} is {rec!r}: a slice is "
-                f"{{'value', 'direction': {HIGHER!r}|{LOWER!r}, 'limit'?}}; a bare number has no direction"
+                f"{{'value', 'direction': {HIGHER!r}|{LOWER!r}}}; a bare number has no direction"
             )
         direction = rec.get("direction")
-        if direction not in DIRECTIONS:
-            raise ValueError(f"{what} slice {name!r} direction {direction!r} not in {DIRECTIONS}")
-        out[str(name)] = (_num(rec.get("value")), str(direction), _num(rec.get("limit")))
+        if direction != rule["direction"]:
+            raise ValueError(f"{what} slice {name!r} direction {direction!r} disagrees with the table ({rule['direction']!r})")
+        stated = rec.get("limit")
+        if stated is not None:
+            want = rule["limit"]
+            got = _num(stated)
+            if want == NO_REGRESSION or got is None or abs(got - float(want)) > _TOL:
+                raise ValueError(f"{what} slice {name!r} limit {stated!r} disagrees with the table ({want!r})")
+        out[name] = (_num(rec.get("value")), str(direction), rule["limit"])
     return out
 
 
@@ -168,11 +231,7 @@ def iteration_bar(new: Mapping[str, Any], prev: Mapping[str, Any]) -> dict[str, 
     for name, (base, direction, _limit) in sorted(prev_slices.items()):
         if name not in new_slices:
             fail.append(f"slice:{name}")
-            continue
-        value, new_dir, _lim = new_slices[name]
-        if new_dir != direction:
-            fail.append(f"slice:{name} direction {new_dir} != baseline {direction}")
-        elif _worse(direction, value, base):
+        elif _worse(direction, new_slices[name][0], base):
             fail.append(f"slice:{name}")
     return {"pass": not fail, "fail": fail, "lane_rms_gain": gain, "no_baseline": no_baseline,
             "ssl_pretrain": {"new": bool(new["ssl_pretrain"]), "baseline": bool(prev["ssl_pretrain"])}}
@@ -214,9 +273,10 @@ def naming_bar(
 ) -> dict[str, Any]:
     """``{"name": "2.0"|"1.x", "pass", "fail", ...}``. No IQU45 drive records means 1.x.
 
-    Beyond the iteration bar: lane RMS >= 25% better, **every scenario slice on
-    the new card passes its own ``limit``** (and at least one slice is
-    reported), and the day and night drives. ``count_backstop`` is the
+    Beyond the iteration bar: lane RMS >= 25% better, **every required slice in
+    ``SLICE_RULES`` is on the card and passes the table's limit** (the card's own
+    direction and limit are refused when they differ), and the day and night
+    drives. ``count_backstop`` is the
     PROPOSAL pending Michael on AEB / hand-rule activations.
     """
     fail: list[str] = []
@@ -226,12 +286,17 @@ def naming_bar(
     if it["lane_rms_gain"] is None or it["lane_rms_gain"] < NAME_RMS_GAIN - _TOL:
         fail.append("lane_rms_25")
     new_slices = _slices(new, "new")
-    if not new_slices:
-        fail.append("slices_pass: no scenario slice reported")
-    for name, (value, direction, limit) in sorted(new_slices.items()):
-        if limit is None:
-            fail.append(f"slices_pass: {name} has no pass limit")
-        elif not _meets_limit(direction, value, limit):
+    for name, rule in SLICE_RULES.items():
+        if name not in new_slices:
+            if rule["labelable_today"] or REQUIRE_UNLABELABLE_SLICES_FOR_2_0:
+                fail.append(f"slices_pass: {name} required slice missing")
+            continue  # a slice that cannot be labelled yet, and is not required, may be absent
+        value, direction, limit = new_slices[name]
+        if limit == NO_REGRESSION:
+            if value is None:
+                fail.append(f"slices_pass: {name} not measured")
+            # otherwise: the iteration bar above already failed it if it regressed
+        elif not _meets_limit(direction, value, float(limit)):
             fail.append(f"slices_pass: {name} {value!r} fails {direction} limit {limit!r}")
     held_map = split_manifest.get("heldout_map")
     if held_map is None or str(held_map).strip() == "":

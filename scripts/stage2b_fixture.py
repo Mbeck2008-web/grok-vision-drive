@@ -15,6 +15,7 @@ import numpy as np
 
 DT = 0.2  # 5 Hz keeps the recording (and the CPU training on it) short; the fit takes steps up to 0.25 s
 SEG = "west_coast_usa#0"
+SEGMENT_GAP_S = 60.0
 SEG_B = "west_coast_usa#1"  # the last of two short segments is the holdout (the repo's whole-segment rule)
 K_THR, K_BRK, K_DRAG = 2.0, 4.5, 0.05  # the car's true map (what fit_motion should find on the train rows)
 CRUISE = 10.0
@@ -47,7 +48,8 @@ def script(n_rows: int, intersections: list[tuple[str, float, str | None]]):
     return out
 
 
-def build(root: Path, n_rows: int, intersections: list[tuple[str, float, str | None]], *, with_signs: bool = True) -> Path:
+def build(root: Path, n_rows: int, intersections: list[tuple[str, float, str | None]], *, with_signs: bool = True,
+          with_aux: bool = False) -> Path:
     import cv2
 
     from python.collect.signal_labels import sign_id
@@ -65,7 +67,7 @@ def build(root: Path, n_rows: int, intersections: list[tuple[str, float, str | N
         ok, buf = cv2.imencode(".png", frame)
         assert ok
         (cam / f"{index:06d}.png").write_bytes(buf.tobytes())
-        t = index * DT
+        t = index * DT + (SEGMENT_GAP_S if index >= SPLIT else 0.0)  # a real second segment starts later; the split manifest purges train rows near the holdout in time
         state = {
             "i": index, "t": t, "dt_s": None if index == 0 else DT, "segment": SEG if index < SPLIT else SEG_B, "spawn_type": "city",
             "ego": {"sim_t": 100.0 + t, "speed_mps": v},
@@ -92,18 +94,36 @@ def build(root: Path, n_rows: int, intersections: list[tuple[str, float, str | N
         sign_lines.append({"t": t, "signs": sorted(signs, key=lambda s: (s["y"], s["x"], s["cls"]))})
     (root / "state.jsonl").write_text("\n".join(json.dumps(r) for r in state_lines) + "\n", encoding="utf-8")
     (root / "gt.jsonl").write_text("\n".join(json.dumps(r) for r in gt_lines) + "\n", encoding="utf-8")
+    if with_aux:  # the train-only planes stage 1 needs (u16 cm depth, u8 sem ids), same shape as test_trainer2_recipe._fixture
+        (root / "raw" / "main_depth").mkdir()
+        (root / "raw" / "main_sem").mkdir()
+        for index in range(n_rows):
+            cm = np.full((48, 64), 1250 + 20 * (index % 7), np.uint16)
+            cm[:12] = 30000
+            cm[-4:, -8:] = 0
+            ids = np.ones((48, 64), np.uint8)
+            ids[:, 32:] = 2 + (index % 2)
+            ids[:10] = 3
+            ids[-3:, :6] = 0
+            for sub, arr in (("main_depth", cm), ("main_sem", ids)):
+                ok, buf = cv2.imencode(".png", arr)
+                assert ok
+                (root / "raw" / sub / f"{index:06d}.png").write_bytes(buf.tobytes())
+        (root / "sem_classes.json").write_text(json.dumps({"kind": "gvd_sem_classes", "train_only": True,
+                                                           "classes": {"0": "unknown", "1": "road", "2": "car", "3": "sky"}}),
+                                               encoding="utf-8")
     if with_signs:
         (root / "signs.jsonl").write_text("\n".join(json.dumps(r) for r in sign_lines) + "\n", encoding="utf-8")
     return root
 
 
-N_ROWS = 300
-SPLIT = 150  # rows [0, SPLIT) are segment #0 (train), the rest segment #1 (the holdout)
-TRAIN_PART = [("stop_sign", 60.0, None), ("traffic_light", 150.0, "red")]
+N_ROWS = 230
+SPLIT = 80  # rows [0, SPLIT) are segment #0 (train: one stop sign, the fit's braking rows), the rest segment #1 (the holdout)
+TRAIN_PART = [("stop_sign", 45.0, None)]
 
 
 def intersections(n_rows: int = N_ROWS) -> list[tuple[str, float, str | None]]:
-    """Two train intersections (the fit's braking rows), then a stop sign and a red light whose 40 m approach starts in segment #1."""
+    """One train intersection, then a stop sign and a red light whose 40 m approach starts in segment #1."""
     head = script(n_rows, TRAIN_PART)
     sign_y = head[SPLIT + 4][0] + 45.0
     return TRAIN_PART + [("stop_sign", sign_y, None), ("traffic_light", sign_y + 90.0, "red")]

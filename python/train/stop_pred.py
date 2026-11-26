@@ -308,6 +308,15 @@ def preflight(train_rows: Iterable[Mapping[str, Any]], hold_rows: Iterable[Mappi
     ``StopNotMeasured`` with the reason; a run whose plan has stage 2b calls this first so SSL / stage 1 / stage 2 are
     not trained for hours before 2b finds the recording cannot be scored.
     """
+    try:
+        return _preflight(train_rows, hold_rows, default_root)
+    except StopNotMeasured as exc:
+        if "stage 2b" in str(exc):
+            raise
+        raise StopNotMeasured(f"stage 2b cannot be scored: {exc}") from exc
+
+
+def _preflight(train_rows: Iterable[Mapping[str, Any]], hold_rows: Iterable[Mapping[str, Any]], default_root: Any) -> dict[str, Any]:
     from python.train.intersection_labels import attach_sign_labels
 
     held = [dict(r) for r in hold_rows]

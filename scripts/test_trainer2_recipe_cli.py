@@ -7,8 +7,10 @@ Nothing here is mocked: ``main`` parses the command line, pre-registers the spli
 stage 7 (joint, with ctl), gates every stage against the earlier metrics, then exports the camera-only deploy graph
 of the last checkpoint and runs the preset-bound deploy check.
 
-Stage 2b is not in this run: its exit metric cannot be measured before PR 6b (see
-``trainer2_recipe.UNMEASURABLE_STAGES``); ``check_cli_default_plan_stops_before_training`` runs the default plan.
+``check_cli_full_curriculum_stages_0_1_2_7`` runs ``--stage 0,1,2,7`` on the plain fixture (no stop events).
+``check_cli_default_plan_trains_through_2b`` runs the DEFAULT plan (0, 1, 2, 2b, 7) on ``stage2b_fixture`` (stop signs and
+red lights in the held-out segment) and ``check_cli_default_plan_refuses_without_stop_events`` shows the default plan
+stopping before anything trains when the recording cannot score 2b.
 """
 from __future__ import annotations
 
@@ -183,21 +185,78 @@ def check_cli_full_curriculum_stages_0_1_2_7() -> None:
           "gates pass, camera-only export + preset deploy check OK")
 
 
-def check_cli_default_plan_stops_before_training() -> None:
-    if not _ready("check_cli_default_plan_stops_before_training"):
+def check_cli_default_plan_refuses_without_stop_events() -> None:
+    if not _ready("check_cli_default_plan_refuses_without_stop_events"):
         return
+    import stage2b_fixture as fx
+
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
-        strips = base_tests._fixture(base)
+        for label, strips, words in (
+            ("plain fixture", base_tests._fixture(base), ("stage 2b", "sim_t")),
+            ("signs.jsonl missing", fx.build(base / "bare", fx.N_ROWS, fx.intersections(fx.N_ROWS), with_signs=False, with_aux=True),
+             ("stage 2b", "0 stop-sign/line", "vacuous")),
+        ):
+            ck = base / f"ck_{label.split()[0]}"
+            ck.mkdir()
+            code, text = _main(["--strips", str(strips), "--recipe", "trainer2", "--no-augment", "--cams", "main", "--no-panel",
+                                "--no-resume", "--ckpt-dir", str(ck)], base)
+            assert code == 2 and "Traceback" not in text, (label, code, text[-1500:])
+            for word in (*words, "Nothing was trained", "--stage"):
+                assert word in text, (label, word, text[-1500:])
+            assert "ssl-pretrain:" not in text and not (ck / "run_manifest.json").exists(), (label, "must stop before SSL and the manifest")
+            assert not list((base / "cache").rglob("ssl_stem_*")) and not list(ck.glob("*.npz")), label
+    print("CLI default plan: stops before SSL / manifest / any stage when the recording cannot score stage 2b OK")
+
+
+def check_cli_default_plan_trains_through_2b() -> None:
+    """The default plan (no --stage) trains 0, 1, 2, 2b, 7 end to end and gates every stage, 2b on its stop metrics."""
+    if not _ready("check_cli_default_plan_trains_through_2b"):
+        return
+    import stage2b_fixture as fx
+
+    from python.train import trainer2_recipe as rec
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        strips = fx.build(base / "stops", fx.N_ROWS, fx.intersections(fx.N_ROWS), with_aux=True)
         ck = base / "ck"
         ck.mkdir()
-        code, text = _main(["--strips", str(strips), "--recipe", "trainer2", "--no-augment", "--cams", "main", "--no-panel",
-                            "--no-resume", "--ckpt-dir", str(ck)], base)
-        assert code == 2 and "Traceback" not in text, (code, text[-1500:])
-        assert "stage 2b" in text and "PR 6b" in text and "Nothing was trained" in text, text[-1500:]
-        assert "ssl-pretrain:" not in text and not (ck / "run_manifest.json").exists(), "the run must stop before SSL and the manifest"
-        assert not list((base / "cache").rglob("ssl_stem_*")) and not list(ck.glob("*.npz"))
-    print("CLI default plan: stops before SSL / manifest / any stage because stage 2b cannot exit OK")
+        seen: dict[str, list] = {}
+        real_exit = rec.stage_exited_all
+
+        def spy(stage_id, evals_by, *, epochs):
+            seen.setdefault(stage_id, []).append(({k: list(v) for k, v in evals_by.items()}, int(epochs)))
+            return real_exit(stage_id, evals_by, epochs=epochs)
+
+        rec.stage_exited_all = spy
+        try:
+            code, text = _main(_flags(strips, ck, "", "--lr", FULL_RUN_LR), base)
+        finally:
+            rec.stage_exited_all = real_exit
+        assert code is None, (code, text[-3000:])
+        assert "Traceback" not in text and "MetricNotMeasured" not in text and "StopNotMeasured" not in text, text[-3000:]
+        # the 2b preflight ran before the manifest was written and before stage 0 trained
+        assert "stage 2b preflight OK" in text and text.index("stage 2b preflight OK") < text.index("pre-registered now") < text.index("stage 0 SSL"), text[:2500]
+        exits = {m[0]: (int(m[1]), json.loads(m[2])) for m in re.findall(
+            r"recipe trainer2: stage (\w+) \([^)]*\) exited after (\d+) epoch\(s\), ckpt=\S+ metrics=(\{.*\})", text)}
+        assert sorted(exits) == ["0", "1", "2", "2b", "7"], (sorted(exits), text[-2500:])
+        assert "trained=['0', '1', '2', '2b', '7'] skipped=[]" in text, text[-1500:]
+        s2b, s7 = exits["2b"][1], exits["7"][1]
+        for name, m in (("2b", s2b), ("7", s7)):
+            assert set(m) == {"lane_rms", "lane_r", "depth_absrel", "sem_miou", *rec.STOP_METRICS}, (name, m)
+            assert all(np.isfinite(v) for v in m.values()), (name, m)
+        assert all(s2b[k] >= 0.0 for k in rec.STOP_METRICS), s2b
+        # 2b exited through the real rule on its three stop metrics
+        series, epochs = seen["2b"][-1]
+        assert set(series) == set(rec.STAGE_PRIMARY_METRICS["2b"]) == set(rec.STOP_METRICS), series
+        assert all(np.isfinite(v).all() for v in series.values()) and epochs == exits["2b"][0] <= rec.STAGE_MAX_EPOCHS, (series, epochs)
+        assert real_exit("2b", series, epochs=epochs)
+        # the motion map was fitted on train rows only, once per stop stage, with no holdout id in the fit set
+        fits = re.findall(r"stop motion fitted on (\d+) train row pairs.*\(holdout ids in fit set: 0\)", text)
+        assert len(fits) == 2 and all(int(n) < fx.SPLIT for n in fits), fits  # stage 2b and stage 7
+    print("CLI default plan: 0 / 1 / 2 / 2b / 7 train end to end, 2b exits on missed_stop / missed_light / false_brake, "
+          "stage 7 re-measures them OK")
 
 
 def check_cli_stage_errors_exit_2_without_traceback() -> None:
@@ -227,8 +286,8 @@ def check_cli_stage_errors_exit_2_without_traceback() -> None:
 
 
 def main() -> int:
-    checks = (check_cli_default_plan_stops_before_training, check_cli_stage_errors_exit_2_without_traceback,
-              check_cli_full_curriculum_stages_0_1_2_7)
+    checks = (check_cli_default_plan_refuses_without_stop_events, check_cli_stage_errors_exit_2_without_traceback,
+              check_cli_full_curriculum_stages_0_1_2_7, check_cli_default_plan_trains_through_2b)
     failed = 0
     for check in checks:
         try:

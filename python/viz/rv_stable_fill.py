@@ -372,7 +372,9 @@ ROAD_SNAP_MAX_ABOVE_M: float = 0.30
 # 0.08 -> 0.13, 10-15 m 0.12 -> 0.19; f100 main 10-15 m 0.12 -> 0.18; narrow 10-15 m 0.09 -> 0.21. Wide with the rejection
 # gains at 0-5 m (f160 0.11 -> 0.07, held-out f100 0.20 -> 0.06) and is unchanged at 5-15 m. Side cams: see gate (b) in
 # tests/props (pillarL/R, repeatR snap curb/car px).
-ROAD_SNAP_CAMS: tuple[str, ...] = ("wide", "main", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+# gvd/rv-side-rear: wide is OFF by default (Michael 2026-11-26 1:08 PM CT; switchable: add "wide" back, range cap ROAD_SNAP_RANGE_M).
+# With wide off its road keeps the net's own height, a +0.2..+0.6 m cone with a step at ~3 m (see the ripple notes in the report).
+ROAD_SNAP_CAMS: tuple[str, ...] = ("main", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
 # Wide's horizon band: at a 15-25 m ground hit the ray is ~3 deg below the horizon, so 0.30 m of height is ~5 m of depth and the
 # runtime z test cannot tell road from a 0.3-0.5 m curb/step there (f160: 20 of 22 snapped px GT z > 0.30 at 15-30 m). Wide snaps to 15 m only.
 ROAD_SNAP_RANGE_M: dict[str, float] = {"wide": 15.0}

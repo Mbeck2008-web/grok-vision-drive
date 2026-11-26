@@ -272,6 +272,49 @@ def check_module_is_numpy_only_and_safe() -> None:
     print("check_module_is_numpy_only_and_safe: OK")
 
 
+def check_vendored_bench_wires_sort_splats() -> None:
+    """Text/AST only. The bench imports glfw/moderngl at top level; do not import it."""
+    path = ROOT / "tools" / "rv_gl33_splat_bench.py"
+    src = path.read_text(encoding="utf-8")
+    assert "argsort(-d" not in src, "vendored bench still contains argsort(-d"
+    tree = ast.parse(src)
+    imported_from = None
+    calls = []
+    argsort_minus_d = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(a.name == "sort_splats" for a in node.names):
+            imported_from = node.module
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "sort_splats":
+            calls.append(node)
+        is_argsort = (
+            (isinstance(func, ast.Attribute) and func.attr == "argsort")
+            or (isinstance(func, ast.Name) and func.id == "argsort")
+        )
+        if is_argsort and node.args:
+            a0 = node.args[0]
+            if isinstance(a0, ast.UnaryOp) and isinstance(a0.op, ast.USub):
+                argsort_minus_d.append(node)
+    assert imported_from == "python.viz.rv_splat_sort", imported_from
+    assert len(calls) == 1, f"expected one sort_splats call, got {len(calls)}"
+    call = calls[0]
+    assert len(call.args) >= 3, ast.dump(call)
+    a0, a1, a2 = call.args[0], call.args[1], call.args[2]
+    assert isinstance(a0, ast.Name) and a0.id == "d", ast.dump(a0)
+    def _num(n):
+        if isinstance(n, ast.Constant):
+            return n.value
+        raise AssertionError(f"expected numeric constant, got {ast.dump(n)}")
+    assert _num(a1) == 0.05, _num(a1)
+    assert _num(a2) == 200.0, _num(a2)
+    assert not argsort_minus_d, "bench still calls argsort(-d, ...)"
+    # Confirm the file would import GL if executed — but we only parsed it.
+    assert "import glfw" in src and "import moderngl" in src
+    print("check_vendored_bench_wires_sort_splats: OK")
+
+
 # ------------------------------------------------- behavior change vs float
 
 def _assert_float_order_within_quantum(d32: np.ndarray, near: float, far: float) -> int:
@@ -597,6 +640,7 @@ def main() -> None:
     check_nan_inf()
     check_validation_and_purity()
     check_module_is_numpy_only_and_safe()
+    check_vendored_bench_wires_sort_splats()
     check_float_order_differs_only_within_quantum()
     check_render_instrument()
     _run_hypothesis_props_or_skip()
@@ -627,6 +671,10 @@ def test_validation_and_purity() -> None:
 
 def test_module_is_numpy_only_and_safe() -> None:
     check_module_is_numpy_only_and_safe()
+
+
+def test_vendored_bench_wires_sort_splats() -> None:
+    check_vendored_bench_wires_sort_splats()
 
 
 def test_float_order_within_quantum() -> None:

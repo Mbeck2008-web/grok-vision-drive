@@ -6,19 +6,21 @@ Assignment: GVD swarm-4 `gvd/rv-radix-sort`. Replace the CPU depth sort of the
 
 ## Where the old sort lived
 
-Only in the step-4 proxy bench (`rv_gl33_splat_bench.py`, copy in
-`/workspace/rv-preview/tools`, run on IQU45; not in this repo):
+The bench is now vendored at `tools/rv_gl33_splat_bench.py` and wired
+(`order = sort_splats(d, 0.05, 200.0)`, same near/far as the bench projection).
+The original copy remains in `/workspace/rv-preview/tools` (run on IQU45):
 
 ```
 d     = (pos - eye) @ fwd                 # float32 view-space depth along forward
-order = np.argsort(-d, kind="stable")     # farthest first (painter order)
+order = sort_splats(d, 0.05, 200.0)       # farthest first (painter order)
 ```
 
-No splat sort exists in the repo at the base commit, and `gvd_viz` is not touched
-here. So this adds a new module with the same contract. `sort_splats(depth, near,
-far, descending=True)` is the drop-in for the `argsort(-d)` line.
-`reality_view_c.py` has its own `np.lexsort((htie, -hz))` for billboards; it is a
-different sort (per-pixel overwrite) and is not changed.
+Previously `order = np.argsort(-d, kind="stable")`. No splat sort existed in
+the repo at the base commit, and `gvd_viz` is not touched here. So this adds a
+new module with the same contract. `sort_splats(depth, near, far, descending=True)`
+is the drop-in for the `argsort(-d)` line. `reality_view_c.py` has its own
+`np.lexsort((htie, -hz))` for billboards; it is a different sort (per-pixel
+overwrite) and is not changed.
 
 ## Interface
 

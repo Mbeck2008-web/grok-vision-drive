@@ -485,14 +485,16 @@ def check_output_appearing_after_precheck_is_refused() -> None:
             try:
                 mig.migrate_file(old, dst)
             except mig.MigrationRefused as exc:
-                assert "exists" in str(exc), exc
+                text = str(exc)
+                assert "already exists" in text, exc
+                assert "write failed" not in text, exc
             else:
                 raise AssertionError("an output that appeared after the pre-check was replaced")
         finally:
             epoch_ckpt.serialise = real_serialise
         assert dst.read_bytes() == precious, "racing file was overwritten"
         assert not list(d.glob("*.partial*")), "temp file left behind"
-    print("output created after the pre-check: refused, file intact, no temp left")
+    print("output created after the pre-check: refused with 'already exists' (not 'write failed'), file intact, no temp left")
 
 
 def check_unreadable_input_is_refused_exit_2() -> None:
@@ -523,7 +525,36 @@ def check_unreadable_input_is_refused_exit_2() -> None:
             r = _cli(str(bad), str(out), "--min-free-gb", "0")
             assert r.returncode == 2 and "REFUSED" in r.stderr and "Traceback" not in r.stderr, (bad.name, r.returncode, r.stderr)
             assert not out.exists(), bad.name
-    print("garbage / truncated / empty / missing / directory input: REFUSED exit 2, no traceback, no output")
+        # valid JSON meta that is not an object, or a bad weight_names value: refusal, not a traceback
+        from python.train.epoch_ckpt import FORMAT
+
+        def _write_meta(path: Path, meta_obj) -> None:
+            import json
+
+            np.savez(path, meta=np.array(json.dumps(meta_obj)), w0=np.zeros(3, np.float32))
+
+        malformed = {
+            "meta_list.npz": ["not", "an", "object"],
+            "meta_null.npz": None,
+            "meta_string.npz": "not an object",
+            "names_noniter.npz": {"format": FORMAT, "weight_names": 123},
+            "names_nonstr.npz": {"format": FORMAT, "weight_names": [1, 2, 3]},
+        }
+        for name, meta_obj in malformed.items():
+            bad = d / name
+            _write_meta(bad, meta_obj)
+            out = d / (bad.stem + ".out.npz")
+            try:
+                mig.migrate_file(bad, out)
+            except mig.MigrationRefused:
+                pass
+            else:
+                raise AssertionError(f"{name}: accepted")
+            assert not out.exists() and not list(d.glob("*.partial*")), name
+            r = _cli(str(bad), str(out), "--min-free-gb", "0")
+            assert r.returncode == 2 and "REFUSED" in r.stderr and "Traceback" not in r.stderr, (name, r.returncode, r.stderr)
+            assert not out.exists(), name
+    print("garbage / truncated / empty / missing / directory / list-null-string meta / bad weight_names: REFUSED exit 2, no traceback, no output")
 
 
 def check_low_disk_space_is_refused() -> None:
@@ -631,6 +662,58 @@ def load_epoch_ckpt_from(blob: bytes, path: Path) -> dict:
     return load_epoch_ckpt(path)["weights"]
 
 
+def check_min_free_gb_cli() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        for bad in ("nan", "inf", "-1"):
+            out = d / f"bad_{bad}.npz"
+            r = _cli(str(old), str(out), "--min-free-gb", bad)
+            assert r.returncode == 2 and "Traceback" not in r.stderr + r.stdout, (bad, r.returncode, r.stderr, r.stdout)
+            assert "min-free-gb" in r.stderr or "REFUSED" in r.stderr, (bad, r.stderr)
+            assert not out.exists() and not list(d.glob("*.partial*")), bad
+        out = d / "zero.npz"
+        r = _cli(str(old), str(out), "--min-free-gb", "0")
+        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+        assert out.exists() and "96 -> 80" in r.stdout
+    print("--min-free-gb nan/inf/-1: exit 2, no traceback, no output; 0 is allowed and writes")
+
+
+def check_disk_floor_boundary() -> None:
+    import shutil
+
+    import migrate_ckpt_classes as mig
+    from python.train.epoch_ckpt import DEFAULT_MIN_FREE_GB, GB
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        measured = d / "measured.npz"
+        mig.migrate_file(old, measured, min_free_bytes=0)
+        size = measured.stat().st_size
+        floor = int(DEFAULT_MIN_FREE_GB * GB)
+        real = shutil.disk_usage
+        try:
+            # free - size == floor: exactly at the floor, must write
+            shutil.disk_usage = lambda p: shutil._ntuple_diskusage(floor + size, 0, floor + size)
+            exact = d / "exact.npz"
+            mig.migrate_file(old, exact)
+            assert exact.exists() and exact.stat().st_size == size
+            # one byte short of that: refused, nothing written
+            shutil.disk_usage = lambda p: shutil._ntuple_diskusage(floor + size - 1, 0, floor + size - 1)
+            short = d / "short.npz"
+            try:
+                mig.migrate_file(old, short)
+            except mig.MigrationRefused as exc:
+                assert "low space" in str(exc), exc
+            else:
+                raise AssertionError("one byte under the floor was accepted")
+            assert not short.exists() and not list(d.glob("*.partial*"))
+        finally:
+            shutil.disk_usage = real
+    print("disk floor boundary: free-size == floor writes; one byte less is refused")
+
+
 CHECKS = (
     check_default_still_refuses,
     check_no_load_path_hook,
@@ -646,6 +729,8 @@ CHECKS = (
     check_output_appearing_after_precheck_is_refused,
     check_unreadable_input_is_refused_exit_2,
     check_low_disk_space_is_refused,
+    check_disk_floor_boundary,
+    check_min_free_gb_cli,
     check_link_oserror_is_refused,
     check_input_read_once_hash_matches_loaded_bytes,
 )

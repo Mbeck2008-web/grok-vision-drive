@@ -513,7 +513,33 @@ def check_iteration_bar_requires_labelable_slices_and_missed() -> None:
     card["stop"]["slices"]["red_light"] = {"events": 6, "missed": None}
     res = iteration_bar(card, _card(0.20))
     assert not res["pass"] and "red_light: missed not reported" in res["fail"], res
-    print("iteration bar: every labelable slice required on both cards (empty maps fail); stop 'missed' is required OK")
+    # P1: a non-mapping rec (0, [], "missed") is a clean "missed not reported", never a TypeError.
+    for bad in (0, [], "missed"):
+        card = _card(0.15)
+        card["stop"]["slices"]["red_light"] = bad
+        try:
+            res = iteration_bar(card, _card(0.20))
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(f"non-mapping red_light rec {bad!r} raised {type(exc).__name__}: {exc}") from exc
+        assert not res["pass"] and res["fail"].count("red_light: missed not reported") == 1, (bad, res)
+        assert "red_light" not in res["fail"], (bad, res)  # not scored as a counted miss
+    # missed must be a real int: reject 0.5, "0", bool (int(True)==1 / int("0")==0 would mis-score).
+    for bad in (0.5, 0.0, "0", "1", True, False):
+        card = _card(0.15)
+        card["stop"]["slices"]["red_light"] = {"events": 6, "missed": bad}
+        try:
+            res = iteration_bar(card, _card(0.20))
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(f"non-int missed {bad!r} raised {type(exc).__name__}: {exc}") from exc
+        assert not res["pass"] and "red_light: missed not reported" in res["fail"], (bad, res)
+    card = _card(0.15)
+    card["stop"]["slices"]["red_light"] = {"events": 6, "missed": 1}
+    res = iteration_bar(card, _card(0.20))
+    assert not res["pass"] and "red_light" in res["fail"] and "red_light: missed not reported" not in res["fail"], res
+    # P6b: missing from new but present in baseline is listed once, not twice (required-loop + prev-loop).
+    res = iteration_bar(_card(0.15, slices=_slices(**{"yield": None})), _card(0.20))
+    assert not res["pass"] and res["fail"].count("slice:yield") == 1, res
+    print("iteration bar: every labelable slice required on both cards (empty maps fail); stop 'missed' is a real int; non-mapping rec fails cleanly OK")
 
 
 def check_slice_rules_are_frozen() -> None:

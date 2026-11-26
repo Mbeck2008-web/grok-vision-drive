@@ -206,7 +206,7 @@ def iteration_bar(new: Mapping[str, Any], prev: Mapping[str, Any]) -> dict[str, 
     """Per-iteration merge bar of ``new`` against the previous shipped/best ``prev``.
 
     Every ``labelable_today`` slice in ``SLICE_RULES`` must be on both cards; a stop-score
-    slice (``stop_side_angle``, ``red_light``) must include ``missed`` (not defaulted to 0).
+    slice (``stop_side_angle``, ``red_light``) must include an ``int`` ``missed`` (not defaulted to 0; not a bool, float or string).
     """
     _require_card(new, "new")
     _require_card(prev, "baseline")
@@ -223,7 +223,9 @@ def iteration_bar(new: Mapping[str, Any], prev: Mapping[str, Any]) -> dict[str, 
             fail.append(f"{name}: slice missing from the stop scores")
         elif not isinstance(rec, Mapping) or "missed" not in rec or rec.get("missed") is None:
             fail.append(f"{name}: missed not reported")
-        elif int(rec["missed"]) != 0:
+        elif type(rec["missed"]) is not int:  # not bool, not 0.5, not "0"
+            fail.append(f"{name}: missed not reported")
+        elif rec["missed"] != 0:
             fail.append(name)
     for key, label in (("false_brakes_per_km", "false_brake_rate"), ("green_false_brakes_per_km", "green_false_brake_rate")):
         got, base = _num(stop.get(key)), _num(prev["stop"].get(key))

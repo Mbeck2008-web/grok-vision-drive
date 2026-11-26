@@ -1071,6 +1071,16 @@ def check_run_recipe_end_to_end() -> None:
         assert err is None, (err, text[-1500:])
         s2 = sorted(ck.rglob("*.ckpt_ep*.npz"), key=lambda q: q.stat().st_mtime)
         assert str(res.last_ckpt) == str(s2[-1]) and res.trained == ["2"], (res, s2[-1])
+        # the export is the last epoch checkpoint's weights (no best-weight restore under the recipe)
+        from onnx import numpy_helper
+
+        from python.train.epoch_ckpt import load_epoch_ckpt
+        inits = {i.name.removeprefix("net."): numpy_helper.to_array(i) for i in onnx.load(str(export)).graph.initializer}
+        last_w = load_epoch_ckpt(s2[-1])["weights"]
+        shared = [k for k in last_w if k in inits and inits[k].shape == np.shape(last_w[k])]
+        assert len(shared) >= 10, len(shared)
+        diff = [k for k in shared if not np.array_equal(inits[k], np.asarray(last_w[k]))]
+        assert not diff, diff[:5]
         # a mid-curriculum start without a baseline is refused
         res, err, text = run("2", export_path=None)
         assert err is not None and "mid-curriculum" in str(err), err

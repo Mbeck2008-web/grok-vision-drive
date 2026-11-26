@@ -2847,6 +2847,26 @@ def assert_road_snap_cams(cams) -> None:
     )
 
 
+def resolve_road_snap_cams(src=None):
+    """The snap-cam set used by the reject check.
+
+    The literal fallback is allowed only on heads *without* snap_road_for_cam. If
+    ``hasattr(src, 'snap_road_for_cam')`` is true, a missing ROAD_SNAP_CAMS is a FAIL
+    (clear message), not a fallback. When the set is present it must equal the literal.
+    """
+    src = sf if src is None else src
+    cams = runtime_road_snap_cams(src)
+    if hasattr(src, "snap_road_for_cam") and cams is None:
+        raise AssertionError(
+            "snap_road_for_cam is present but ROAD_SNAP_CAMS is missing; "
+            "the literal fallback is only allowed on heads without snap_road_for_cam"
+        )
+    if cams is None:
+        return EXPECTED_ROAD_SNAP_CAMS
+    assert_road_snap_cams(cams)
+    return cams
+
+
 def _snap_scene(cam):
     rz = sf._pixel_rays(cam)[..., 2]
     h = float(np.asarray(cam.pos)[2])
@@ -2914,11 +2934,13 @@ def check_snap_rejects_raised_pred_z() -> None:
     """Skeptic (13:59 / 15:11): the one-sided pred-z > 0.30 m rejection must be in the snap path for cams in
     ROAD_SNAP_CAMS (imported from the runtime; must equal the literal
     {main, pillarL, pillarR, repeatL, repeatR, rear} so dropping a cam cannot silently shrink the check).
-    Behavioural (synthetic pred z 0.5 vs 0.05 m road px) + mutants: no rejection; a snap that acts on narrow;
-    a ROAD_SNAP_CAMS that drops pillarR. For every cam not in the set, snap_road_for_cam must change zero road
-    px (output equals input). Scoping correction, not a loosening. Expected FAIL on this head (road_snap has
-    no rejection; normal FAIL, Fix item for Redesigner) with a raised-pred-z message on a snap cam, not narrow."""
-    runtime_set = runtime_road_snap_cams()
+    The literal fallback is allowed only when snap_road_for_cam is absent; if that entry point exists,
+    a missing ROAD_SNAP_CAMS is a FAIL, not a fallback. Behavioural (synthetic pred z 0.5 vs 0.05 m) +
+    mutants: no rejection; a snap that acts on narrow; a ROAD_SNAP_CAMS that drops pillarR; snap_road_for_cam
+    present with ROAD_SNAP_CAMS deleted. Positive control: stub snap_road_for_cam + literal set, set-equality
+    passes (rejection aside). For every cam not in the set, snap_road_for_cam must change zero road px.
+    Scoping correction, not a loosening. Expected FAIL on this head (road_snap has no rejection; normal FAIL,
+    Fix item for Redesigner) with a raised-pred-z message on a snap cam, not narrow or a missing set."""
     # mutant: dropping pillarR from ROAD_SNAP_CAMS must FAIL the set-equality assertion
     dropped = EXPECTED_ROAD_SNAP_CAMS - {"pillarR"}
     try:
@@ -2929,14 +2951,58 @@ def check_snap_rejects_raised_pred_z() -> None:
     else:
         dropped_caught = False
     assert dropped_caught, "mutant that drops pillarR from ROAD_SNAP_CAMS was not caught"
-    if runtime_set is not None:
-        assert_road_snap_cams(runtime_set)
-        snap_cams = runtime_set
+
+    def _stub_snap_road_for_cam(cam_id, cam, depth, road):  # exact runtime signature
+        return depth, np.zeros(np.shape(depth), bool)
+
+    def _snap_module_snapshot():
+        return (hasattr(sf, "snap_road_for_cam"), getattr(sf, "snap_road_for_cam", None),
+                hasattr(sf, "ROAD_SNAP_CAMS"), getattr(sf, "ROAD_SNAP_CAMS", None))
+
+    def _restore_snap_module(had_fn, fn, had_set, sset):
+        if had_fn:
+            sf.snap_road_for_cam = fn
+        elif hasattr(sf, "snap_road_for_cam"):
+            delattr(sf, "snap_road_for_cam")
+        if had_set:
+            sf.ROAD_SNAP_CAMS = sset
+        elif hasattr(sf, "ROAD_SNAP_CAMS"):
+            delattr(sf, "ROAD_SNAP_CAMS")
+
+    snap_state = _snap_module_snapshot()
+    try:
+        # mutant: snap_road_for_cam present, ROAD_SNAP_CAMS absent -> must FAIL, not fall back
+        sf.snap_road_for_cam = _stub_snap_road_for_cam
+        if hasattr(sf, "ROAD_SNAP_CAMS"):
+            delattr(sf, "ROAD_SNAP_CAMS")
+        try:
+            resolve_road_snap_cams(sf)
+            missing_caught, missing_msg = False, None
+        except AssertionError as e:
+            missing_caught, missing_msg = True, str(e)
+        assert missing_caught, (
+            "mutant: snap_road_for_cam present but ROAD_SNAP_CAMS absent was not caught (literal fallback used)"
+        )
+        print(f"  mutant missing ROAD_SNAP_CAMS with snap_road_for_cam: caught ({missing_msg})", flush=True)
+
+        # positive control: stub snap_road_for_cam + ROAD_SNAP_CAMS equal to the literal -> set-equality passes
+        sf.snap_road_for_cam = _stub_snap_road_for_cam
+        sf.ROAD_SNAP_CAMS = tuple(sorted(EXPECTED_ROAD_SNAP_CAMS))
+        ctrl = resolve_road_snap_cams(sf)
+        assert_road_snap_cams(ctrl)
+        print(f"  positive control stub snap_road_for_cam + ROAD_SNAP_CAMS == literal: set-equality passed ({sorted(ctrl)})",
+              flush=True)
+    finally:
+        _restore_snap_module(*snap_state)
+        # the head's real attributes must be back before any later snap call
+        assert _snap_module_snapshot() == snap_state, "failed to restore sf snap attributes after mutants"
+
+    snap_cams = resolve_road_snap_cams()
+    if runtime_road_snap_cams() is not None:
         print(f"  ROAD_SNAP_CAMS (from runtime) {sorted(snap_cams)} == literal {sorted(EXPECTED_ROAD_SNAP_CAMS)}", flush=True)
     else:
-        # this head has no ROAD_SNAP_CAMS; still scope reject+snap to the contracted set (narrow is not a snap cam)
-        snap_cams = EXPECTED_ROAD_SNAP_CAMS
-        print(f"  ROAD_SNAP_CAMS absent on this head; reject+snap scoped to the literal set {sorted(snap_cams)}", flush=True)
+        print(f"  ROAD_SNAP_CAMS absent on this head and snap_road_for_cam is absent; "
+              f"reject+snap scoped to the literal fallback {sorted(snap_cams)}", flush=True)
 
     def mutant(cam, cid, d, road):   # rejection removed: snap decided on a ground-level depth, then applied to d
         rz = sf._pixel_rays(cam)[..., 2]

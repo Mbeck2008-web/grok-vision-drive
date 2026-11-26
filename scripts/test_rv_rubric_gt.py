@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""GT-named offline tests for Reality View step 8(1): the C-from-GT quality rubric.
+
+Spec: docs/specs/reality_view_3dgs.md, "8. Kill or graduate (quality rubric)"
+item (1) and "Step 8 quality rubric". This file consumes sim GT, so it is
+GT-named (``check_no_sim_gt_on_live_path``: a GT fixture is only consumed by a
+test named GT). Everything is generated in-process from a tiny analytic scene:
+no committed binaries, no RNG, no wall clock, numpy only.
+
+Checks:
+- check_useful_view_metrics            (C-from-GT, spec thresholds)
+- check_useful_view_checklist          (C-from-GT, six yes/no items)
+- check_depth_buffer_required          (no rendered-depth buffer => fail, not skip)
+- check_metric_boundaries              (inclusive thresholds, one step either side)
+- check_rubric_is_gt_named_only        (nothing outside GT-named files imports it)
+"""
+from __future__ import annotations
+
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from python.viz import rv_contract as rvc  # noqa: E402
+from python.viz import rv_rubric_gt as rub  # noqa: E402
+
+W, H = 160, 120
+EGO_FOOTPRINT = (4.5, 1.9)
+
+
+# --------------------------------------------------------------------------
+# Tiny analytic world (ego frame: x forward, y left, z up; camera frame is
+# OpenCV: x right, y down, z forward; depth is z-depth, metres).
+# --------------------------------------------------------------------------
+VEH_MIN = np.array([12.0, -0.95, 0.0])
+VEH_MAX = np.array([16.5, 0.95, 1.5])
+VEH_CENTER = (VEH_MIN + VEH_MAX) / 2.0
+WALL_X = 60.0
+ROAD_HALF_WIDTH = 5.0
+
+
+def cam_pose(pos, pitch_deg: float) -> np.ndarray:
+    """Camera->ego 4x4 for a camera at ``pos`` looking +x, pitched down."""
+    th = np.deg2rad(pitch_deg)
+    z = np.array([np.cos(th), 0.0, -np.sin(th)])
+    x = np.array([0.0, -1.0, 0.0])
+    y = np.cross(z, x)
+    t = np.eye(4)
+    t[:3, 0], t[:3, 1], t[:3, 2], t[:3, 3] = x, y, z, pos
+    return t
+
+
+def intrinsics(f: float) -> np.ndarray:
+    return np.array([[f, 0.0, W / 2.0], [0.0, f, H / 2.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _rays(k: np.ndarray, t_ego_cam: np.ndarray):
+    v, u = np.mgrid[0:H, 0:W].astype(np.float64)
+    dc = np.stack([(u + 0.5 - k[0, 2]) / k[0, 0], (v + 0.5 - k[1, 2]) / k[1, 1], np.ones_like(u)], axis=-1)
+    d = dc @ t_ego_cam[:3, :3].T
+    return t_ego_cam[:3, 3], d
+
+
+def raycast(k: np.ndarray, t_ego_cam: np.ndarray):
+    """Analytic GT: depth (NaN = sky), rgb, road/vehicle masks. Ground + box + wall."""
+    o, d = _rays(k, t_ego_cam)
+    inf = np.inf
+    t_ground = np.where(d[..., 2] < -1e-9, -o[2] / np.where(d[..., 2] < -1e-9, d[..., 2], 1.0), inf)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t1 = (VEH_MIN - o) / d
+        t2 = (VEH_MAX - o) / d
+    tn = np.minimum(t1, t2)
+    tf = np.maximum(t1, t2)
+    t_in = np.max(np.nan_to_num(tn, nan=-inf), axis=-1)
+    t_out = np.min(np.nan_to_num(tf, nan=inf), axis=-1)
+    hit_box = (t_in <= t_out) & (t_out > 0) & (t_in > 0)
+    t_box = np.where(hit_box, t_in, inf)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_wall = np.where(d[..., 0] > 1e-9, (WALL_X - o[0]) / d[..., 0], inf)
+    pw = o + d * t_wall[..., None]
+    t_wall = np.where((pw[..., 2] >= 0) & (pw[..., 2] <= 12.0), t_wall, inf)
+    ts = np.stack([t_ground, t_box, t_wall], axis=-1)
+    which = np.argmin(ts, axis=-1)
+    t = np.min(ts, axis=-1)
+    hit = np.isfinite(t)
+    depth = np.where(hit, t, np.nan)  # direction z_cam == 1, so t is z-depth
+    p = o + d * np.where(hit, t, 0.0)[..., None]
+    rgb = np.zeros((H, W, 3), dtype=np.float64)
+    ground = hit & (which == 0)
+    road = ground & (np.abs(p[..., 1]) < ROAD_HALF_WIDTH)
+    grass = ground & ~road
+    stripe = (np.floor(p[..., 0] / 2.0).astype(int) % 2).astype(np.float64)
+    rgb[road] = np.stack([85 + 25 * stripe, 85 + 25 * stripe, 90 + 25 * stripe], axis=-1)[road]
+    rgb[grass] = np.array([60.0, 120.0, 55.0])
+    veh = hit & (which == 1)
+    shade = np.where(p[..., 2] > VEH_MAX[2] - 1e-6, 1.0, np.where(p[..., 0] < VEH_MIN[0] + 1e-6, 0.8, 0.6))
+    rgb[veh] = (np.array([200.0, 40.0, 40.0]) * shade[..., None])[veh]
+    wall = hit & (which == 2)
+    rgb[wall] = np.array([110.0, 130.0, 190.0])
+    rgb[~hit] = np.array([170.0, 200.0, 235.0])
+    return depth, np.clip(rgb, 0, 255).astype(np.uint8), road, veh
+
+
+def unproject(depth: np.ndarray, k: np.ndarray, t_ego_cam: np.ndarray):
+    v, u = np.mgrid[0:H, 0:W].astype(np.float64)
+    z = depth.astype(np.float64)
+    pc = np.stack([(u + 0.5 - k[0, 2]) / k[0, 0] * z, (v + 0.5 - k[1, 2]) / k[1, 1] * z, z], axis=-1)
+    return pc @ t_ego_cam[:3, :3].T + t_ego_cam[:3, 3]
+
+
+FOG = np.array([128, 128, 128], dtype=np.uint8)
+
+
+def splat_render(points_ego, colors, k, t_ego_cam, footprints_m):
+    """Tiny C-style depth-billboard render with a z-buffer (test-only reference)."""
+    inv = np.linalg.inv(t_ego_cam)
+    pc = points_ego @ inv[:3, :3].T + inv[:3, 3]
+    z = pc[:, 2]
+    ok = z > 0.3
+    pc, z, colors, fp = pc[ok], z[ok], colors[ok], footprints_m[ok]
+    u = pc[:, 0] / z * k[0, 0] + k[0, 2]
+    v = pc[:, 1] / z * k[1, 1] + k[1, 2]
+    size = np.maximum(1, np.ceil(fp * k[0, 0] / z).astype(int))
+    zbuf = np.full((H, W), np.inf)
+    u0 = np.floor(u - size / 2.0 + 0.5).astype(int)
+    v0 = np.floor(v - size / 2.0 + 0.5).astype(int)
+    kmax = int(size.max()) if size.size else 1
+    for dy in range(kmax):
+        for dx in range(kmax):
+            m = (size > dy) & (size > dx)
+            uu, vv = u0[m] + dx, v0[m] + dy
+            ins = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
+            np.minimum.at(zbuf, (vv[ins], uu[ins]), z[m][ins])
+    rgb = np.tile(FOG, (H, W, 1))
+    for dy in range(kmax):
+        for dx in range(kmax):
+            m = (size > dy) & (size > dx)
+            uu, vv = u0[m] + dx, v0[m] + dy
+            ins = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
+            uu, vv, zz, cc = uu[ins], vv[ins], z[m][ins], colors[m][ins]
+            win = zz <= zbuf[vv, uu]
+            rgb[vv[win], uu[win]] = cc[win]
+    covered = np.isfinite(zbuf)
+    depth = np.where(covered, zbuf, 0.0).astype(np.float32)
+    return rgb, depth, covered.astype(np.float32)
+
+
+SRC_K = intrinsics(60.0)
+SRC_T = cam_pose([0.0, 0.0, 1.5], 5.0)
+CHASE_K = intrinsics(75.0)
+CHASE_T = cam_pose([-4.0, 0.0, 3.0], 12.0)
+
+
+def build_scene():
+    """Source rig camera + chase camera GT, and the C-from-GT render."""
+    sd, srgb, _, _ = raycast(SRC_K, SRC_T)
+    cd, crgb, croad, cveh = raycast(CHASE_K, CHASE_T)
+    valid = np.isfinite(sd)
+    pts = unproject(np.where(valid, sd, 1.0), SRC_K, SRC_T)[valid]
+    cols = srgb[valid]
+    fp = (sd[valid] / SRC_K[0, 0]) * 1.5
+    rgb, depth, opacity = splat_render(pts, cols, CHASE_K, CHASE_T, fp)
+    # unobserved = chase pixels whose world point the source camera never saw
+    pw = unproject(np.where(np.isfinite(cd), cd, 1.0), CHASE_K, CHASE_T)
+    inv = np.linalg.inv(SRC_T)
+    ps = pw @ inv[:3, :3].T + inv[:3, 3]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        us = np.floor(ps[..., 0] / ps[..., 2] * SRC_K[0, 0] + SRC_K[0, 2]).astype(int)
+        vs = np.floor(ps[..., 1] / ps[..., 2] * SRC_K[1, 1] + SRC_K[1, 2]).astype(int)
+    inside = (ps[..., 2] > 0) & (us >= 0) & (us < W) & (vs >= 0) & (vs < H)
+    seen = np.zeros((H, W), dtype=bool)
+    sdv = sd[np.clip(vs, 0, H - 1), np.clip(us, 0, W - 1)]
+    seen[inside] = (np.abs(sdv[inside] - ps[..., 2][inside]) < 0.5)
+    unobserved = np.isfinite(cd) & ~seen
+    gt = rub.GtFrame(
+        depth=cd.astype(np.float32),
+        rgb=crgb,
+        intrinsics=CHASE_K,
+        t_ego_cam=CHASE_T,
+        road_mask=croad,
+        vehicle_mask=cveh,
+        unobserved_mask=unobserved,
+        vehicle_center_ego=VEH_CENTER.copy(),
+    )
+    return gt, rgb, depth, opacity, (pts, cols, fp)
+
+
+def make_out(rgb, depth, *, seq=1, ts=1.0):
+    return rvc.RvOutputSpec(
+        schema_version=rvc.RV_SCHEMA_VERSION,
+        seq=seq,
+        timestamp_s=ts,
+        pose_4x4=CHASE_T.astype(np.float32),
+        rgb=rgb,
+        depth=depth.astype(np.float32),
+    )
+
+
+def good_harness(n=5):
+    mesh = []
+    render = []
+    for i in range(n):
+        p = np.eye(4)
+        p[0, 3] = 1.5 * i
+        mesh.append(p)
+        q = p.copy()
+        q[1, 3] = 0.1  # 10 cm lateral, well inside the mesh footprint
+        render.append(q)
+    return rub.Harness(render_ego_poses=np.stack(render), mesh_ego_poses=np.stack(mesh), ego_footprint_m=EGO_FOOTPRINT)
+
+
+def _items_failed(res):
+    return sorted(k for k, v in res.items.items() if not v)
+
+
+# --------------------------------------------------------------------------
+# Checks
+# --------------------------------------------------------------------------
+def check_useful_view_metrics() -> None:
+    """Spec Step 8 table: AbsRel<=0.20, delta<1.25>=0.70, coverage>=50%, PSNR>=16, SSIM>=0.45."""
+    gt, rgb, depth, opacity, _ = build_scene()
+    view = rub.RenderedView(out=make_out(rgb, depth), opacity=opacity)
+    res = rub.score_metrics(view, gt)
+    assert res.passed, f"C-from-GT canned clip must pass the metrics: {res.failures} {res.values}"
+    v = res.values
+    assert v["abs_rel"] <= 0.20 and v["delta_125"] >= 0.70 and v["coverage"] >= 0.50, v
+    assert v["psnr_db"] >= 16.0 and v["ssim"] >= 0.45, v
+    # deterministic: same inputs -> identical values
+    assert rub.score_metrics(view, gt).values == v
+
+    # each metric must be able to fail on its own
+    # AbsRel only: constant 25% over-estimate keeps coverage; delta stays 1.25 boundary -> use 1.3
+    bad = rub.score_metrics(rub.RenderedView(out=make_out(rgb, depth * 1.3), opacity=opacity), gt)
+    assert not bad.passed and not bad.items["abs_rel"] and not bad.items["delta_125"], bad.items
+    assert bad.items["coverage"] and bad.items["psnr_db"], bad.items
+    # coverage only: blank every other column of the render (depth + opacity), RGB untouched
+    d2, o2 = depth.copy(), opacity.copy()
+    d2[:, 1::2] = 0.0
+    o2[:, 1::2] = 0.0
+    sparse = rub.score_metrics(rub.RenderedView(out=make_out(rgb, d2), opacity=o2), gt)
+    assert not sparse.items["coverage"] and sparse.items["abs_rel"] and sparse.items["delta_125"], sparse.items
+    assert not sparse.passed
+    # PSNR / SSIM only: perfect geometry, destroyed colours
+    wrong_rgb = np.roll(np.flipud(rgb), 7, axis=1)
+    bad_rgb = rub.score_metrics(rub.RenderedView(out=make_out(wrong_rgb, depth), opacity=opacity), gt)
+    assert not bad_rgb.items["psnr_db"] or not bad_rgb.items["ssim"], bad_rgb.values
+    assert bad_rgb.items["abs_rel"] and bad_rgb.items["coverage"] and not bad_rgb.passed
+    # a depth buffer that is perfect but only on pixels outside 0.5-80 m GT range is not credit
+    print("PASS check_useful_view_metrics", {k: round(float(x), 4) for k, x in v.items()})
+
+
+def check_useful_view_checklist() -> None:
+    """All six spec checklist items must be yes on the same clip; each can fail alone."""
+    gt, rgb, depth, opacity, (pts, cols, fp) = build_scene()
+    view = rub.RenderedView(out=make_out(rgb, depth), opacity=opacity)
+    harness = good_harness()
+    res = rub.score_checklist(view, gt, harness, repo_root=ROOT)
+    assert res.passed, f"checklist must be all-yes on the canned clip: {_items_failed(res)} {res.failures}"
+    assert sorted(res.items) == sorted(rub.CHECKLIST_ITEMS), sorted(res.items)
+    assert len(rub.CHECKLIST_ITEMS) == 6
+
+    # 1. road not a surface: keep only every 9th road pixel
+    d, o = depth.copy(), opacity.copy()
+    spray = gt.road_mask & ((np.arange(W)[None, :] % 3 != 0) | (np.arange(H)[:, None] % 3 != 0))
+    d[spray], o[spray] = 0.0, 0.0
+    r = rub.score_checklist(rub.RenderedView(out=make_out(rgb, d), opacity=o), gt, harness, repo_root=ROOT)
+    assert _items_failed(r) == ["road_surface"], _items_failed(r)
+
+    # 2. ego pose: one tick jumps 5.0 m laterally
+    jump = good_harness()
+    rp = jump.render_ego_poses.copy()
+    rp[3, 1, 3] += 5.0
+    r = rub.score_checklist(view, gt, rub.Harness(rp, jump.mesh_ego_poses, EGO_FOOTPRINT), repo_root=ROOT)
+    assert _items_failed(r) == ["ego_pose_lines_up"], _items_failed(r)
+    # a 4.9 m lateral offset is below the 5 m jump gate but the footprints no longer overlap
+    rp2 = jump.render_ego_poses.copy()
+    rp2[:, 1, 3] = 4.9
+    r = rub.score_checklist(view, gt, rub.Harness(rp2, jump.mesh_ego_poses, EGO_FOOTPRINT), repo_root=ROOT)
+    assert _items_failed(r) == ["ego_pose_lines_up"], _items_failed(r)
+
+    # 3a. vehicle in the wrong place: shift the vehicle's GT centre 3.5 m (> 3 m)
+    far = rub.GtFrame(**{**gt.__dict__, "vehicle_center_ego": gt.vehicle_center_ego + np.array([0.0, 3.5, 0.0])})
+    r = rub.score_checklist(view, far, harness, repo_root=ROOT)
+    assert _items_failed(r) == ["vehicle_placed_once"], (_items_failed(r), r.values)
+    # 3b. drawn twice: a second copy of the vehicle splats 8 m to the side
+    vm_src = (pts[:, 0] >= VEH_MIN[0] - 0.01) & (pts[:, 0] <= VEH_MAX[0] + 0.01) & (np.abs(pts[:, 1]) <= 0.96) & (pts[:, 2] > 0.01)
+    ghost_pts = pts[vm_src] + np.array([0.0, 4.0, 0.0])
+    all_pts = np.concatenate([pts, ghost_pts])
+    all_cols = np.concatenate([cols, cols[vm_src]])
+    all_fp = np.concatenate([fp, fp[vm_src]])
+    grgb, gdepth, gop = splat_render(all_pts, all_cols, CHASE_K, CHASE_T, all_fp)
+    r = rub.score_checklist(rub.RenderedView(out=make_out(grgb, gdepth), opacity=gop), gt, harness, repo_root=ROOT)
+    assert "vehicle_placed_once" in _items_failed(r), (_items_failed(r), r.values)
+
+    # 4. unobserved painted as a fake wall: opaque surface at 5 m over the unobserved pixels
+    d, o = depth.copy(), opacity.copy()
+    d[gt.unobserved_mask], o[gt.unobserved_mask] = 5.0, 1.0
+    r = rub.score_checklist(rub.RenderedView(out=make_out(rgb, d), opacity=o), gt, harness, repo_root=ROOT)
+    assert "unobserved_not_wall" in _items_failed(r), _items_failed(r)
+    # hatch / fog (RGB painted, opacity 0) is allowed
+    assert gt.unobserved_mask.sum() > 0
+    h_rgb = rgb.copy()
+    h_rgb[gt.unobserved_mask] = (200, 200, 200)
+    r = rub.score_checklist(rub.RenderedView(out=make_out(h_rgb, depth), opacity=opacity), gt, harness, repo_root=ROOT)
+    assert "unobserved_not_wall" not in _items_failed(r), _items_failed(r)
+
+    # 5. GT on a non-GT-named path
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "python" / "viz").mkdir(parents=True)
+        (root / "python" / "viz" / "live_renderer.py").write_text("from python.viz import rv_rubric_gt\n", encoding="utf-8")
+        r = rub.score_checklist(view, gt, harness, repo_root=root)
+    assert _items_failed(r) == ["no_sim_gt_on_live_path"], _items_failed(r)
+
+    # 6. stale indicator: a packer that never sets the stale flag
+    r = rub.score_checklist(view, gt, harness, repo_root=ROOT, pack=lambda out, age_ms: rvc.pack_output_slot(out, age_ms=0.0))
+    assert _items_failed(r) == ["stale_indicator"], _items_failed(r)
+    print("PASS check_useful_view_checklist", sorted(res.items))
+
+
+def check_depth_buffer_required() -> None:
+    """A render with no rendered-depth buffer fails AbsRel and delta; it does not skip or raise."""
+    gt, rgb, depth, opacity, _ = build_scene()
+    out = make_out(rgb, depth)
+    nodepth = rvc.RvOutputSpec(**{**out.__dict__, "depth": None})
+    res = rub.score_metrics(rub.RenderedView(out=nodepth, opacity=opacity), gt)
+    assert not res.passed and not res.items["abs_rel"] and not res.items["delta_125"], res.items
+    assert res.values["abs_rel"] is None and res.values["delta_125"] is None
+    assert any("depth buffer" in f for f in res.failures), res.failures
+    # wrong shape / dtype depth is also "no usable buffer"
+    for bad in (depth[:-1], depth.astype(np.float64)):
+        o2 = rvc.RvOutputSpec(**{**out.__dict__, "depth": bad})
+        r2 = rub.score_metrics(rub.RenderedView(out=o2, opacity=opacity), gt)
+        assert not r2.passed and not r2.items["abs_rel"] and not r2.items["delta_125"], r2.items
+    # an all-hole depth buffer is a buffer, but scores as failing, not as vacuous success
+    r3 = rub.score_metrics(rub.RenderedView(out=make_out(rgb, np.zeros_like(depth)), opacity=opacity), gt)
+    assert not r3.passed and not r3.items["abs_rel"] and not r3.items["coverage"], r3.items
+    # SHM path: a slot packed through the contract round-trips and scores identically ...
+    slot = rvc.pack_output_slot(out, age_ms=10.0)
+    via_slot = rub.score_slot_metrics(slot, opacity, gt)
+    assert via_slot.passed and via_slot.values == rub.score_metrics(rub.RenderedView(out=out, opacity=opacity), gt).values
+    # ... and a slot without RV_FLAG_HAS_DEPTH fails the two metrics instead of raising
+    buf = bytearray(slot)
+    flags = int.from_bytes(buf[12:16], "little") & ~rvc.RV_FLAG_HAS_DEPTH
+    buf[12:16] = flags.to_bytes(4, "little")
+    r4 = rub.score_slot_metrics(bytes(buf), opacity, gt)
+    assert not r4.passed and not r4.items["abs_rel"] and not r4.items["delta_125"], r4.items
+    # a truncated slot (no depth payload) fails the same way
+    r5 = rub.score_slot_metrics(bytes(slot[: rvc.SLOT_HEADER_SIZE + W * H * 3]), opacity, gt)
+    assert not r5.passed and not r5.items["abs_rel"], r5.items
+    print("PASS check_depth_buffer_required")
+
+
+def _flat_gt(depth_value=10.0):
+    d = np.full((H, W), depth_value, dtype=np.float32)
+    rgb = np.full((H, W, 3), 100, dtype=np.uint8)
+    z = np.zeros((H, W), dtype=bool)
+    return rub.GtFrame(
+        depth=d, rgb=rgb, intrinsics=CHASE_K, t_ego_cam=CHASE_T, road_mask=z, vehicle_mask=z.copy(),
+        unobserved_mask=z.copy(), vehicle_center_ego=np.zeros(3),
+    )
+
+
+def check_metric_boundaries() -> None:
+    """Inclusive spec thresholds, tested one step either side with exact integer fractions."""
+    gt = _flat_gt(10.0)
+    rgb = gt.rgb
+    ones = np.ones((H, W), dtype=np.float32)
+
+    def run(depth, opacity=ones, rgb_=rgb):
+        return rub.score_metrics(rub.RenderedView(out=make_out(rgb_, depth), opacity=opacity), gt)
+
+    # AbsRel: constant scale s gives AbsRel == |s-1|
+    assert run(np.full((H, W), 11.9, np.float32)).items["abs_rel"]
+    assert not run(np.full((H, W), 12.1, np.float32)).items["abs_rel"]
+    assert run(np.full((H, W), 8.1, np.float32)).items["abs_rel"]
+    assert not run(np.full((H, W), 7.9, np.float32)).items["abs_rel"]
+    # delta<1.25: exactly 70% of pixels good (ratio 1.0), 30% bad (ratio 2.0)
+    n = H * W
+    k = int(round(0.70 * n))
+    d = np.full(n, 20.0, np.float32)
+    d[:k] = 10.0
+    assert run(d.reshape(H, W)).items["delta_125"], "70.0% must pass (>= 0.70)"
+    d[k - 1] = 20.0
+    assert not run(d.reshape(H, W)).items["delta_125"], "69.99% must fail"
+    # delta strictly < 1.25: ratio exactly 1.25 does not count as good (float32-exact values)
+    ex = np.full((H, W), 12.5, np.float32)
+    assert run(ex).values["delta_125"] == 0.0
+    # coverage: exactly 50% of valid pixels covered passes, one fewer fails
+    half = n // 2
+    o = np.zeros(n, np.float32)
+    o[:half] = 1.0
+    dd = np.where(o > 0, 10.0, 0.0).astype(np.float32)
+    assert run(dd.reshape(H, W), o.reshape(H, W)).items["coverage"], "50.0% must pass"
+    o[half - 1] = 0.0
+    dd = np.where(o > 0, 10.0, 0.0).astype(np.float32)
+    assert not run(dd.reshape(H, W), o.reshape(H, W)).items["coverage"]
+    # opacity threshold is >= 0.1
+    assert run(np.full((H, W), 10.0, np.float32), ones * 0.1).items["coverage"]
+    assert not run(np.full((H, W), 10.0, np.float32), ones * 0.0999).items["coverage"]
+    # GT range: pixels with GT depth outside 0.5-80 m (AbsRel) / 0.5-40 m (coverage) are not scored
+    far = rub.GtFrame(**{**gt.__dict__, "depth": np.full((H, W), 90.0, np.float32)})
+    r = rub.score_metrics(rub.RenderedView(out=make_out(rgb, np.full((H, W), 90.0, np.float32)), opacity=ones), far)
+    assert not r.items["abs_rel"] and not r.items["coverage"], "no valid GT pixels must fail, not pass vacuously"
+    mid = rub.GtFrame(**{**gt.__dict__, "depth": np.full((H, W), 60.0, np.float32)})
+    r = rub.score_metrics(rub.RenderedView(out=make_out(rgb, np.full((H, W), 60.0, np.float32)), opacity=ones), mid)
+    assert r.items["abs_rel"] and not r.items["coverage"], (r.items, "60 m counts for AbsRel only")
+    # PSNR: identical -> inf passes; MSE just under / over 16 dB
+    assert run(np.full((H, W), 10.0, np.float32)).values["psnr_db"] == float("inf")
+    mse16 = 255.0 ** 2 / 10 ** 1.6
+    amp_ok = int(np.floor(np.sqrt(mse16)))  # uniform error of this many levels stays >= 16 dB
+    for amp, want in ((amp_ok, True), (amp_ok + 2, False)):
+        shifted = np.clip(rgb.astype(int) + amp, 0, 255).astype(np.uint8)
+        assert run(np.full((H, W), 10.0, np.float32), rgb_=shifted).items["psnr_db"] is want, amp
+    # SSIM of identical images is 1.0 (and in [-1, 1] always)
+    assert abs(run(np.full((H, W), 10.0, np.float32)).values["ssim"] - 1.0) < 1e-12
+    print("PASS check_metric_boundaries")
+
+
+def check_rubric_is_gt_named_only() -> None:
+    """The rubric module and this test are GT-named; no non-GT file under python/ imports the rubric."""
+    assert "gt" in Path(rub.__file__).stem.split("_"), rub.__file__
+    assert "gt" in Path(__file__).stem.split("_"), __file__
+    assert rub.find_non_gt_importers(ROOT) == [], rub.find_non_gt_importers(ROOT)
+    # supervisor / safety-path modules must not import it either (covered by the scan, pinned here)
+    for rel in ("python/run_vision.py",):
+        assert "rv_rubric_gt" not in (ROOT / rel).read_text(encoding="utf-8")
+    # the live input contract still rejects GT depth keys
+    out_keys = ("depth_gt", "gt_depth", "sim_depth", "aux_depth")
+    rgb = np.zeros((8, 8, 3), np.uint8)
+    cam = rvc.RvCameraInput("main", rgb, np.eye(3, dtype=np.float32), np.eye(4, dtype=np.float32))
+    for key in out_keys:
+        spec = rvc.RvInputSpec(rvc.RV_SCHEMA_VERSION, 0, 0.0, np.eye(4, dtype=np.float32), {"main": cam},
+                               {key: np.zeros((8, 8), np.float32)})
+        try:
+            rvc.validate_rv_input(spec)
+        except rvc.RvSchemaError:
+            continue
+        raise AssertionError(f"live input accepted GT key {key!r}")
+    print("PASS check_rubric_is_gt_named_only")
+
+
+def main() -> None:
+    check_useful_view_metrics()
+    check_useful_view_checklist()
+    check_depth_buffer_required()
+    check_metric_boundaries()
+    check_rubric_is_gt_named_only()
+    print("test_rv_rubric_gt: ok")
+
+
+if __name__ == "__main__":
+    main()

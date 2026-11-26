@@ -115,6 +115,10 @@ The 2.0 map is also barred from that matched holdout (so it cannot be used for s
 
 **Intervention (one definition, used everywhere "zero interventions" or a 0-count is scored on the 2.0 drive).** An intervention is any of: a takeover, a collision, a missed stop-sign or red-light stop (full stop held ≥ 0.5 s), a curb strike, **and** any AEB or hand-coded stop-rule activation during the 2.0 drive. "Zero interventions" means the safety backstop never fires. **GVD call 2026-11-25** (interpreting Michael's "zero interventions"). This is not Michael's own words, so it is not labeled decided by Michael.
 
+**Open question, PROPOSAL pending Michael (do not read as decided):** whether an AEB or hand-coded stop-rule activation counts as an intervention. `python/train/trainer2_bar.py` counts it today (`BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS = True`, argument `count_backstop`); with False the activations are still tallied and reported (`backstop`) but not counted in `total`. Both settings are pinned by `check_backstop_config_proposal_pending_michael`, so his ruling is a one-line change.
+
+**Scoring rules in `trainer2_bar.py` (implementation of the rules above, no new thresholds):** the scenario-slice set, each slice's direction (`higher_is_better` / `lower_is_better`) and its 2.0 limit are the **Slice rules table** under Scenario slices below, pinned in code as `SLICE_RULES`; a run card cannot choose them (a slice name, direction or stated limit that differs from the table raises). Iteration bar: every `labelable_today` slice in the table must be on both cards, and there is no regression in the slice's direction; a stop-score slice must include `missed` (not defaulted to 0). 2.0 bar: **every slice in the table must be on the card and pass its table limit** (a missing slice, a `None`/NaN value or a value past the limit fails). The four slices that cannot be labelled yet are required too (`REQUIRE_UNLABELABLE_SLICES_FOR_2_0`, **PROPOSAL pending Michael**: literal reading of "every scenario slice from the addenda also passes"). A `None` or non-finite lane RMS, false-brake rate, slice value, drive length or VRAM fails (never passes); `stop_events.score` returns `None` for a rate with no distance. An unknown drive-event kind raises.
+
 The 30-minute live drive is run **on Desktop-IQU45 by GVD**. Swarm coders do not touch IQU45. It is blocked until the **2.0 bar blockers** in Dependencies to build exist.
 
 ## Learned stop braking (Michael, 6:37 PM; Q6 and lights decided 2026-11-25)
@@ -153,6 +157,26 @@ Collision proxy used below (spec proposal): in the event window, no `tags.impact
 | 6 | Sharp curves: speed reduced before curve entry | **Yes** (geometry from ego) | `state.jsonl` `ego.yaw_rate` and `ego.speed_mps` (`collect_scene_lanes.py:3709-3713`). Clip-mode observer already uses \|yaw_rate\|/speed ≥ `SHARP_CURVE_PER_M` (1/50 m) at speed ≥ `SHARP_CURVE_MIN_MPS` (5 m/s) (`clip_mode.py:77-79, 298-307`). | Event: a row meeting those two constants. **"Speed reduced before curve entry" (spec proposal):** peak speed in the 2 s before the first such row is ≥ 10% below the speed 4 s before that row. |
 | 7 | Night / rain / fog, reported as separate slices | **Partial** | Clip-mode: `clip_tags.json` has `weather`, `time_of_day_h`, `edge_case` (`clip_mode.write_tags`). Night can also be checked from mean main luma ≤ `NIGHT_MAX_LUMA` (60) (`clip_mode.py:80, 314-323`). Rain/fog: the collector sends `core_weather.setWeather` (`python/collect/auto_mode.environment_commands`); `_observe` says rain/fog are **not observable from the recording offline**. Non-clip runs: weather/tod are only in `collect.json` `argv` when `--weather` / `--time-of-day` were passed, not a per-row field in `state.jsonl`. | Slice membership: `clip_tags` when present; else `argv` if those flags were set; night also by luma. Report each of night, rain, fog on its own. Metrics = the iteration/2.0 cuts restricted to that slice. |
 | 8 | Safety: heartbeat / AEB / disengage tests pass, and live inference VRAM ≤ 4 GB | **Yes** (tests and caps, not a GT slice) | Existing offline checks around heartbeat / AEB / engage (suite). Vision cap: `config/hardware.yaml` `max_inference_vram_gb: 4`. `check_student_export_fits_deploy` / `check_safety_path_no_trainer_imports`. | The suite and the deploy VRAM check must stay green. Not a holdout-label slice. |
+
+### Slice rules table (pinned in `python/train/trainer2_bar.SLICE_RULES`)
+
+One number per slice on the run card. **Basis `spec`** = the criterion and number are in the table above (0 collisions, 0 cone contacts, false-brake rate no worse than the previous model). **Basis `PROPOSAL`** = the spec states only a measurable proxy and no number; the limit is the strictest reading (1.0 = every event handled correctly) and waits for Michael. The key names are the scorer's own; the spec numbers rows 1-8. Row 8 (safety tests and the 4 GB VRAM cap) is not a holdout slice: the suite and the drive's `live_vram_gb` gate it.
+
+| Slice key | Row | Direction | 2.0 limit | Basis | Labelable today |
+|---|---|---|---|---|---|
+| `lead_vehicle_collisions` | 1 | lower_is_better | 0 | spec | yes |
+| `lead_brake_light_reaction` | 1 | higher_is_better | 1.0 | PROPOSAL | yes |
+| `cut_in_collisions` | 2 | lower_is_better | 0 | spec | yes |
+| `cut_in_false_brakes_per_km` | 2 | lower_is_better | no_regression | spec | yes |
+| `cone_contacts` | 3 | lower_is_better | 0 | spec | no |
+| `yield` | 4 | higher_is_better | 1.0 | PROPOSAL | yes |
+| `railroad_crossing` | 5 | higher_is_better | 1.0 | PROPOSAL | no |
+| `sharp_curve` | 6 | higher_is_better | 1.0 | PROPOSAL | yes |
+| `night` | 7 | higher_is_better | 1.0 | PROPOSAL | yes |
+| `rain` | 7 | higher_is_better | 1.0 | PROPOSAL | no |
+| `fog` | 7 | higher_is_better | 1.0 | PROPOSAL | no |
+
+`lead_brake_light_reaction`, `yield` and `sharp_curve` are the share of that slice's events that meet the row's proxy; `night`, `rain` and `fog` are 1.0 when every iteration/2.0 cut restricted to that slice passes, else 0.0.
 
 ## Fail-and-learn closed-loop data (Michael, 8:39 PM)
 

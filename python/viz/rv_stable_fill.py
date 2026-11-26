@@ -350,7 +350,7 @@ def ground_clamp(cam: CameraPose, depth: np.ndarray, *, ground_z: float = 0.0, m
 
 
 ROAD_CLASS_IDS: tuple[int, ...] = (2,)   # net semantic id for drivable road (clip015: GT/ground-hit 0.86-1.04)
-ROAD_SNAP_MAX_M: float = 60.0           # beyond this a 0.1 m mount-height error is > 5% depth; clip015: 25->60 m cuts tunnel far-road float 0.51->0.15 m (main)
+ROAD_SNAP_MAX_M: float = 25.0           # GT road rises 0.4-1.1 deg off ego z=0 (clip015); beyond ~25 m pinning to z=0 is worse than net depth (f40 15-25 m: -0.55 m at 60 vs +0.15 m at 25)
 ROAD_SNAP_ERODE_PX: int = 4             # stay this many px inside the road class (12x16 class grid edges are blocky)
 
 

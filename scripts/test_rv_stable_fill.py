@@ -18,8 +18,8 @@ S7 ground clamp: a camera cannot see below the road. Depth farther than the down
    ground-plane hit (wide cam 88.7 deg vFOV, pitch -8, 1.24 m up) is capped there (x margin);
    true road, nearer surfaces (hood, walls) and rays at/above the horizon are untouched.
 S9 road is flat: net-labelled road pixels (>= 4 px inside the label, downward ray hitting within
-   60 m) are placed exactly on the ground plane, whatever the coarse net depth says, so the near road
-   cannot bend down/up and two cameras' road meets; road label edges, road beyond 60 m, non-road and
+   25 m) are placed exactly on the ground plane, whatever the coarse net depth says, so the near road
+   cannot bend down/up and two cameras' road meets; road label edges, road beyond 25 m, non-road and
    upward rays are left alone.
 S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
    (narrow 250, main/wide 250, 100 m cams 99.5); non-sky pixels beyond the cap or +inf are
@@ -266,7 +266,7 @@ def check_road_snap() -> None:
     bend = np.interp(ys, [0, 45, 89], [1.0, 0.5, 2.5])
     raw = np.where(np.isfinite(hit), hit * bend, 80.0)
     road = (ys >= 20) & (xs >= 30) & (xs < 130)  # reaches past ROAD_SNAP_MAX_M near the horizon
-    assert sf.ROAD_SNAP_MAX_M == 60.0
+    assert sf.ROAD_SNAP_MAX_M == 25.0
     R = 20.0  # this small fixture's horizon is only ~60 m out, so test the range gate at 20 m
     out, m = sf.road_snap(cam, raw, road, max_hit_m=R)
     core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= R)

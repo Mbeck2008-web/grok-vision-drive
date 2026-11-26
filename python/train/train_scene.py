@@ -4043,6 +4043,8 @@ def train_directory(
                     **({} if not stop_m else {k: stop_m[k] for k in (
                         "missed_stop", "missed_light", "false_brake", "stop_events", "light_events", "stop_km",
                         "stop_side_angle_events", "stop_side_angle_missed")}),
+                    # the train-row map this pass's profile was integrated with
+                    **({} if not stop_m else {"stop_motion": dict(stop_m["motion"])}),
                     **({} if aux_ev is None else {
                         "depth_absrel": aux_ev.absrel(), "sem_miou": aux_ev.miou(),
                         "depth_cells": int(aux_ev.rel_n), "sem_cells": int(aux_ev.sem_n),

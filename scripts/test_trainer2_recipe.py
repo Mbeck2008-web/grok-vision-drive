@@ -1700,8 +1700,8 @@ def _fake_env(base):
              "2": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3},
              "2b": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3, "missed_stop": 1.0,
                     "missed_light": 1.0, "false_brake": 1.0},
-             "7": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3, "missed_stop": 1.0,
-                   "missed_light": 1.0, "false_brake": 1.0}}  # stage 7 re-measures the stop metrics a 2b baseline holds
+             "7": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3}}
+    stop_part = {"missed_stop": 1.0, "missed_light": 1.0, "false_brake": 1.0}
 
     def fake_train(root, **kw):
         sid = kw["recipe_stage"]
@@ -1714,7 +1714,10 @@ def _fake_env(base):
         net = SceneNet(cams=("main",), ctl="ctl" in kw["heads"], aux_sensors=True, **scene_net_kwargs("small"))
         path = Path(kw["ckpt_dir"]) / f"scene_x.run20260101T00000{env.n}Z.ckpt_ep{env.n}_step{env.n}.npz"
         _ckpt_of(net, path, epoch=env.n, step=env.n, ctl="ctl" in kw["heads"], heads=list(kw["heads"]), preset="small")
-        return {"holdout_evals": [dict(table[sid])] * 4, "epoch_ckpts": [str(path)], "epochs_run": 4}
+        ev = dict(table[sid])
+        if sid == "7" and any(c[0] == "train" and c[1] == "2b" for c in calls):
+            ev.update(stop_part)  # stage 7 re-measures the stop metrics a 2b baseline holds
+        return {"holdout_evals": [ev] * 4, "epoch_ckpts": [str(path)], "epochs_run": 4}
 
     def run(*, stage="0,1,2,7", export=None, preset="small", extra=(), ck_name="ck", strips_root=None):
         use = strips_root or strips

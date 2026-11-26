@@ -90,6 +90,12 @@ def check_stage_2b_trains_end_to_end() -> None:
             one = fx.build(base / label, fx.N_ROWS, picked)
             _s, err, out = _train_2b(torch, train_scene, rec, one, base, label)
             assert isinstance(err, StopNotMeasured) and want in str(err), (label, err, out[-800:])
+        # events in the holdout but no braking in the train segment: refused with the fit's reason, never a soft skip
+        head = fx.script(fx.N_ROWS, [])
+        sy = head[fx.SPLIT + 4][0] + 45.0
+        nb = fx.build(base / "nobrake", fx.N_ROWS, [("stop_sign", sy, None), ("traffic_light", sy + 90.0, "red")])
+        _s, err, out = _train_2b(torch, train_scene, rec, nb, base, "nobrake")
+        assert isinstance(err, StopNotMeasured) and "motion fit needs" in str(err), (err, out[-800:])
         # the real thing
         strips = fx.build(base / "stops", fx.N_ROWS, fx.intersections(fx.N_ROWS))
         stats, err, out = _train_2b(torch, train_scene, rec, strips, base, "ok")
@@ -109,6 +115,9 @@ def check_stage_2b_trains_end_to_end() -> None:
         e = evals[0]
         for key in rec.STOP_METRICS:
             assert e[key] is not None and np.isfinite(e[key]) and e[key] >= 0.0, (key, e)
+        sm = e["stop_motion"]  # the map that scored this pass is the one fitted on the train rows
+        assert (sm["n_rows"], sm["n_brake_rows"]) == (n_pairs, n_brake), (sm, fit.group(0))
+        assert abs(sm["k_thr"] - k_thr) < 1e-3 and abs(sm["k_brk"] - k_brk) < 1e-3 and abs(sm["k_drag"] - k_drag) < 1e-3, sm
         assert e["stop_events"] == 1 and e["light_events"] == 1 and e["stop_km"] > 0.0, e
         assert e["missed_stop"] <= e["stop_events"] and e["missed_light"] <= e["light_events"], e
         # the recipe turns it into the stage result the runner gates on

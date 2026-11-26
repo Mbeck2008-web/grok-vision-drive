@@ -19,6 +19,8 @@ Checks
 * scale<1 is applied and a wrong canvas size raises SceneCkptInputError; run_vision asks the backend for all the ckpt's cams.
 * engage stays hard-blocked in --scene-ckpt shadow mode with an 8-cam checkpoint.
 * run_vision passes the live frame dict (not ``main``) to observe.
+* a flagged stub-drive tick becomes ``stop_command(reason='scene_ckpt_low')`` (brake 1).
+* ``missing_cams`` is kept when the net has no ``lane_gt`` head, and in ``scene_ckpt_as_state`` when pred is None.
 
     py -3 scripts/test_scene_ckpt_8cam.py
 """
@@ -417,6 +419,81 @@ def check_missing_cams_logged_once_per_change() -> None:
     print("missing cams logged once per change (3 lines for 9 ticks, none for the complete ticks) OK")
 
 
+def check_missing_cams_kept_when_no_lane_gt() -> None:
+    """observe still puts missing_cams on the pred when the net has no lane_gt head (kills MC10)."""
+    from python.train.scene_ckpt_runtime import scene_ckpt_as_state
+
+    frames = _fixture_frames()
+    dropped = {k: v for k, v in frames.items() if k != "rear"}
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        rt, _ = _runtime(Path(tmp), None)
+        real = rt.net.forward
+
+        def no_gt(*a, **k):
+            pred, state = real(*a, **k)
+            pred.lane_gt = None
+            return pred, state
+
+        rt.net.forward = no_gt
+        pred = rt.observe(dropped, 0.1)
+        assert pred.lane_gt is None and pred.lane_x is None, pred
+        assert tuple(pred.missing_cams) == ("rear",), pred.missing_cams
+        assert pred.as_state()["missing_cams"] == ["rear"], pred.as_state()
+        st = scene_ckpt_as_state(pred, drive=True, engaged=False, steer=0.0)
+        assert st["missing_cams"] == ["rear"], st
+    print("observe with no lane_gt head still carries missing_cams (rear dropped) OK")
+
+
+def check_scene_ckpt_as_state_none_pred_keeps_missing_cams() -> None:
+    """scene_ckpt_as_state(pred=None) keeps the missing_cams key (kills MC14)."""
+    from python.train.scene_ckpt_runtime import scene_ckpt_as_state
+
+    for pred in (None, object()):
+        st = scene_ckpt_as_state(pred, drive=True, engaged=False, steer=0.0)
+        assert "missing_cams" in st, st
+        assert st["missing_cams"] == [], st
+        assert st["lane_x"] is None and st["confidence"] == 0.0, st
+        assert st["drive"] is True and st["source"] == "scene_ckpt", st
+    print("scene_ckpt_as_state(None) and a pred with no as_state keep missing_cams=[] OK")
+
+
+def check_flagged_tick_issues_scene_ckpt_low() -> None:
+    """Stub drive run: a flagged tick must become stop_command('scene_ckpt_low').
+
+    The stub bundle has no cameras, so every tick is missing_cams-flagged. The
+    wiring from apply_scene_ckpt_lane(...) == 'stop' to ckpt_stop to
+    stop_command(reason='scene_ckpt_low') is what puts brake=1. Kills RV1
+    (``elif ckpt_stop:`` -> ``elif False:``) and RV2 (the == 'stop' result ignored).
+    """
+    from test_live_default_path import run_supervisor
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime, _net = _runtime(Path(tmp), None, seed=9)
+        text, states = run_supervisor(
+            ["--scene-ckpt", str(runtime.path), "--scene-ckpt-drive", "--force-engage", "--run-seconds", "2"],
+            seconds=2.0,
+            echo=True,
+        )
+    assert states, text[-2000:]
+    engaged = [st for st in states if st.get("engaged")]
+    assert engaged, (
+        "control: the harness never engaged, so a scene_ckpt_low assertion would be vacuous",
+        [st.get("engaged") for st in states[:8]],
+        text[-2000:],
+    )
+    reasons = [st.get("cmd_reason") for st in engaged]
+    assert all(r == "scene_ckpt_low" for r in reasons), reasons[:12]
+    for st in engaged:
+        brake = float((st.get("ego") or {}).get("brake") or 0.0)
+        assert brake == 1.0, (st.get("cmd_reason"), brake)
+        ckpt = st.get("scene_ckpt") or {}
+        assert ckpt.get("missing_cams"), ckpt
+    print(
+        f"flagged stub tick: {len(engaged)}/{len(states)} engaged ticks "
+        f"cmd_reason=scene_ckpt_low brake=1 OK"
+    )
+
+
 # ------------------------------------------------------------------ scale and canvas guard (Skeptic 2 r1, fix 4)
 
 
@@ -506,6 +583,9 @@ CHECKS = (
     check_main_only_input_is_gone,
     check_missing_cams_flagged_each_of_8,
     check_missing_cams_logged_once_per_change,
+    check_missing_cams_kept_when_no_lane_gt,
+    check_scene_ckpt_as_state_none_pred_keeps_missing_cams,
+    check_flagged_tick_issues_scene_ckpt_low,
     check_scale_applied_and_canvas_guard,
     check_run_vision_requests_all_ckpt_cams,
     check_engage_still_blocked_with_8cam_ckpt,

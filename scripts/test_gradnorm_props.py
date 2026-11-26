@@ -322,6 +322,20 @@ def check_equal_heads_take_no_step() -> None:
     assert out["a"] < 1.0 < out["b"] and abs(out["a"] + out["b"] - 2.0) < 1e-12, out
 
 
+def check_on_target_head_beside_moving_heads_takes_no_step() -> None:
+    """Only the middle head sits exactly on target (G = [1, 2, 3], g_bar = 2, r = 1): its sign
+    term is 0, so before projection it stays at 1.0 while the other two move. With every head
+    on target the projection hides a wrong sign at diff == 0; here it can't."""
+    from python.train.trainer2_balance import project_weights as _pw
+
+    for lr in (0.1, 0.01):
+        gn = GradNorm(["a", "b", "c"], alpha=1.0, lr=lr)
+        out = gn.update({"a": 1.0, "b": 1.0, "c": 1.0}, {"a": 1.0, "b": 2.0, "c": 3.0}, active=["a", "b", "c"])
+        want = _pw({"a": 1.0 + lr * 1.0, "b": 1.0, "c": 1.0 - lr * 3.0}, 3.0)
+        for k in ("a", "b", "c"):
+            assert math.isclose(out[k], want[k], rel_tol=0, abs_tol=1e-12), (lr, k, out, want)
+
+
 def check_overlap_and_unknown_active_refused() -> None:
     _raises(GradNorm, ["a", "b"], fixed={"b": 2.0})
     assert GradNorm(["a"], fixed={"b": 2.0}).weight_of("b") == 2.0
@@ -726,6 +740,7 @@ def main() -> None:
     check_record_and_combine_exact()
     check_overlap_and_unknown_active_refused()
     check_equal_heads_take_no_step()
+    check_on_target_head_beside_moving_heads_takes_no_step()
     check_pin_alpha_overflow()
     check_pin_huge_grad_norm_keeps_sum()
     check_pin_ctor_refuses_poison_hyperparams()
@@ -753,6 +768,7 @@ def test_exact_values_and_messages() -> None:
     check_record_and_combine_exact()
     check_overlap_and_unknown_active_refused()
     check_equal_heads_take_no_step()
+    check_on_target_head_beside_moving_heads_takes_no_step()
 
 
 def test_pins() -> None:

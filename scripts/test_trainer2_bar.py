@@ -2,8 +2,11 @@
 """Trainer 2.0: per-iteration merge bar and the 2.0 naming bar (docs/specs/trainer_2.md, Decision rules).
 
 Checks: check_iteration_bar_thresholds, check_2_0_bar_not_claimed_without_iqu45_drive,
-check_intervention_tally (AEB and hand-rule activations count as interventions:
-GVD call 2026-11-25, a proposal pending Michael). Pure Python.
+check_intervention_tally, check_slice_direction, check_2_0_requires_every_slice_to_pass,
+check_unmeasured_is_not_passing, check_unknown_intervention_kind_raises,
+check_backstop_config_proposal_pending_michael (AEB and hand-rule activations count as
+interventions: GVD call 2026-11-25, a PROPOSAL pending Michael), check_drive_record_gates.
+Pure Python.
 """
 from __future__ import annotations
 
@@ -14,6 +17,28 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+HI, LO = "higher_is_better", "lower_is_better"
+
+
+def _s(value, direction=HI, limit=None):
+    rec = {"value": value, "direction": direction}
+    if limit is not None:
+        rec["limit"] = limit
+    return rec
+
+
+def _slices(**over):
+    base = {
+        "lead_brake": _s(1.0, HI, 1.0),
+        "cut_in": _s(1.0, HI, 1.0),
+        "sharp_curve": _s(0.9, HI, 0.8),
+        "cut_in_collisions": _s(0, LO, 0),
+        "cut_in_false_brakes_per_km": _s(0.5, LO, 1.0),
+    }
+    base.update(over)
+    return {k: v for k, v in base.items() if v is not None}
 
 
 def _card(rms: float = 0.20, *, missed: int = 0, side_missed: int = 0, red_missed: int = 0,
@@ -28,7 +53,7 @@ def _card(rms: float = 0.20, *, missed: int = 0, side_missed: int = 0, red_misse
             "false_brakes_per_km": fb_km,
             "green_false_brakes_per_km": green_fb_km,
         },
-        "slices": dict(slices or {"lead_brake": 1.0, "cut_in": 1.0, "sharp_curve": 0.9}),
+        "slices": dict(_slices() if slices is None else slices),
     }
 
 
@@ -51,14 +76,14 @@ def check_iteration_bar_thresholds() -> None:
         ({"red_missed": 1}, "red_light"),
         ({"fb_km": 0.51}, "false_brake_rate"),
         ({"green_fb_km": 0.11}, "green_false_brake_rate"),
-        ({"slices": {"lead_brake": 1.0, "cut_in": 0.99, "sharp_curve": 0.9}}, "slice:cut_in"),
-        ({"slices": {"lead_brake": 1.0, "sharp_curve": 0.9}}, "slice:cut_in"),
+        ({"slices": _slices(cut_in=_s(0.99, HI, 1.0))}, "slice:cut_in"),
+        ({"slices": _slices(cut_in=None)}, "slice:cut_in"),
     ):
         res = iteration_bar(_card(0.15, **kw), prev)
         assert not res["pass"] and key in res["fail"], (kw, res)
     same_fb = iteration_bar(_card(0.15, fb_km=0.5, green_fb_km=0.1), prev)  # "no worse" includes equal
     assert same_fb["pass"], same_fb
-    new_slice = iteration_bar(_card(0.15, slices={"lead_brake": 1.0, "cut_in": 1.0, "sharp_curve": 0.9, "yield": 0.5}), prev)
+    new_slice = iteration_bar(_card(0.15, slices=_slices(**{"yield": _s(0.5, HI, 1.0)})), prev)
     assert new_slice["pass"] and new_slice["no_baseline"] == ["yield"], new_slice
     bad = copy.deepcopy(prev)
     del bad["ssl_pretrain"]
@@ -76,17 +101,16 @@ def check_intervention_tally() -> None:
 
     assert set(INTERVENTION_KINDS) == {
         "takeover", "collision", "missed_stop_sign", "missed_red_light", "curb_strike", "aeb", "hand_rule"}
-    t = tally_interventions([{"kind": "aeb", "t": 3.0}, {"kind": "hand_rule", "t": 9.0}, {"kind": "takeover", "t": 12.0},
-                             {"kind": "lane_change", "t": 14.0}])
+    t = tally_interventions([{"kind": "aeb", "t": 3.0}, {"kind": "hand_rule", "t": 9.0}, {"kind": "takeover", "t": 12.0}])
     assert t == {"takeover": 1, "collision": 0, "missed_stop_sign": 0, "missed_red_light": 0, "curb_strike": 0,
-                 "aeb": 1, "hand_rule": 1, "total": 3}, t
+                 "aeb": 1, "hand_rule": 1, "backstop": 2, "total": 3}, t
     try:
         tally_interventions([{"t": 1.0}])
     except ValueError:
         pass
     else:
         raise AssertionError("event without kind accepted")
-    print("interventions: takeover/collision/missed stop/red/curb strike + AEB + hand rule tallied; other events ignored OK")
+    print("interventions: takeover/collision/missed stop/red/curb strike + AEB + hand rule tallied OK")
 
 
 def check_2_0_bar_not_claimed_without_iqu45_drive() -> None:
@@ -111,7 +135,9 @@ def check_2_0_bar_not_claimed_without_iqu45_drive() -> None:
     rms = naming_bar(_card(0.1501), prev, split_manifest=split, drives=[_drive("day"), _drive("night")])
     assert rms["name"] == "1.x" and "lane_rms_25" in rms["fail"], rms
     nomap = naming_bar(new, prev, split_manifest={"heldout_map": None}, drives=[_drive("day"), _drive("night")])
-    assert nomap["name"] == "1.x" and any(f.startswith("heldout_map") for f in nomap["fail"]), nomap
+    assert nomap["name"] == "1.x" and "heldout_map: split manifest names none" in nomap["fail"], nomap
+    nomap_no_drive = naming_bar(new, prev, split_manifest={"heldout_map": "  "}, drives=[])
+    assert "heldout_map: split manifest names none" in nomap_no_drive["fail"], nomap_no_drive
     box = naming_bar(new, prev, split_manifest=split, drives=[dict(_drive("day"), source="box"), _drive("night")])
     assert box["name"] == "1.x" and any(f.startswith("iqu45") for f in box["fail"]), box
     vram = naming_bar(new, prev, split_manifest=split, drives=[_drive("day"), dict(_drive("night"), live_vram_gb=4.2)])
@@ -121,8 +147,216 @@ def check_2_0_bar_not_claimed_without_iqu45_drive() -> None:
     print("2.0 bar: named only with a 30-min day AND night IQU45 drive on the held-out map, random traffic, 0 interventions, RMS >= 25% OK")
 
 
+def check_slice_direction() -> None:
+    """Slices carry a direction: a rising lower-is-better slice is a regression (it used to pass)."""
+    import math
+
+    from python.train.trainer2_bar import iteration_bar
+
+    prev = _card(0.20)
+    for over, key in (
+        ({"cut_in_false_brakes_per_km": _s(4.0, LO, 1.0)}, "slice:cut_in_false_brakes_per_km"),  # 0.5 -> 4.0 /km
+        ({"cut_in_collisions": _s(3, LO, 0)}, "slice:cut_in_collisions"),  # 0 -> 3
+        ({"cut_in_false_brakes_per_km": _s(0.5000001, LO, 1.0)}, "slice:cut_in_false_brakes_per_km"),
+        ({"lead_brake": _s(0.99, HI, 1.0)}, "slice:lead_brake"),
+        ({"lead_brake": _s(float("nan"), HI, 1.0)}, "slice:lead_brake"),
+        ({"cut_in_collisions": _s(float("nan"), LO, 0)}, "slice:cut_in_collisions"),
+        ({"cut_in_collisions": _s(None, LO, 0)}, "slice:cut_in_collisions"),
+        ({"cut_in_collisions": _s(float("inf"), LO, 0)}, "slice:cut_in_collisions"),
+        ({"lead_brake": _s(True, HI, 1.0)}, "slice:lead_brake"),  # a bool is not a measurement
+    ):
+        res = iteration_bar(_card(0.15, slices=_slices(**over)), prev)
+        assert not res["pass"] and key in res["fail"], (over, res)
+    better = iteration_bar(_card(0.15, slices=_slices(
+        cut_in_false_brakes_per_km=_s(0.2, LO, 1.0), lead_brake=_s(1.0, HI, 1.0))), prev)
+    assert better["pass"], better  # lower-is-better improving, higher-is-better equal
+    equal = iteration_bar(_card(0.15, slices=_slices(cut_in_false_brakes_per_km=_s(0.5, LO, 1.0))), prev)
+    assert equal["pass"], equal
+    flipped = iteration_bar(_card(0.15, slices=_slices(cut_in_false_brakes_per_km=_s(0.1, HI, 1.0))), prev)
+    assert not flipped["pass"] and any("direction" in f for f in flipped["fail"]), flipped
+    assert math.isfinite(better["lane_rms_gain"])
+    for bad in ({"lead_brake": 1.0}, {"lead_brake": {"value": 1.0}}, {"lead_brake": {"value": 1.0, "direction": "up"}}):
+        for which in ("new", "baseline"):
+            cards = (_card(0.15, slices=_slices(**bad)), prev) if which == "new" else (_card(0.15), _card(0.20, slices=_slices(**bad)))
+            try:
+                iteration_bar(*cards)
+            except ValueError:
+                continue
+            raise AssertionError(f"{which} slice {bad!r} without a direction accepted")
+    print("slice direction: cut-in false brakes 0.5->4.0/km and collisions 0->3 fail; lower-is-better improvement passes OK")
+
+
+def check_2_0_requires_every_slice_to_pass() -> None:
+    """Spec: "every scenario slice from the addenda also passes". No regression is not the same as passing."""
+    from python.train.trainer2_bar import naming_bar
+
+    split = {"heldout_map": "utah"}
+    drives = [_drive("day"), _drive("night")]
+    new, prev = _card(0.15), _card(0.20)
+    assert naming_bar(new, prev, split_manifest=split, drives=drives)["name"] == "2.0"
+    # Same value on both cards: no regression, still not passing (yield pass-rate 0.2 vs limit 1.0).
+    weak = _slices(**{"yield_pass_rate": _s(0.2, HI, 1.0)})
+    res = naming_bar(_card(0.15, slices=weak), _card(0.20, slices=weak), split_manifest=split, drives=drives)
+    assert res["name"] == "1.x" and res["iteration"]["pass"], res
+    assert any(f.startswith("slices_pass: yield_pass_rate") for f in res["fail"]), res
+    # A lower-is-better slice that did not regress but is over its limit (1 collision vs limit 0).
+    hot = _slices(cut_in_collisions=_s(1, LO, 0))
+    res = naming_bar(_card(0.15, slices=hot), _card(0.20, slices=hot), split_manifest=split, drives=drives)
+    assert res["name"] == "1.x" and any(f.startswith("slices_pass: cut_in_collisions") for f in res["fail"]), res
+    # Exactly at the limit passes (higher and lower).
+    edge = _slices(**{"yield_pass_rate": _s(1.0, HI, 1.0), "cut_in_collisions": _s(0, LO, 0)})
+    assert naming_bar(_card(0.15, slices=edge), _card(0.20, slices=edge), split_manifest=split, drives=drives)["name"] == "2.0"
+    # One failing slice among passing ones is enough.
+    one = _slices(**{"yield_pass_rate": _s(0.99, HI, 1.0)})
+    res = naming_bar(_card(0.15, slices=one), _card(0.20, slices=one), split_manifest=split, drives=drives)
+    assert res["name"] == "1.x" and sum(f.startswith("slices_pass") for f in res["fail"]) == 1, res
+    # A slice with no limit cannot be shown to pass; no slice at all is not "every slice passes".
+    nolimit = _slices(**{"yield_pass_rate": _s(1.0, HI)})
+    res = naming_bar(_card(0.15, slices=nolimit), _card(0.20, slices=nolimit), split_manifest=split, drives=drives)
+    assert res["name"] == "1.x" and "slices_pass: yield_pass_rate has no pass limit" in res["fail"], res
+    res = naming_bar(_card(0.15, slices={}), _card(0.20, slices={}), split_manifest=split, drives=drives)
+    assert res["name"] == "1.x" and "slices_pass: no scenario slice reported" in res["fail"], res
+    # NaN slice value fails its limit as well.
+    nan = _slices(cut_in_collisions=_s(float("nan"), LO, 0))
+    res = naming_bar(_card(0.15, slices=nan), _card(0.20, slices=nan), split_manifest=split, drives=drives)
+    assert res["name"] == "1.x" and any(f.startswith("slices_pass: cut_in_collisions") for f in res["fail"]), res
+    print("2.0 bar: every slice must meet its own limit (yield 0.2 with no regression is 1.x), at-limit passes OK")
+
+
+def check_unmeasured_is_not_passing() -> None:
+    """None / NaN / inf never pass: lane RMS, false-brake rates, drive minutes, VRAM. (stop_events.score gives None at km = 0.)"""
+    from python.train.trainer2_bar import iteration_bar, naming_bar
+
+    prev = _card(0.20)
+    nan, inf = float("nan"), float("inf")
+    for bad in (nan, None, inf, "n/a"):
+        res = iteration_bar(_card(0.15, fb_km=bad), prev)
+        assert not res["pass"] and any(f.startswith("false_brake_rate: not measured") for f in res["fail"]), (bad, res)
+        res = iteration_bar(_card(0.15, green_fb_km=bad), prev)
+        assert not res["pass"] and any(f.startswith("green_false_brake_rate: not measured") for f in res["fail"]), (bad, res)
+        res = iteration_bar(_card(bad), prev)
+        assert not res["pass"] and "lane_rms" in res["fail"] and res["lane_rms_gain"] is None, (bad, res)
+        res = iteration_bar(_card(0.15), _card(0.20, fb_km=bad))
+        assert not res["pass"] and any("baseline not measured" in f for f in res["fail"]), (bad, res)
+    split = {"heldout_map": "utah"}
+    day_night = [_drive("day"), _drive("night")]
+    res = naming_bar(_card(nan), prev, split_manifest=split, drives=day_night)
+    assert res["name"] == "1.x" and "lane_rms_25" in res["fail"], res
+    for bad in (nan, None, inf, "x"):
+        res = naming_bar(_card(0.15), prev, split_manifest=split, drives=[_drive("day"), dict(_drive("night"), minutes=bad)])
+        assert res["name"] == "1.x" and any(f.startswith("drive_minutes") for f in res["fail"]), (bad, res)
+        res = naming_bar(_card(0.15), prev, split_manifest=split, drives=[_drive("day"), dict(_drive("night"), live_vram_gb=bad)])
+        assert res["name"] == "1.x" and any(f.startswith("live_vram") for f in res["fail"]), (bad, res)
+    try:
+        iteration_bar(_card(0.15), _card(nan))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("NaN baseline lane RMS accepted")
+    # A stop card without the 22-37.5 deg or red-light slice has not shown 0 missed there.
+    for gone in ("stop_side_angle", "red_light"):
+        card = _card(0.15)
+        del card["stop"]["slices"][gone]
+        res = iteration_bar(card, prev)
+        assert not res["pass"] and any(f.startswith(f"{gone}: slice missing") for f in res["fail"]), res
+    print("unmeasured: None/NaN/inf RMS, false-brake rates, minutes and VRAM fail instead of passing OK")
+
+
+def check_unknown_intervention_kind_raises() -> None:
+    from python.train.trainer2_bar import tally_interventions
+
+    for kind in ("Takeover", "disengage", "AEB", "takeover ", "lane_change", 5):
+        try:
+            tally_interventions([{"kind": kind, "t": 1.0}])
+        except ValueError as exc:
+            assert "unknown drive event kind" in str(exc), exc
+        else:
+            raise AssertionError(f"kind {kind!r} silently ignored")
+    for no_kind in ({"t": 1.0}, {"kind": None}, {"kind": "  "}):
+        try:
+            tally_interventions([no_kind])
+        except ValueError as exc:
+            assert "without kind" in str(exc), exc
+        else:
+            raise AssertionError(f"event {no_kind!r} without a kind accepted")
+    try:
+        tally_interventions([{"kind": "aeb"}, {"kind": "Takeover"}])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("one unknown kind among valid ones was ignored")
+    print("interventions: unknown or mis-cased event kinds raise instead of reading as a clean drive OK")
+
+
+def check_backstop_config_proposal_pending_michael() -> None:
+    """OPEN QUESTION, PROPOSAL pending Michael: do AEB / hand-rule activations count as interventions?
+
+    Default True is GVD's 2026-11-25 call, not his ruling. Both settings are pinned so his answer is a
+    one-line change of BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS.
+    """
+    from python.train import trainer2_bar as bar
+
+    assert bar.BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS is True  # PROPOSAL pending Michael
+    assert bar.BACKSTOP_KINDS == ("aeb", "hand_rule")
+    events = [{"kind": "aeb", "t": 1.0}, {"kind": "hand_rule", "t": 2.0}]
+    on = bar.tally_interventions(events)
+    off = bar.tally_interventions(events, count_backstop=False)
+    assert on["total"] == 2 and on["backstop"] == 2, on
+    assert off["total"] == 0 and off["backstop"] == 2 and off["aeb"] == 1 and off["hand_rule"] == 1, off
+    assert bar.tally_interventions([{"kind": "collision"}], count_backstop=False)["total"] == 1
+    new, prev = _card(0.15), _card(0.20)
+    split = {"heldout_map": "utah"}
+    drives = [_drive("day"), _drive("night", events=events)]
+    counted = bar.naming_bar(new, prev, split_manifest=split, drives=drives)
+    assert counted["name"] == "1.x" and any(f.startswith("interventions:") for f in counted["fail"]), counted
+    reported = bar.naming_bar(new, prev, split_manifest=split, drives=drives, count_backstop=False)
+    assert reported["name"] == "2.0", reported
+    assert reported["interventions"][1]["backstop"] == 2, reported["interventions"]  # still reported
+    core = [_drive("day"), _drive("night", events=[{"kind": "curb_strike", "t": 5.0}])]
+    assert bar.naming_bar(new, prev, split_manifest=split, drives=core, count_backstop=False)["name"] == "1.x"
+    print("backstop: AEB / hand-rule count as interventions by default (PROPOSAL pending Michael); both settings pinned OK")
+
+
+def check_drive_record_gates() -> None:
+    from python.train.trainer2_bar import MAX_LIVE_VRAM_GB, naming_bar
+
+    new, prev = _card(0.15), _card(0.20)
+    split = {"heldout_map": "utah"}
+    ok = [_drive("day"), _drive("night")]
+    assert naming_bar(new, prev, split_manifest=split, drives=ok)["name"] == "2.0"
+    gone = _drive("night")
+    del gone["camera_only"]
+    cases = {
+        "camera_only": [dict(_drive("day"), camera_only=False), _drive("night")],
+        "camera_only missing": [_drive("day"), gone],
+        "camera_only truthy": [_drive("day"), dict(_drive("night"), camera_only="yes")],
+    }
+    for why, drives in cases.items():
+        res = naming_bar(new, prev, split_manifest=split, drives=drives)
+        assert res["name"] == "1.x" and any(f.startswith("camera_only") for f in res["fail"]), (why, res)
+    novram = _drive("night")
+    del novram["live_vram_gb"]
+    for why, night in (("None", dict(_drive("night"), live_vram_gb=None)), ("missing", novram)):
+        res = naming_bar(new, prev, split_manifest=split, drives=[_drive("day"), night])
+        assert res["name"] == "1.x" and any(f.startswith("live_vram") for f in res["fail"]), (why, res)
+    at_cap = naming_bar(new, prev, split_manifest=split,
+                        drives=[_drive("day"), dict(_drive("night"), live_vram_gb=MAX_LIVE_VRAM_GB)])
+    assert at_cap["name"] == "2.0", at_cap  # exactly 4.0 GB is allowed
+    print("drive records: camera_only must be True, live_vram_gb must be present and <= 4.0 GB OK")
+
+
 def main() -> int:
-    checks = (check_iteration_bar_thresholds, check_intervention_tally, check_2_0_bar_not_claimed_without_iqu45_drive)
+    checks = (
+        check_iteration_bar_thresholds,
+        check_intervention_tally,
+        check_2_0_bar_not_claimed_without_iqu45_drive,
+        check_slice_direction,
+        check_2_0_requires_every_slice_to_pass,
+        check_unmeasured_is_not_passing,
+        check_unknown_intervention_kind_raises,
+        check_backstop_config_proposal_pending_michael,
+        check_drive_record_gates,
+    )
     failed = 0
     for check in checks:
         try:

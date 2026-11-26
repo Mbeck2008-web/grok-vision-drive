@@ -114,6 +114,10 @@ The 2.0 map is also barred from that matched holdout (so it cannot be used for s
 
 **Intervention (one definition, used everywhere "zero interventions" or a 0-count is scored on the 2.0 drive).** An intervention is any of: a takeover, a collision, a missed stop-sign or red-light stop (full stop held ≥ 0.5 s), a curb strike, **and** any AEB or hand-coded stop-rule activation during the 2.0 drive. "Zero interventions" means the safety backstop never fires. **GVD call 2026-11-25** (interpreting Michael's "zero interventions"). This is not Michael's own words, so it is not labeled decided by Michael.
 
+**Open question, PROPOSAL pending Michael (do not read as decided):** whether an AEB or hand-coded stop-rule activation counts as an intervention. `python/train/trainer2_bar.py` counts it today (`BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS = True`, argument `count_backstop`); with False the activations are still tallied and reported (`backstop`) but not counted in `total`. Both settings are pinned by `check_backstop_config_proposal_pending_michael`, so his ruling is a one-line change.
+
+**Scoring rules in `trainer2_bar.py` (implementation of the rules above, no new thresholds):** each scenario slice carries a direction (`higher_is_better` / `lower_is_better`, required) and, for the 2.0 bar, its own pass `limit` (e.g. collisions ≤ 0; limits are **spec proposals** where the slice table gives only a proxy). Iteration bar: no regression in the slice's direction. 2.0 bar: **every slice on the card must itself pass its limit** (a slice without a limit, or no slice at all, fails). A `None` or non-finite lane RMS, false-brake rate, slice value, drive length or VRAM fails (never passes); `stop_events.score` returns `None` for a rate with no distance. An unknown drive-event kind raises.
+
 The 30-minute live drive is run **on Desktop-IQU45 by GVD**. Swarm coders do not touch IQU45. It is blocked until the **2.0 bar blockers** in Dependencies to build exist.
 
 ## Learned stop braking (Michael, 6:37 PM; Q6 and lights decided 2026-11-25)

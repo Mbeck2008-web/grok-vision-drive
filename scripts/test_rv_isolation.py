@@ -41,9 +41,10 @@ if str(ROOT) not in sys.path:
 GATE_REL = 0.05  # spec: loop Hz and infer_ms p95 change < 5% with RV on vs off
 LOOP_HZ = 50.0  # paced stub loop; 20 ms period
 WARMUP_TICKS = 25
-MEASURE_TICKS = 100
+MEASURE_TICKS = 150
+P95_RATIO_MAX = 1.05  # pre-registered: median over pairs of p95(child)/p95(paired OFF) <= 1.05
 CPU_QUANTILE = 0.10  # box noise only adds CPU time; the low quantile tracks the uncontended cost
-ROUNDS = 5  # interleaved A/B reps: OFF, gen, OFF, renderer per rep
+ROUNDS = 7  # pre-registered: 7 reps of (OFF, gen, OFF, renderer) = 7 paired A/B reps per child
 FRAME_W, FRAME_H = 320, 240  # supervisor -> child frame handoff (already-captured RGB copy)
 CRASH_DETECT_BOUND_S = 1.0
 CRASH_DETECT_BOUND_TICKS = 25
@@ -291,36 +292,31 @@ def _thread_cpu_reader():
 def check_safety_loop_latency_unchanged() -> None:
     """Slow child generator / slow (hung) child renderer do not move the stub loop by >5%.
 
-    Method (wall-clock p95 of a 3 ms stand-in is +-30% noise on a loaded shared
-    box, so it is reported, not gated):
-    - Paced 50 Hz stub loop: heartbeat stamp, fixed-work stand-in infer, real
-      shadow_tick + NullActuator, then RV ``after_apply``.
-    - Interleaved A/B reps: each rep runs OFF, ON+slow_generator, OFF,
-      ON+slow_renderer (fresh child per run, WARMUP_TICKS discarded), after one
-      discarded OFF warm-up run. Each run gives one number per metric; the gate
-      compares the median over reps of the child runs with the median over all
-      OFF runs, so drift and load spikes hit both sides.
-    - Gated at 5% (spec: loop Hz and infer p95 change < 5%):
-      (a) loop Hz over the measured ticks (median over reps vs OFF);
-      (b) safety-path CPU per tick (this thread's CPU from the heartbeat stamp
-          through actuator.apply: stand-in infer + shadow_tick + apply), at the
-          p10 per run, median over reps vs OFF. Load from other processes only
-          adds CPU time (preemption, cache / SMT contention), so the low quantile
-          estimates the uncontended cost and is stable run to run, while a child
-          that slows the supervisor thread on every tick shifts all quantiles;
-      (c) RV share of supervisor CPU: after_apply CPU / whole-tick CPU, paired
-          inside the same run, < 5% (median over reps);
-      (d) after_apply wall p95 < 5% of the period (a child that makes the loop
-          wait, even a bounded wait or sleep that the paced Hz would hide,
-          fails here).
-      Per-tick wall p95 (infer, period) on a loaded shared box swings by more
-      than 5% between identical OFF runs, so it is printed per rep, not gated.
+    Pre-registered method (fixed before any result was collected; also in
+    docs/specs/rv_isolation_latency_spec.md):
+    - Paced 50 Hz stub loop: heartbeat stamp, fixed-work stand-in infer
+      (~3 ms), real shadow_tick + NullActuator, then RV ``after_apply``.
+    - ROUNDS = 7 reps, each rep = OFF, ON+slow_generator, OFF, ON+slow_renderer
+      (fresh child per run; WARMUP_TICKS = 25 discarded, MEASURE_TICKS = 150
+      measured per run), after one discarded OFF warm-up run. Each child run
+      is paired with the OFF run immediately before it: 7 pairs per child.
+    - PRIMARY gate (wall clock, spec "infer_ms p95 change < 5%"): for each
+      pair, ratio = p95(child run) / p95(paired OFF run), for (i) stand-in
+      infer_ms wall and (ii) loop period wall. Gate: median of the 7 ratios
+      <= 1.05 for each metric and each child.
+    - ADDITIONAL gates (on top, not replacements):
+      (a) loop Hz: median of per-pair Hz ratios within [0.95, 1.05];
+      (b) safety-path thread CPU per tick (heartbeat stamp .. actuator.apply)
+          at p10 per run: median of per-pair ratios <= 1.05;
+      (c) RV share of supervisor CPU (after_apply CPU / whole-tick CPU, same
+          run) < 5%, median over runs;
+      (d) after_apply wall p95 < 5% of the period (1 ms), median over runs.
     - Structural: every Popen.wait / communicate on the child is trapped during
       the loop (any call fails the check); the backpressure drop path must be
       exercised (hung renderer -> dropped handoffs, generator mid-write stall ->
       dropped torn/busy reads); the host must not degrade on a slow-but-alive
       child.
-    Wall infer p50/p95 and period p50/p95 are printed per rep for the record.
+    Per-rep wall p50/p95, CPU and Hz numbers and the per-pair ratios are printed.
     """
     _calibrate_infer()
     frame = _frame_bytes()
@@ -409,19 +405,34 @@ def check_safety_loop_latency_unchanged() -> None:
     )
     print(f"  host stats: {host_stats}", flush=True)
 
+    pair_log = []
+    failures = []
     for cond in ("gen", "renderer"):
-        for key, label in (("hz", "loop Hz"), ("cpu_q", f"safety-path CPU/tick p{int(CPU_QUANTILE * 100)}")):
-            b, v = _med("off", key), _med(cond, key)
-            rel = (v - b) / b
-            assert abs(rel) < GATE_REL, (
-                f"{cond}: {label} median moved {rel * 100:+.2f}% (base {b:.4f}, RV {v:.4f}); gate 5%"
-            )
+        # runs["off"] alternates: index 2k is paired with gen rep k, 2k+1 with renderer rep k.
+        offs = runs["off"][0::2] if cond == "gen" else runs["off"][1::2]
+        kids = runs[cond]
+        assert len(offs) == len(kids) == ROUNDS
+        for key, label, lo, hi in (
+            ("inf_p95", "infer_ms wall p95", None, P95_RATIO_MAX),
+            ("per_p95", "loop period wall p95", None, P95_RATIO_MAX),
+            ("hz", "loop Hz", 1.0 - GATE_REL, 1.0 + GATE_REL),
+            ("cpu_q", f"safety-path CPU p{int(CPU_QUANTILE * 100)}", None, P95_RATIO_MAX),
+        ):
+            ratios = [k[key] / o[key] for o, k in zip(offs, kids)]
+            m = statistics.median(ratios)
+            pair_log.append(f"  pairs {cond:<8} {label:<26} ratios=[{', '.join(f'{x:.3f}' for x in ratios)}] median={m:.4f}")
+            if (lo is not None and m < lo) or m > hi:
+                failures.append(f"{cond}: {label} median paired ratio {m:.4f} outside [{lo}, {hi}]")
         share = _med(cond, "rv_share")
-        assert share < GATE_REL, f"{cond}: after_apply is {share * 100:.2f}% of safety-loop CPU; gate 5%"
+        if share >= GATE_REL:
+            failures.append(f"{cond}: after_apply is {share * 100:.2f}% of safety-loop CPU; gate 5%")
         p95_post_s = _med(cond, "post_p95_us") / 1e6
-        assert p95_post_s < GATE_REL * period_s, (
-            f"{cond}: after_apply p95 {p95_post_s * 1e6:.0f} us >= 5% of the {period_s * 1000:.0f} ms period: the loop waited on RV"
-        )
+        if p95_post_s >= GATE_REL * period_s:
+            failures.append(
+                f"{cond}: after_apply p95 {p95_post_s * 1e6:.0f} us >= 5% of the {period_s * 1000:.0f} ms period: the loop waited on RV"
+            )
+    print("\n".join(pair_log), flush=True)
+    assert not failures, "; ".join(failures)
     assert host_stats["renderer"]["handoff_dropped"] > 0, "hung renderer never caused a backpressure drop"
     assert host_stats["gen"]["out_applied"] > 0, "slow generator output was never applied"
     assert host_stats["gen"]["out_dropped"] > 0, "generator mid-write stall never produced a dropped (torn/busy) read"

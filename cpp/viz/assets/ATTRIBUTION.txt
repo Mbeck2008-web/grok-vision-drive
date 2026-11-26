@@ -40,4 +40,14 @@ Changes made (CC BY 4.0 requires that adaptations be indicated):
   - No decimation. Triangle count after both badge removals and the
     rear-glass fill: 26,538 (under 30,000).
 
+The committed tesla_model3_ego.glb is the source of truth for this mesh
+(SHA-256 1107241762a6fcb50c77cf565e95d8d9b60c061e01c041b88271ca2ad13afd38).
+The rear-T strip, the 84-triangle glass fill, and the hole-rim flatten
+were a one-off post-pass on prepare_ego_glb.py output (SHA-256
+fa1ac2450f36a48356abdf2390346e8c1190ffb986e031dc430124a59e10dae8). That
+post-pass is not in the repository, so those steps cannot be reproduced
+byte-for-byte from the car-only source or by re-running prepare_ego_glb.py.
+Re-running prepare_ego_glb.py would restore the rear badge; do not replace
+the committed file with that output.
+
 Tesla is a trademark; the CC BY 4.0 license does not grant trademark rights.

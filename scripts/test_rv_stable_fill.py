@@ -17,6 +17,9 @@ S5 classify_unknown: fractions sum to the unknown fraction and each cause lands 
 S7 ground clamp: a camera cannot see below the road. Depth farther than the downward ray's
    ground-plane hit (wide cam 88.7 deg vFOV, pitch -8, 1.24 m up) is capped there (x margin);
    true road, nearer surfaces (hood, walls) and rays at/above the horizon are untouched.
+S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
+   (narrow 250, main/wide 250, 100 m cams 99.5); non-sky pixels beyond the cap or +inf are
+   drawn AT the cap (kept, not dropped); sky stays sky; nearer depth is untouched.
 S6 flag default OFF; numpy/cv2 only (no torch); DampedHeading rejects non-finite input.
 """
 from __future__ import annotations
@@ -218,6 +221,38 @@ def check_ground_clamp() -> None:
         pass
 
 
+def check_far_drawn_at_cap() -> None:
+    assert sf.depth_cap_m(800.0) == 250.0 and sf.depth_cap_m(300.0) == 250.0
+    assert abs(sf.depth_cap_m(100.0) - 99.5) < 1e-9
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        try:
+            sf.depth_cap_m(bad)
+            raise AssertionError(f"far_m {bad} must raise")
+        except ValueError:
+            pass
+    d = np.array([[10.0, 249.0, 260.0, np.inf], [400.0, 655.35, 5.0, np.inf]])
+    sky = np.array([[False, False, False, False], [False, False, False, True]])
+    out, far = sf.far_to_cap(d, sky, 250.0)
+    assert far.tolist() == [[False, False, True, True], [True, True, False, False]]
+    assert np.allclose(out[far], 250.0), "far pixels must be drawn at the cap, not dropped"
+    assert out[0, 0] == 10.0 and out[0, 1] == 249.0 and out[1, 2] == 5.0
+    assert np.isinf(out[1, 3]), "sky stays sky"
+    # end to end: a building 400 m out (beyond the old 120 m cut) survives into the chase render
+    cam = camera_from_angles("main", (0.0, 1.2, 1.26), 0.0, 0.0, 34.0, 64, 48, near_m=0.05, far_m=400.0)
+    dep, _ = sf.far_to_cap(np.full((48, 64), 400.0), np.zeros((48, 64), bool), sf.depth_cap_m(300.0))
+    ys, xs = np.nonzero(np.ones((48, 64), bool))
+    pts = sf.unproject(cam, dep, ys, xs)
+    chase = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 160, 90, 0.0)
+    r = sf.compose(chase, pts, np.full((len(pts), 3), 200, np.uint8), np.full(len(pts), 8.0),
+                   sky_rgb=None, ground_rgb=None, fill=False)
+    assert r.masks["observed"].sum() > 20, "far building must be drawn"
+    try:
+        sf.far_to_cap(d, sky[:, :3], 250.0)
+        raise AssertionError("shape mismatch must raise")
+    except ValueError:
+        pass
+
+
 def check_flag_and_deps() -> None:
     assert sf.STABLE_FILL_DEFAULT_ON is False
     tree = ast.parse(MOD.read_text(encoding="utf-8"))
@@ -258,6 +293,10 @@ def test_ground_clamp() -> None:
     check_ground_clamp()
 
 
+def test_far_drawn_at_cap() -> None:
+    check_far_drawn_at_cap()
+
+
 def test_flag_and_deps() -> None:
     check_flag_and_deps()
 
@@ -265,7 +304,7 @@ def test_flag_and_deps() -> None:
 if __name__ == "__main__":
     for fn in (check_metrics, check_damped_view_less_jitter, check_damped_follows_turn,
                check_depth_filter_flicker_and_reset, check_compose_explains_every_pixel,
-               check_classifier, check_ground_clamp, check_flag_and_deps):
+               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

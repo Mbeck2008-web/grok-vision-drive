@@ -49,6 +49,11 @@ GRID_CELL_M: float = 0.25
 GRID_HALF_M: float = 60.0
 FAR_M: float = 120.0
 PRIOR_MAX_M: float = 30.0
+# Farthest depth worth drawing per camera: the GT depth of that camera stops at its far plane
+# (cameras.json far_m; a pixel at ~far_m is "no hit"), and the depth head's metric range stops at
+# FAR_CLASS_M (python/train/depth_hires.py: GT >= 250 m is the "far" class, not a distance).
+HEAD_FAR_CLASS_M: float = 250.0
+GT_NO_HIT_FRAC: float = 0.995
 
 MASK_NAMES = ("observed", "filled", "ground_prior", "sky", "far", "unknown")
 CAUSES = ("sky", "far_plane", "never_seen", "occluded", "invalid_depth", "splat_gap")
@@ -296,6 +301,29 @@ class CamDepthFilter:
         self.pose = tuple(pose)
         self.t = float(t)
         return depth_f, out_w
+
+
+def depth_cap_m(cam_far_m: float, head_far_m: float = HEAD_FAR_CLASS_M) -> float:
+    """Farthest metric depth to draw for one camera: min(GT far plane x 0.995, head far class)."""
+    f = float(cam_far_m)
+    if not (math.isfinite(f) and f > 0):
+        raise ValueError(f"camera far_m must be finite and > 0, got {cam_far_m!r}")
+    return min(f * GT_NO_HIT_FRAC, float(head_far_m))
+
+
+def far_to_cap(depth: np.ndarray, sky: np.ndarray, cap_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Far-flagged pixels are drawn at the cap, never dropped.
+
+    A non-sky pixel whose depth is beyond ``cap_m`` (or +inf: the net / GT said "far") is placed at
+    ``cap_m`` along its own ray, so distant buildings stay in the picture at the farthest range the
+    depth source supports. Sky stays sky. Returns (depth, far mask).
+    """
+    d = np.asarray(depth, np.float64)
+    sk = np.asarray(sky, bool)
+    if d.shape != sk.shape:
+        raise ValueError(f"depth {d.shape} and sky {sk.shape} differ")
+    far = ~sk & ((d > cap_m) | np.isposinf(d))
+    return np.where(far, float(cap_m), d), far
 
 
 def ground_clamp(cam: CameraPose, depth: np.ndarray, *, ground_z: float = 0.0, margin: float = 1.1) -> tuple[np.ndarray, np.ndarray]:

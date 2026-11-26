@@ -20,6 +20,7 @@ ap.add_argument("--chase", default="damped", choices=["rigid", "damped"]); ap.ad
 ap.add_argument("--depth-filter", type=int, default=1); ap.add_argument("--grid", type=int, default=1)
 ap.add_argument("--fill", type=int, default=1); ap.add_argument("--sky", type=int, default=1); ap.add_argument("--prior", type=int, default=1)
 ap.add_argument("--ground-clamp", type=int, default=1)
+ap.add_argument("--max-depth", choices=["v2", "cap"], default="cap", help="v2: drop depth >= 120 m (old). cap: per-cam cap, far drawn at cap")
 ap.add_argument("--pose-src", default="vo", choices=["vo", "gt"]); ap.add_argument("--depth-src", default="pred", choices=["pred", "gt"])
 ap.add_argument("--classify-dir", default=""); ap.add_argument("--classify-crop", default="0,0,960,540")
 ap.add_argument("--frames", default=""); ap.add_argument("--save-frames", type=int, default=1); ap.add_argument("--label", default="")
@@ -42,6 +43,7 @@ def proc_res(c):
     w, h = c["resolution"]; return (256, 192) if abs(w / h - 4 / 3) < 0.01 else (320, 180)
 CAM_POSE = {}
 CLAMP_STATS: dict = {}
+FAR_STATS: dict = {}
 for cid, c in cams_json.items():
     if cid in CAMS:
         pw, ph = proc_res(c)
@@ -77,7 +79,7 @@ def cam_frame(cam, idx):
         g = cv2.imread(str(Path(a.gt_depth_root) / f"{cam}_depth" / "000" / f"{idx:06d}.png"), cv2.IMREAD_UNCHANGED).astype(np.float32) / 100.0
         g = cv2.resize(g, (pw, ph), interpolation=cv2.INTER_NEAREST)
         depth = np.where(g > 0, g, np.inf)
-        sky = ~(g > 0) | (g > 300)
+        sky = ~(g > 0) | (g >= min(c["far_m"] * S.GT_NO_HIT_FRAC, 655.0))  # far plane / uint16 cm saturation = no hit
     clamp_frac = 0.0
     if a.ground_clamp and a.depth_src != "gt":
         depth, cl = S.ground_clamp(CAM_POSE[cam], depth)
@@ -89,7 +91,13 @@ def cam_frame(cam, idx):
     cut = np.hypot(gx, gy) > 0.12 * inv
     far_side = cv2.dilate(depth.astype(np.float32), np.ones((5, 5), np.uint8))
     depth = np.where(cut & ~sky, far_side, depth)
-    valid = ~sky & np.isfinite(depth) & (depth > 0.3) & (depth < S.FAR_M)
+    if a.max_depth == "cap":
+        cap = S.depth_cap_m(c["far_m"])
+        depth, farm = S.far_to_cap(depth, sky, cap)
+        FAR_STATS.setdefault(cam, []).append(float(np.mean(farm)))
+        valid = ~sky & np.isfinite(depth) & (depth > 0.3) & (depth <= cap)
+    else:
+        valid = ~sky & np.isfinite(depth) & (depth > 0.3) & (depth < S.FAR_M)
     if cam in EGO_MASK:
         r0, c0, c1 = EGO_MASK[cam]; valid[int(r0 * ph):, int(c0 * pw):int(c1 * pw)] = False
     return rgb, depth, valid, sky
@@ -217,5 +225,7 @@ fr = sorted((out / "frames").glob("f*.png"))
 if len(fr) >= 3:
     res["temporal_jitter"] = round(S.temporal_jitter([cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB) for f in fr]), 4)
 res["ground_clamp_frac_by_cam"] = {c: round(float(np.mean(v)), 5) for c, v in CLAMP_STATS.items()}
+res["far_at_cap_frac_by_cam"] = {c: round(float(np.mean(v)), 5) for c, v in FAR_STATS.items()}
+res["depth_cap_m_by_cam"] = {c: round(S.depth_cap_m(cams_json[c]["far_m"]), 2) for c in CAMS}
 res["config"] = vars(a)
 (out / "stats.json").write_text(json.dumps(res, indent=1)); print(json.dumps({k: v for k, v in res.items() if k != "config"}, indent=1))

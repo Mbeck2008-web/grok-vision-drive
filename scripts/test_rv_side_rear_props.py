@@ -1362,6 +1362,18 @@ KNOWN_FAILING: dict[str, str] = {
     "check_side_objects_keep_height_pins": "N: pillarR parked car x2.5 lost 1.07 m on 88 px; pole x3 lost 1.07 m on 351/391 px; curbs lost 0.11 m",
     "prop_side_objects_keep_height": "N: pillarL pole at x=-2.0, y0=0.0: lost 0.592 m",
     "check_road_labelled_object_top_stays_put": "N: pillarR car top 218 px moved outward (GT z 1.50 m); curb top 1487 px, height lost 0.15 m; main car top also snapped outward",
+    "check_clip015_snap_misplace": "f40/f160: pillarR 18.10% (f40 36.90%/f160 3.50%), repeatR 4.65% (f40 9.99%), wide 15.00% at 0-15 m; wide 59.35% at 15-30 m (GT z>0.30)",
+    "check_holdout_snap_misplace": "f100/f200: wide 15.00% and pillarR 4.44% at 0-15 m; wide 37.67%, rear 6.25%, repeatL 5.29% at 15-30 m",
+    "check_clean_holdout_snap_misplace": "f70: pillarR 55.49%, pillarL 41.55%, repeatR 24.60%, wide 14.34%, rear 5.16% at 0-15 m; wide 79.38%, rear 9.44% at 15-30 m",
+    "check_clip015_edge_position": "f40/f160: wide 5-15 m median 1.334/p90 5.119 vs 10%/20% of |x_gt| 4.36 m; also narrow/main 5-15 p90 over the 20% gate",
+    "check_holdout_edge_position": "f100/f200: wide 5-15 m median 0.551/p90 5.453 vs |x_gt| 5.19 m; narrow/main p90 over at 5-15 m",
+    "check_clean_holdout_edge_position": "f70: wide 5-15 m median 2.183/p90 4.595; pillarL 5-15 m 2.453/5.904; pillarR 0-5 m 0.568/6.308",
+    "check_clip015_snap_no_worse_than_off": "f40/f160: pillarR |dz| median 0.246 vs 0.184 off; pillarL 0.049/0.603 vs 0.048/0.593",
+    "check_holdout_snap_no_worse_than_off": "f100/f200: pillarR p90 0.436 vs 0.285 off",
+    "check_clean_holdout_snap_no_worse_than_off": "f70: pillarR median 0.048 vs 0.035; repeatR p90 0.555 vs 0.415; pillarL 0.098 vs 0.094",
+    "check_clip015_footprint": "f40/f160: narrow 45.3%, main 70.4%, wide 83.8%, pillarR 81.9%, repeatL 93.0% (min 95%)",
+    "check_holdout_footprint": "f100/f200: narrow 46.9%, main 72.6%, wide 88.1%, pillarR 89.2%, repeatR 93.4%",
+    "check_clean_holdout_footprint": "f70: pillarL 18.3%, narrow 49.5%, pillarR 58.8%, main 72.2%, wide 86.0%",
 }
 
 _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}

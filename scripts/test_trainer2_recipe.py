@@ -828,7 +828,19 @@ def check_balanced_loss_keeps_extras() -> None:
     loss, _ = balanced_loss(total, terms, bal, ramp, step=0, coeffs={"aux_depth": 0.5})
     loss.backward()
     assert abs(float(b.grad) - 1.0) < 1e-6, b.grad  # w=2 x c=0.5
-    print("balanced_loss: extras (aux_depth) keep their gradient and coefficient; no-graph terms skipped OK")
+    # a zero-coefficient term is not balanced (it is not in the loss at all)
+    terms = {"lane_gt": a * 1.0, "aux_depth": b * 1.0}
+    _loss, names = balanced_loss(terms["lane_gt"], terms, bal, ramp, step=0, coeffs={"aux_depth": 0.0})
+    assert names == ["lane_gt"], names
+    # the ramp applies: a head that enters at step 100 contributes nothing at step 0
+    late = HeadRamp({"lane_gt": -2000, "aux_depth": 100})
+    a.grad = b.grad = None
+    terms = {"lane_gt": a * 1.0, "aux_depth": b * 1.0}
+    total = terms["lane_gt"] + 0.5 * terms["aux_depth"]
+    loss, _ = balanced_loss(total, terms, bal, late, step=0, coeffs={"aux_depth": 0.5})
+    loss.backward()
+    assert abs(float(b.grad)) < 1e-9 and float(a.grad) == 1.0, (a.grad, b.grad)
+    print("balanced_loss: extras (aux_depth) keep their gradient and coefficient; no-graph / zero-coef terms skipped; ramp applied OK")
 
 
 def _fixture(base):

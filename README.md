@@ -264,6 +264,7 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 | `py -3 scripts\bot_engage.py on\|off` | none | Offline smoke only |
 | `py -3 scripts\validate_scene_lanes.py` | `--strips` (required), `--out`, `--montage` (4) | Offline smoke only |
 | `py -3 scripts\eval_scene_lanes.py` | `--strips` (required), `--checkpoint`, `--check-targets`, `--out`, `--worst` (8) | Unproven |
+| `py -3 scripts\migrate_ckpt_classes.py OLD.npz [NEW.npz]` | `--force` (replace NEW only). Opt-in: maps a 96-output (pre-v2, six classes) epoch checkpoint onto the 80-output head, dropping the removed people class; main's refusal stays the default. See `docs/CKPT_MIGRATE_CLASSES.md` | Offline smoke only |
 | `py -3 scripts\relabel_painted.py <root>` | `--zip MAP=PATH`, `--out` (`gt_painted.jsonl`) | Offline smoke only |
 | `py -3 scripts\live_lane_test.py` | `--seconds` (30), `--min-in-lane` (80), `--host`, `--port` | Unproven |
 | `py -3 scripts\gt_report.py <log>` | `--png` | Offline smoke only |

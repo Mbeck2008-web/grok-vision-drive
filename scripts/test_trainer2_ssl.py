@@ -730,11 +730,16 @@ def check_recipe_off_is_bit_identical() -> None:
     pin = json.loads(DEFAULTS_PIN.read_text(encoding="utf-8"))["defaults"]
     got = json.loads(json.dumps(vars(build_parser().parse_args(["--no-ssl-pretrain"])), sort_keys=True, default=str))
     added = {k: got[k] for k in set(got) - set(pin)}
-    assert added == dict(NEW_FLAGS, no_ssl_pretrain=True), added
+    # Flags this PR (SSL) added must still be present. Later PRs may add more (recipe,
+    # --stage, --accum, --kd); those are not this check's to forbid.
+    expect = dict(NEW_FLAGS, no_ssl_pretrain=True)
+    missing = {k: v for k, v in expect.items() if added.get(k) != v}
+    assert not missing, (missing, added)
     assert not set(pin) - set(got), set(pin) - set(got)
     changed = sorted(k for k in pin if got[k] != pin[k])
     assert not changed, f"pre-existing train_scene defaults changed: {changed}"
-    print(f"recipe off: {len(pin)} pre-existing defaults == main 8ce34d5 pin; only {sorted(NEW_FLAGS)} added OK")
+    print(f"recipe off: {len(pin)} pre-existing defaults == main 8ce34d5 pin; SSL flags {sorted(NEW_FLAGS)} present "
+          f"({len(added) - len(NEW_FLAGS)} later flag(s) not pinned)")
 
 
 def main() -> int:

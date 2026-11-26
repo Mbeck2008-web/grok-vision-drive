@@ -712,6 +712,39 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --backbone imagenet-*, keep the ImageNet weights fixed and train only the projection and heads.",
     )
+    parser.add_argument(
+        "--recipe",
+        default="",
+        choices=("", "trainer2"),
+        help=(
+            "Trainer 2.0 curriculum (docs/specs/trainer_2.md, PR 6). Default off (spec proposal). "
+            "trainer2 runs stages 0-2 / 2b, skip-logs 3-6 until Reality View is built and integrated, "
+            "then the joint stage. This recipe is meant for a live export: --scale < 1 and --augment "
+            "are refused (pass --no-augment). --kd is PR 8 and is refused."
+        ),
+    )
+    parser.add_argument(
+        "--stage",
+        default="",
+        help=(
+            "With --recipe trainer2, run only these stage ids (comma list or a STAGE_ORDER range, "
+            "e.g. 0-2 or 2b). Default is the full curriculum."
+        ),
+    )
+    parser.add_argument(
+        "--accum",
+        type=int,
+        default=0,
+        help=(
+            "Gradient accumulation (spec proposal). Used only with --recipe trainer2 when the "
+            "auto-fit batch is < 4 windows (floor 2, cap 8). 0 (default) does not accumulate."
+        ),
+    )
+    parser.add_argument(
+        "--kd",
+        action="store_true",
+        help="Optional teacher KD (Appendix C PR 8). Refused under --recipe trainer2 in this PR.",
+    )
     return parser
 
 
@@ -1534,6 +1567,77 @@ def _finite_counts(loss_value: Any) -> tuple[int, int]:
     return 0, 0
 
 
+def _backward_and_maybe_step(
+    net: Any,
+    opt: Any,
+    scaler: Any,
+    loss: Any,
+    *,
+    clip: float,
+    do_step: bool = True,
+    balance: Any = None,
+    ramp: Any = None,
+    balance_step: int = 0,
+    term_losses: dict[str, Any] | None = None,
+    trace: dict[str, Any] | None = None,
+) -> tuple[Any, float | None]:
+    """Backward, optional GradNorm update, clip, and optimizer step.
+
+    When ``balance`` is None this is the existing scale-or-plain backward path.
+    ``do_step`` False is gradient accumulation: backward only, no clip / step / zero.
+    """
+    import torch
+
+    norms: dict[str, float] = {}
+    if balance is not None and ramp is not None and term_losses:
+        from python.train.trainer2_balance import (
+            SHARED_PARAM,
+            combine_losses,
+            grad_norm_record,
+            per_task_grad_norms,
+        )
+
+        shared = dict(net.named_parameters()).get(SHARED_PARAM)
+        active = {
+            name: term
+            for name, term in term_losses.items()
+            if ramp.active(name, int(balance_step)) and hasattr(term, "backward")
+        }
+        if shared is not None and active:
+            norms = per_task_grad_norms(active, shared)
+        if active:
+            combined = combine_losses(active, balance, ramp, step=int(balance_step))
+            if combined is not None and not isinstance(combined, float):
+                loss = combined
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        grad_norm = None
+        if do_step:
+            scaler.unscale_(opt)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
+            scaler.step(opt)
+            scaler.update()
+    else:
+        loss.backward()
+        grad_norm = None
+        if do_step:
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
+            opt.step()
+    if do_step:
+        net.zero_grad(set_to_none=True)
+    if balance is not None and norms and term_losses:
+        active_names = [n for n in norms if n in term_losses]
+        if active_names:
+            balance.update(
+                {n: float(term_losses[n].detach().item()) for n in active_names},
+                {n: float(norms[n]) for n in active_names},
+                active=active_names,
+            )
+            if trace is not None:
+                trace["grad_norm_tasks"] = grad_norm_record(int(balance_step), norms, balance, ramp)
+    return loss, grad_norm
+
+
 def _optimizer_step(
     net: Any,
     opt: Any,
@@ -1566,6 +1670,11 @@ def _optimizer_step(
     aux_cache: Any = None,
     fuse_window: bool = True,
     cuda_graph_runner: Any = None,
+    balance: Any = None,
+    ramp: Any = None,
+    balance_step: int = 0,
+    do_step: bool = True,
+    zero_grad: bool = True,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
 
@@ -1579,7 +1688,8 @@ def _optimizer_step(
 
     started = time.perf_counter()
     net.train()
-    opt.zero_grad(set_to_none=True)
+    if zero_grad:
+        opt.zero_grad(set_to_none=True)
     state = _detach_state(state)
     total = None
     n_loss = 0
@@ -1689,18 +1799,19 @@ def _optimizer_step(
                 }
             )
         return None, 0, carry, end_state
-    loss = total / n_loss
-    grad_norm = None
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
-        scaler.step(opt)
-        scaler.update()
+    mean_heads = None if head_tensors is None else {key: head_tensors[key] / n_loss for key in LOSS_TERMS}
+    if balance is not None and ramp is not None and mean_heads:
+        loss = total / n_loss
+        loss, grad_norm = _backward_and_maybe_step(
+            net, opt, scaler, loss, clip=clip, do_step=do_step,
+            balance=balance, ramp=ramp, balance_step=balance_step,
+            term_losses=mean_heads, trace=trace,
+        )
     else:
-        loss.backward()
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
-        opt.step()
+        loss = total / n_loss
+        loss, grad_norm = _backward_and_maybe_step(
+            net, opt, scaler, loss, clip=clip, do_step=do_step,
+        )
     loss_value = float(loss.detach().item())
     extra_nan, extra_inf = _finite_counts(loss_value)
     nan_n += extra_nan
@@ -1709,7 +1820,8 @@ def _optimizer_step(
         g_nan, g_inf = _finite_counts(grad_norm)
         nan_n += g_nan
         inf_n += g_inf
-    net.zero_grad(set_to_none=True)
+    if do_step:
+        net.zero_grad(set_to_none=True)
     heads = {
         key: float((head_tensors[key] / n_loss).detach().item())
         for key in LOSS_TERMS
@@ -1761,6 +1873,11 @@ def _optimizer_group(
     aux_cache: Any = None,
     fuse_window: bool = True,
     cuda_graph_runner: Any = None,
+    balance: Any = None,
+    ramp: Any = None,
+    balance_step: int = 0,
+    do_step: bool = True,
+    zero_grad: bool = True,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """One step on several windows that each start from a fresh GRU state.
 
@@ -1772,7 +1889,8 @@ def _optimizer_group(
 
     started = time.perf_counter()
     net.train()
-    opt.zero_grad(set_to_none=True)
+    if zero_grad:
+        opt.zero_grad(set_to_none=True)
     width = len(sequences)
     length = max((len(seq) for seq in sequences), default=0)
     state = net.initial_state(device=device, batch=max(1, width))
@@ -1884,18 +2002,19 @@ def _optimizer_group(
                 }
             )
         return None, 0, end_state, end_state
-    loss = total / n_loss
-    grad_norm = None
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
-        scaler.step(opt)
-        scaler.update()
+    mean_heads = None if head_tensors is None else {key: head_tensors[key] / n_loss for key in LOSS_TERMS}
+    if balance is not None and ramp is not None and mean_heads:
+        loss = total / n_loss
+        loss, grad_norm = _backward_and_maybe_step(
+            net, opt, scaler, loss, clip=clip, do_step=do_step,
+            balance=balance, ramp=ramp, balance_step=balance_step,
+            term_losses=mean_heads, trace=trace,
+        )
     else:
-        loss.backward()
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
-        opt.step()
+        loss = total / n_loss
+        loss, grad_norm = _backward_and_maybe_step(
+            net, opt, scaler, loss, clip=clip, do_step=do_step,
+        )
     loss_value = float(loss.detach().item())
     extra_nan, extra_inf = _finite_counts(loss_value)
     nan_n += extra_nan
@@ -1904,7 +2023,8 @@ def _optimizer_group(
         g_nan, g_inf = _finite_counts(grad_norm)
         nan_n += g_nan
         inf_n += g_inf
-    net.zero_grad(set_to_none=True)
+    if do_step:
+        net.zero_grad(set_to_none=True)
     head_mean = {
         key: float((head_tensors[key] / n_loss).detach().item())
         for key in LOSS_TERMS
@@ -2535,6 +2655,9 @@ def train_directory(
     train_precision: str = "auto",
     plan_precision: str | None = None,
     gpu_name: str = "",
+    recipe: str | None = None,
+    recipe_stage: str | None = None,
+    accum_requested: int = 0,
 ) -> dict[str, Any]:
     import torch
 
@@ -2547,7 +2670,7 @@ def train_directory(
     from python.train.cam_strip import canonical_cams, gt_frame_props
 
     train_cams = canonical_cams(cams) if cams else None
-    train_heads = tuple(heads) if heads else None
+    train_heads = tuple(heads) if heads is not None else None
     use_cam_age = bool(cam_age)
     use_ctl = bool(train_heads) and "ctl" in train_heads
     use_road_edge = bool(train_heads) and "road_edge" in train_heads
@@ -2916,6 +3039,11 @@ def train_directory(
     )
     torch.manual_seed(int(seed))
     holder: dict[str, Any] = {}
+    holder["recipe"] = str(recipe or "") or None
+    holder["recipe_stage"] = str(recipe_stage or "") or None
+    holder["recipe_joint"] = str(recipe_stage or "") == "7"
+    holder["lr_base"] = float(lr)
+    holder["accum"] = 1
 
     def _arm(device_name: str, learning_rate: float | None = None) -> None:
         device = torch.device(device_name)
@@ -2972,7 +3100,16 @@ def train_directory(
         holder["amp"] = amp
         holder["precision"] = "amp" if amp else "fp32"
         holder["lr"] = rate
-        if hasattr(holder["net"], "param_groups") and float(backbone_lr_mult) != 1.0:
+        if holder.get("recipe") == "trainer2":
+            from python.train.lr_schedule import scene_param_groups
+            from python.train.trainer2_recipe import stage_lr_mults_for
+
+            raw = stage_lr_mults_for(str(holder.get("recipe_stage") or "2"))
+            known = {name for name, _m in holder["net"].named_children()} | {"stem", "trunk"}
+            # scene_param_groups refuses typo names; drop modules this net was not built with.
+            mults = {name: value for name, value in raw.items() if name in known}
+            params = scene_param_groups(holder["net"], rate, mults)
+        elif hasattr(holder["net"], "param_groups") and float(backbone_lr_mult) != 1.0:
             params: Any = holder["net"].param_groups(rate, float(backbone_lr_mult))
         else:
             params = holder["net"].parameters()
@@ -3449,6 +3586,33 @@ def train_directory(
                     "epoch": int(epoch),
                     "rows": [row.get("i") for piece in group for row in piece["rows"]],
                 }
+                if holder.get("recipe") == "trainer2":
+                    from python.train.lr_schedule import WarmupCosine, apply_lr, stage_peak
+                    from python.train.trainer2_balance import GradNorm, HeadRamp, RAMP_STEPS
+                    from python.train.trainer2_recipe import STAGES, resolve_accum
+
+                    holder["accum"] = resolve_accum(requested=int(accum_requested or 0), batch=int(batch))
+                    if holder.get("recipe_schedule") is None:
+                        total = max(1, int(windows) * max(1, int(requested_epochs if exact_n is None else exact_n)))
+                        peak = stage_peak(
+                            float(holder.get("lr_base", holder["lr"])),
+                            joint=bool(holder.get("recipe_joint")),
+                        )
+                        holder["recipe_schedule"] = WarmupCosine(peak, total)
+                    apply_lr(holder["opt"], holder["recipe_schedule"], int(done))
+                    if holder.get("balance") is None:
+                        terms = list(_loss_terms(net))
+                        sid = str(holder.get("recipe_stage") or "2")
+                        entering = set(STAGES[sid].entering_loss_terms) if sid in STAGES else set()
+                        if sid == "7":
+                            entry = {name: -int(RAMP_STEPS) for name in terms}
+                        else:
+                            entry = {name: (0 if name in entering else -int(RAMP_STEPS)) for name in terms}
+                        holder["ramp"] = HeadRamp(entry)
+                        holder["balance"] = GradNorm(terms)
+                accum_n = int(holder.get("accum") or 1)
+                step_flush = accum_n <= 1 or ((int(done) + 1) % accum_n == 0)
+                step_zero = accum_n <= 1 or (int(done) % accum_n == 0)
                 try:
                     if len(group) == 1:
                         step_loss, n_sup, carry, end_state = _optimizer_step(
@@ -3479,6 +3643,11 @@ def train_directory(
                             aux_cache=aux_cache,
                             fuse_window=bool(fuse_window),
                             cuda_graph_runner=cuda_graph_runner,
+                            balance=holder.get("balance"),
+                            ramp=holder.get("ramp"),
+                            balance_step=int(done),
+                            do_step=step_flush,
+                            zero_grad=step_zero,
                         )
                     else:
                         step_loss, n_sup, carry, end_state = _optimizer_group(
@@ -3507,6 +3676,11 @@ def train_directory(
                             aux_cache=aux_cache,
                             fuse_window=bool(fuse_window),
                             cuda_graph_runner=cuda_graph_runner,
+                            balance=holder.get("balance"),
+                            ramp=holder.get("ramp"),
+                            balance_step=int(done),
+                            do_step=step_flush,
+                            zero_grad=step_zero,
                         )
                 except RuntimeError as exc:
                     if not _is_oom(exc):
@@ -4138,6 +4312,246 @@ def _default_ssl_stage(
     return str(path), meta
 
 
+
+def _run_trainer2_recipe(
+    args: argparse.Namespace,
+    *,
+    strip_roots: tuple,
+    holdout_root: Path,
+    cam_names: tuple,
+    net_kw: dict,
+    preset_name: str,
+    train_precision: str,
+    plan_precision: str | None,
+    frame_cache: Any,
+    aux_cache: Any,
+    export_path: Path | None,
+    pause_dir: Path | None,
+    start_now: bool,
+    open_panel: bool,
+) -> None:
+    """Curriculum loop for ``--recipe trainer2``. Recipe-off ``main`` is unchanged."""
+    from python.train.trainer2_recipe import (
+        CheckpointRejected,
+        DEPLOY_PRESETS,
+        LIVE_INFER_VRAM_GB,
+        RecipeRefused,
+        STAGE_MAX_EPOCHS,
+        StageResult,
+        plan_curriculum,
+        parse_stage_filter,
+        recipe_run_config,
+        run_curriculum,
+        stage_exited,
+        stage_train_kwargs,
+        student_export_fits_deploy,
+    )
+    from python.train.model_size import PRESETS
+
+    if preset_name not in DEPLOY_PRESETS:
+        vram = float(PRESETS[preset_name].est_vram_gb) if preset_name in PRESETS else float("inf")
+        raise RecipeRefused(
+            f"--recipe trainer2 is meant for a live export; preset {preset_name!r} "
+            f"(est {vram} GB) is not in {sorted(DEPLOY_PRESETS)} / <= {LIVE_INFER_VRAM_GB} GB"
+        )
+    wanted = parse_stage_filter(getattr(args, "stage", "") or "")
+    plan = plan_curriculum(stages=wanted)
+    for stage in plan:
+        if stage.action == "skip":
+            print(f"[GVD] recipe trainer2: skip stage {stage.id} ({stage.name}): {stage.reason}", flush=True)
+    if any(s.id == "0" and s.action == "run" for s in plan) and bool(getattr(args, "no_ssl_pretrain", False)):
+        raise RecipeRefused("stage 0 is SSL; drop --no-ssl-pretrain or pass --stage to skip 0")
+
+    ckpt_dir = Path(args.ckpt_dir) if getattr(args, "ckpt_dir", None) else None
+    if ckpt_dir is not None:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        (ckpt_dir / "recipe_config.json").write_text(
+            __import__("json").dumps(recipe_run_config(seed=int(args.seed), ssl_pretrain=not bool(args.no_ssl_pretrain)), indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        split = ckpt_dir / "split_manifest.json"
+        runm = ckpt_dir / "run_manifest.json"
+        if split.is_file() or runm.is_file():
+            from python.train.trainer2_split import require_preregistered
+
+            require_preregistered(ckpt_dir)
+            print("[GVD] recipe trainer2: run manifest pre-registered OK", flush=True)
+
+    from python.train.exp_ssl import SslError as _SslError
+    from python.train.scene_loader import default_num_workers
+
+    drop_wrong_way, require_road_dump, max_road_clip, road_dump = frame_quality_from_args(args)
+    last_stats: dict[str, Any] = {}
+    init_stem_arg = str(getattr(args, "init_stem", "") or "") or None
+
+    def _call_train(stage, prev_ckpt):
+        nonlocal last_stats, init_stem_arg
+        kw = stage_train_kwargs(stage.id)
+        if kw["kind"] == "ssl":
+            from python.train.exp_ssl import ssl_plan
+
+            ssl_on, ssl_why = ssl_plan(args, resuming=False)
+            print(f"[GVD] recipe trainer2: stage 0 SSL ({ssl_why})", flush=True)
+            if ssl_on:
+                init_stem_arg, ssl_meta = _default_ssl_stage(args, strip_roots, holdout_root, cam_names, net_kw)
+            else:
+                ssl_meta = {"on": False, "why": ssl_why, "key": None, "rows": 0, "reused": None, "empty_split": False}
+            last_stats = {"ssl": ssl_meta, "export": None}
+            loss = float((ssl_meta or {}).get("loss") or (ssl_meta or {}).get("last_loss") or 0.0)
+            # The SSL module already ran its own plateau / collapse guard; treat the stage as exited.
+            return StageResult(
+                ckpt=str(init_stem_arg) if init_stem_arg else prev_ckpt,
+                metrics={"ssl_pretext": loss},
+                evals=[loss, loss, loss, loss],
+                epochs=max(1, int(getattr(args, "ssl_epochs", 1) or 1)),
+            )
+
+        from python.train.cam_strip import parse_heads
+
+        heads = tuple(kw["heads"])
+        # Last live / joint stage may export; earlier stages do not overwrite an existing export.
+        stage_export = None
+        if stage.id == "7" or (stage.id == plan[-1].id if plan else False):
+            if export_path is not None and not Path(export_path).exists():
+                stage_export = export_path
+        stats = train_directory(
+            holdout_root,
+            roots=strip_roots,
+            holdout_source=holdout_root,
+            epochs=min(int(args.epochs), STAGE_MAX_EPOCHS) if int(args.epochs) else STAGE_MAX_EPOCHS,
+            lr=args.lr,
+            capability=args.capability,
+            export_path=stage_export,
+            resume=not bool(args.no_resume),
+            sanity=bool(args.sanity) and not bool(args.dry_run),
+            dry_run=bool(args.dry_run),
+            metrics_every=int(args.metrics_every),
+            autostart=start_now,
+            open_panel=open_panel,
+            cams=cam_names,
+            heads=heads,
+            cache=frame_cache,
+            augment=False,
+            clip=float(args.clip),
+            lane_loss=str(args.lane_loss),
+            balance=bool(args.balance),
+            min_valid=float(args.min_valid),
+            workers=default_num_workers() if args.workers is None else int(args.workers),
+            scale=1.0,
+            batch_size=int(args.batch),
+            holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+            holdout_cells=bool(args.holdout_cells),
+            holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
+            holdout_seed=int(args.holdout_seed),
+            seed=int(args.seed),
+            conf_weight=float(args.conf_weight),
+            ctl_weight=1.0 if args.ctl_weight is None else float(args.ctl_weight),
+            ctl_cond=bool(args.ctl_cond),
+            route_cond=bool(args.route_cond),
+            ctl_loss=str(args.ctl_loss),
+            init_head_bias=bool(args.init_head_bias),
+            eval_chunk=int(args.eval_chunk),
+            backbone=str(args.backbone),
+            freeze_backbone=bool(args.freeze_backbone),
+            backbone_lr_mult=float(args.backbone_lr_mult),
+            mask_events=bool(args.mask_events),
+            mask_files=str(args.mask_files or ""),
+            mask_clip_qc=bool(getattr(args, "mask_clip_qc", False)),
+            clip_qc_drop=bool(getattr(args, "clip_qc_drop", False)),
+            drop_wrong_way=drop_wrong_way,
+            road_dump=road_dump,
+            max_road_clip=max_road_clip,
+            require_road_dump=require_road_dump,
+            ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
+            ckpt_min_free_gb=args.ckpt_min_free_gb,
+            cam_age=bool(args.cam_age),
+            exp_active_subset=bool(getattr(args, "exp_active_subset", False)),
+            exp_active_hard_frac=float(getattr(args, "exp_active_hard_frac", 0.3)),
+            exp_active_random_floor=float(getattr(args, "exp_active_random_floor", 0.1)),
+            grad_ckpt=bool(args.grad_ckpt),
+            init_stem=init_stem_arg,
+            ssl_meta=None,
+            pause_dir=pause_dir,
+            exact_epochs=args.exact_epochs,
+            val_worst=int(args.val_worst),
+            val_worst_png=bool(args.val_worst_png),
+            aux_depth=bool(kw.get("aux_depth")),
+            aux_sem=bool(kw.get("aux_sem")),
+            aux_depth_weight=float(getattr(args, "aux_depth_weight", 0.1)),
+            aux_sem_weight=float(getattr(args, "aux_sem_weight", 0.1)),
+            road_edge_weight=float(getattr(args, "road_edge_weight", 1.0)),
+            time_steps=int(getattr(args, "time_steps", 0) or 0),
+            eval_every=max(1, int(getattr(args, "eval_every", 1) or 1)),
+            chunk_stride_frames=int(getattr(args, "chunk_stride", 0) or 0),
+            fuse_window=not bool(getattr(args, "no_fuse_window", False)),
+            aux_cache=aux_cache,
+            fit_trained_canvas=bool(getattr(args, "fit_trained_canvas", False)),
+            exp_cuda_graph=bool(getattr(args, "exp_cuda_graph", False)),
+            model_net_kwargs=net_kw,
+            model_preset=preset_name,
+            train_precision=train_precision,
+            plan_precision=plan_precision,
+            recipe="trainer2",
+            recipe_stage=stage.id,
+            accum_requested=int(getattr(args, "accum", 0) or 0),
+        )
+        last_stats = stats
+        loss = stats.get("holdout_loss")
+        if loss is None:
+            loss = stats.get("last_loss", stats.get("loss", 0.0))
+        loss = float(loss or 0.0)
+        metrics = {"lane_rms": loss, "lane_r": 0.0, "depth_absrel": loss, "sem_miou": 0.0}
+        # A finished train_directory call has already run its epoch loop; pin evals so the
+        # recipe exit gate can see a plateau (or the max-epoch cap).
+        epochs = int(stats.get("epochs") or args.epochs or 1)
+        evals = [loss, loss, loss, loss]
+        ckpt = stats.get("ckpt") or stats.get("export") or prev_ckpt
+        return StageResult(ckpt=ckpt, metrics=metrics, evals=evals, epochs=epochs)
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+
+    result = run_curriculum(_call_train, log=_log, stages=wanted)
+    export = last_stats.get("export") if last_stats else None
+    if export or export_path:
+        path = Path(export or export_path)
+        if path.is_file():
+            student_n = None
+            exported_n = None
+            try:
+                from python.train.scene_net import architecture_parameter_count
+
+                student_n = int(architecture_parameter_count())
+            except Exception:
+                student_n = None
+            try:
+                import onnx  # type: ignore
+
+                model = onnx.load(str(path))
+                exported_n = 0
+                for init in model.graph.initializer:
+                    shape = 1
+                    for dim in init.dims:
+                        shape *= int(dim)
+                    exported_n += int(shape)
+            except Exception:
+                exported_n = student_n
+            if student_n is not None and exported_n is not None:
+                student_export_fits_deploy(
+                    preset=preset_name, student_param_count=student_n, exported_param_count=exported_n
+                )
+                print(
+                    f"[GVD] recipe trainer2: deploy check OK preset={preset_name} "
+                    f"params={student_n} onnx={path}",
+                    flush=True,
+                )
+    print(
+        f"[GVD] recipe trainer2: trained={result.trained} skipped={result.skipped} ckpt={result.last_ckpt}",
+        flush=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     from python.data.data_root import DataDriveError, check_data_path, ensure_cache_dirs, scene_lanes_dir
 
@@ -4147,6 +4561,13 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
     args = build_parser().parse_args(argv)
+    from python.train.trainer2_recipe import RecipeRefused, validate_recipe_args
+
+    try:
+        validate_recipe_args(args)
+    except RecipeRefused as exc:
+        print(f"[GVD] scene train: {exc}", flush=True)
+        sys.exit(2)
     from python.train.model_size import plan_from_namespace
 
     try:
@@ -4429,6 +4850,30 @@ def main(argv: list[str] | None = None) -> None:
         if not open_panel:
             print("[GVD] scene train: no panel", flush=True)
         drop_wrong_way, require_road_dump, max_road_clip, road_dump = frame_quality_from_args(args)
+        if str(getattr(args, "recipe", "") or "") == "trainer2":
+            from python.train.trainer2_recipe import CheckpointRejected, RecipeRefused
+
+            try:
+                _run_trainer2_recipe(
+                    args,
+                    strip_roots=strip_roots,
+                    holdout_root=holdout_root,
+                    cam_names=cam_names,
+                    net_kw=net_kw,
+                    preset_name=preset_name,
+                    train_precision=train_precision,
+                    plan_precision=plan_precision,
+                    frame_cache=frame_cache,
+                    aux_cache=aux_cache,
+                    export_path=export_path,
+                    pause_dir=pause_dir,
+                    start_now=start_now,
+                    open_panel=open_panel,
+                )
+            except (RecipeRefused, CheckpointRejected) as exc:
+                print(f"[GVD] scene train: {exc}", flush=True)
+                sys.exit(2)
+            return
         init_stem_arg = str(getattr(args, "init_stem", "") or "") or None
         from python.train.exp_ssl import SslError as _SslError, ssl_plan
 

@@ -71,6 +71,7 @@ GT is eval-only: it never enters cam_frame (pred mode).
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import atexit
 import json
@@ -1410,42 +1411,69 @@ def check_clip015_rear_holes_poseB() -> None:
 
 
 
-def check_snapped_pixels_not_exempt_from_edge_cut() -> None:
-    """Snapped pixels must still take the depth-edge cut.
+@contextlib.contextmanager
+def cut_clamp_tap():
+    """Record the runtime cam_frame's calls to the two geometry stages it shares with the renderer:
+    ("cut", depth_in, sky_arg, ground_hit, depth_out) for sf.edge_cut_far_side and ("clamp", depth_in, depth_out) for
+    sf.ground_clamp, in call order. The preview reaches them through ``S.<name>`` at call time, so patching the
+    module attributes is seen by cam_frame; both are restored on exit."""
+    log: list = []
+    oc, og = sf.edge_cut_far_side, sf.ground_clamp
 
-    tools/rv_stable_preview.py does ``depth = np.where(cut & ~sky & ~snapped, far_side, depth)``,
-    so a snapped pixel at a cut is left at the ground-plane hit. An off-plane road-labelled
-    pixel at a depth edge must still be cut. NEW vs a56f514 (no rv_stable_preview / road_snap).
-    """
+    def cut(depth, sky, ground_hit, *a, **k):
+        out = oc(depth, sky, ground_hit, *a, **k)
+        log.append(("cut", np.array(depth, np.float64), np.array(sky, bool), np.array(ground_hit, np.float64), np.array(out)))
+        return out
+
+    def clamp(cam, depth, *a, **k):
+        out = og(cam, depth, *a, **k)
+        log.append(("clamp", np.array(depth, np.float64), np.array(out[0])))
+        return out
+
+    sf.edge_cut_far_side, sf.ground_clamp = cut, clamp
+    try:
+        yield log
+    finally:
+        sf.edge_cut_far_side, sf.ground_clamp = oc, og
+
+
+def run_tapped(cid, raw, lab):
+    """(cam_frame outputs, tap log) for one synthetic input."""
+    with cut_clamp_tap() as log:
+        out = pv().run(cid, raw, lab)
+    return out, log
+
+
+def check_snapped_pixels_not_exempt_from_edge_cut() -> None:
+    """Snapped pixels must still take the depth-edge cut (tightening: retargeted from wide, which no longer snaps).
+
+    The runtime must hand ``edge_cut_far_side`` exactly the sky mask: adding the snapped px to it (the old
+    ``cut & ~sky & ~snapped``, as a ``sky | snapped`` argument) exempts them from the cut. With clamp margin 1.0 a
+    snapped px sits at its own ground hit, so the cut can only move it where the far side is equal; the exemption is
+    therefore not visible in the output on a flat scene, and the argument is what is pinned. Cams: main and pillarR
+    (both in ROAD_SNAP_CAMS); left half road at 2.5x depth (snaps onto the plane), right half non-road at 2.5x."""
     p = pv()
-    cam = p.cam["wide"]
-    g = geom(cam)
-    H, W = g["hit"].shape
-    ys, xs = np.mgrid[0:H, 0:W]
-    # Left: road-labelled, 2.5x too far (snaps onto the plane). Right: not road, also 2.5x
-    # (clamp leaves a depth step vs the snapped hit). The 5x5 far-side of snapped edge
-    # pixels is the unsnapped far depth; they must still be cut, not left at the plane hit.
-    raw = np.where(g["down"], g["hit"] * 2.5, 1e4)
-    road = g["down"] & (xs < W // 2)
-    sem = np.where(~g["down"], sf_sky(), np.where(road, ROAD_ID, NONROAD_ID))
-    _, d, v, sky = p.run("wide", raw, sem)
-    snap = p.last_snap
-    assert snap is not None and snap.any() and snap[:, : W // 2].any()
-    # Replay snap+clamp, then the cut, to identify snapped pixels that sit on a depth edge.
-    pre, snapped = sf.road_snap(cam, raw, (sem == ROAD_ID) & (sem != sf_sky()), max_hit_m=sf.ROAD_SNAP_MAX_M)
-    pre, _ = sf.ground_clamp(cam, pre, margin=float(p.a.clamp_margin or 1.0))
-    inv = 1.0 / np.maximum(pre, 1e-3)
-    gy, gx = np.gradient(inv)
-    cut = np.hypot(gx, gy) > 0.12 * inv
-    far_side = cv2.dilate(pre.astype(np.float32), np.ones((5, 5), np.uint8))
-    need = cut & ~sky & snapped & (np.abs(far_side - pre) > 1e-3)
-    assert need.any(), "fixture must place a snapped pixel on a depth edge"
-    kept = need & (np.abs(d - pre) <= 1e-3)
-    n_need, n_kept = int(need.sum()), int(kept.sum())
-    assert not kept.any(), (
-        f"{n_kept}/{n_need} snapped px at a depth edge were exempt from the cut "
-        f"(tools/rv_stable_preview.py: `cut & ~sky & ~snapped`); NEW vs a56f514"
-    )
+    snap_cams = resolve_road_snap_cams()
+    bad = []
+    for cid in ("main", "pillarR"):
+        assert cid in snap_cams, f"{cid} must be in ROAD_SNAP_CAMS for this check (got {sorted(snap_cams)})"
+        cam = p.cam[cid]
+        g = geom(cam)
+        H, W = g["hit"].shape
+        ys, xs = np.mgrid[0:H, 0:W]
+        raw = np.where(g["down"], g["hit"] * 2.5, 1e4)
+        road = g["down"] & (xs < W // 2)
+        sem = np.where(~g["down"], sf_sky(), np.where(road, ROAD_ID, NONROAD_ID))
+        fr, log = run_tapped(cid, raw, sem)
+        sky, snap = fr[3], p.last_snap
+        assert snap is not None and snap.any() and snap[:, : W // 2].any(), f"{cid}: fixture must snap road px"
+        cuts = [e for e in log if e[0] == "cut"]
+        assert len(cuts) == 1, f"{cid}: cam_frame called the edge cut {len(cuts)} times"
+        sky_arg = cuts[0][2]
+        extra = int((sky_arg & ~sky).sum())
+        if extra or not np.array_equal(sky_arg, sky):
+            bad.append(f"{cid}: edge cut got {extra} non-sky px in its sky mask ({int(snap.sum())} snapped px are exempt from the cut)")
+    assert not bad, "; ".join(bad)
 
 
 def pose_a_chase():
@@ -3837,7 +3865,6 @@ KNOWN_FAILING: dict[str, str] = {
     "check_synthetic_width": "L+E: pillarL/R 0-5 m median 14.8% p90 47.3%; repeatL/R 0-5 m 16.6%/23.0%, 5-15 m 28.1%/48.2%; rear 15-30 m",
     "check_synthetic_edge_overshoot": "L: road 0.35 m (pillars) / 0.71 m (repeats) past the GT edge at 0-5 m (12x16 label bleed)",
     "check_side_objects_keep_height_pins": "N: pillarR parked car x2.5 lost 1.07 m on 88 px; pole x3 lost 1.07 m on 351/391 px; curbs lost 0.11 m",
-    "check_snapped_pixels_not_exempt_from_edge_cut": "NEW vs a56f514: 456/456 snapped px at a depth edge were exempt from the cut (tools/rv_stable_preview.py: `cut & ~sky & ~snapped`, added at 4df1176). wide, left-half road 2.5x / right unsnapped 2.5x, clamp on.",
     "prop_side_objects_keep_height": "N: pillarL pole at x=-2.0, y0=0.0: lost 0.592 m",
     "check_road_labelled_object_top_stays_put": "N: pillarR car top 218 px moved outward (GT z 1.50 m); curb top 1487 px, height lost 0.15 m; main car top also snapped outward",
     # pillarR/repeatR (b): michael 2026-11-26 13:50 CT, net seg+depth, Trainer 2.0 -- residual after a pred-z>0.30 rejection only

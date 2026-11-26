@@ -20,6 +20,7 @@ Checks:
 - check_checklist_one_fail_is_not_passed  (exactly one item failing => passed is False)
 - check_psnr_peak_is_255               (MSE 25.5^2 => 20.0 dB; kills 255->256)
 - check_ssim_guards                    (shape mismatch and <7px raise ValueError)
+- check_score_metrics_rgb_shape_mismatch (wrong-shape render fails psnr_db/ssim, no raise)
 """
 from __future__ import annotations
 
@@ -1002,6 +1003,47 @@ def check_ssim_guards() -> None:
     print("PASS check_ssim_guards")
 
 
+def check_score_metrics_rgb_shape_mismatch() -> None:
+    """score_metrics: a render whose RGB shape is not the GT camera's fails psnr_db/ssim cleanly (no raise)."""
+    flat = _flat_gt(10.0)
+    ones = np.ones((H, W), dtype=np.float32)
+    d_ok = np.full((H, W), 10.0, np.float32)
+    gt_rgb = np.asarray(flat.rgb)
+    bad_shapes = (
+        (H, W + 1, 3),          # one column wider
+        (H - 1, W, 3),          # one row shorter
+        (W, H, 3),              # transposed
+        (H, W),                 # grayscale, no channel axis
+    )
+    for shape in bad_shapes:
+        assert shape != gt_rgb.shape
+        rgb = np.zeros(shape, dtype=gt_rgb.dtype)
+        try:
+            res = rub.score_metrics(rub.RenderedView(out=make_out(rgb, d_ok), opacity=ones), flat)
+        except Exception as exc:  # noqa: BLE001 - the point is that it must not raise
+            raise AssertionError(f"score_metrics must fail psnr_db/ssim, not raise, for rgb {shape}: {exc!r}") from exc
+        # depth stays the GT shape, so the contract also rejects the depth buffer
+        # (depth must match the render's RGB); what matters here is no raise.
+        assert not res.items["psnr_db"] and not res.items["ssim"], (shape, res.items)
+        assert res.values["psnr_db"] is None and res.values["ssim"] is None, (shape, res.values)
+        assert any(f.startswith("psnr_db/ssim:") and "shape" in f for f in res.failures), (shape, res.failures)
+        assert not res.passed
+    # a coherent render at another resolution (RGB, depth and opacity all the
+    # render's own shape, none the GT camera's) fails every metric, never raises
+    for shape in ((H, W + 1), (H - 1, W), (W, H)):
+        try:
+            res = rub.score_metrics(
+                rub.RenderedView(out=make_out(np.zeros(shape + (3,), gt_rgb.dtype), np.full(shape, 10.0, np.float32)),
+                                 opacity=np.ones(shape, np.float32)), flat)
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(f"score_metrics must fail, not raise, for a {shape} render: {exc!r}") from exc
+        assert _items_failed(res) == sorted(rub.METRIC_ITEMS), (shape, res.items)
+        assert all(v is None for v in res.values.values()), (shape, res.values)
+        assert any("not the GT camera's" in f for f in res.failures), (shape, res.failures)
+        assert not res.passed
+    print("PASS check_score_metrics_rgb_shape_mismatch")
+
+
 def main() -> None:
     check_useful_view_metrics()
     check_useful_view_checklist()
@@ -1015,6 +1057,7 @@ def main() -> None:
     check_checklist_one_fail_is_not_passed()
     check_psnr_peak_is_255()
     check_ssim_guards()
+    check_score_metrics_rgb_shape_mismatch()
     print("test_rv_rubric_gt: ok")
 
 

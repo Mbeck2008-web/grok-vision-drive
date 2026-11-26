@@ -182,6 +182,11 @@ def score_metrics(view: RenderedView, gt: GtFrame) -> RubricResult:
     failures: list[str] = []
 
     depth, why = _usable_depth(view.out)
+    gt_shape = np.shape(gt.depth)
+    if depth is not None and depth.shape != gt_shape:
+        # A render at another resolution than the GT camera is not scorable
+        # pixel-for-pixel: fail the depth metrics, never raise.
+        depth, why = None, f"rendered depth shape {depth.shape} is not the GT camera's {gt_shape}"
     if depth is None:
         # Spec: "A run that does not emit that buffer fails these two metrics
         # (it does not skip them)."

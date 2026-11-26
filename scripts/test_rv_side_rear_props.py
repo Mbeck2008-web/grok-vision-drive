@@ -594,6 +594,37 @@ def hole_fraction(chase, rend_pts, gt_road_pts):
     return out
 
 
+# Visible holes (synthetic rear holes only): GT road px not covered by what the RENDERER paints. The footprint and the
+# splat cap are the renderer's own functions, bound here by name so check_visible_holes_use_renderer_footprint can
+# assert identity; no number is copied. hole_fraction (fixed 0.3 m footprint, default cap) is unchanged for its other callers.
+HOLE_FOOTPRINT_FN = sf.point_footprint
+HOLE_CAP_FN = sf.splat_max_radius_px
+
+
+def visible_hole_fraction(chase, rend_pts, rend_foot, gt_road_pts, gt_foot, max_radius_px):
+    """{bin: (hole frac, n GT road px)} like hole_fraction, but both point sets are splatted with their own per-point
+    footprints (the renderer's point_footprint) and the renderer's splat cap, i.e. what the chase view draws."""
+    def paint(pts, foot):
+        if pts.shape[0] == 0:
+            return np.zeros((chase.height, chase.width), bool)
+        r = sf.compose(chase, pts, np.full((pts.shape[0], 3), 128, np.uint8), foot, sky_rgb=None, ground_rgb=None,
+                       fill=True, max_radius_px=max_radius_px)
+        return r.masks["observed"] | r.masks["filled"]
+    gt_m = paint(gt_road_pts, gt_foot)
+    rd_m = paint(rend_pts, rend_foot)
+    rays = sf._pixel_rays(chase)
+    dz = rays[..., 2]
+    down = dz < -1e-9
+    t = np.where(down, -chase.pos[2] / np.where(down, dz, -1.0), np.nan)
+    rng = np.hypot(chase.pos[0] + t * rays[..., 0], chase.pos[1] + t * rays[..., 1])
+    out = {}
+    for (lo, hi) in HOLE_BINS:
+        m = gt_m & down & (rng >= lo) & (rng < hi)
+        n = int(m.sum())
+        out[(lo, hi)] = (float((m & ~rd_m).sum()) / n if n else 0.0, n)
+    return out
+
+
 def hole_gate(fr_by_view, label):
     bad = []
     for deg, bins in fr_by_view.items():
@@ -623,19 +654,22 @@ def synthetic_frame(cams=None, label_fn=None):
 
 
 def synthetic_rear_holes():
+    """Visible holes on the synthetic road (what renders; not a data-presence check, see check_synthetic_rear_density)."""
     fr = synthetic_frame()
-    rend, gtp = [], []
+    rend, rf, gtp, gf = [], [], [], []
     for cid, x in fr.items():
         cam = x["cam"]
         ys, xs = np.nonzero(x["v"])
         p = sf.unproject(cam, x["d"], ys, xs)
-        rend.append(p[ego_box_filter(p)])
+        k = ego_box_filter(p)
+        rend.append(p[k]); rf.append(HOLE_FOOTPRINT_FN(cam, x["d"])[ys, xs][k])
         ys, xs = np.nonzero(x["gt_road"])
         q = sf.unproject(cam, x["gt_d"], ys, xs)
-        gtp.append(q[ego_box_filter(q)])
-    rend = np.concatenate(rend)
-    gtp = np.concatenate(gtp)
-    return {deg: hole_fraction(ch, rend, gtp) for deg, ch in rear_views().items()}
+        k = ego_box_filter(q)
+        gtp.append(q[k]); gf.append(HOLE_FOOTPRINT_FN(cam, x["gt_d"])[ys, xs][k])
+    rend, rf, gtp, gf = (np.concatenate(v) for v in (rend, rf, gtp, gf))
+    cap = HOLE_CAP_FN(int(pv().defaults["width"]))
+    return {deg: visible_hole_fraction(ch, rend, rf, gtp, gf, cap) for deg, ch in rear_views().items()}
 
 
 # ------------------------------------------------------------------ deterministic checks
@@ -703,9 +737,42 @@ def _edge(label_fn) -> None:
 
 
 def check_synthetic_rear_holes() -> None:
+    """Visible holes (what renders; not a data-presence check): GT road px in the +-135 / 180 deg chase views that the
+    renderer's own splat (point_footprint, splat_max_radius_px(W)) leaves unpainted. Limits unchanged (2% / 5%)."""
     h = synthetic_rear_holes()
-    print("synthetic rear holes:", {deg: {f"{lo:g}-{hi:g}": (round(100 * f, 2), n) for (lo, hi), (f, n) in b.items()} for deg, b in h.items()}, flush=True)
-    hole_gate(h, "synthetic")
+    print("synthetic rear VISIBLE holes (renderer footprint + cap; % of GT road px, n):",
+          {deg: {f"{lo:g}-{hi:g}": (round(100 * f, 2), n) for (lo, hi), (f, n) in b.items()} for deg, b in h.items()}, flush=True)
+    hole_gate(h, "synthetic visible (what renders; not a data-presence check)")
+
+
+def check_visible_holes_use_renderer_footprint() -> None:
+    """Identity guard for check_synthetic_rear_holes: the footprint function IS the renderer's sf.point_footprint, the cap
+    function IS sf.splat_max_radius_px, the preview uses the same two, and every splat the visible-holes path makes
+    carries max_radius_px == splat_max_radius_px(W) and a per-point (not constant 0.3 m) footprint."""
+    W = int(pv().defaults["width"])
+    assert HOLE_FOOTPRINT_FN is sf.point_footprint, "hole footprint function is not the renderer's sf.point_footprint"
+    assert HOLE_CAP_FN is sf.splat_max_radius_px, "hole cap function is not the renderer's sf.splat_max_radius_px"
+    src = PREVIEW.read_text(encoding="utf-8")
+    assert "S.point_footprint(" in src and "S.splat_max_radius_px(a.width)" in src, "the preview no longer uses point_footprint / splat_max_radius_px(a.width)"
+    calls = []
+    oc = sf.compose
+
+    def rec(chase, pts, cols, foot, *a, **k):
+        calls.append((k.get("max_radius_px"), np.asarray(foot, np.float64)))
+        return oc(chase, pts, cols, foot, *a, **k)
+
+    sf.compose = rec
+    try:
+        synthetic_rear_holes()
+    finally:
+        sf.compose = oc
+    want = sf.splat_max_radius_px(W)
+    bad = sorted({c for c, _ in calls if c != want})
+    const = sum(1 for _, f in calls if f.size and np.allclose(f, 0.3))
+    print(f"  visible holes: {len(calls)} splats, cap {sorted({c for c, _ in calls})} (renderer splat_max_radius_px({W}) = {want}), "
+          f"constant-0.3 m footprints {const}", flush=True)
+    assert calls and not bad, f"splat cap {bad} != sf.splat_max_radius_px({W}) = {want}"
+    assert not const, f"{const} splats use a constant 0.3 m footprint instead of point_footprint"
 
 
 def check_no_nan_and_sky() -> None:
@@ -1645,6 +1712,186 @@ def check_narrow_wide_road_px_unchanged_by_snap() -> None:
         p.a.road_snap = saved
     print(f"  narrow/wide px changed by road snap on vs off: {changed}; snapped px: {masks}", flush=True)
     assert not any(changed.values()) and not any(masks.values()), f"narrow/wide road px changed by snap: {changed}, snapped {masks}"
+
+
+# ------------------------------------------------------------------ local road density (synthetic frame only)
+# Cells over the GT road, per snap cam: cross-track 1 m (floor x), along-track one cell per group of image rows whose
+# GT-road ranges are >= 1 m apart (1 m or the local row spacing, whichever is larger; far rows are 3-10 m apart).
+# Band 15-30 m (hypot(x, y) of the unprojected GT road px); a cam with no GT road there (pillarL/R: road only at
+# 2.4-5.2 m) uses 0-15 m instead. Count = rendered (pre-splat) points of that cam in the cell. Floor per cell = pinned
+# head count minus max(1 px, 10% of it); cells empty on head (another cam owns them: yield) are excluded and reported.
+DENSITY_BAND = (15.0, 30.0)
+DENSITY_FALLBACK_BAND = (0.0, 15.0)
+DENSITY_MIN_ALONG_M = 1.0
+DENSITY_LOSS_FRAC = 0.10
+ROAD_DENSITY_PINS = {   # cam -> ((along-track cell, cross-track cell, rendered pts), ...) on the head synthetic frame
+    "main": (
+        (0, -4, 50), (0, -3, 44), (0, -2, 44), (0, -1, 44), (0, 0, 44), (0, 1, 44), (0, 2, 44), (0, 3, 50),
+        (1, -4, 49), (1, -3, 41), (1, -2, 41), (1, -1, 41), (1, 0, 41), (1, 1, 41), (1, 2, 41), (1, 3, 49),
+        (2, -4, 40), (2, -3, 38), (2, -2, 38), (2, -1, 38), (2, 0, 38), (2, 1, 38), (2, 2, 38), (2, 3, 40),
+        (3, -4, 35), (3, -3, 34), (3, -2, 35), (3, -1, 35), (3, 0, 35), (3, 1, 35), (3, 2, 34), (3, 3, 35),
+        (4, -4, 32), (4, -3, 32), (4, -2, 32), (4, -1, 31), (4, 0, 31), (4, 1, 32), (4, 2, 32), (4, 3, 32),
+        (5, -4, 14), (5, -3, 15), (5, -2, 14), (5, -1, 15), (5, 0, 15), (5, 1, 14), (5, 2, 15), (5, 3, 14),
+        (6, -4, 14), (6, -3, 13), (6, -2, 14), (6, -1, 14), (6, 0, 14), (6, 1, 14), (6, 2, 13), (6, 3, 14),
+        (7, -4, 13), (7, -3, 13), (7, -2, 13), (7, -1, 13), (7, 0, 13), (7, 1, 13), (7, 2, 13), (7, 3, 13),
+        (8, -4, 12), (8, -3, 13), (8, -2, 12), (8, -1, 12), (8, 0, 12), (8, 1, 12), (8, 2, 13), (8, 3, 12),
+        (9, -4, 12), (9, -3, 11), (9, -2, 12), (9, -1, 11), (9, 0, 11), (9, 1, 12), (9, 2, 11), (9, 3, 12),
+    ),
+    "pillarL": (
+        (0, -3, 980), (1, -4, 2561), (1, -3, 7065), (2, -4, 3009), (2, -3, 592), (3, -4, 590),
+    ),
+    "pillarR": (
+        (0, 2, 980), (1, 2, 7065), (1, 3, 2561), (2, 2, 592), (2, 3, 3009), (3, 3, 590),
+    ),
+    "rear": (
+        (0, -4, 8), (0, -3, 8), (0, -2, 8), (0, -1, 8), (0, 0, 8), (0, 1, 8), (0, 2, 8), (0, 3, 8),
+        (1, -4, 6), (1, -3, 7), (1, -2, 7), (1, -1, 7), (1, 0, 7), (1, 1, 7), (1, 2, 7), (1, 3, 6),
+        (2, -4, 5), (2, -3, 6), (2, -2, 5), (2, -1, 6), (2, 0, 6), (2, 1, 5), (2, 2, 6), (2, 3, 5),
+        (3, -4, 0), (3, -3, 0), (3, -2, 0), (3, -1, 0), (3, 0, 0), (3, 1, 0), (3, 2, 0), (3, 3, 0),
+    ),
+    "repeatL": (
+        (0, -4, 11), (0, -3, 5), (0, -2, 7), (0, -1, 14), (0, 0, 15), (1, -4, 12), (1, -3, 1), (1, -2, 8),
+        (1, -1, 12), (1, 0, 12), (2, -4, 8), (2, -3, 0), (2, -2, 8), (2, -1, 11), (2, 0, 10), (2, 1, 3),
+        (3, -4, 2), (3, -3, 0), (3, -2, 9), (3, -1, 8), (3, 0, 9), (3, 1, 6),
+    ),
+    "repeatR": (
+        (0, -1, 15), (0, 0, 14), (0, 1, 7), (0, 2, 5), (0, 3, 11), (1, -1, 12), (1, 0, 12), (1, 1, 8),
+        (1, 2, 1), (1, 3, 12), (2, -2, 3), (2, -1, 10), (2, 0, 11), (2, 1, 8), (2, 2, 0), (2, 3, 8),
+        (3, -2, 6), (3, -1, 9), (3, 0, 8), (3, 1, 9), (3, 2, 0), (3, 3, 2),
+    ),
+}
+
+
+def _density_pts(cam, d, mask):
+    ys, xs = np.nonzero(mask & np.isfinite(d))
+    p = sf.unproject(cam, d, ys, xs)
+    k = ego_box_filter(p)
+    return ys[k], xs[k], p[k]
+
+
+def density_edges(cam, gt_d, gt_road):
+    """(along-track range edges, GT road points in the band, band) for one cam."""
+    gy, _, gp = _density_pts(cam, gt_d, gt_road)
+    rg = np.hypot(gp[:, 0], gp[:, 1])
+    lo, hi = DENSITY_BAND
+    if not ((rg >= lo) & (rg < hi)).any():
+        lo, hi = DENSITY_FALLBACK_BAND
+    sel = (rg >= lo) & (rg < hi)
+    gy, gp, rg = gy[sel], gp[sel], rg[sel]
+    mr = np.sort(np.array([rg[gy == r].mean() for r in np.unique(gy)]))
+    edges = [lo]
+    for a_, b_ in zip(mr[:-1], mr[1:]):
+        mid = 0.5 * (a_ + b_)
+        if mid - edges[-1] >= DENSITY_MIN_ALONG_M and hi - mid >= DENSITY_MIN_ALONG_M:
+            edges.append(mid)
+    edges.append(hi)
+    return np.array(edges), gp
+
+
+def density_cells(p, edges):
+    rg = np.hypot(p[:, 0], p[:, 1])
+    b = np.searchsorted(edges, rg, side="right") - 1
+    ok = (rg >= edges[0]) & (rg < edges[-1])
+    return list(zip(b[ok].tolist(), np.floor(p[ok][:, 0]).astype(int).tolist()))
+
+
+def density_inputs(fr=None):
+    """({cam: edges}, {cam: GT cell set}, {cam: (ys, xs, rendered points)}) on the synthetic frame, snap cams only."""
+    from collections import Counter
+    fr = synthetic_frame() if fr is None else fr
+    edges, gt_cells, rend = {}, {}, {}
+    for cid in sorted(resolve_road_snap_cams()):
+        x = fr[cid]
+        edges[cid], gp = density_edges(x["cam"], x["gt_d"], x["gt_road"])
+        gt_cells[cid] = set(Counter(density_cells(gp, edges[cid])))
+        rend[cid] = _density_pts(x["cam"], x["d"], x["v"])
+    return edges, gt_cells, rend
+
+
+def density_violations(edges, gt_cells, rend, pins=None):
+    """Cells whose rendered count is below pinned - max(1, 10%); also reports a changed cell grid. {cam: [(cell, pin, got)]}"""
+    from collections import Counter
+    pins = ROAD_DENSITY_PINS if pins is None else pins
+    bad = {}
+    for cid, pin in pins.items():
+        pm = {(b, x): n for b, x, n in pin}
+        if set(pm) != gt_cells[cid]:
+            bad.setdefault(cid, []).append(("grid", len(pm), len(gt_cells[cid])))
+            continue
+        got = Counter(density_cells(rend[cid][2], edges[cid])) if len(rend[cid][2]) else Counter()
+        for cell, n in sorted(pm.items()):
+            if n > 0 and got.get(cell, 0) < n - max(1, int(DENSITY_LOSS_FRAC * n)):
+                bad.setdefault(cid, []).append((cell, n, got.get(cell, 0)))
+    return bad
+
+
+def check_synthetic_rear_density() -> None:
+    """Local density of RENDERED points over the GT road (the data-presence check that the visible-holes metric is not):
+    on the synthetic frame, per snap cam, every pinned cell keeps >= pinned - max(1 px, 10%) rendered points. Fixed
+    synthetic scene only (no clip frame, nothing near the sealed pred idxs 63-107 / 163-207)."""
+    edges, gt_cells, rend = density_inputs()
+    from collections import Counter
+    for cid in sorted(edges):
+        pm = {(b, x): n for b, x, n in ROAD_DENSITY_PINS[cid]}
+        got = Counter(density_cells(rend[cid][2], edges[cid]))
+        vals = [got.get(c, 0) for c in pm]
+        nz = sorted(v for v in vals if v)
+        print(f"  density {cid}: band {edges[cid][0]:g}-{edges[cid][-1]:g} m, {len(edges[cid]) - 1} along-track x 1 m cross-track cells, "
+              f"{len(pm)} GT cells, rendered/cell min/med/max {min(nz) if nz else 0}/{int(np.median(nz)) if nz else 0}/{max(nz) if nz else 0}, "
+              f"empty {sum(1 for v in vals if v == 0)} (excluded), floor 0 (n<=1) {sum(1 for c in pm if 0 < pm[c] <= 1)}", flush=True)
+    bad = density_violations(edges, gt_cells, rend)
+    assert not bad, "; ".join(f"{cid}: {len(v)} cells below floor, e.g. {v[0]}" for cid, v in bad.items())
+
+
+def check_synthetic_rear_density_has_teeth() -> None:
+    """The density check must fail on: one real far road row of rear dropped (every rear image row with GT road in the
+    15-30 m band), a seeded 10% drop in the 15-30 m band, a 2x2 m road patch deleted at the 20 m point, and each snap cam
+    dropped. Rear rows that feed no counted cell (not rendered on the road at baseline, or only off-road px) are listed, not tested."""
+    edges, gt_cells, rend = density_inputs()
+    assert not density_violations(edges, gt_cells, rend), "baseline must pass"
+
+    def sub(fn):
+        out = {}
+        for cid, (ys, xs, p) in rend.items():
+            k = fn(cid, ys, xs, p)
+            out[cid] = (ys[k], xs[k], p[k])
+        return out
+
+    def n_bad(r):
+        return sum(len(v) for v in density_violations(edges, gt_cells, r).values())
+
+    ry, _, rp = rend["rear"]
+    pinned = {(b_, x_) for b_, x_, n_ in ROAD_DENSITY_PINS["rear"] if n_ > 0}
+    cells = density_cells(rp, edges["rear"])
+    road_rows = sorted({int(r) for r, c in zip(ry, cells) if c in pinned})        # rear rows that feed a counted road cell
+    xr = synthetic_frame()["rear"]
+    gy, _, gp = _density_pts(xr["cam"], xr["gt_d"], xr["gt_road"])
+    rg0 = np.hypot(gp[:, 0], gp[:, 1])
+    gt_rows = sorted(set(gy[(rg0 >= DENSITY_BAND[0]) & (rg0 < DENSITY_BAND[1])].tolist()))
+    rr = np.hypot(rp[:, 0], rp[:, 1])
+    all_rows = sorted(set(ry[(rr >= 15) & (rr < 30)].tolist()))
+    report, survivors = {}, []
+    for r in road_rows:
+        report[f"rear row {r}"] = n_bad(sub(lambda cid, ys, xs, p, r=r: ~((cid == "rear") & (ys == r))))
+        if not report[f"rear row {r}"]:
+            survivors.append(f"rear row {r}")
+    rng = np.random.default_rng(0)
+
+    def drop10(cid, ys, xs, p):
+        rg_ = np.hypot(p[:, 0], p[:, 1])
+        return ~(((rg_ >= 15) & (rg_ < 30)) & (rng.random(len(rg_)) < 0.10))
+
+    report["seeded 10% drop 15-30 m"] = n_bad(sub(drop10))
+    patch = lambda cid, ys, xs, p: ~((np.abs(p[:, 0]) <= 1.0) & (np.abs(p[:, 1] + 16.97) <= 1.0) & (np.abs(p[:, 2]) < 0.3))
+    report["2x2 m patch at (0, -16.97)"] = n_bad(sub(patch))
+    for cid in sorted(rend):
+        report[f"drop {cid}"] = n_bad(sub(lambda c, ys, xs, p, cid=cid: np.full(len(ys), c != cid)))
+    survivors += [k for k, v in report.items() if v == 0 and not k.startswith("rear row")]
+    unrendered = [r for r in gt_rows if r not in road_rows]
+    off_road = [r for r in all_rows if r not in gt_rows]
+    print(f"  density teeth (cells below floor): {report}; rear rows with GT road in the band but no rendered pt in a counted cell "
+          f"(rear yields there, not tested): {unrendered}; rows with 15-30 m px only off the GT road: {off_road}", flush=True)
+    assert not survivors, f"density check survives: {survivors}"
 
 
 def pose_a_chase():
@@ -3958,6 +4205,9 @@ CHECKS = [
     check_synthetic_edge_overshoot_exact_labels,
     check_synthetic_edge_overshoot,
     check_synthetic_rear_holes,
+    check_visible_holes_use_renderer_footprint,
+    check_synthetic_rear_density,
+    check_synthetic_rear_density_has_teeth,
     check_side_objects_keep_height_pins,
     check_snapped_pixels_not_exempt_from_edge_cut,
     check_cut_then_clamp_order_and_nothing_under_road,

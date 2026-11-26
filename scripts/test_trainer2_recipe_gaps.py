@@ -221,12 +221,56 @@ def check_manifest_records_real_git_sha() -> None:
     print("run manifest records the checkout's real git sha (CLI path), and only an explicit override replaces it OK")
 
 
+def _stage7_ckpt(torch, base: Path):
+    """A stage-7-shaped checkpoint (ctl + aux + road_edge + stop_line) with perturbed weights."""
+    from python.train.model_size import scene_net_kwargs
+    from python.train.scene_net import SceneNet
+
+    heads = ["lanes", "objects", "signs", "lane_gt", "road_edge", "stop_line", "ctl"]
+    net = SceneNet(cams=("main",), ctl=True, aux_sensors=True, road_edge=True, stop_line=True, **scene_net_kwargs("small"))
+    with torch.no_grad():
+        for prm in net.parameters():
+            prm.add_(torch.randn_like(prm) * 1e-2)
+    return base_tests._ckpt_of(net, base / "s7.ckpt_ep3_step7.npz", ctl=True, heads=heads, run="r3-run", scale=1.0)
+
+
+def check_export_records_ckpt_sha256() -> None:
+    """The exported ONNX names the checkpoint it came from by file, sha256, epoch, step, run and scale."""
+    if not _ready("check_export_records_ckpt_sha256", onnx=True):
+        return
+    import onnx
+
+    torch = base_tests._torch()
+    rec = base_tests._recipe()
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        ck = _stage7_ckpt(torch, base)
+        out = base / "deploy.onnx"
+        rec.export_camera_only_deploy(ck, out, preset="small")
+        props = {p.key: p.value for p in onnx.load(str(out)).metadata_props}
+        want = hashlib.sha256(ck.read_bytes()).hexdigest()
+        assert props.get("gvd_ckpt_sha256") == want and len(want) == 64, (props.get("gvd_ckpt_sha256"), want)
+        assert props.get("gvd_ckpt_file") == ck.name, props
+        assert props.get("gvd_ckpt_epoch") == "3" and props.get("gvd_ckpt_step") == "7", props
+        assert props.get("gvd_ckpt_run") == "r3-run" and float(props.get("gvd_scale")) == 1.0, props
+        # another checkpoint (other random weights) records its own, different hash: the field is the file's, not a constant
+        (base / "two").mkdir()
+        ck2 = _stage7_ckpt(torch, base / "two")
+        out2 = base / "deploy2.onnx"
+        rec.export_camera_only_deploy(ck2, out2, preset="small")
+        props2 = {p.key: p.value for p in onnx.load(str(out2)).metadata_props}
+        want2 = hashlib.sha256(ck2.read_bytes()).hexdigest()
+        assert want2 != want and props2["gvd_ckpt_sha256"] == want2, (props2["gvd_ckpt_sha256"], want2, want)
+    print("exported ONNX carries the checkpoint's real sha256 / file / epoch / step / run / scale OK")
+
+
 CHECKS = (
     check_aux_eval_gt_only_class,
     check_aux_eval_inf_gt_depth,
     check_stages_change_weights_at_real_lr,
     check_aux_eval_only_on_recipe_runs,
     check_manifest_records_real_git_sha,
+    check_export_records_ckpt_sha256,
 )
 
 

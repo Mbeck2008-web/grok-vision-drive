@@ -135,8 +135,8 @@ def check_examples() -> None:
     assert np.array_equal(sort_splats(srt[::-1].copy(), NEAR, FAR, descending=True), np.arange(777))
     # same-quantum ties: stable by input index (not by float depth)
     q = quantum_m(NEAR, FAR)
-    base = np.float32(50.0)
-    tie = np.array([base + q * 0.10, base + q * 0.05, base], np.float32)
+    mid = NEAR + 30000 * q  # centre of bin 30000
+    tie = np.array([mid + q * 0.10, mid + q * 0.05, mid - q * 0.10], np.float32)
     assert len({int(x) for x in quantize_depth(tie, NEAR, FAR)}) == 1
     assert sort_splats(tie, NEAR, FAR).tolist() == [0, 1, 2]  # float argsort would give [0, 1, 2]
     assert sort_splats(tie[::-1].copy(), NEAR, FAR).tolist() == [0, 1, 2]  # float argsort would give [2, 1, 0]
@@ -229,7 +229,7 @@ def check_module_is_numpy_only_and_safe() -> None:
         elif isinstance(node, ast.ImportFrom):
             assert node.level == 0, "relative import"
             mods.add((node.module or "").split(".")[0])
-    assert mods <= {"__future__", "numpy"}, mods
+    assert mods <= {"__future__", "math", "numpy"}, mods
     low = src.lower()
     for word in ("random", "time.", "perf_counter", "heartbeat", "aeb", "engage", "cuda", "torch", "moderngl", "numba"):
         assert word not in low, word
@@ -245,11 +245,14 @@ def _assert_float_order_within_quantum(d32: np.ndarray, near: float, far: float)
     d = d32.astype(np.float64)
     ok = ~np.isnan(d) & (d >= near) & (d <= far)  # clipped depths are culled by the renderer
     seq = d[order]
-    # every later element that is deeper than an earlier one must be within one quantum of it
-    sv = np.where(ok[order], seq, -np.inf)
+    okp = ok[order]
+    # every later in-range element that is deeper than an earlier one must be within one quantum
+    sv = np.where(okp, seq, -np.inf)
     rev_max = np.maximum.accumulate(sv[::-1])[::-1]
     later_max = np.concatenate([rev_max[1:], [-np.inf]])
-    gap = np.where(ok[order] & np.isfinite(later_max), later_max - seq, -np.inf)
+    gap = np.full(seq.shape, -np.inf)
+    sel = okp & np.isfinite(later_max)
+    gap[sel] = later_max[sel] - seq[sel]
     worst = gap.max() if gap.size else -np.inf
     assert worst <= quantum * (1 + 1e-9), (worst, quantum)
     # pairs in different bins keep float order: key sequence is non-increasing for valid entries
@@ -279,11 +282,15 @@ def check_float_order_differs_only_within_quantum() -> None:
     q64 = quantum_m(NEAR, 64.0)
     assert 0.00097 < q64 < 0.00099
     _assert_float_order_within_quantum(d, NEAR, 64.0)
-    # worst-case misorder is real (>0) but bounded by one quantum
-    two = np.array([30.0 + 0.9 * q, 30.0], np.float32)
+    # worst-case misorder is real (>0) but bounded by one quantum: two splats 0.8 quantum apart
+    mid = NEAR + 30000 * q  # centre of bin 30000
+    two = np.array([mid - 0.4 * q, mid + 0.4 * q], np.float32)
     assert len(set(quantize_depth(two, NEAR, FAR).tolist())) == 1
-    assert sort_splats(two, NEAR, FAR).tolist() == [0, 1]
-    # (an exact worst-case pair is 1 quantum minus an ulp apart)
+    assert _float_ref(two).tolist() == [1, 0]  # float order: deeper splat (index 1) first
+    assert sort_splats(two, NEAR, FAR).tolist() == [0, 1]  # key tie: input order
+    # ... but one bin apart is never flipped (centres of adjacent bins, 1 quantum apart)
+    adj = np.array([mid, mid + 1.0 * q], np.float32)
+    assert sort_splats(adj, NEAR, FAR).tolist() == [1, 0]
     print("check_float_order_differs_only_within_quantum: OK")
 
 
@@ -441,6 +448,7 @@ def check_perf_proxy() -> None:
 def _build_props():
     if given is None:
         return []
+    JIT = float(np.float32(0.004))
     f32 = st.floats(width=32, allow_nan=True, allow_infinity=True)
     ranges = st.tuples(
         st.floats(min_value=-10.0, max_value=10.0, allow_nan=False, allow_infinity=False),
@@ -450,7 +458,7 @@ def _build_props():
     base = st.lists(f32, min_size=0, max_size=60)
     clustered = st.tuples(
         st.lists(st.floats(min_value=0.0, max_value=70.0, width=32), min_size=1, max_size=6),
-        st.lists(st.tuples(st.integers(0, 5), st.floats(min_value=-0.004, max_value=0.004, width=32)), min_size=0, max_size=60),
+        st.lists(st.tuples(st.integers(0, 5), st.floats(min_value=-JIT, max_value=JIT, width=32)), min_size=0, max_size=60),
     ).map(lambda t: [np.float32(t[0][i % len(t[0])] + j) for i, j in t[1]])
     arrays = st.one_of(base, clustered).map(lambda xs: np.array(xs, dtype=np.float32))
     cfg = settings(max_examples=200, deadline=None, suppress_health_check=[HealthCheck.too_slow])

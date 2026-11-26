@@ -97,4 +97,4 @@ asserts new-sort p95 <= 15 ms.
 ## Out of scope / not touched
 
 No flag, no GPU selection, no GL, no recorder, no `_scene_depth` / `depths_for`, nothing
-on the heartbeat / AEB / engage path. The module imports only numpy (an AST check pins it).
+on the heartbeat / AEB / engage path. The module imports only numpy and math (an AST check pins it).

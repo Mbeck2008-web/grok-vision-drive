@@ -30,12 +30,11 @@ def _wrap(rad: float) -> float:
     return (rad + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def _xy(row: Mapping[str, Any]) -> tuple[float, float] | None:
-    pos = row.get("pos")
-    if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+def _vec2(value: Any) -> tuple[float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
         return None
     try:
-        x, y = float(pos[0]), float(pos[1])
+        x, y = float(value[0]), float(value[1])
     except (TypeError, ValueError):
         return None
     if not (math.isfinite(x) and math.isfinite(y)):
@@ -43,8 +42,26 @@ def _xy(row: Mapping[str, Any]) -> tuple[float, float] | None:
     return x, y
 
 
+def _nested_vec(row: Mapping[str, Any], key: str) -> tuple[float, float] | None:
+    """Top-level pos/dir (v1 / tests), else ego, else capture (collect v2)."""
+    got = _vec2(row.get(key))
+    if got is not None:
+        return got
+    for nest in ("ego", "capture"):
+        block = row.get(nest)
+        if isinstance(block, Mapping):
+            got = _vec2(block.get(key))
+            if got is not None:
+                return got
+    return None
+
+
+def _xy(row: Mapping[str, Any]) -> tuple[float, float] | None:
+    return _nested_vec(row, "pos")
+
+
 def _heading_of(row: Mapping[str, Any], pts: list[tuple[float, float]], index: int) -> float:
-    direc = row.get("dir")
+    direc = _nested_vec(row, "dir")
     if isinstance(direc, (list, tuple)) and len(direc) >= 2:
         try:
             dx, dy = float(direc[0]), float(direc[1])

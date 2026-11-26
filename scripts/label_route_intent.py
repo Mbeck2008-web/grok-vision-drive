@@ -2,6 +2,10 @@
 """Write intent.jsonl hindsight turn commands from state.jsonl + a road graph.
 
 Training / eval only. Refuses to overwrite gt.jsonl.
+
+``--graph`` accepts a fixture levels JSON, a {nodes, edges} JSON, or a
+``<data>/roads/<map>.json.gz`` dump. Poses are read from top-level pos or,
+when that is missing, from ego.pos / capture.pos (collect v2).
 """
 from __future__ import annotations
 
@@ -13,24 +17,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from python.collect.road_graph import load_label_graph  # noqa: E402
 from python.collect.route_hindsight import label_sequence  # noqa: E402
-from python.sensors.route_intent import Graph  # noqa: E402
-
-
-def load_label_graph(path: Path, level: str | None) -> Graph:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if isinstance(data, dict) and "levels" in data:
-        name = level or next(iter(data["levels"]))
-        return Graph.from_fixture(data, name)
-    nodes = {str(k): (float(v[0]), float(v[1])) for k, v in data["nodes"].items()}
-    edges = tuple((str(e["a"]), str(e["b"]), bool(e.get("oneway", False))) for e in data["edges"])
-    return Graph(nodes=nodes, edges=edges)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Hindsight junction commands for --route-cond")
     parser.add_argument("--state", required=True, help="state.jsonl from a recording")
-    parser.add_argument("--graph", required=True, help="Road graph JSON (junctions_synthetic format OK)")
+    parser.add_argument("--graph", required=True, help="Road graph JSON, or <data>/roads/<map>.json.gz")
     parser.add_argument("--level", default=None, help="Level key when --graph has multiple levels")
     parser.add_argument("--out", required=True, help="intent.jsonl sidecar (not gt.jsonl)")
     args = parser.parse_args(argv)

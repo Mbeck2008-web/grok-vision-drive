@@ -12,7 +12,7 @@ turn-by-turn command from `route_intent` (`{turn, next_jct_m}`). This is
 For each recorded frame that approaches a junction, the training command is
 the turn the car *actually took afterwards*, read from its future trajectory
 (heading change and exit through the box) plus the offline road graph /
-`state.jsonl` poses. Those poses are training-only GT. At run time the same
+`state.jsonl` poses. Real collect `state.jsonl` stores pose at `ego.pos` / `ego.dir` (and the same under `capture`); the labeler reads those when top-level `pos` is missing, and `--graph` accepts `<data>/roads/<map>.json.gz`. Those poses are training-only GT. At run time the same
 command slot is filled from GPS `route_intent`, never from the graph.
 
 ## Non-goals

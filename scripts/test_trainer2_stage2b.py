@@ -228,6 +228,7 @@ def check_fit_motion_train_rows_only() -> None:
     m = stop_pred.fit_motion(rows, holdout_ids={9999, 10000})
     assert abs(m.k_thr - 1.5) < 1e-6 and abs(m.k_brk - 5.0) < 1e-6 and abs(m.k_drag - 0.05) < 1e-6, m.as_dict()
     assert m.n_rows == len(rows) - 1 and m.n_brake_rows > 10, m.as_dict()
+    assert set(m.ids) == {str(r["i"]) for r in rows}, "the fit records which rows it saw"
     # a holdout id in the fit set is refused, naming it (not dropped): the fit never sees holdout rows
     try:
         stop_pred.fit_motion(rows, holdout_ids={17})
@@ -286,7 +287,162 @@ def check_fit_motion_train_rows_only() -> None:
     assert min(r["ego"]["speed_mps"] for r in odd) > 1.0
     m = stop_pred.fit_motion(odd, holdout_ids=set())
     assert m.k_thr == 0.0 and m.k_brk > 0.0 and m.k_drag >= 0.0, m.as_dict()
+    # the remaining coefficients are REFITTED without the clamped column (not just the negative one set to 0)
+    xs = [(r["pedals"]["brake_ai"], a["ego"]["speed_mps"], (b["ego"]["speed_mps"] - a["ego"]["speed_mps"]) / DT)
+          for a, b in zip(odd, odd[1:]) for r in (a,) if b["ego"]["speed_mps"] > 0.0]
+    design = np.asarray([[-b, -v] for b, v, _ in xs])
+    ref, *_ = np.linalg.lstsq(design, np.asarray([y for _, _, y in xs]), rcond=None)
+    assert ref[0] > 0.0 and ref[1] >= 0.0 and abs(m.k_brk - ref[0]) < 1e-6 and abs(m.k_drag - ref[1]) < 1e-6, (m.as_dict(), ref)
     print("motion fit: recovers k_thr / k_brk / k_drag from train rows, refuses holdout ids, unfittable sets and k_brk <= 0 OK")
+
+
+def _brake_rows(n, n_brake, *, brake=0.6, dt=DT, v0=60.0, start=0):
+    """``n`` rows of a car braking for its first ``n_brake`` rows (map k_brk 5, k_thr 1.5, drag .05), then on the throttle."""
+    rows, v = [], v0
+    for k in range(n):
+        thr, brk = (0.0, brake) if k < n_brake else (0.5 + 0.5 * np.sin(k / 3.0), 0.0)
+        rows.append({"i": start + k, "segment": "s", "ego": {"sim_t": 10.0 + k * dt, "speed_mps": v},
+                     "pedals": {"throttle_ai": float(thr), "brake_ai": float(brk), "parkingbrake_ai": 0.0}, "veh": {"reverse": 0}})
+        v = max(0.0, v + (1.5 * thr - 5.0 * brk - 0.05 * v) * dt)
+    return rows
+
+
+def check_fit_motion_edges() -> None:
+    """The fit's gates one by one: pair count, braking-row count / threshold, time step, glitches, motion constructor."""
+    from python.train import stop_pred
+
+    # 30 usable pairs and 10 braking rows is the least that fits (31 rows -> 30 pairs); one fewer of either is refused
+    ok = stop_pred.fit_motion(_brake_rows(31, 10), holdout_ids=set())
+    assert ok.n_rows == 30 and ok.n_brake_rows == 10 and abs(ok.k_brk - 5.0) < 1e-6, ok.as_dict()
+    for rows, why in ((_brake_rows(30, 10), "29 / 10"), (_brake_rows(60, 9), "59 / 9")):
+        try:
+            stop_pred.fit_motion(rows, holdout_ids=set())
+        except stop_pred.StopNotMeasured as exc:
+            assert why in str(exc), (why, exc)
+        else:
+            raise AssertionError(f"{why} must be refused")
+    # brake_ai at the 0.1 gate: 0.6 counts as braking, a 0.05 touch does not
+    assert stop_pred.fit_motion(_brake_rows(60, 10, brake=0.6), holdout_ids=set()).n_brake_rows == 10
+    try:
+        stop_pred.fit_motion(_brake_rows(60, 40, brake=0.05), holdout_ids=set())
+    except stop_pred.StopNotMeasured as exc:
+        assert "0 braking" in str(exc) or "/ 0" in str(exc), exc
+    else:
+        raise AssertionError("a brake touch below the 0.1 gate is not a braking row")
+    good = _brake_rows(120, 30)
+    base = stop_pred.fit_motion(good, holdout_ids=set())
+    # a stretch recorded with the wrong clock (speeds stepped at 0.1 s but stamped 0.5 s or 0.015 s apart) is not a fit row
+    for bad_dt in (0.5, 0.015):
+        extra = _brake_rows(60, 60, brake=0.2, v0=50.0, start=1000)
+        for k, r in enumerate(extra):
+            r["segment"] = "other"
+            r["ego"] = {"sim_t": 500.0 + k * bad_dt, "speed_mps": r["ego"]["speed_mps"]}
+        got = stop_pred.fit_motion(good + extra, holdout_ids=set())
+        assert got.n_rows == base.n_rows and abs(got.k_brk - base.k_brk) < 1e-9 and abs(got.k_drag - base.k_drag) < 1e-9, (bad_dt, got.as_dict())
+    # a speed glitch (a respawn: 8 m/s -> 300 m/s -> 8) is not an acceleration
+    glitch = [dict(r) for r in good]
+    glitch[50] = dict(glitch[50], ego={"sim_t": glitch[50]["ego"]["sim_t"], "speed_mps": 300.0})
+    got = stop_pred.fit_motion(glitch, holdout_ids=set())
+    assert abs(got.k_brk - 5.0) < 0.05 and got.n_rows == base.n_rows - 2, got.as_dict()
+    # the motion constructor: finite, non-negative, and braking must slow the car
+    for args in ((-0.1, 1.0, 0.1), (1.0, 1.0, -0.1), (1.0, 0.0, 0.1), (1.0, -1.0, 0.1), (float("nan"), 1.0, 0.1), (1.0, 1.0, float("inf"))):
+        try:
+            stop_pred.Motion(*args)
+        except stop_pred.StopNotMeasured:
+            pass
+        else:
+            raise AssertionError(f"Motion{args} must be refused")
+    assert stop_pred.Motion(0.0, 0.5, 0.0).accel(1.0, 1.0, 10.0) == -0.5
+    print("motion fit gates: 30 pairs / 10 braking rows, 0.1 brake gate, dt 0.02-0.25 s, glitch cap, constructor refusals OK")
+
+
+def _srow(k, t, v, y=None, *, sid="A", cls="stop_sign", state=None, brake=0.0, thr=0.0):
+    """One ``stop_events.score`` row."""
+    stops = [] if y is None else [{"id": sid, "cls": cls, "x": 0.5, "y": y, "state": state}]
+    return {"i": k, "t": t, "v": v, "split": "holdout", "source": "S", "ctl_brake": brake, "ctl_throttle": thr, "stops": stops}
+
+
+def check_spans_and_profile_edges() -> None:
+    """Approach spans (what the profile covers) and the profile's own edges: t0 row, time holes, rows outside a span."""
+    from python.train import stop_events as se
+    from python.train import stop_pred
+
+    # a target that goes away across a time hole ends the span there; one that flickers (same clock) does not
+    rows = [_srow(k, k * 0.1, 8.0, 30 - 0.8 * k) for k in range(11)]
+    rows += [_srow(k, 3.0 + (k - 11) * 0.1, 8.0) for k in range(11, 15)]
+    rows += [_srow(k, 3.5 + (k - 15) * 0.1, 8.0, 20 - 0.8 * (k - 15)) for k in range(15, 21)]
+    assert stop_pred._approach_spans(rows) == [(0, 10)], stop_pred._approach_spans(rows)
+    flick = [_srow(k, k * 0.1, 8.0, None if 11 <= k <= 14 else 30 - 0.8 * k) for k in range(21)]
+    assert stop_pred._approach_spans(flick) == [(0, 20)], stop_pred._approach_spans(flick)
+    # the span ends at the line + 1 m: the target is at y = 2.0, 0.5, -0.8 (still in), -1.2 (out), -3 (out)
+    ys = [30.0, 20.0, 10.0, 2.0, 0.5, -0.8, -1.2, -3.0]
+    line = [_srow(k, k * 0.1, 8.0, y) for k, y in enumerate(ys)]
+    assert stop_pred._approach_spans(line) == [(0, 5)], stop_pred._approach_spans(line)
+    # two overlapping approaches are one span (one car, one profile), the longer end wins when one is nested in the other
+    nest = []
+    for k in range(60):
+        r = _srow(k, k * 0.1 + (2.0 if k > 30 else 0.0), 3.0, 39.0 - 0.3 * k)
+        if 10 <= k <= 30:
+            r["stops"].append({"id": "B", "cls": "stop_sign", "x": 0.5, "y": 35.0 - 0.3 * (k - 10), "state": None})
+        nest.append(r)
+    assert stop_pred._approach_spans(nest) == [(0, 59)], stop_pred._approach_spans(nest)
+    apart = [_srow(k, k * 0.1, 8.0, 30 - 0.8 * k) for k in range(40)]
+    apart += [_srow(k, 20.0 + k * 0.1, 8.0, 30 - 0.8 * (k - 40), sid="C") for k in range(40, 80)]
+    spans = stop_pred._approach_spans(apart)
+    assert len(spans) == 2 and spans[0][0] == 0 and spans[1][0] == 40, spans
+
+    motion = stop_pred.Motion(2.0, 4.0, 0.0)
+    # t0 row keeps the recorded speed even when earlier rows (outside the span) are braking; rows outside a span are no stop
+    pre = [_srow(k, k * 0.1, 8.0, None, brake=0.9) for k in range(10)]
+    app = [_srow(10 + k, 1.0 + k * 0.1, 8.0, 30 - 0.8 * k, brake=0.9) for k in range(11)]
+    post = [_srow(21 + k, 2.1 + k * 0.1, 8.0, None, brake=0.9) for k in range(5)]
+    allrows = pre + app + post
+    stop_pred.add_predicted_speed(allrows, motion)
+    assert all(r["pred_v"] == stop_pred.NOT_SCORED_V for r in pre + post) and stop_pred.NOT_SCORED_V >= 10 * se.STOP_V_MPS
+    assert app[0]["pred_v"] == 8.0, app[0]["pred_v"]  # t0: the recorded speed, not one step of the 0.9 brake
+    assert abs(app[1]["pred_v"] - (8.0 - 4.0 * 0.9 * 0.1)) < 1e-9 and app[-1]["pred_v"] < app[1]["pred_v"]
+    # a hole in the clock inside the span (3 s between two rows with the target in view) is not integrated across
+    hole = [_srow(k, k * 0.1 + (3.0 if k >= 6 else 0.0), 8.0, 30 - 0.8 * k, brake=0.9) for k in range(12)]
+    stop_pred.add_predicted_speed(hole, motion)
+    assert hole[6]["pred_v"] == hole[5]["pred_v"] and hole[7]["pred_v"] < hole[6]["pred_v"], [r["pred_v"] for r in hole]
+    # a row whose clock does not advance is not integrated either
+    same = [_srow(k, 0.0 if k == 3 else k * 0.1, 8.0, 30 - 0.8 * k, brake=0.9) for k in range(8)]
+    same[3]["t"] = same[2]["t"]
+    stop_pred.add_predicted_speed(same, motion)
+    assert same[3]["pred_v"] == same[2]["pred_v"], [r["pred_v"] for r in same]
+
+    # ctl outputs outside [0, 1] are clamped before they drive the profile; a non-finite one is refused
+    pairs = [({"i": 0, "ego": {"sim_t": 1.0, "speed_mps": 5.0}, "signs": []}, _ctl(2.5, 1.7)),
+             ({"i": 1, "ego": {"sim_t": 1.1, "speed_mps": 5.0}, "signs": []}, _ctl(-0.4, -0.2))]
+    rows, _ = stop_pred.stop_rows(pairs)
+    assert (rows[0]["ctl_throttle"], rows[0]["ctl_brake"], rows[1]["ctl_throttle"], rows[1]["ctl_brake"]) == (1.0, 1.0, 0.0, 0.0), rows
+    try:
+        stop_pred.stop_rows([({"i": 0, "ego": {"sim_t": 1.0, "speed_mps": 5.0}}, _ctl(float("nan"), 0.0))])
+    except stop_pred.StopNotMeasured:
+        pass
+    else:
+        raise AssertionError("a non-finite ctl prediction must be refused")
+    # an id'd stop line is a stop-sign-class event (counted in missed_stop); a sign with no id is skipped, not scored
+    ev_rows = [_srow(k, k * 0.1, 8.0, 30 - 0.8 * k, cls="stop_line", brake=0.0) for k in range(40)]
+    stop_pred.add_predicted_speed(ev_rows, stop_pred.Motion(2.0, 4.0, 0.0))
+    res = se.score(ev_rows, speed_key="pred_v")
+    assert res["slices"]["stop_line"]["events"] == 1 and res["slices"]["stop_line"]["missed"] == 1, res["slices"]
+
+    # the red -> green rule (a proposal, off by default) must never see the RECORDED speed: a lamp that turns green
+    # while the recorded car drives on is still an event the MODEL is scored on
+    saved = se.RED_TO_GREEN_PROCEED_IS_MISS
+    try:
+        se.RED_TO_GREEN_PROCEED_IS_MISS = False
+        lamp = [_srow(k, k * 0.1, 8.0, 40 - 0.8 * k, cls="traffic_light", state="red" if k < 10 else "green", brake=0.9)
+                for k in range(50)]
+        pairs = [({"i": r["i"], "ego": {"sim_t": 100.0 + r["t"], "speed_mps": r["v"]}, "source": "S",
+                   "signs": [dict(s, id=s["id"]) for s in r["stops"]]}, _ctl(0.0, r["ctl_brake"])) for r in lamp]
+        assert stop_pred.recorded_events(pairs) == {"stop": 0, "light": 1, "rows": 50}, stop_pred.recorded_events(pairs)
+        got = stop_pred.measure(pairs, motion)
+        assert got["light_events"] == 1 and got["missed_light"] == 0.0, got
+    finally:
+        se.RED_TO_GREEN_PROCEED_IS_MISS = saved
+    print("approach spans (time holes, line + 1 m, merging), t0 row, clock holes, clamps, stop_line slice, red->green never reads recorded v OK")
 
 
 def check_profile_never_reads_recorded_speed_after_t0() -> None:
@@ -450,6 +606,31 @@ def check_preflight_on_recording() -> None:
             assert str(exc).startswith("stage 2b cannot be scored"), exc
         else:
             raise AssertionError("a recording with no intersections must refuse")
+        # only one kind of event in the holdout is not enough: each is refused, saying which is missing
+        ints = fx.intersections(fx.N_ROWS)
+        for label, picked, want in (("sign only", ints[:2], "1 stop-sign/line and 0 red/yellow-light"),
+                                    ("light only", [ints[0], ints[2]], "0 stop-sign/line and 1 red/yellow-light")):
+            if label == "light only":  # the light alone, placed where the sign's approach starts
+                picked = [ints[0], ("traffic_light", ints[1][1], "red")]
+            rec = fx.build(base / label.replace(" ", "_"), fx.N_ROWS, picked)
+            trx, hox = legacy_split_rows((rec,), rec, holdout_blocks=1)
+            try:
+                stop_pred.preflight(trx, hox, default_root=rec)
+            except stop_pred.StopNotMeasured as exc:
+                assert want in str(exc), (label, str(exc)[:200])
+            else:
+                raise AssertionError(f"{label}: must refuse")
+        # events are there but the train segment never brakes: the fit's own reason, still named as stage 2b
+        head = fx.script(fx.N_ROWS, [])
+        sign_y = head[fx.SPLIT + 4][0] + 45.0
+        nobrake = fx.build(base / "nobrake", fx.N_ROWS, [("stop_sign", sign_y, None), ("traffic_light", sign_y + 90.0, "red")])
+        trn, hon = legacy_split_rows((nobrake,), nobrake, holdout_blocks=1)
+        try:
+            stop_pred.preflight(trn, hon, default_root=nobrake)
+        except stop_pred.StopNotMeasured as exc:
+            assert str(exc).startswith("stage 2b cannot be scored: the motion fit needs"), exc
+        else:
+            raise AssertionError("no braking rows in train must refuse")
     print("preflight: events + train-only fit answered from the manifest split; no sign ids / no join root / no stops refuse with the reason OK")
 
 
@@ -457,7 +638,7 @@ def main() -> int:
     checks = (check_sign_ids_are_stable, check_stop_rows_inputs, check_predicted_speed_profile, check_measure_known_counts,
               check_side_angle_slice_and_empty_metrics, check_fit_motion_train_rows_only,
               check_profile_never_reads_recorded_speed_after_t0, check_brake_zero_behaviour,
-              check_preflight_on_recording)
+              check_preflight_on_recording, check_fit_motion_edges, check_spans_and_profile_edges)
     failed = 0
     for check in checks:
         try:

@@ -1718,12 +1718,25 @@ def check_narrow_wide_road_px_unchanged_by_snap() -> None:
 # Cells over the GT road, per snap cam: cross-track 1 m (floor x), along-track one cell per group of image rows whose
 # GT-road ranges are >= 1 m apart (1 m or the local row spacing, whichever is larger; far rows are 3-10 m apart).
 # Band 15-30 m (hypot(x, y) of the unprojected GT road px); a cam with no GT road there (pillarL/R: road only at
-# 2.4-5.2 m) uses 0-15 m instead. Count = rendered (pre-splat) points of that cam in the cell. Floor per cell = pinned
-# head count minus max(1 px, 10% of it); cells empty on head (another cam owns them: yield) are excluded and reported.
+# 2.4-5.2 m) uses 0-15 m instead. Count = rendered (pre-splat) points of that cam in the cell. Floor per non-empty
+# cell = max(1, pinned - max(1 px, 10% of it)): a count-1 cell dropping to 0 fails. Cells empty on head (another cam
+# owns them: yield) are excluded only if they match the pinned excluded-cell list exactly; a new empty cell fails
+# that assert rather than joining the set. Rear rows 74 and 78-81 contribute 0 GT-road px the rear renders in the
+# 15-30 m band (equivalence: they cannot change the density counts).
 DENSITY_BAND = (15.0, 30.0)
 DENSITY_FALLBACK_BAND = (0.0, 15.0)
 DENSITY_MIN_ALONG_M = 1.0
 DENSITY_LOSS_FRAC = 0.10
+DENSITY_EQUIV_ROWS = (74, 78, 79, 80, 81)   # rear; 0 GT-road px the rear renders in the 15-30 m band
+# Pinned empty-at-baseline cells (n=0): rear 8, repeatL 2, repeatR 2. A new empty cell must not join this set.
+ROAD_DENSITY_EXCLUDED: dict[str, tuple[tuple[int, int], ...]] = {
+    "main": (),
+    "pillarL": (),
+    "pillarR": (),
+    "rear": ((3, -4), (3, -3), (3, -2), (3, -1), (3, 0), (3, 1), (3, 2), (3, 3)),
+    "repeatL": ((2, -3), (3, -3)),
+    "repeatR": ((2, 2), (3, 2)),
+}
 ROAD_DENSITY_PINS = {   # cam -> ((along-track cell, cross-track cell, rendered pts), ...) on the head synthetic frame
     "main": (
         (0, -4, 50), (0, -3, 44), (0, -2, 44), (0, -1, 44), (0, 0, 44), (0, 1, 44), (0, 2, 44), (0, 3, 50),
@@ -1808,9 +1821,22 @@ def density_inputs(fr=None):
     return edges, gt_cells, rend
 
 
-def density_violations(edges, gt_cells, rend, pins=None):
-    """Cells whose rendered count is below pinned - max(1, 10%); also reports a changed cell grid. {cam: [(cell, pin, got)]}"""
+def density_floor(n: int) -> int:
+    """Minimum rendered-point count for a non-empty pinned cell: max(1, n - max(1, 10% of n))."""
+    if n <= 0:
+        return 0
+    return max(1, n - max(1, int(DENSITY_LOSS_FRAC * n)))
+
+
+def density_counts(edges, rend, cid):
     from collections import Counter
+    pts = rend[cid][2]
+    return Counter(density_cells(pts, edges[cid])) if len(pts) else Counter()
+
+
+def density_violations(edges, gt_cells, rend, pins=None):
+    """Cells whose rendered count is below max(1, pinned - max(1, 10%)); also reports a changed cell grid.
+    {cam: [(cell, pin, got, floor)]}"""
     pins = ROAD_DENSITY_PINS if pins is None else pins
     bad = {}
     for cid, pin in pins.items():
@@ -1818,27 +1844,82 @@ def density_violations(edges, gt_cells, rend, pins=None):
         if set(pm) != gt_cells[cid]:
             bad.setdefault(cid, []).append(("grid", len(pm), len(gt_cells[cid])))
             continue
-        got = Counter(density_cells(rend[cid][2], edges[cid])) if len(rend[cid][2]) else Counter()
+        got = density_counts(edges, rend, cid)
         for cell, n in sorted(pm.items()):
-            if n > 0 and got.get(cell, 0) < n - max(1, int(DENSITY_LOSS_FRAC * n)):
-                bad.setdefault(cid, []).append((cell, n, got.get(cell, 0)))
+            if n > 0 and got.get(cell, 0) < density_floor(n):
+                bad.setdefault(cid, []).append((cell, n, got.get(cell, 0), density_floor(n)))
     return bad
+
+
+def density_exclusion_mismatch(edges, gt_cells, rend, pins=None, excluded=None):
+    """Observed empty cells (pinned or GT) must equal the pinned excluded-cell list exactly.
+    {cam: ('observed-empty'|'pins-vs-excluded', observed, want)}"""
+    pins = ROAD_DENSITY_PINS if pins is None else pins
+    excluded = ROAD_DENSITY_EXCLUDED if excluded is None else excluded
+    bad = {}
+    for cid, pin in pins.items():
+        pm = {(b, x): n for b, x, n in pin}
+        want = frozenset(excluded.get(cid, ()))
+        pinned_empty = frozenset(c for c, n in pm.items() if n == 0)
+        if pinned_empty != want:
+            bad[cid] = ("pins-vs-excluded", sorted(pinned_empty), sorted(want))
+            continue
+        got = density_counts(edges, rend, cid)
+        observed = frozenset(c for c in (set(pm) | set(gt_cells[cid])) if got.get(c, 0) == 0)
+        if observed != want:
+            bad[cid] = ("observed-empty", sorted(observed), sorted(want))
+    return bad
+
+
+def density_exclusion_fail_msg(bad) -> str:
+    return "; ".join(
+        f"{cid}: {kind} {obs} != pinned excluded {want}" for cid, (kind, obs, want) in bad.items()
+    )
+
+
+def rear_equiv_row_rendered_gt_road(rend) -> int:
+    """Rendered rear points on rows 74 and 78-81 that lie on the GT road in the 15-30 m band."""
+    ys, _, p = rend["rear"]
+    if len(p) == 0:
+        return 0
+    rg = np.hypot(p[:, 0], p[:, 1])
+    on = (np.isin(ys, DENSITY_EQUIV_ROWS)
+          & (rg >= DENSITY_BAND[0]) & (rg < DENSITY_BAND[1])
+          & (np.abs(p[:, 0]) <= ROAD_HALF_M)
+          & (np.abs(p[:, 2]) <= sf.STATIC_MAX_HEIGHT_M))
+    return int(on.sum())
+
+
+def density_in_cell(p, edges, cell):
+    rg = np.hypot(p[:, 0], p[:, 1])
+    b = np.searchsorted(edges, rg, side="right") - 1
+    ok = (rg >= edges[0]) & (rg < edges[-1])
+    return ok & (b == cell[0]) & (np.floor(p[:, 0]).astype(int) == cell[1])
 
 
 def check_synthetic_rear_density() -> None:
     """Local density of RENDERED points over the GT road (the data-presence check that the visible-holes metric is not):
-    on the synthetic frame, per snap cam, every pinned cell keeps >= pinned - max(1 px, 10%) rendered points. Fixed
-    synthetic scene only (no clip frame, nothing near the sealed pred idxs 63-107 / 163-207)."""
+    on the synthetic frame, per snap cam, every non-empty pinned cell keeps >= max(1, pinned - max(1 px, 10%))
+    rendered points; the empty-at-baseline set equals ROAD_DENSITY_EXCLUDED exactly; rear rows 74 and 78-81
+    contribute 0 GT-road px the rear renders in the 15-30 m band. Fixed synthetic scene only (no clip frame,
+    nothing near the sealed pred idxs 63-107 / 163-207)."""
     edges, gt_cells, rend = density_inputs()
-    from collections import Counter
     for cid in sorted(edges):
         pm = {(b, x): n for b, x, n in ROAD_DENSITY_PINS[cid]}
-        got = Counter(density_cells(rend[cid][2], edges[cid]))
+        got = density_counts(edges, rend, cid)
         vals = [got.get(c, 0) for c in pm]
         nz = sorted(v for v in vals if v)
+        n1 = sum(1 for c in pm if pm[c] == 1)
         print(f"  density {cid}: band {edges[cid][0]:g}-{edges[cid][-1]:g} m, {len(edges[cid]) - 1} along-track x 1 m cross-track cells, "
               f"{len(pm)} GT cells, rendered/cell min/med/max {min(nz) if nz else 0}/{int(np.median(nz)) if nz else 0}/{max(nz) if nz else 0}, "
-              f"empty {sum(1 for v in vals if v == 0)} (excluded), floor 0 (n<=1) {sum(1 for c in pm if 0 < pm[c] <= 1)}", flush=True)
+              f"empty {sum(1 for v in vals if v == 0)} (excluded {list(ROAD_DENSITY_EXCLUDED.get(cid, ()))}), "
+              f"count-1 cells (floor 1) {n1}", flush=True)
+    excl = density_exclusion_mismatch(edges, gt_cells, rend)
+    assert not excl, density_exclusion_fail_msg(excl)
+    n_eq = rear_equiv_row_rendered_gt_road(rend)
+    assert n_eq == 0, (
+        f"rear rows {DENSITY_EQUIV_ROWS} contribute {n_eq} GT-road px the rear renders in the 15-30 m band (must be 0)"
+    )
     bad = density_violations(edges, gt_cells, rend)
     assert not bad, "; ".join(f"{cid}: {len(v)} cells below floor, e.g. {v[0]}" for cid, v in bad.items())
 
@@ -1886,11 +1967,75 @@ def check_synthetic_rear_density_has_teeth() -> None:
     report["2x2 m patch at (0, -16.97)"] = n_bad(sub(patch))
     for cid in sorted(rend):
         report[f"drop {cid}"] = n_bad(sub(lambda c, ys, xs, p, cid=cid: np.full(len(ys), c != cid)))
+
+    def drop_cell(cid, cell):
+        def fn(c, ys, xs, p, cid=cid, cell=cell):
+            if c != cid:
+                return np.ones(len(ys), bool)
+            return ~density_in_cell(p, edges[c], cell)
+        return sub(fn)
+
+    ones = {cid: [(b, x) for b, x, n in ROAD_DENSITY_PINS[cid] if n == 1] for cid in ("repeatL", "repeatR")}
+    ones_msg = {}
+    for cid, cells in ones.items():
+        assert cells, f"{cid} must have a pinned count-1 cell"
+        for cell in cells:
+            r = drop_cell(cid, cell)
+            bad = density_violations(edges, gt_cells, r)
+            report[f"drop count-1 {cid} {cell}"] = sum(len(v) for v in bad.values())
+            if bad:
+                ones_msg[f"{cid} {cell}"] = "; ".join(f"{c}: {len(v)} cells below floor, e.g. {v[0]}" for c, v in bad.items())
+            else:
+                survivors.append(f"drop count-1 {cid} {cell}")
+
+    empty_nonexcl = ("rear", (0, 0))   # pinned 8, not in ROAD_DENSITY_EXCLUDED
+    r_empty = drop_cell(*empty_nonexcl)
+    excl_empty = density_exclusion_mismatch(edges, gt_cells, r_empty)
+    report[f"empty non-excluded {empty_nonexcl[0]} {empty_nonexcl[1]}"] = 1 if excl_empty else 0
+    empty_msg = density_exclusion_fail_msg(excl_empty) if excl_empty else ""
+    if not excl_empty:
+        survivors.append(f"empty non-excluded {empty_nonexcl[0]} {empty_nonexcl[1]}")
+
+    gt_inj = {c: set(v) for c, v in gt_cells.items()}
+    inj_cell = (9, 0)
+    gt_inj["rear"] = gt_inj["rear"] | {inj_cell}
+    excl_inj = density_exclusion_mismatch(edges, gt_inj, rend)
+    report[f"inject empty cell rear {inj_cell}"] = 1 if excl_inj else 0
+    inj_msg = density_exclusion_fail_msg(excl_inj) if excl_inj else ""
+    if not excl_inj:
+        survivors.append(f"inject empty cell rear {inj_cell}")
+
+    n_eq0 = rear_equiv_row_rendered_gt_road(rend)
+    assert n_eq0 == 0, (
+        f"baseline: rear rows {DENSITY_EQUIV_ROWS} contribute {n_eq0} GT-road px the rear renders in the 15-30 m band (must be 0)"
+    )
+    ys, xs, p = rend["rear"]
+    equiv_src = None
+    for row in (78, 79, 80, 81, 74):
+        idx = np.where(ys == row)[0]
+        if len(idx):
+            equiv_src = int(row), int(idx[0])
+            break
+    assert equiv_src is not None, "no rendered rear point on rows 74 or 78-81 to move onto the GT road"
+    p2 = np.array(p, copy=True)
+    p2[equiv_src[1]] = (0.0, -20.0, 0.0)
+    r_eq = dict(rend)
+    r_eq["rear"] = (ys, xs, p2)
+    n_eq = rear_equiv_row_rendered_gt_road(r_eq)
+    report[f"move rear row {equiv_src[0]} pt onto GT road at 20 m"] = n_eq
+    eq_msg = (f"rear rows {DENSITY_EQUIV_ROWS} contribute {n_eq} GT-road px the rear renders in the 15-30 m band (must be 0)"
+              if n_eq else "")
+    if n_eq == 0:
+        survivors.append(f"move rear row {equiv_src[0]} pt onto GT road at 20 m")
+
     survivors += [k for k, v in report.items() if v == 0 and not k.startswith("rear row")]
     unrendered = [r for r in gt_rows if r not in road_rows]
     off_road = [r for r in all_rows if r not in gt_rows]
     print(f"  density teeth (cells below floor): {report}; rear rows with GT road in the band but no rendered pt in a counted cell "
-          f"(rear yields there, not tested): {unrendered}; rows with 15-30 m px only off the GT road: {off_road}", flush=True)
+          f"(rear yields there; equivalence: 0 GT-road px rendered in the 15-30 m band): {unrendered}; "
+          f"rows with 15-30 m px only off the GT road: {off_road}", flush=True)
+    print(f"  count-1 FAIL messages: {ones_msg}; empty-non-excluded: {empty_msg}; inject-empty: {inj_msg}; "
+          f"move-equiv-row: {eq_msg}", flush=True)
     assert not survivors, f"density check survives: {survivors}"
 
 

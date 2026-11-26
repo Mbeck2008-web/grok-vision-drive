@@ -71,6 +71,7 @@ GT is eval-only: it never enters cam_frame (pred mode).
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import atexit
 import json
@@ -1410,42 +1411,240 @@ def check_clip015_rear_holes_poseB() -> None:
 
 
 
-def check_snapped_pixels_not_exempt_from_edge_cut() -> None:
-    """Snapped pixels must still take the depth-edge cut.
+@contextlib.contextmanager
+def cut_clamp_tap():
+    """Record the runtime cam_frame's calls to the two geometry stages it shares with the renderer:
+    ("cut", depth_in, sky_arg, ground_hit, depth_out) for sf.edge_cut_far_side and ("clamp", depth_in, depth_out) for
+    sf.ground_clamp, in call order. The preview reaches them through ``S.<name>`` at call time, so patching the
+    module attributes is seen by cam_frame; both are restored on exit."""
+    log: list = []
+    oc, og = sf.edge_cut_far_side, sf.ground_clamp
 
-    tools/rv_stable_preview.py does ``depth = np.where(cut & ~sky & ~snapped, far_side, depth)``,
-    so a snapped pixel at a cut is left at the ground-plane hit. An off-plane road-labelled
-    pixel at a depth edge must still be cut. NEW vs a56f514 (no rv_stable_preview / road_snap).
-    """
+    def cut(depth, sky, ground_hit, *a, **k):
+        out = oc(depth, sky, ground_hit, *a, **k)
+        log.append(("cut", np.array(depth, np.float64), np.array(sky, bool), np.array(ground_hit, np.float64), np.array(out)))
+        return out
+
+    def clamp(cam, depth, *a, **k):
+        out = og(cam, depth, *a, **k)
+        log.append(("clamp", np.array(depth, np.float64), np.array(out[0])))
+        return out
+
+    sf.edge_cut_far_side, sf.ground_clamp = cut, clamp
+    try:
+        yield log
+    finally:
+        sf.edge_cut_far_side, sf.ground_clamp = oc, og
+
+
+def run_tapped(cid, raw, lab):
+    """(cam_frame outputs, tap log) for one synthetic input."""
+    with cut_clamp_tap() as log:
+        out = pv().run(cid, raw, lab)
+    return out, log
+
+
+def check_snapped_pixels_not_exempt_from_edge_cut() -> None:
+    """Snapped pixels must still take the depth-edge cut (tightening: retargeted from wide, which no longer snaps).
+
+    The runtime must hand ``edge_cut_far_side`` exactly the sky mask: adding the snapped px to it (the old
+    ``cut & ~sky & ~snapped``, as a ``sky | snapped`` argument) exempts them from the cut. With clamp margin 1.0 a
+    snapped px sits at its own ground hit, so the cut can only move it where the far side is equal; the exemption is
+    therefore not visible in the output on a flat scene, and the argument is what is pinned. Cams: main and pillarR
+    (both in ROAD_SNAP_CAMS); left half road at 2.5x depth (snaps onto the plane), right half non-road at 2.5x."""
     p = pv()
-    cam = p.cam["wide"]
-    g = geom(cam)
+    snap_cams = resolve_road_snap_cams()
+    bad = []
+    for cid in ("main", "pillarR"):
+        assert cid in snap_cams, f"{cid} must be in ROAD_SNAP_CAMS for this check (got {sorted(snap_cams)})"
+        cam = p.cam[cid]
+        g = geom(cam)
+        H, W = g["hit"].shape
+        ys, xs = np.mgrid[0:H, 0:W]
+        raw = np.where(g["down"], g["hit"] * 2.5, 1e4)
+        road = g["down"] & (xs < W // 2)
+        sem = np.where(~g["down"], sf_sky(), np.where(road, ROAD_ID, NONROAD_ID))
+        fr, log = run_tapped(cid, raw, sem)
+        sky, snap = fr[3], p.last_snap
+        assert snap is not None and snap.any() and snap[:, : W // 2].any(), f"{cid}: fixture must snap road px"
+        cuts = [e for e in log if e[0] == "cut"]
+        assert len(cuts) == 1, f"{cid}: cam_frame called the edge cut {len(cuts)} times"
+        sky_arg = cuts[0][2]
+        extra = int((sky_arg & ~sky).sum())
+        if extra or not np.array_equal(sky_arg, sky):
+            bad.append(f"{cid}: edge cut got {extra} non-sky px in its sky mask ({int(snap.sum())} snapped px are exempt from the cut)")
+    assert not bad, "; ".join(bad)
+
+
+UNDER_ROAD_TOL_M = 0.05   # no rendered point below the road plane by more than this (z < -0.05 m)
+
+
+def cut_clamp_order_scenes(cid):
+    """(name, raw net depth, coarse labels) fed to cam_frame for the order / under-road check: the flat synthetic
+    ground with the net's 12x16 labels, and a left-road / right-non-road scene at 2.5x depth (net depth under the road)."""
+    cam = pv().cam[cid]
+    depth, fine, net, gt_road, g = ground_scene(cam)
+    H, W = g["hit"].shape
+    xs = np.mgrid[0:H, 0:W][1]
+    half = np.where(g["down"], g["hit"] * np.where(xs < W // 2, 1.0, 2.5), 1e4)
+    return [("ground", depth, net), ("left road / right 2.5x deep", half, net)]
+
+
+def check_cut_then_clamp_order_and_nothing_under_road() -> None:
+    """38c9827: the depth-edge cut runs first and the ground clamp after it, on every snapping cam, and nothing is
+    rendered under the road. (1) call order cam_frame -> edge_cut_far_side then ground_clamp, with the clamp's input
+    exactly the cut's output (a clamp-then-cut order fails here); (2) valid rendered points with z < -0.05 m: 0 per cam
+    on the synthetic scenes (the count is printed). Swapping the order alone leaves the guarded cut under-road-free on
+    these scenes, so (1) is what pins the order."""
+    bad = []
+    counts = {}
+    for cid in sorted(resolve_road_snap_cams()):
+        cam = pv().cam[cid]
+        n_under = 0
+        for name, raw, lab in cut_clamp_order_scenes(cid):
+            fr, log = run_tapped(cid, raw, lab)
+            _, d, v, _ = fr
+            kinds = [e[0] for e in log]
+            if kinds != ["cut", "clamp"]:
+                bad.append(f"{cid} {name}: cam_frame stage order {kinds} (want ['cut', 'clamp'])")
+                continue
+            if not np.array_equal(log[1][1], log[0][4], equal_nan=True):
+                bad.append(f"{cid} {name}: ground_clamp input is not the edge cut's output")
+            under = v & np.isfinite(d) & (heights(cam, d) < -UNDER_ROAD_TOL_M)
+            n_under += int(under.sum())
+            if under.any():
+                bad.append(f"{cid} {name}: {int(under.sum())} rendered px below the road plane by > {UNDER_ROAD_TOL_M} m")
+        counts[cid] = n_under
+    print(f"  rendered px below the road plane (z < -{UNDER_ROAD_TOL_M} m), synthetic scenes, per snap cam: {counts}", flush=True)
+    assert not bad, "; ".join(bad)
+
+
+# Fixed synthetic edge scenes (flat ground + upright faces, plus two near blocks): NOT clip frames, so nothing here reads
+# the sealed pred idxs 63-107 / 163-207. Same object list on every snap cam; only faces in a cam's view cut.
+EDGE_CUT_OBJECTS = (("car", 2.5, 0.0), ("pole", 3.0, 1.0), ("curb", 3.5, -3.0), ("car", -2.5, -1.0), ("car", 2.5, 6.0),
+                    ("car", -2.5, -6.0), ("pole", -3.0, 3.0), ("pole", 3.0, -4.0), ("car", 3.0, -8.0), ("pole", 2.0, 4.0),
+                    ("pole", -2.0, -2.0))
+EDGE_CUT_BLOCK_Q = (0.75, 0.5)   # a near block (rows 55-90%, cols 30-70%) at q x the ground depth
+
+
+def edge_cut_scenes(cid):
+    cam = pv().cam[cid]
+    depth, fine, net, gt_road, g = ground_scene(cam)
     H, W = g["hit"].shape
     ys, xs = np.mgrid[0:H, 0:W]
-    # Left: road-labelled, 2.5x too far (snaps onto the plane). Right: not road, also 2.5x
-    # (clamp leaves a depth step vs the snapped hit). The 5x5 far-side of snapped edge
-    # pixels is the unsnapped far depth; they must still be cut, not left at the plane hit.
-    raw = np.where(g["down"], g["hit"] * 2.5, 1e4)
-    road = g["down"] & (xs < W // 2)
-    sem = np.where(~g["down"], sf_sky(), np.where(road, ROAD_ID, NONROAD_ID))
-    _, d, v, sky = p.run("wide", raw, sem)
-    snap = p.last_snap
-    assert snap is not None and snap.any() and snap[:, : W // 2].any()
-    # Replay snap+clamp, then the cut, to identify snapped pixels that sit on a depth edge.
-    pre, snapped = sf.road_snap(cam, raw, (sem == ROAD_ID) & (sem != sf_sky()), max_hit_m=sf.ROAD_SNAP_MAX_M)
-    pre, _ = sf.ground_clamp(cam, pre, margin=float(p.a.clamp_margin or 1.0))
-    inv = 1.0 / np.maximum(pre, 1e-3)
-    gy, gx = np.gradient(inv)
-    cut = np.hypot(gx, gy) > 0.12 * inv
-    far_side = cv2.dilate(pre.astype(np.float32), np.ones((5, 5), np.uint8))
-    need = cut & ~sky & snapped & (np.abs(far_side - pre) > 1e-3)
-    assert need.any(), "fixture must place a snapped pixel on a depth edge"
-    kept = need & (np.abs(d - pre) <= 1e-3)
-    n_need, n_kept = int(need.sum()), int(kept.sum())
-    assert not kept.any(), (
-        f"{n_kept}/{n_need} snapped px at a depth edge were exempt from the cut "
-        f"(tools/rv_stable_preview.py: `cut & ~sky & ~snapped`); NEW vs a56f514"
-    )
+    out = []
+    for kind, x0, y0 in EDGE_CUT_OBJECTS:
+        gt, fine2, face, _ = side_object_scene(cam, kind, x0, y0)
+        out.append((f"{kind}@x{x0:g},y{y0:g}", np.where(np.isfinite(gt), gt, 1e4), coarse(fine2)))
+    blk = (ys >= int(H * 0.55)) & (ys < int(H * 0.9)) & (xs >= int(W * 0.3)) & (xs < int(W * 0.7))
+    for q in EDGE_CUT_BLOCK_Q:
+        out.append((f"block q{q:g}", np.where(g["down"], g["hit"] * np.where(blk, q, 1.0), 1e4), net))
+    return out
+
+
+def edge_cut_runs(cams=None):
+    """{cam: [(scene, sky, depth_in, depth_out)]} for every snap cam through the real cam_frame (edge cut tapped)."""
+    res = {}
+    for cid in sorted(cams or resolve_road_snap_cams()):
+        rows = []
+        for name, raw, lab in edge_cut_scenes(cid):
+            fr, log = run_tapped(cid, raw, lab)
+            cuts = [e for e in log if e[0] == "cut"]
+            assert len(cuts) == 1, f"{cid} {name}: {len(cuts)} edge cut calls"
+            rows.append((name, fr[3], cuts[0][1], cuts[0][4]))
+        res[cid] = rows
+    return res
+
+
+def _moved(d_in, d_out):
+    return ~np.isclose(d_in, d_out, equal_nan=True)
+
+
+def sky_moves(rows, cut_fn=None):
+    """Sky px whose depth the cut changed, summed over the scenes; ``cut_fn`` replays the cut with another sky mask."""
+    n = 0
+    for _, sky, d_in, d_out in rows:
+        out = d_out if cut_fn is None else cut_fn(d_in, sky)
+        n += int((_moved(d_in, out) & sky).sum())
+    return n
+
+
+def check_edge_cut_never_touches_sky() -> None:
+    """The depth-edge cut never changes a sky px (its depth stays what it was going in; a sky px is a 2-D backdrop, never
+    moved onto a far side). Real cam_frame on the fixed synthetic edge scenes, all snap cams. Fixture: the cut does move
+    px (otherwise nothing is tested), and the positive control (a cut that ignores the sky mask) moves sky px."""
+    runs = edge_cut_runs()
+    moved = {cid: sum(int(_moved(di, do).sum()) for _, _, di, do in rows) for cid, rows in runs.items()}
+    assert sum(moved.values()) > 500, f"fixture: the edge cut must move px, moved {moved}"
+    bad = {cid: sky_moves(rows) for cid, rows in runs.items() if sky_moves(rows)}
+    ctl = {cid: sky_moves(rows, lambda d, sky: sf.edge_cut_far_side(d, np.zeros_like(sky), np.full(d.shape, np.inf)))
+           for cid, rows in runs.items()}
+    assert any(ctl.values()), f"positive control (cut ignoring the sky mask) moved no sky px: {ctl}"
+    print(f"  sky px changed by the cut {sum(bad.values())} (px moved by the cut per cam {moved}); "
+          f"control cut without the sky mask changes {ctl}", flush=True)
+    assert not bad, f"the edge cut changed sky px: {bad}"
+
+
+# Exact cut-px counts on the fixed synthetic edge scenes above: (px the cut moved, sum of the depth change over them, m).
+# Measured on a5978d5 (cut: 5x5 far side, |grad inv| > 0.12 inv, never past the ground hit). A change of the dilate
+# window (+-1 px radius) or of the 0.12 threshold (-> 0.13) changes these. Tolerance on the sum only absorbs float noise.
+EDGE_CUT_PINS = {
+    "main": (131, 319952.345), "pillarL": (300, 1959808.126), "pillarR": (332, 2279718.148),
+    "repeatL": (258, 1589485.703), "repeatR": (230, 1179667.853), "rear": (207, 819837.046),
+}
+EDGE_CUT_SUM_TOL = 0.05
+
+
+def edge_cut_pin_violations(runs, pins=EDGE_CUT_PINS):
+    bad = []
+    for cid, (n_pin, s_pin) in pins.items():
+        rows = runs[cid]
+        n = sum(int(_moved(di, do).sum()) for _, _, di, do in rows)
+        sm = sum(float(np.sum((do - di)[_moved(di, do)])) for _, _, di, do in rows)
+        if n != n_pin or abs(sm - s_pin) > EDGE_CUT_SUM_TOL:
+            bad.append(f"{cid}: cut moved {n} px (sum {sm:.3f} m), pinned {n_pin} px (sum {s_pin:.3f} m)")
+    return bad
+
+
+def check_edge_cut_pin_counts() -> None:
+    """Exact edge-cut px count and depth-change sum per snap cam on the fixed synthetic edge scenes (real cam_frame).
+    Pins the 5x5 dilate window and the 0.12 gradient threshold: a +-1 px window radius or a 0.13 threshold moves them."""
+    runs = edge_cut_runs()
+    assert set(runs) == set(EDGE_CUT_PINS), f"pins cover {sorted(EDGE_CUT_PINS)}, snap cams are {sorted(runs)}"
+    got = {cid: (sum(int(_moved(di, do).sum()) for _, _, di, do in rows),
+                 round(sum(float(np.sum((do - di)[_moved(di, do)])) for _, _, di, do in rows), 3)) for cid, rows in runs.items()}
+    print(f"  edge cut (px moved, sum dz m) per snap cam, synthetic scenes: {got}", flush=True)
+    bad = edge_cut_pin_violations(runs)
+    assert not bad, "; ".join(bad)
+
+
+def check_narrow_wide_road_px_unchanged_by_snap() -> None:
+    """check_clip015_footprint is computed over SNAPPED px only, so a cam that does not snap drops out of it (narrow and
+    wide have no entry on a5978d5 and pass by omission). Make that explicit: narrow and wide are not in ROAD_SNAP_CAMS and
+    their rendered depth and validity are identical with --road-snap 1 and 0 (0 px changed, snap mask empty), on the
+    flat synthetic ground and on the left-road / right-2.5x scene."""
+    p = pv()
+    snap_cams = set(resolve_road_snap_cams())
+    leak = snap_cams & {"narrow", "wide"}
+    assert not leak, f"{sorted(leak)} must not be in ROAD_SNAP_CAMS (got {sorted(snap_cams)})"
+    changed, masks = {}, {}
+    saved = p.a.road_snap
+    try:
+        for cid in ("narrow", "wide"):
+            n_changed = n_mask = 0
+            for name, raw, lab in cut_clamp_order_scenes(cid):
+                p.a.road_snap = 1
+                _, d_on, v_on, _ = p.run(cid, raw, lab)
+                m_on = p.last_snap
+                p.a.road_snap = 0
+                _, d_off, v_off, _ = p.run(cid, raw, lab)
+                n_changed += int(((~np.isclose(d_on, d_off, equal_nan=True)) | (v_on != v_off)).sum())
+                n_mask += 0 if m_on is None else int(np.asarray(m_on).sum())
+            changed[cid], masks[cid] = n_changed, n_mask
+    finally:
+        p.a.road_snap = saved
+    print(f"  narrow/wide px changed by road snap on vs off: {changed}; snapped px: {masks}", flush=True)
+    assert not any(changed.values()) and not any(masks.values()), f"narrow/wide road px changed by snap: {changed}, snapped {masks}"
 
 
 def pose_a_chase():
@@ -3761,6 +3960,10 @@ CHECKS = [
     check_synthetic_rear_holes,
     check_side_objects_keep_height_pins,
     check_snapped_pixels_not_exempt_from_edge_cut,
+    check_cut_then_clamp_order_and_nothing_under_road,
+    check_edge_cut_never_touches_sky,
+    check_edge_cut_pin_counts,
+    check_narrow_wide_road_px_unchanged_by_snap,
     check_road_labelled_object_top_stays_put,
     check_behind_car_strip_holes,
     check_clip015_render_edge_and_holes,
@@ -3834,18 +4037,15 @@ SEAL_GUARD_REPORT_ONLY = frozenset({
 # (after ground_clamp: far rows pushed below the road, out of the ground band); L = the net's 12x16 class
 # grid (road label bleeds past the edge); N = road_snap flattens objects inside a road-majority cell.
 KNOWN_FAILING: dict[str, str] = {
-    "check_synthetic_width_exact_labels": "E: exact depth + exact labels: repeatL/R 15-30 m median |err| 30.8% p90 100%; rear 15-30 m 96.8%/100%",
     "check_synthetic_width": "L+E: pillarL/R 0-5 m median 14.8% p90 47.3%; repeatL/R 0-5 m 16.6%/23.0%, 5-15 m 28.1%/48.2%; rear 15-30 m",
     "check_synthetic_edge_overshoot": "L: road 0.35 m (pillars) / 0.71 m (repeats) past the GT edge at 0-5 m (12x16 label bleed)",
     "check_side_objects_keep_height_pins": "N: pillarR parked car x2.5 lost 1.07 m on 88 px; pole x3 lost 1.07 m on 351/391 px; curbs lost 0.11 m",
-    "check_snapped_pixels_not_exempt_from_edge_cut": "NEW vs a56f514: 456/456 snapped px at a depth edge were exempt from the cut (tools/rv_stable_preview.py: `cut & ~sky & ~snapped`, added at 4df1176). wide, left-half road 2.5x / right unsnapped 2.5x, clamp on.",
     "prop_side_objects_keep_height": "N: pillarL pole at x=-2.0, y0=0.0: lost 0.592 m",
     "check_road_labelled_object_top_stays_put": "N: pillarR car top 218 px moved outward (GT z 1.50 m); curb top 1487 px, height lost 0.15 m; main car top also snapped outward",
     # pillarR/repeatR (b): michael 2026-11-26 13:50 CT, net seg+depth, Trainer 2.0 -- residual after a pred-z>0.30 rejection only
     "check_clip015_snap_misplace": "f40/f160 DRAWN-only: pillarR 18.10% (7317/40432; f40 36.90%/f160 3.50%), repeatR 4.65% (1835/39434), wide 10.12% (3555/35133; was 15.00% all-snapped 7461/49726) at 0-15 m; wide 61.64% (188/305; all-snapped 59.35% 219/369) at 15-30 m (GT z>0.30) || pillarR/repeatR (b) attribution (Breaker, dev f50/f120 + Tracer swarm-2/logs/rv_snapb.txt f40, rv_snapb_more.txt f20/f50/f120/f150): residual after a one-sided pred-z>0.30 rejection = pred-road px with raw net z<=0.30 (net seg+depth): pillarR f50 2635/6274 (Tracer 2635), repeatR f50 779/1947 (Tracer 779), f120 0/3672 and 0/957 (Tracer 0) -> root cause of the residual 'net seg+depth (pred road on curb, raw z<=0.30), Trainer 2.0'; approval michael 2026-11-26 13:50 CT: \"Yeah, if this issue can be fixed with training on a large data set like the one that we're creating that's perfectly fine\". The rest of the (b) px (raw z>0.30) are snap-created: the rejection is ABSENT on dee9827 (check_snap_rejects_raised_pred_z FAILs, normal FAIL, Fix item Redesigner). Approval does not cover wide or other cams.",
     "check_clip015_edge_position": "f40/f160: wide 5-15 m median 1.334/p90 5.119 vs 10%/20% of |x_gt| 4.36 m; also narrow/main 5-15 p90 over the 20% gate",
     "check_clip015_snap_no_worse_than_off": "f40/f160: pillarR |dz| median 0.246 vs 0.184 off; pillarL 0.049/0.603 vs 0.048/0.593",
-    "check_clip015_footprint": "f40/f160: narrow 45.3%, main 70.4%, wide 83.8%, pillarR 81.9%, repeatL 93.0% (min 95%)",
     # ---- ripple / streak / sky (swarm-4 Breaker, wide snap OFF, thresholds by rule on f10/25/50/120/140/155) ----
     # wide coarse-row dz: michael 2026-11-26 13:50 CT, net depth, Trainer 2.0
     "check_clip015_ripple_wide_dz": "NEW (wide snap OFF; snap ON passes these bins at f40/f110/f160): wide |dz| f110 0-5 m 0.130 > 0.080, 5-10 m 0.327 > 0.163; f160 0-5 0.103, 5-10 0.277; f40 15-30 0.435 > 0.417. Root cause: net depth (12x16 coarse-row bands, wide f110 R6..R9 +0.43/+0.19/+0.22/+0.07 m; Tracer swarm-2/logs/rv_ring2.txt), fix in training (Trainer 2.0), not runtime. Approval michael 2026-11-26 13:50 CT: \"Yeah, if this issue can be fixed with training on a large data set like the one that we're creating that's perfectly fine\". Limits unchanged.",

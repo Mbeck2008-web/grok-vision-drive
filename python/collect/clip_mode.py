@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from python.collect.auto_mode import hour_to_beamng_tod
-from python.collect.spawn_mix import HIGHWAY, SPEED, classify_roads, load_nav_roads, spawn_roads_path
+from python.collect.spawn_mix import CITY, HIGHWAY, SPEED, classify_roads, load_nav_roads, spawn_roads_path
 from python.sensors.tech import TECH_GFX
 
 EDGE_CASES: tuple[str, ...] = (
@@ -71,12 +71,22 @@ EGO_MODEL = "sbr"
 GFX = TECH_GFX
 MIN_CLIP_S = 30.0
 MAX_CLIP_S = 60.0
-# Long highway/arterial clips (opt-in via collect_clips --long-clips).
+# Long regular-driving clips (opt-in via collect_clips --long-clips).
+# Short 30-60 s clips stay the edge-case batch; long clips are 10-15 min
+# of ordinary driving (highway end-to-end plus a city/dirt loop when the
+# map has those roads; otherwise a varied seeded route).
 DEFAULT_LONG_CLIPS = 0
-DEFAULT_LONG_CLIP_MIN_S = 180.0
-DEFAULT_LONG_CLIP_MAX_S = 300.0
+DEFAULT_LONG_CLIP_MIN_S = 600.0
+DEFAULT_LONG_CLIP_MAX_S = 900.0
+DEFAULT_LONG_HIGHWAY_FRAC = 0.7
+LONG_TAG = "long"
 LONG_HIGHWAY_TAG = "long_highway"
 HIGHWAY_SPEED_MIN, HIGHWAY_SPEED_MAX = SPEED[HIGHWAY]
+# Wide clamp so a highway-then-city/dirt loop is not stuck at highway speed.
+LONG_SPEED_MIN, LONG_SPEED_MAX = 8.0, 30.0
+# Skeptic ceiling scaled from ~14.3 GiB / 300 s: about 43 GiB per 900 s clip.
+# The 20 GiB free-space floor and 3.5 GiB per-file stop are not loosened.
+LONG_CLIP_DISK_GIB_PER_900S = 43.0
 SPAWN_KIND = {"merge": "ramp", "cut_in": "highway", "heavy_traffic": "highway", "sharp_curve": "city", "junction": "city"}
 CUT_IN_AHEAD_M = 25.0
 # Quality thresholds (quick check, not a training filter).
@@ -115,6 +125,10 @@ class ClipPlan:
     ego_model: str = EGO_MODEL
     notes: list[str] = field(default_factory=list)
     long_highway: bool = False
+    long: bool = False
+    long_route: str | None = None
+    long_direction: int | None = None
+    route_legs: list[str] = field(default_factory=list)
     speed_min: float | None = None
     speed_max: float | None = None
     tags: list[str] = field(default_factory=list)
@@ -172,38 +186,120 @@ def highway_maps(maps: Iterable[str]) -> tuple[str, ...]:
     return tuple(m for m in maps if str(m) and map_has_highway_pool(str(m)))
 
 
-def apply_long_highway(
-    plan: ClipPlan, *, min_s: float, max_s: float, maps: Iterable[str] | None = None
-) -> ClipPlan:
-    """Turn one planned clip into a long highway/arterial run at highway speed.
+@lru_cache(maxsize=32)
+def map_has_city_pool(map_name: str) -> bool:
+    """True when the map's road dump has at least one city-classified road."""
+    try:
+        path = spawn_roads_path(str(map_name))
+        if path is None or not path.is_file():
+            return False
+        pools = classify_roads(load_nav_roads(path))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return bool(pools.get(CITY))
 
-    The clip is placed on a map from ``maps`` (or the planned map) that has a
-    highway road pool. If none of those maps has a highway pool, the plan is
-    left unchanged and is not tagged ``long_highway``.
+
+def city_maps(maps: Iterable[str]) -> tuple[str, ...]:
+    return tuple(m for m in maps if str(m) and map_has_city_pool(str(m)))
+
+
+def map_has_dirt_roads(map_name: str) -> bool:
+    """Dirt by the clip-mode map list (map descriptions; not a spawn kind)."""
+    return str(map_name) in DIRT_MAPS
+
+
+def _route_legs_for(map_name: str, *, highway_first: bool) -> list[str]:
+    """Planned legs. Missing highway/dirt is omitted, never faked."""
+    legs: list[str] = []
+    if highway_first and map_has_highway_pool(map_name):
+        legs.append("highway")
+        if map_has_city_pool(map_name):
+            legs.append("city")
+        if map_has_dirt_roads(map_name):
+            legs.append("dirt")
+        legs.append("highway")
+        return legs
+    if map_has_highway_pool(map_name):
+        legs.append("highway")
+    if map_has_city_pool(map_name):
+        legs.append("city")
+    if map_has_dirt_roads(map_name):
+        legs.append("dirt")
+    return legs or ["varied"]
+
+
+def apply_long_highway(
+    plan: ClipPlan,
+    *,
+    min_s: float,
+    max_s: float,
+    maps: Iterable[str] | None = None,
+    highway_frac: float = DEFAULT_LONG_HIGHWAY_FRAC,
+) -> ClipPlan:
+    """Turn one planned clip into a long regular-driving run.
+
+    With probability ``highway_frac``, when the session pool has a highway
+    map, the clip is a highway-first route: spawn at one end of a highway
+    (direction alternates by clip index), drive to the far end, then loop
+    back via city and dirt roads when that map has them.
+
+    Maps with no highway or no dirt are not skipped. They still get a long
+    clip on a varied seeded route, and are not tagged ``long_highway``.
     """
     if float(min_s) <= 0.0 or float(max_s) < float(min_s):
         raise ValueError(f"long clip length range {min_s}-{max_s} s is empty")
+    frac = float(highway_frac)
+    if not (0.0 <= frac <= 1.0):
+        raise ValueError(f"long_highway_frac must be in [0, 1], not {highway_frac}")
     pool = tuple(str(m) for m in (maps if maps is not None else (plan.map,)) if str(m))
-    hwy = highway_maps(pool)
-    if not hwy:
+    if not pool:
         return plan
     rng = random.Random(f"gvd-long-clip:{int(plan.seed)}:{int(plan.index)}")
     duration = round(rng.uniform(float(min_s), float(max_s)), 3)
-    map_name = plan.map if plan.map in hwy else rng.choice(hwy)
+    hwy = highway_maps(pool)
+    highway_first = bool(hwy) and (rng.random() < frac)
+    if highway_first:
+        map_name = rng.choice(hwy)
+        route = "highway_loop"
+        spawn_kind: str | None = HIGHWAY
+        tagged_highway = True
+    else:
+        map_name = rng.choice(pool)
+        route = "varied"
+        if map_has_city_pool(map_name):
+            spawn_kind = CITY
+        elif map_has_highway_pool(map_name):
+            spawn_kind = HIGHWAY
+        else:
+            spawn_kind = None
+        tagged_highway = False
+    direction = int(plan.index) % 2
+    spawn_seed = rng.randrange(1, 2**31 - 1)
+    legs = _route_legs_for(map_name, highway_first=highway_first)
     tags = list(plan.tags)
-    if LONG_HIGHWAY_TAG not in tags:
-        tags.append(LONG_HIGHWAY_TAG)
     notes = list(plan.notes)
-    if LONG_HIGHWAY_TAG not in notes:
-        notes.append(LONG_HIGHWAY_TAG)
+    if LONG_TAG not in tags:
+        tags.append(LONG_TAG)
+    if LONG_TAG not in notes:
+        notes.append(LONG_TAG)
+    if tagged_highway:
+        if LONG_HIGHWAY_TAG not in tags:
+            tags.append(LONG_HIGHWAY_TAG)
+        if LONG_HIGHWAY_TAG not in notes:
+            notes.append(LONG_HIGHWAY_TAG)
     return replace(
         plan,
         map=map_name,
         duration_s=duration,
-        spawn_kind=HIGHWAY,
-        long_highway=True,
-        speed_min=HIGHWAY_SPEED_MIN,
-        speed_max=HIGHWAY_SPEED_MAX,
+        spawn_kind=spawn_kind,
+        spawn_seed=int(spawn_seed),
+        long=True,
+        long_highway=tagged_highway,
+        long_route=route,
+        long_direction=direction,
+        route_legs=list(legs),
+        speed_min=LONG_SPEED_MIN,
+        speed_max=LONG_SPEED_MAX,
         min_paint_cov=None,
         tags=tags,
         notes=notes,
@@ -315,6 +411,11 @@ def clip_argv(plan: ClipPlan, out_dir: Path, *, chase: bool = False, extra: Iter
         argv += ["--speed-min", repr(float(plan.speed_min))]
     if plan.speed_max is not None:
         argv += ["--speed-max", repr(float(plan.speed_max))]
+    if plan.long or plan.long_highway:
+        # Default collector --segment-min is 12 min; a 15 min clip must not be split.
+        minutes = max(1, int(math.ceil(float(plan.duration_s) / 60.0)))
+        argv += ["--segment-min", repr(float(minutes))]
+        argv += ["--route", "span"]
     if chase:
         argv.append("--chase-cam")
     argv += [str(x) for x in extra]
@@ -535,8 +636,8 @@ def quality_check(clip: Path | str, plan: ClipPlan, *, exit_code: int) -> dict[s
         names = {str(c.get("name")) for c in (r.get("traffic") or []) if isinstance(c, dict)}
         placed = max(placed, sum(1 for n in names if n.startswith("gvd_traffic_")))
     observed, note = _observe(plan, clip, rows, gt, placed)
-    if plan.long_highway:
-        observed, note = None, f"{LONG_HIGHWAY_TAG}: edge-case observation skipped; long highway/arterial run"
+    if plan.long or plan.long_highway:
+        observed, note = None, f"{LONG_TAG}: edge-case observation skipped; long regular-driving run"
     elif observed is False:
         reasons.append(f"edge case not observed ({note})")
     clip_class = "train" if not reasons else ("reject" if (len(rows) == 0 or lossy or undecodable) else "pretrain_only")
@@ -582,7 +683,11 @@ def write_tags(
         "qc": dict(qc),
         "plan_notes": list(plan.notes),
         "tags": list(plan.tags),
+        "long": bool(plan.long or plan.long_highway),
         "long_highway": bool(plan.long_highway),
+        "long_route": plan.long_route,
+        "long_direction": plan.long_direction,
+        "route_legs": list(plan.route_legs),
         **dict(extra or {}),
     }
     with open(path, "x", encoding="utf-8") as fh:
@@ -610,6 +715,7 @@ def run_clips(
     long_clips: int = DEFAULT_LONG_CLIPS,
     long_min_s: float = DEFAULT_LONG_CLIP_MIN_S,
     long_max_s: float = DEFAULT_LONG_CLIP_MAX_S,
+    long_highway_frac: float = DEFAULT_LONG_HIGHWAY_FRAC,
 ) -> Path:
     """Record ``clips`` clips into a new session folder. ``runner(argv)`` runs the collector.
 
@@ -645,6 +751,7 @@ def run_clips(
             "long_clips": int(long_clips),
             "long_min_s": float(long_min_s),
             "long_max_s": float(long_max_s),
+            "long_highway_frac": float(long_highway_frac),
             "results": results,
         }
         if stop_reason:
@@ -662,7 +769,10 @@ def run_clips(
             break
         plan = plan_clip(index, seed, maps, max_traffic, min_s=min_s, max_s=max_s, edge_cases=cases)
         if index in long_at:
-            plan = apply_long_highway(plan, min_s=long_min_s, max_s=long_max_s, maps=maps)
+            plan = apply_long_highway(
+                plan, min_s=long_min_s, max_s=long_max_s, maps=maps,
+                highway_frac=long_highway_frac,
+            )
         clip = new_clip_dir(session, plan)
         argv = clip_argv(plan, clip, chase=chase, extra=extra)
         log(f"clip {index + 1}/{clips} {clip.name}: {plan.edge_case} map={plan.map} traffic={plan.traffic} "

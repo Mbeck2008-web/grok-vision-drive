@@ -1,7 +1,11 @@
 """Edge-case clip mode: many 30-60 s lossless clips per session, each in its own new folder.
 
-Optional ``--long-clips N`` mixes N 3-5 minute highway/arterial clips through the batch
-(default 0, so current behaviour is unchanged).
+Short clips are the edge-case batch (30-60 s). Optional ``--long-clips N`` mixes
+N 10-15 minute regular-driving clips through the batch (default 0, so current
+behaviour is unchanged). Long clips spawn at a highway end when the map has a
+highway, drive to the far end, then loop back via city and dirt roads when those
+exist; maps without highway or dirt still get a varied seeded route and are not
+skipped.
 
     py -3 scripts\\collect_clips.py --clips 5 --out E:\\GVD_data\\clips_v2 \\
         --maps west_coast_usa,italy,east_coast_usa --max-traffic 6 --seed 1 --chase-cam
@@ -31,6 +35,7 @@ from python.collect.clip_mode import (  # noqa: E402
     DEFAULT_LONG_CLIP_MAX_S,
     DEFAULT_LONG_CLIP_MIN_S,
     DEFAULT_LONG_CLIPS,
+    DEFAULT_LONG_HIGHWAY_FRAC,
     EDGE_CASES,
     GFX,
     MAX_CLIP_S,
@@ -83,13 +88,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_LONG_CLIPS,
         metavar="N",
         help=(
-            "How many clips in this batch are long highway/arterial runs "
-            f"(default {DEFAULT_LONG_CLIPS}: off, same as today; the supervisor "
-            "must pass this flag). About 5-10 is the usual ask; that is a "
-            "recommendation, not a cap (N cannot exceed --clips). "
-            "They are spread through the batch by --seed, use a highway spawn "
-            "on a map that has highway roads, at highway target speed "
-            "(20-30 m/s), and are tagged long_highway."
+            "How many clips in this batch are long regular-driving runs "
+            f"(default {DEFAULT_LONG_CLIPS}: off; short 30-60 s clips stay "
+            "the edge cases. The supervisor must pass this flag). About 5-10 "
+            "is the usual ask; that is a recommendation, not a cap (N cannot "
+            "exceed --clips). They are 10-15 min (see --long-clip-s), spread "
+            "by --seed. When the map has a highway, the AI starts at one end, "
+            "drives to the far end, then loops back via city and dirt roads "
+            "if present, with a different route and direction each time. "
+            "Maps without highway or dirt are not skipped: the AI drives a "
+            "varied seeded route. Tagged 'long' (and 'long_highway' only for "
+            "a highway-first route)."
         ),
     )
     parser.add_argument(
@@ -99,7 +108,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="MIN,MAX",
         help=(
             "Duration range in seconds for --long-clips "
-            f"(default {DEFAULT_LONG_CLIP_MIN_S:g},{DEFAULT_LONG_CLIP_MAX_S:g})."
+            f"(default {DEFAULT_LONG_CLIP_MIN_S:g},{DEFAULT_LONG_CLIP_MAX_S:g}: "
+            "10-15 minutes of regular driving)."
+        ),
+    )
+    parser.add_argument(
+        "--long-clip-highway-frac",
+        type=float,
+        default=DEFAULT_LONG_HIGHWAY_FRAC,
+        metavar="FRAC",
+        help=(
+            "Fraction of long clips that use a highway-first route when the "
+            f"session pool has a highway map (default {DEFAULT_LONG_HIGHWAY_FRAC:g}). "
+            "The rest, and any clip on a map with no highway, use a varied "
+            "seeded route. 0-1 inclusive."
         ),
     )
     parser.add_argument("--edge-cases", default="", help=f"Comma-separated subset of {','.join(EDGE_CASES)}.")
@@ -157,6 +179,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-traffic must be 0 or more")
     if not (MIN_CLIP_S <= args.min_s <= args.max_s <= MAX_CLIP_S):
         parser.error(f"clip length must satisfy {MIN_CLIP_S:.0f} <= --min-s <= --max-s <= {MAX_CLIP_S:.0f}")
+    if not (0.0 <= float(args.long_clip_highway_frac) <= 1.0):
+        parser.error("--long-clip-highway-frac must be between 0 and 1")
     if args.tech_fail_relaunch < 0:
         parser.error("--tech-fail-relaunch must be 0 or more")
     if args.tech_relaunch_cap < 1:
@@ -215,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         long_clips=args.long_clips,
         long_min_s=args.long_clip_s[0],
         long_max_s=args.long_clip_s[1],
+        long_highway_frac=args.long_clip_highway_frac,
     )
     print(f"session {session}")
     if watchdog.halt_reason:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Long highway/arterial clips mixed into a collect_clips batch.
+"""Long regular-driving clips mixed into a collect_clips batch.
 
 Offline. Plans, argv, tags, and scheduling only; no BeamNG.
 
@@ -33,7 +33,8 @@ def check_default_off_unchanged() -> None:
     cli = _cli()
     args = cli.parse_args(["--out", "/tmp/x"])
     assert args.long_clips == 0, args
-    assert args.long_clip_s == (180.0, 300.0), args.long_clip_s
+    assert args.long_clip_s == (600.0, 900.0), args.long_clip_s
+    assert abs(args.long_clip_highway_frac - 0.7) < 1e-12, args.long_clip_highway_frac
 
     plans = [plan_clip(i, seed=7, maps=MAPS, max_traffic=8) for i in range(40)]
     for p in plans:
@@ -47,9 +48,11 @@ def check_cli_long_clip_flags() -> None:
     cli = _cli()
     args = cli.parse_args(["--out", "/tmp/x", "--clips", "60", "--long-clips", "8"])
     assert args.long_clips == 8 and args.clips == 60
-    assert args.long_clip_s == (180.0, 300.0)
-    args = cli.parse_args(["--out", "/tmp/x", "--clips", "20", "--long-clips", "5", "--long-clip-s", "180,240"])
+    assert args.long_clip_s == (600.0, 900.0)
+    assert abs(args.long_clip_highway_frac - 0.7) < 1e-12
+    args = cli.parse_args(["--out", "/tmp/x", "--clips", "20", "--long-clips", "5", "--long-clip-s", "180,240", "--long-clip-highway-frac", "0.4"])
     assert args.long_clips == 5 and args.long_clip_s == (180.0, 240.0)
+    assert abs(args.long_clip_highway_frac - 0.4) < 1e-12
     for bad in (
         ["--long-clips", "-1"],
         ["--clips", "5", "--long-clips", "10"],
@@ -57,6 +60,8 @@ def check_cli_long_clip_flags() -> None:
         ["--long-clip-s", "0,300"],
         ["--long-clip-s", "abc"],
         ["--max-s", "90"],
+        ["--long-clip-highway-frac", "-0.1"],
+        ["--long-clip-highway-frac", "1.1"],
     ):
         try:
             cli.parse_args(["--out", "/tmp/x"] + bad)
@@ -104,19 +109,20 @@ def check_long_plan_duration_spawn_speed_and_tags() -> None:
     from scripts.gvd_test_env import collect_root
 
     base = plan_clip(3, seed=11, maps=MAPS, max_traffic=4)
-    plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=MAPS)
-    again = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=MAPS)
+    plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=MAPS, highway_frac=1.0)
+    again = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=MAPS, highway_frac=1.0)
     assert plan.duration_s == again.duration_s
     assert 180.0 <= plan.duration_s <= 300.0
     assert plan.long_highway is True
     assert plan.spawn_kind == "highway"
-    assert plan.speed_min == 20.0 and plan.speed_max == 30.0
+    assert plan.speed_min == 8.0 and plan.speed_max == 30.0
     assert "long_highway" in plan.tags
     argv = clip_argv(plan, Path("/tmp/x/clip"))
     assert float(argv[argv.index("--clip-s") + 1]) == plan.duration_s
     assert argv[argv.index("--spawn-kind") + 1] == "highway"
-    assert float(argv[argv.index("--speed-min") + 1]) == 20.0
+    assert float(argv[argv.index("--speed-min") + 1]) == 8.0
     assert float(argv[argv.index("--speed-max") + 1]) == 30.0
+    assert float(argv[argv.index("--segment-min") + 1]) * 60.0 >= plan.duration_s
     # A normal plan does not pick up the highway speed clamp.
     normal_argv = clip_argv(base, Path("/tmp/x/clip"))
     assert "--speed-min" not in normal_argv and "--speed-max" not in normal_argv
@@ -129,7 +135,9 @@ def check_long_plan_duration_spawn_speed_and_tags() -> None:
     assert "long_highway" in tags["tags"]
     assert tags["duration_s"] == plan.duration_s
     assert tags["spawn_kind"] == "highway"
-    print("long plan: 180-300 s, highway spawn, 20-30 m/s, tagged long_highway")
+    assert plan.long is True
+    assert "long" in plan.tags
+    print("long plan: custom 180-300 s, highway-first route, tagged long + long_highway")
 
 
 def check_batch_mixes_long_clips() -> None:
@@ -159,16 +167,17 @@ def check_batch_mixes_long_clips() -> None:
             tags = json.loads((session / Path(argv[argv.index("--out") + 1]).name / "clip_tags.json").read_text(encoding="utf-8"))
             if i in want:
                 assert 180.0 <= dur <= 300.0, (i, dur)
-                assert argv[argv.index("--spawn-kind") + 1] == "highway"
-                assert float(argv[argv.index("--speed-min") + 1]) == 20.0
-                assert float(argv[argv.index("--speed-max") + 1]) == 30.0
-                assert "long_highway" in tags["tags"]
+                assert "long" in tags["tags"], (i, tags)
+                assert tags.get("long") is True
+                # Short-clip flags stay off the short clips; long clips stay long.
                 long_seen.append(i)
             else:
                 assert 30.0 <= dur <= 60.0, (i, dur)
-                assert "long_highway" not in tags.get("tags", [])
+                assert "long" not in tags.get("tags", [])
+                assert tags.get("long_highway") is not True
+                assert "--segment-min" not in argv
         assert set(long_seen) == want
-    print("run_clips: 3 of 10 clips are long highway, spread by seed, rest unchanged")
+    print("run_clips: 3 of 10 clips are long regular driving, spread by seed, short clips unchanged")
 
 
 def check_long_clip_early_end_kept_like_normal() -> None:
@@ -208,8 +217,8 @@ def check_long_dirt_recipe_does_not_fail_highway_footage() -> None:
     from scripts.gvd_test_env import collect_root
 
     base = plan_clip(0, seed=1, maps=MAPS, max_traffic=2, edge_cases=("dirt_road",), min_s=4.0, max_s=4.0)
-    plan = apply_long_highway(base, min_s=4.0, max_s=4.0, maps=MAPS)
-    assert plan.long_highway and plan.spawn_kind == "highway"
+    plan = apply_long_highway(base, min_s=4.0, max_s=4.0, maps=MAPS, highway_frac=1.0)
+    assert plan.long and plan.long_highway and plan.spawn_kind == "highway"
     assert plan.map in ("west_coast_usa", "italy")
     with collect_root() as root:
         d = root / "clip"
@@ -220,7 +229,7 @@ def check_long_dirt_recipe_does_not_fail_highway_footage() -> None:
 
 
 def check_long_clips_only_on_highway_maps() -> None:
-    """Long clips use only maps with a highway pool; otherwise they are not tagged."""
+    """Highway-first routes stay on highway maps; maps without highway are not skipped."""
     from python.collect.clip_mode import (
         apply_long_highway,
         highway_maps,
@@ -239,33 +248,39 @@ def check_long_clips_only_on_highway_maps() -> None:
     hwy = set(highway_maps(default))
     assert hwy == {"west_coast_usa", "italy"}, hwy
 
+    # highway_frac=1: every long clip on a highway map, tagged long_highway.
     seen_maps = set()
     for seed in range(80):
         for i in long_clip_indices(60, 8, seed):
             base = plan_clip(i, seed=seed, maps=default, max_traffic=4)
-            plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=default)
+            plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=default, highway_frac=1.0)
+            assert plan.long is True, (seed, i, plan)
             assert plan.long_highway is True, (seed, i, plan)
             assert plan.map in hwy, (seed, i, base.map, plan.map, base.edge_case)
             assert plan.spawn_kind == "highway"
+            assert plan.long_route == "highway_loop"
             seen_maps.add(plan.map)
     assert seen_maps <= hwy
-    # Default pool includes a no-highway map; long clips must still land on a highway map.
 
     dirt_pool = ("utah", "jungle_rock_island", "italy", "east_coast_usa", "small_island", "west_coast_usa")
     for seed in range(40):
         base = plan_clip(0, seed=seed, maps=dirt_pool, max_traffic=2, edge_cases=("dirt_road",))
-        plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=dirt_pool)
-        assert plan.long_highway is True, (seed, base.map, plan)
+        plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=dirt_pool, highway_frac=1.0)
+        assert plan.long and plan.long_highway, (seed, base.map, plan)
         assert map_has_highway_pool(plan.map), (seed, base.map, plan.map, base.edge_case)
 
-    # A session with no highway map must not tag the clip long_highway.
+    # A session with no highway map still records a long regular-driving clip
+    # (varied seeded route). It is not skipped and is not tagged long_highway.
     base = plan_clip(0, seed=1, maps=("east_coast_usa",), max_traffic=0)
-    plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=("east_coast_usa",))
+    plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=("east_coast_usa",), highway_frac=1.0)
+    assert plan.long is True
     assert plan.long_highway is False
     assert "long_highway" not in plan.tags
-    assert "long_highway" not in plan.notes
+    assert "long" in plan.tags
     assert plan.map == "east_coast_usa"
-    assert plan.duration_s == base.duration_s
+    assert plan.long_route == "varied"
+    assert 180.0 <= plan.duration_s <= 300.0
+    assert plan.duration_s != base.duration_s or base.duration_s >= 180.0
 
     def runner(argv: list[str]) -> int:
         out = Path(argv[argv.index("--out") + 1])
@@ -276,16 +291,19 @@ def check_long_clips_only_on_highway_maps() -> None:
         session = run_clips(
             root, clips=20, seed=3, maps=default, max_traffic=4, runner=runner,
             min_s=30.0, max_s=60.0, long_clips=5, long_min_s=180.0, long_max_s=300.0,
+            long_highway_frac=1.0,
         )
         want = set(long_clip_indices(20, 5, seed=3))
         for i, row in enumerate(json.loads((session / "session.json").read_text(encoding="utf-8"))["results"]):
             tags = json.loads((session / row["dir"] / "clip_tags.json").read_text(encoding="utf-8"))
             if i in want:
+                assert tags["long"] is True, (i, tags)
                 assert tags["long_highway"] is True, (i, tags)
                 assert row["map"] in hwy, (i, row)
             else:
+                assert tags.get("long") is not True
                 assert tags["long_highway"] is False
-    print("long clips: only maps with a highway pool; untagged when the pool has none")
+    print("highway-first routes stay on highway maps; no-highway maps still get varied long clips")
 
 
 def check_long_clip_boundaries_and_tags() -> None:
@@ -330,14 +348,14 @@ def check_long_clip_boundaries_and_tags() -> None:
         pass
     else:
         raise AssertionError("apply_long_highway accepted MIN > MAX")
-    pinned = apply_long_highway(base, min_s=200.0, max_s=200.0, maps=("west_coast_usa",))
+    pinned = apply_long_highway(base, min_s=200.0, max_s=200.0, maps=("west_coast_usa",), highway_frac=1.0)
     assert pinned.duration_s == 200.0
     assert pinned.min_paint_cov is None
 
     # Duration uses both ends of the range, and the seed includes the clip index.
     faded = plan_clip(0, seed=4, maps=("west_coast_usa",), max_traffic=2, edge_cases=("faded_paint",))
     assert faded.min_paint_cov == 0.0
-    cleared = apply_long_highway(faded, min_s=180.0, max_s=300.0, maps=("west_coast_usa",))
+    cleared = apply_long_highway(faded, min_s=180.0, max_s=300.0, maps=("west_coast_usa",), highway_frac=1.0)
     assert cleared.min_paint_cov is None
     assert LONG_HIGHWAY_TAG in cleared.notes
     durs = []
@@ -368,7 +386,7 @@ def check_long_clip_boundaries_and_tags() -> None:
     with collect_root() as root:
         clip = root / "clip"
         clip.mkdir()
-        plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=("west_coast_usa",))
+        plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=("west_coast_usa",), highway_frac=1.0)
         tags = json.loads(write_tags(clip, plan, {"quality": "train", "reasons": []}).read_text(encoding="utf-8"))
         assert tags["long_highway"] is True
         assert "long_highway" in tags["tags"]
@@ -412,16 +430,168 @@ def check_collect_clips_main_passes_long_clip_kwargs() -> None:
         assert captured["long_clips"] == 2, captured
         assert captured["long_min_s"] == 180.0, captured
         assert captured["long_max_s"] == 240.0, captured
+        assert abs(float(captured["long_highway_frac"]) - 0.7) < 1e-12, captured
         sessions = sorted(p for p in root.iterdir() if p.is_dir() and (p / "session.json").is_file())
         manifest = json.loads((sessions[0] / "session.json").read_text(encoding="utf-8"))
         assert manifest["long_clips"] == 2
         assert manifest["long_min_s"] == 180.0 and manifest["long_max_s"] == 240.0
         long_n = sum(
             1 for row in manifest["results"]
-            if json.loads((sessions[0] / row["dir"] / "clip_tags.json").read_text(encoding="utf-8")).get("long_highway")
+            if json.loads((sessions[0] / row["dir"] / "clip_tags.json").read_text(encoding="utf-8")).get("long")
         )
         assert long_n == 2, manifest["results"]
     print("collect_clips.main: forwards long_clips and long_clip_s to run_clips")
+
+
+
+def check_long_clip_default_duration_bounds() -> None:
+    """Default long clips are 10-15 min (600-900 s); durations are seeded and not pinned."""
+    from python.collect.clip_mode import apply_long_highway, plan_clip
+
+    cli = _cli()
+    args = cli.parse_args(["--out", "/tmp/x"])
+    assert args.long_clip_s == (600.0, 900.0)
+    base = plan_clip(3, seed=11, maps=MAPS, max_traffic=0)
+    plan = apply_long_highway(base, min_s=600.0, max_s=900.0, maps=MAPS, highway_frac=1.0)
+    assert 600.0 <= plan.duration_s <= 900.0
+    durs = [
+        apply_long_highway(plan_clip(i, seed=7, maps=("west_coast_usa",), max_traffic=0),
+                           min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=1.0).duration_s
+        for i in range(40)
+    ]
+    assert any(d > 600.5 for d in durs) and any(d < 899.5 for d in durs), durs
+    assert len(set(durs)) > 1, durs
+    p0 = apply_long_highway(plan_clip(0, seed=7, maps=("west_coast_usa",), max_traffic=0),
+                            min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=1.0)
+    assert p0.duration_s == apply_long_highway(plan_clip(0, seed=7, maps=("west_coast_usa",), max_traffic=0),
+                                               min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=1.0).duration_s
+    print("default duration: 600-900 s, seeded, not pinned to MIN or MAX")
+
+
+def check_long_clip_highway_frac_mix() -> None:
+    """--long-clip-highway-frac (default 0.7) is a seeded mix, not a hard map skip."""
+    from python.collect.clip_mode import apply_long_highway, long_clip_indices, plan_clip
+
+    default = ("west_coast_usa", "italy", "east_coast_usa")
+    n_hw = n_var = 0
+    for seed in range(40):
+        for i in long_clip_indices(60, 8, seed):
+            plan = apply_long_highway(
+                plan_clip(i, seed=seed, maps=default, max_traffic=0),
+                min_s=600.0, max_s=900.0, maps=default, highway_frac=0.7,
+            )
+            assert plan.long is True
+            assert 600.0 <= plan.duration_s <= 900.0
+            if plan.long_highway:
+                assert plan.long_route == "highway_loop"
+                assert plan.map in ("west_coast_usa", "italy")
+                n_hw += 1
+            else:
+                assert plan.long_route == "varied"
+                assert plan.map in default
+                assert "long_highway" not in plan.tags
+                n_var += 1
+    total = n_hw + n_var
+    frac = n_hw / total
+    assert total == 40 * 8, total
+    assert 0.60 <= frac <= 0.80, (frac, n_hw, n_var)
+    # Same seed+index is deterministic.
+    a = apply_long_highway(plan_clip(3, seed=9, maps=default, max_traffic=0),
+                           min_s=600.0, max_s=900.0, maps=default, highway_frac=0.7)
+    b = apply_long_highway(plan_clip(3, seed=9, maps=default, max_traffic=0),
+                           min_s=600.0, max_s=900.0, maps=default, highway_frac=0.7)
+    assert a.long_route == b.long_route and a.map == b.map and a.duration_s == b.duration_s
+    # frac=0: all varied, still on the pool, including maps with a highway.
+    varied = [
+        apply_long_highway(plan_clip(i, seed=1, maps=default, max_traffic=0),
+                           min_s=600.0, max_s=900.0, maps=default, highway_frac=0.0)
+        for i in range(30)
+    ]
+    assert all(p.long and not p.long_highway and p.long_route == "varied" for p in varied)
+    print(f"highway_frac mix: {n_hw}/{total}={frac:.3f} highway-first under default 0.7")
+
+
+def check_long_clip_routes_direction_and_maps() -> None:
+    """Highway-first: spawn a highway end-to-end loop, alternate direction, vary the route.
+
+    Dirt and highway legs are only planned when the map actually has them. A map
+    with neither is still a long clip, on a varied seeded route.
+    """
+    from python.collect.clip_mode import (
+        DIRT_MAPS,
+        apply_long_highway,
+        clip_argv,
+        map_has_highway_pool,
+        plan_clip,
+    )
+    from pathlib import Path as _P
+
+    def apply(i, seed, maps, **kw):
+        return apply_long_highway(
+            plan_clip(i, seed=seed, maps=maps, max_traffic=0),
+            min_s=600.0, max_s=900.0, maps=maps, highway_frac=kw.get("highway_frac", 1.0),
+        )
+
+    # italy has highway, city, and is listed as a dirt map.
+    italy = [apply(i, 11, ("italy",)) for i in range(16)]
+    assert all(p.long_highway and p.long_route == "highway_loop" for p in italy)
+    assert all(p.route_legs[0] == "highway" and p.route_legs[-1] == "highway" for p in italy)
+    assert all("city" in p.route_legs for p in italy)
+    assert all("dirt" in p.route_legs for p in italy)
+    dirs = [p.long_direction for p in italy]
+    assert set(dirs) == {0, 1}, dirs
+    assert dirs == [i % 2 for i in range(16)], dirs
+    # Route / spawn variety across clips; same index is stable.
+    seeds = [p.spawn_seed for p in italy]
+    assert len(set(seeds)) > 1, seeds
+    assert italy[0].spawn_seed == apply(0, 11, ("italy",)).spawn_seed
+    argv = clip_argv(italy[0], _P("/tmp/x/clip"))
+    assert argv[argv.index("--spawn-kind") + 1] == "highway"
+    seg = float(argv[argv.index("--segment-min") + 1])
+    assert seg * 60.0 >= italy[0].duration_s, (seg, italy[0].duration_s)
+
+    # west_coast_usa has highway+city, not a DIRT_MAPS entry: no faked dirt leg.
+    assert "west_coast_usa" not in DIRT_MAPS
+    wc = apply(0, 2, ("west_coast_usa",))
+    assert wc.long_route == "highway_loop" and "city" in wc.route_legs
+    assert "dirt" not in wc.route_legs
+
+    # east_coast_usa: no highway, is a dirt map. Still a long clip, varied route, no long_highway.
+    assert not map_has_highway_pool("east_coast_usa")
+    assert "east_coast_usa" in DIRT_MAPS
+    ec = [apply(i, 5, ("east_coast_usa",), highway_frac=1.0) for i in range(12)]
+    assert all(p.long and not p.long_highway and p.long_route == "varied" and p.map == "east_coast_usa" for p in ec)
+    assert all("highway" not in p.route_legs for p in ec)
+    assert all("dirt" in p.route_legs or "city" in p.route_legs for p in ec)
+    assert len({(p.spawn_seed, p.long_direction, tuple(p.route_legs)) for p in ec}) > 1
+    # Default pool: some long clips can land on east_coast_usa under frac < 1.
+    default = ("west_coast_usa", "italy", "east_coast_usa")
+    landed = {
+        apply_long_highway(plan_clip(i, seed=s, maps=default, max_traffic=0),
+                           min_s=600.0, max_s=900.0, maps=default, highway_frac=0.7).map
+        for s in range(20) for i in range(8)
+    }
+    assert "east_coast_usa" in landed, landed
+    print("routes: direction alternates, spawn/route vary, no-highway maps still counted")
+
+
+def check_disk_guards_unchanged_for_long_clips() -> None:
+    """20 GiB free-space floor and 3.5 GiB per-file cap are unchanged at the 43 GiB/900 s ceiling."""
+    from python.collect.clip_mode import LONG_CLIP_DISK_GIB_PER_900S
+    from python.data.data_root import MIN_FREE_BYTES
+    import importlib.util
+    from pathlib import Path as _P
+
+    assert MIN_FREE_BYTES == 20 * 1024 * 1024 * 1024
+    spec = importlib.util.spec_from_file_location("collect_scene_lanes_disk", _P(__file__).resolve().parents[1] / "scripts" / "collect_scene_lanes.py")
+    # Don't exec the collector (it is heavy). Parse the default from the source or clip CLI.
+    # The collector flag default is the documented 3.5 GiB cap.
+    from scripts import test_control_log  # noqa: F401 — exists in repo
+    text = (_P(__file__).resolve().parents[1] / "scripts" / "collect_scene_lanes.py").read_text(encoding="utf-8")
+    assert "default=3.5" in text
+    assert abs(float(LONG_CLIP_DISK_GIB_PER_900S) - 43.0) < 1e-9
+    # 8 long clips ≈ 344 GiB at the ceiling; the floor still stops at 20 GiB free.
+    print("disk guards: 20 GiB floor and 3.5 GiB/file unchanged; ceiling 43 GiB per 900 s clip")
 
 
 def main() -> None:
@@ -436,6 +606,10 @@ def main() -> None:
     check_long_clips_only_on_highway_maps()
     check_long_clip_boundaries_and_tags()
     check_collect_clips_main_passes_long_clip_kwargs()
+    check_long_clip_default_duration_bounds()
+    check_long_clip_highway_frac_mix()
+    check_long_clip_routes_direction_and_maps()
+    check_disk_guards_unchanged_for_long_clips()
     print("test_rec_long_clips: OK")
 
 

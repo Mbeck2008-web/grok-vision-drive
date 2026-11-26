@@ -3834,7 +3834,6 @@ SEAL_GUARD_REPORT_ONLY = frozenset({
 # (after ground_clamp: far rows pushed below the road, out of the ground band); L = the net's 12x16 class
 # grid (road label bleeds past the edge); N = road_snap flattens objects inside a road-majority cell.
 KNOWN_FAILING: dict[str, str] = {
-    "check_synthetic_width_exact_labels": "E: exact depth + exact labels: repeatL/R 15-30 m median |err| 30.8% p90 100%; rear 15-30 m 96.8%/100%",
     "check_synthetic_width": "L+E: pillarL/R 0-5 m median 14.8% p90 47.3%; repeatL/R 0-5 m 16.6%/23.0%, 5-15 m 28.1%/48.2%; rear 15-30 m",
     "check_synthetic_edge_overshoot": "L: road 0.35 m (pillars) / 0.71 m (repeats) past the GT edge at 0-5 m (12x16 label bleed)",
     "check_side_objects_keep_height_pins": "N: pillarR parked car x2.5 lost 1.07 m on 88 px; pole x3 lost 1.07 m on 351/391 px; curbs lost 0.11 m",
@@ -3845,7 +3844,6 @@ KNOWN_FAILING: dict[str, str] = {
     "check_clip015_snap_misplace": "f40/f160 DRAWN-only: pillarR 18.10% (7317/40432; f40 36.90%/f160 3.50%), repeatR 4.65% (1835/39434), wide 10.12% (3555/35133; was 15.00% all-snapped 7461/49726) at 0-15 m; wide 61.64% (188/305; all-snapped 59.35% 219/369) at 15-30 m (GT z>0.30) || pillarR/repeatR (b) attribution (Breaker, dev f50/f120 + Tracer swarm-2/logs/rv_snapb.txt f40, rv_snapb_more.txt f20/f50/f120/f150): residual after a one-sided pred-z>0.30 rejection = pred-road px with raw net z<=0.30 (net seg+depth): pillarR f50 2635/6274 (Tracer 2635), repeatR f50 779/1947 (Tracer 779), f120 0/3672 and 0/957 (Tracer 0) -> root cause of the residual 'net seg+depth (pred road on curb, raw z<=0.30), Trainer 2.0'; approval michael 2026-11-26 13:50 CT: \"Yeah, if this issue can be fixed with training on a large data set like the one that we're creating that's perfectly fine\". The rest of the (b) px (raw z>0.30) are snap-created: the rejection is ABSENT on dee9827 (check_snap_rejects_raised_pred_z FAILs, normal FAIL, Fix item Redesigner). Approval does not cover wide or other cams.",
     "check_clip015_edge_position": "f40/f160: wide 5-15 m median 1.334/p90 5.119 vs 10%/20% of |x_gt| 4.36 m; also narrow/main 5-15 p90 over the 20% gate",
     "check_clip015_snap_no_worse_than_off": "f40/f160: pillarR |dz| median 0.246 vs 0.184 off; pillarL 0.049/0.603 vs 0.048/0.593",
-    "check_clip015_footprint": "f40/f160: narrow 45.3%, main 70.4%, wide 83.8%, pillarR 81.9%, repeatL 93.0% (min 95%)",
     # ---- ripple / streak / sky (swarm-4 Breaker, wide snap OFF, thresholds by rule on f10/25/50/120/140/155) ----
     # wide coarse-row dz: michael 2026-11-26 13:50 CT, net depth, Trainer 2.0
     "check_clip015_ripple_wide_dz": "NEW (wide snap OFF; snap ON passes these bins at f40/f110/f160): wide |dz| f110 0-5 m 0.130 > 0.080, 5-10 m 0.327 > 0.163; f160 0-5 0.103, 5-10 0.277; f40 15-30 0.435 > 0.417. Root cause: net depth (12x16 coarse-row bands, wide f110 R6..R9 +0.43/+0.19/+0.22/+0.07 m; Tracer swarm-2/logs/rv_ring2.txt), fix in training (Trainer 2.0), not runtime. Approval michael 2026-11-26 13:50 CT: \"Yeah, if this issue can be fixed with training on a large data set like the one that we're creating that's perfectly fine\". Limits unchanged.",

@@ -41,6 +41,11 @@ H  height bias by GT range bin (clip015 f40/f160, needs the clip: GVD_RV_CLIP015
    Near road 0-15 m: median |dz| <= 0.08 m and p90 |dz| <= 0.20 m (Redesigner's pre-set gate;
    KNOWN_FAILING, belongs to gvd/rv-ground-plane). 25-60 m: no worse than the 4df1176 snap
    range (25 m) on the same input. Synthetic graded road: same 25-60 m gate, always runs.
+   Snap on vs off (clip015 f40/f160): per cam, road median |dz| and p90 |dz| with snap on are no
+   worse (+1 mm) than with --road-snap 0 in 0-5, 5-10, 10-15 m.
+   Holdout (Skeptic): every clip gate is re-run on >= 2 held-out clip015 frames >= 40 frames from
+   f40/f160 (GVD_RV_HOLDOUT_FRAMES to pin them) with the same thresholds; pass on f40/f160 + fail on
+   holdout = overfit counterexample.
 G  GT is measurement only: cam_frame in pred mode never reads GT depth (no gt root at all), and
    python/viz/rv_stable_fill.py never reads GT (no state/ego/gt names).
 
@@ -727,6 +732,7 @@ def clip_metrics(clip: Path, preds: Path, gt_root: Path, frames=(40, 160), overr
     P = np.load(preds)
     p = Preview(overrides, root=clip, P=P, cams=cams)
     acc = {b: [] for b in BINS}
+    acc_cam: dict = {}
     near = []
     seams_open, seams_wp = [], []
     for f in frames:
@@ -766,6 +772,7 @@ def clip_metrics(clip: Path, preds: Path, gt_root: Path, frames=(40, 160), overr
             dzv = pr[:, 2] - pg[:, 2]
             for lo, hi in BINS:
                 acc[(lo, hi)].append(dzv[(rr >= lo) & (rr < hi)])
+                acc_cam.setdefault(cid, {b: [] for b in BINS})[(lo, hi)].append(dzv[(rr >= lo) & (rr < hi)])
             near.append(dzv[rr < NEAR_M])
         if "main" in pts and "wide" in pts:
             seams_open.append((f, seam(pts["main"], pts["wide"], 0.0, 60.0)))
@@ -777,18 +784,98 @@ def clip_metrics(clip: Path, preds: Path, gt_root: Path, frames=(40, 160), overr
             return (float("nan"), float("nan"), float("nan"), 0)
         return (float(np.median(x)), float(np.median(np.abs(x))), float(np.percentile(np.abs(x), 90)), int(x.size))
     bins = {b: stats(np.concatenate(parts) if parts else np.zeros(0)) for b, parts in acc.items()}
-    return {"bins": bins, "near": stats(np.concatenate(near) if near else np.zeros(0)),
+    by_cam = {c: {b: stats(np.concatenate(v) if v else np.zeros(0)) for b, v in d_.items()} for c, d_ in acc_cam.items()}
+    return {"bins": bins, "bins_by_cam": by_cam, "near": stats(np.concatenate(near) if near else np.zeros(0)),
             "seam_open": seams_open, "seam_wide_pillar": seams_wp}
 
 
 _CLIP: dict = {}
 
 
-def _clip(overrides=None):
-    key = json.dumps(overrides or {}, sort_keys=True)
+GATE_FRAMES = (40, 160)
+HOLDOUT_MIN_GAP = 40     # Skeptic: held-out frames >= 40 frames from f40/f160 (no fitting on the test set)
+HOLDOUT_N = 2            # at least 2 held-out frames
+SNAP_BINS = ((0.0, 5.0), (5.0, 10.0), (10.0, 15.0))
+
+
+def holdout_frames(P_files, n: int = 4) -> tuple:
+    """Frames in the preds with every cam key, >= HOLDOUT_MIN_GAP from each gate frame (env override
+    GVD_RV_HOLDOUT_FRAMES=a,b,..), up to ``n`` spread evenly."""
+    env = os.environ.get("GVD_RV_HOLDOUT_FRAMES", "").strip()
+    if env:
+        fr = [int(x) for x in env.split(",") if x.strip()]
+    else:
+        fr = sorted({int(k.split("/")[1]) for k in P_files if k.startswith("main/") and k.endswith("/0/d")})
+    fr = [f for f in fr if all(abs(f - g) >= HOLDOUT_MIN_GAP for g in GATE_FRAMES)]
+    if len(fr) > n:
+        fr = [fr[int(round(i * (len(fr) - 1) / (n - 1)))] for i in range(n)]
+    return tuple(fr)
+
+
+def _clip(overrides=None, frames=GATE_FRAMES):
+    key = json.dumps([overrides or {}, list(frames)], sort_keys=True)
     if key not in _CLIP:
-        _CLIP[key] = clip_metrics(*clip015_paths(), overrides=overrides)
+        _CLIP[key] = clip_metrics(*clip015_paths(), frames=frames, overrides=overrides)
     return _CLIP[key]
+
+
+def _holdout() -> tuple:
+    fr = holdout_frames(np.load(clip015_paths()[1]).files)
+    assert len(fr) >= HOLDOUT_N, f"holdout: need >= {HOLDOUT_N} frames >= {HOLDOUT_MIN_GAP} from {GATE_FRAMES}, have {fr}"
+    return fr
+
+
+def _near_gate(m, label):
+    _, med, p90, n = m["near"]
+    assert n > 0 and med <= NEAR_MEDIAN_M and p90 <= NEAR_P90_M, f"{label} near road 0-15 m: median |dz| {med:.3f} m, p90 {p90:.3f} m, n {n}"
+
+
+def _snap_gate(frames, label):
+    on = _clip(None, frames)["bins_by_cam"]
+    off = _clip({"road_snap": 0}, frames)["bins_by_cam"]
+    bad = []
+    for cid in on:
+        for b in SNAP_BINS:
+            c, o = on[cid][b], off.get(cid, {}).get(b, (np.nan,) * 4)
+            if c[3] == 0 or o[3] == 0:
+                continue
+            if c[1] > o[1] + NO_WORSE_TOL_M or c[2] > o[2] + NO_WORSE_TOL_M:
+                bad.append(f"{cid} {b[0]:g}-{b[1]:g} m: snap on median|dz| {c[1]:.3f}/p90 {c[2]:.3f} vs off {o[1]:.3f}/{o[2]:.3f}")
+    assert not bad, f"{label}: " + "; ".join(bad)
+
+
+def check_clip015_snap_no_worse_than_off() -> None:
+    """Per cam, road |dz| with snap on is no worse than snap off in 0-5/5-10/10-15 m (f40, f160)."""
+    if clip015_paths() is None:
+        skip_check("clip015_snap_no_worse_than_off", "clip015 not on this host")
+        return SKIPPED
+    _snap_gate(GATE_FRAMES, "f40/f160")
+
+
+def check_holdout_snap_no_worse_than_off() -> None:
+    if clip015_paths() is None:
+        skip_check("holdout_snap_no_worse_than_off", "clip015 not on this host")
+        return SKIPPED
+    _snap_gate(_holdout(), "holdout")
+
+
+def check_holdout_near_road_bias() -> None:
+    """Same near-road gate on held-out frames (a pass on f40/f160 + fail here = overfit counterexample)."""
+    if clip015_paths() is None:
+        skip_check("holdout_near_road_bias", "clip015 not on this host")
+        return SKIPPED
+    fr = _holdout()
+    m = _clip(None, fr)
+    print(f"holdout {fr} bins:", _fmt_bins(m["bins"]), flush=True)
+    _near_gate(m, f"holdout {fr}")
+
+
+def check_holdout_open_road_seam() -> None:
+    if clip015_paths() is None:
+        skip_check("holdout_open_road_seam", "clip015 not on this host")
+        return SKIPPED
+    for f, (px, med, n, worst) in _clip(None, _holdout())["seam_open"]:
+        assert n == 0 or med <= SEAM_MEDIAN_M, ("holdout", f, med, n, worst)
 
 
 def _fmt_bins(bins):
@@ -803,8 +890,7 @@ def check_clip015_near_road_bias() -> None:
     m = _clip()
     print("clip015 bins (median dz, median |dz|, p90 |dz|, n):", _fmt_bins(m["bins"]), flush=True)
     print("clip015 wide-pillar seams (report only, scoped out):", m["seam_wide_pillar"], flush=True)
-    _, med, p90, n = m["near"]
-    assert n > 0 and med <= NEAR_MEDIAN_M and p90 <= NEAR_P90_M, f"near road 0-15 m: median |dz| {med:.3f} m, p90 {p90:.3f} m, n {n}"
+    _near_gate(m, "f40/f160")
 
 
 def check_clip015_far_bin_no_worse() -> None:
@@ -842,7 +928,7 @@ def check_clip_harness_selftest() -> None:
         cam = pv().cam[cid]
         g = geom(cam)
         fs = (pv().ns["fy_full"](c) * 192.0 / H0) / pv().ns["FY_REF"]
-        for f in (40, 160):
+        for f in GATE_FRAMES:
             (tmp / "raw" / cid / "000").mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(tmp / "raw" / cid / "000" / f"{f:06d}.png"), np.full((H0, W0, 3), 128, np.uint8))
             store[f"{cid}/{f}/0/d"] = np.where(g["down"], g["hit"], 1e4) / fs
@@ -858,6 +944,9 @@ def check_clip_harness_selftest() -> None:
     for (lo, hi), (md, mad, p90, n) in m["bins"].items():
         if hi <= 25.0:
             assert n > 0 and abs(md) < 0.02 and p90 < 0.05, ((lo, hi), md, p90, n)
+    off = clip_metrics(tmp, tmp / "preds.npz", gt_root, overrides={"road_snap": 0})
+    assert set(off["bins_by_cam"]) == {"main", "wide"}
+    assert holdout_frames(["main/0/0/d", "main/40/0/d", "main/80/0/d", "main/100/0/d", "main/200/0/d", "main/201/0/d"]) == (0, 80, 200, 201)
 
 
 # ------------------------------------------------------------------ hypothesis props
@@ -1073,6 +1162,10 @@ CHECKS = [
     check_clip015_near_road_bias,
     check_clip015_far_bin_no_worse,
     check_clip015_open_road_seam,
+    check_clip015_snap_no_worse_than_off,
+    check_holdout_snap_no_worse_than_off,
+    check_holdout_near_road_bias,
+    check_holdout_open_road_seam,
     check_pin_label_edge_dip,
     check_pin_object_base_dip,
     check_pin_horizon_band_dip,
@@ -1101,6 +1194,7 @@ KNOWN_FAILING: dict[str, str] = {
     "prop_filter_keeps_cap": "F: narrow, yaw 1.0 deg/frame: at-cap px span [249.49, 250.51] m",
     "prop_objects_keep_height": "N: main pole at 4.0 m, lat 0.0: px at GT z 1.114 m rendered at 0.000 m",
     "check_clip015_near_road_bias": "clip015 near road 0-15 m bias belongs to gvd/rv-ground-plane (Redesigner's gate 0.08/0.20 m)",
+    "check_holdout_near_road_bias": "same near-road gate on held-out frames; same owner (gvd/rv-ground-plane)",
 }
 
 _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}

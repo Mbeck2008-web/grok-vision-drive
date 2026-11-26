@@ -10,7 +10,11 @@ proposal). Green and unknown are never stop events.
 Checks: check_stop_event_requires_hold, check_stop_side_angle_slice,
 check_light_events_red_yellow_only, check_stop_metrics_on_fixture,
 check_stop_events_split_safe, check_stop_labels_train_only,
-check_hand_rule_untouched. Pure Python (no torch).
+check_hand_rule_untouched, check_missing_gt_row_does_not_end_the_window,
+check_speed_key_scores_the_predicted_profile, check_side_angle_uses_first_visibility_not_entry,
+check_km_counts_holdout_rows_only, check_no_nan_in_scores,
+check_red_to_green_proceed_current_behaviour (PROPOSAL pending Michael).
+Pure Python (no torch).
 """
 from __future__ import annotations
 
@@ -220,6 +224,210 @@ def check_hand_rule_untouched() -> None:
     print(f"hand rule: {len(HAND_RULE_PINS)} files match their main 8ce34d5 sha256 OK")
 
 
+def _drop_target(rows, *, y_lo: float, y_hi: float) -> int:
+    """Blank the GT target on rows with y_lo <= y < y_hi (a dropped label). Returns how many rows."""
+    n = 0
+    for r in rows:
+        if r["stops"] and y_lo <= r["stops"][0]["y"] < y_hi:
+            r["stops"] = []
+            n += 1
+    return n
+
+
+def check_missing_gt_row_does_not_end_the_window() -> None:
+    """A dropped label is skipped, not read as the end of the approach (probe P2b: a held stop scored a miss)."""
+    from python.train import stop_events as se
+
+    base = approach(hold_s=1.5)
+    assert se.score(base)["missed"] == 0
+    # One missing GT row mid-approach (y ~ 30 m), as in the probe.
+    one = approach(hold_s=1.5)
+    assert _drop_target(one, y_lo=29.0, y_hi=30.0) == 1
+    res = se.score(one)
+    assert res["events"] == 1 and res["missed"] == 0, res
+    # Missing rows inside the hold itself (the car sits at y = 2 m, 0 m/s).
+    inside = approach(hold_s=1.5)
+    n = sum(1 for r in inside if r["v"] == 0.0)
+    for r in [r for r in inside if r["v"] == 0.0][2:5]:
+        r["stops"] = []
+    assert n >= 10
+    res = se.score(inside)
+    assert res["events"] == 1 and res["missed"] == 0, res
+    assert math.isclose(res["detail"][0]["stop_distance_m"], 2.0, abs_tol=0.01), res["detail"]
+    # A skipped row that is not a holdout row still keeps the approach out of the score.
+    mixed = approach(hold_s=1.5)
+    _drop_target(mixed, y_lo=29.0, y_hi=30.0)
+    for r in mixed:
+        if not r["stops"]:
+            r["split"] = "train"
+    dropped = [r for r in mixed if not r["stops"]]
+    assert len(dropped) == 1 and dropped[0]["split"] == "train"
+    assert se.score(mixed)["events"] == 0, "a train row inside the window must keep the approach unscored"
+    # A dropout longer than MAX_DT_S is a lost target: a later reappearance does not rescue a run-through.
+    lost = approach(stop_at_y=None)  # drives through at 10 m/s, never stops
+    last_t = lost[-1]["t"]
+    for r in lost:
+        if r["stops"][0]["y"] < 8.0:
+            r["stops"] = []
+    tail = approach(stop_at_y=2.0, hold_s=1.0, t0=last_t + 5.0, i0=9000)  # same id "s1", stopped properly 5 s later
+    res = se.score(lost + tail)
+    assert res["events"] == 1 and res["missed"] == 1, res
+    print("missing GT rows: one-row gap, gap inside the hold, train row in a gap, >1 s dropout all handled; held stop stays held OK")
+
+
+def check_speed_key_scores_the_predicted_profile() -> None:
+    """Contract: ``v`` fixes which approaches exist and km; ``speed_key`` decides whether the stop was held."""
+    from python.train import stop_events as se
+
+    # Expert stops, prediction never slows: default scores the expert, speed_key scores the prediction.
+    rows = approach(hold_s=1.0)
+    for r in rows:
+        r["pred_v"] = 10.0
+    assert se.score(rows)["missed"] == 0
+    assert se.score(rows, speed_key="v")["missed"] == 0
+    pred = se.score(rows, speed_key="pred_v")
+    assert pred["events"] == 1 and pred["missed"] == 1, pred
+    # Expert drives through at 10 m/s; the prediction is below 0.5 m/s for 1.2 s from y ~ 20 m. It is judged
+    # open-loop at the recorded positions, so the stop distance is the recorded y where the hold starts.
+    rows = approach(stop_at_y=None)
+    for r in rows:
+        r["pred_v"] = r["v"]
+    held_idx = [k for k, r in enumerate(rows) if r["stops"][0]["y"] <= 20.0][:12]
+    assert len(held_idx) == 12
+    for k in held_idx:
+        rows[k]["pred_v"] = 0.0
+    assert se.score(rows)["missed"] == 1
+    pred = se.score(rows, speed_key="pred_v")
+    assert pred["events"] == 1 and pred["missed"] == 0, pred
+    assert 18.5 <= pred["detail"][0]["stop_distance_m"] <= 20.0, pred["detail"]
+    # The entry gate and km come from v: a slow recorded entry is never an event, whatever pred_v says.
+    slow = approach(v0=1.5, hold_s=1.0)
+    for r in slow:
+        r["pred_v"] = 0.0
+    assert se.score(slow, speed_key="pred_v")["events"] == 0
+    # ... and a recorded entry >= 2 m/s is an event even when the predicted profile is already stopped there.
+    parked = approach(hold_s=1.0)
+    for r in parked:
+        r["pred_v"] = 0.0
+    res = se.score(parked, speed_key="pred_v")
+    assert res["events"] == 1 and res["missed"] == 0, res
+    assert se.score(rows)["km"] == se.score(rows, speed_key="pred_v")["km"] > 0.0
+    # No fallback to v: a missing, non-numeric, NaN or negative speed_key value is refused.
+    for bad in (None, "fast", float("nan"), float("inf"), -1.0, "missing"):
+        rows2 = approach(hold_s=1.0)
+        for r in rows2:
+            r["pred_v"] = 0.0
+        if bad == "missing":
+            del rows2[3]["pred_v"]
+        else:
+            rows2[3]["pred_v"] = bad
+        try:
+            se.score(rows2, speed_key="pred_v")
+        except se.StopEventError:
+            pass
+        else:
+            raise AssertionError(f"speed_key value {bad!r} accepted")
+    try:
+        se.score(approach(hold_s=1.0), speed_key="pred_v")
+    except se.StopEventError:
+        pass
+    else:
+        raise AssertionError("rows without the speed_key field fell back to v")
+    for key, bad in (("v", float("nan")), ("t", float("nan")), ("v", -0.1)):
+        rows3 = approach(hold_s=1.0)
+        rows3[4][key] = bad
+        try:
+            se.score(rows3)
+        except se.StopEventError:
+            continue
+        raise AssertionError(f"row {key}={bad!r} accepted")
+    print("speed_key: predicted profile decides the hold, v decides events and km; missing / NaN / negative refused OK")
+
+
+def _set_x(rows, fn) -> None:
+    for r in rows:
+        r["stops"][0]["x"] = fn(r["stops"][0]["y"])
+
+
+def check_side_angle_uses_first_visibility_not_entry() -> None:
+    from python.train import stop_events as se
+
+    t30 = math.tan(math.radians(30.0))
+    # First visible at y ~ 60 m, 30 deg off axis (in 22-37.5); by the 40 m entry it is ~7 deg: still the side slice.
+    far_side = approach(y0=60.0, stop_at_y=None)
+    _set_x(far_side, lambda y: y * t30 if y > 52.0 else 5.0)
+    res = se.score(far_side)
+    assert res["events"] == 1, res
+    assert 29.0 < res["detail"][0]["first_bearing_deg"] < 31.0, res["detail"]
+    assert res["slices"]["stop_side_angle"] == {"events": 1, "missed": 1}, res["slices"]
+    # First visible dead ahead, 30 deg off axis only at entry: not the side slice.
+    late_side = approach(y0=60.0, stop_at_y=None)
+    _set_x(late_side, lambda y: 0.5 if y > 45.0 else y * t30)
+    res = se.score(late_side)
+    assert res["events"] == 1 and res["detail"][0]["first_bearing_deg"] < 5.0, res["detail"]
+    assert res["slices"]["stop_side_angle"] == {"events": 0, "missed": 0}, res["slices"]
+    print("side angle: bearing is read at first GT visibility (60 m), not at the 40 m window entry OK")
+
+
+def check_km_counts_holdout_rows_only() -> None:
+    from python.train import stop_events as se
+
+    rows = []
+    for k in range(1000):  # 100 s of train driving at 20 m/s = 2 km that must not count
+        rows.append({"t": round(k * DT, 6), "v": 20.0, "ctl_brake": 0.0, "split": "train", "source": "rec", "i": k, "stops": []})
+    for k in range(100):  # 10 s of holdout at 10 m/s = 100 m
+        rows.append({"t": round(100.0 + k * DT, 6), "v": 10.0, "ctl_brake": 0.0, "split": "holdout", "source": "rec", "i": 1000 + k, "stops": []})
+    res = se.score(rows)
+    assert math.isclose(res["km"], 0.1, rel_tol=1e-9), res["km"]
+    train_only = se.score(rows[:1000])
+    assert train_only["km"] == 0.0, train_only["km"]
+    print(f"km: {res['km']:.3f} km from 100 holdout rows; 2 km of train rows not counted OK")
+
+
+def check_no_nan_in_scores() -> None:
+    """Contract with trainer2_bar: a rate with nothing to divide by is None, never NaN or 0.0."""
+    import json
+
+    from python.train import stop_events as se
+
+    empty = se.score(approach(split="train", stop_at_y=None))
+    assert empty["km"] == 0.0
+    assert empty["false_brakes_per_km"] is None and empty["green_false_brakes_per_km"] is None, empty
+    assert empty["stop_distance_m"] == {"n": 0, "median": None, "p95": None}, empty["stop_distance_m"]
+    json.dumps(empty, allow_nan=False)
+    assert se.score([])["false_brakes_per_km"] is None
+    run = se.score(approach(stop_at_y=None))  # holdout km > 0 but no held stop
+    assert run["km"] > 0.0 and isinstance(run["false_brakes_per_km"], float)
+    assert run["stop_distance_m"]["median"] is None and run["stop_distance_m"]["p95"] is None
+    json.dumps(run, allow_nan=False)
+    ok = se.score(approach(hold_s=1.0))
+    assert isinstance(ok["stop_distance_m"]["median"], float) and isinstance(ok["stop_distance_m"]["p95"], float)
+    json.dumps(ok, allow_nan=False)
+    print("no NaN: km == 0 and no held stop give None (JSON-safe), real values stay floats OK")
+
+
+def check_red_to_green_proceed_current_behaviour() -> None:
+    """PROPOSAL pending Michael: this pins today's behaviour, it does not decide the question.
+
+    Red at first entry, green before the car must stop, car drives on through the line:
+    scored as a MISSED red-light stop (the event is typed by the lamp at entry; the literal spec).
+    If Michael rules this should not count, this test and ``RED_TO_GREEN_PROCEED_IS_MISS`` change together.
+    """
+    from python.train import stop_events as se
+
+    assert se.RED_TO_GREEN_PROCEED_IS_MISS is True  # PROPOSAL pending Michael
+    rows = approach(cls="traffic_light", state="red", stop_at_y=None, v0=6.0, y0=45.0, brake=0.0)
+    for r in rows:
+        if r["stops"][0]["y"] <= 15.0:
+            r["stops"][0]["state"] = "green"
+    assert rows[0]["stops"][0]["state"] == "red" and any(r["stops"][0]["state"] == "green" for r in rows)
+    res = se.score(rows)
+    assert res["events"] == 1 and res["missed"] == 1, res
+    assert res["slices"]["red_light"] == {"events": 1, "missed": 1}, res["slices"]
+    assert res["detail"][0]["state"] == "red"
+    print("red->green then proceed: counted as a missed red light today (PROPOSAL pending Michael; pinned) OK")
+
+
 def main() -> int:
     checks = (
         check_stop_event_requires_hold,
@@ -229,6 +437,12 @@ def main() -> int:
         check_stop_events_split_safe,
         check_stop_labels_train_only,
         check_hand_rule_untouched,
+        check_missing_gt_row_does_not_end_the_window,
+        check_speed_key_scores_the_predicted_profile,
+        check_side_angle_uses_first_visibility_not_entry,
+        check_km_counts_holdout_rows_only,
+        check_no_nan_in_scores,
+        check_red_to_green_proceed_current_behaviour,
     )
     failed = 0
     for check in checks:

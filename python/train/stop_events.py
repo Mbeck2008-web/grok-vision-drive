@@ -26,6 +26,42 @@ Input rows (one per frame, in time order per ``source``)::
 sign). Only holdout rows are scored; an approach with any non-holdout row in
 its window is not scored. GT here is a training/eval label only: this module
 imports nothing from ``python.*`` and no live path imports it.
+
+Speed contract (``speed_key``)
+------------------------------
+``v`` is the recorded ego speed. It alone decides **which** approaches exist
+(the ``ENTRY_V_MPS`` gate) and the holdout distance in ``km``, so every scored
+profile faces the same events and the same per-km denominator. ``speed_key``
+(default ``"v"``) names the field whose speed decides whether the stop was
+**held**: for a live or closed-loop drive that is ``v`` itself; to score a
+model's *predicted* profile (spec: "the predicted (or live) brake profile does
+not produce a full stop") put it in a row field, e.g. ``"pred_v"``, and pass
+``speed_key="pred_v"``. The profile is judged open-loop at the recorded
+positions and times (``y``, ``t`` are not re-integrated from it). Every row
+must carry a finite, non-negative ``speed_key`` value or ``score`` raises
+``StopEventError``; it never falls back to ``v``.
+
+Rows missing a target
+---------------------
+A row that lacks the approach's GT target (a dropped label) is skipped: it
+neither ends the window nor counts as a stop. A dropout longer than
+``MAX_DT_S`` ends the window (the target is lost), and a skipped row inside the
+window still has to be a holdout row.
+
+No NaN in the result
+--------------------
+A rate or quantile with nothing to divide by is ``None`` (JSON-safe), never
+``NaN`` and never ``0.0``: ``false_brakes_per_km`` and
+``green_false_brakes_per_km`` are ``None`` when ``km == 0`` and
+``stop_distance_m["median"|"p95"]`` are ``None`` with no held stop. A consumer
+(``trainer2_bar``) must read ``None`` as "not measured" and fail on it.
+
+Open question, PROPOSAL pending Michael (2026-11-26 ruling): a red light that
+turns green during the approach, after which the car drives on, **counts as a
+missed stop** today (the event is typed by the lamp state at first entry and
+needs the held stop; the literal spec). Whether it should not count is his call.
+``RED_TO_GREEN_PROCEED_IS_MISS`` documents the current behaviour; it is pinned
+by ``check_red_to_green_proceed_current_behaviour``.
 """
 
 from __future__ import annotations
@@ -45,12 +81,15 @@ LIGHT_CLASS = "traffic_light"
 STOP_LAMPS = ("red", "yellow")
 MAX_DT_S = 1.0
 _EPS = 1e-6
+# PROPOSAL pending Michael: current behaviour, not a switch. Red at entry, green later, car drives on = missed stop.
+RED_TO_GREEN_PROCEED_IS_MISS = True
 
 __all__ = [
     "BRAKE_ON",
     "ENTRY_V_MPS",
     "HOLD_S",
     "LINE_TOL_M",
+    "RED_TO_GREEN_PROCEED_IS_MISS",
     "SIDE_ANGLE_DEG",
     "STOP_V_MPS",
     "WINDOW_M",
@@ -82,16 +121,29 @@ def _in_window(target: Mapping[str, Any]) -> bool:
     return -LINE_TOL_M <= y <= WINDOW_M
 
 
-def _check(row: Mapping[str, Any]) -> None:
-    for key in ("t", "v", "split"):
+def _check(row: Mapping[str, Any], speed_key: str) -> None:
+    for key in ("t", "v", "split", speed_key):
         if key not in row or row[key] is None:
             raise StopEventError(f"row {row.get('source')!r} i={row.get('i')!r} has no {key!r}")
+    try:
+        stamp = float(row["t"])
+    except (TypeError, ValueError) as exc:
+        raise StopEventError(f"row {row.get('source')!r} i={row.get('i')!r} 't' is not a number") from exc
+    if not math.isfinite(stamp):
+        raise StopEventError(f"row {row.get('source')!r} i={row.get('i')!r} 't' is {stamp!r}")
+    for key in dict.fromkeys(("v", speed_key)):
+        try:
+            speed = float(row[key])
+        except (TypeError, ValueError) as exc:
+            raise StopEventError(f"row {row.get('source')!r} i={row.get('i')!r} {key!r} is not a number") from exc
+        if not math.isfinite(speed) or speed < 0.0:
+            raise StopEventError(f"row {row.get('source')!r} i={row.get('i')!r} {key!r} is {speed!r}, not a finite speed >= 0")
 
 
-def _quantile(values: list[float], q: float) -> float:
+def _quantile(values: list[float], q: float) -> float | None:
     vals = sorted(values)
     if not vals:
-        return float("nan")
+        return None
     pos = (len(vals) - 1) * q
     lo = int(math.floor(pos))
     hi = int(math.ceil(pos))
@@ -109,7 +161,7 @@ def _slice_names(ev: Mapping[str, Any]) -> list[str]:
     return names
 
 
-def _events_for_source(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _events_for_source(rows: list[Mapping[str, Any]], speed_key: str = "v") -> list[dict[str, Any]]:
     first_seen: dict[str, Mapping[str, Any]] = {}
     for row in rows:
         for tgt in row.get("stops") or []:
@@ -128,21 +180,32 @@ def _events_for_source(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
         if float(rows[entry]["v"]) < ENTRY_V_MPS:
             continue
         window: list[tuple[Mapping[str, Any], float]] = []
+        bridged: list[Mapping[str, Any]] = []  # label-less rows between two rows of the window
+        pending: list[Mapping[str, Any]] = []
+        last_t = float(rows[entry]["t"])
         for row in rows[entry:]:
             tgt = next((s for s in row.get("stops") or [] if str(s["id"]) == sid), None)
-            if tgt is None or float(tgt["y"]) < -LINE_TOL_M:
+            if tgt is None:
+                if float(row["t"]) - last_t > MAX_DT_S:
+                    break  # the target is lost, not just a dropped label
+                pending.append(row)
+                continue
+            if float(tgt["y"]) < -LINE_TOL_M:
                 break
             window.append((row, float(tgt["y"])))
-        if any(str(r["split"]) != "holdout" for r, _y in window):
+            bridged.extend(pending)
+            pending = []
+            last_t = float(row["t"])
+        if any(str(r["split"]) != "holdout" for r in [*(r for r, _y in window), *bridged]):
             continue
         held_at = None
         run_start = None
         for k, (row, y) in enumerate(window):
-            if float(row["v"]) < STOP_V_MPS:
+            if float(row[speed_key]) < STOP_V_MPS:
                 if run_start is None:
                     run_start = k
                 nxt_t = float(window[k + 1][0]["t"]) if k + 1 < len(window) else None
-                still = nxt_t is not None and float(window[k + 1][0]["v"]) < STOP_V_MPS
+                still = nxt_t is not None and float(window[k + 1][0][speed_key]) < STOP_V_MPS
                 if not still:
                     t0 = float(window[run_start][0]["t"])
                     t1 = nxt_t if nxt_t is not None else float(row["t"])
@@ -169,11 +232,16 @@ def _events_for_source(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return events
 
 
-def score(rows: Iterable[Mapping[str, Any]], *, brake_key: str = "ctl_brake") -> dict[str, Any]:
-    """Events, misses, false brakes, stop distance and slices over the holdout rows."""
+def score(rows: Iterable[Mapping[str, Any]], *, brake_key: str = "ctl_brake", speed_key: str = "v") -> dict[str, Any]:
+    """Events, misses, false brakes, stop distance and slices over the holdout rows.
+
+    ``speed_key`` names the speed profile judged for the held stop (see the
+    module docstring, "Speed contract"); ``v`` still sets which approaches
+    exist and the holdout ``km``.
+    """
     by_source: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
-        _check(row)
+        _check(row, speed_key)
         by_source.setdefault(str(row.get("source") or ""), []).append(row)
     detail: list[dict[str, Any]] = []
     false_brakes = 0
@@ -181,7 +249,7 @@ def score(rows: Iterable[Mapping[str, Any]], *, brake_key: str = "ctl_brake") ->
     metres = 0.0
     for src_rows in by_source.values():
         src_rows = sorted(src_rows, key=lambda r: float(r["t"]))
-        detail.extend(_events_for_source(src_rows))
+        detail.extend(_events_for_source(src_rows, speed_key))
         prev_on = False
         prev_t = None
         for row in src_rows:
@@ -222,8 +290,8 @@ def score(rows: Iterable[Mapping[str, Any]], *, brake_key: str = "ctl_brake") ->
         "false_brakes": false_brakes,
         "green_false_brakes": green_false,
         "km": km,
-        "false_brakes_per_km": (false_brakes / km) if km > 0 else float("nan"),
-        "green_false_brakes_per_km": (green_false / km) if km > 0 else float("nan"),
+        "false_brakes_per_km": (false_brakes / km) if km > 0 else None,
+        "green_false_brakes_per_km": (green_false / km) if km > 0 else None,
         "stop_distance_m": {
             "n": len(dists),
             "median": _quantile(dists, 0.5),

@@ -205,8 +205,8 @@ def _meets_limit(direction: str, value: float | None, limit: float | None) -> bo
 def iteration_bar(new: Mapping[str, Any], prev: Mapping[str, Any]) -> dict[str, Any]:
     """Per-iteration merge bar of ``new`` against the previous shipped/best ``prev``.
 
-    Every ``labelable_today`` slice in ``SLICE_RULES`` must be on both cards; a stop-score
-    slice (``stop_side_angle``, ``red_light``) must include an ``int`` ``missed`` (not defaulted to 0; not a bool, float or string).
+    Every ``labelable_today`` slice in ``SLICE_RULES`` must be on both cards; the headline ``stop['missed']`` and each stop-score slice
+    (``stop_side_angle``, ``red_light``) must include an ``int`` ``missed`` (not defaulted to 0; not a bool, float or string).
     """
     _require_card(new, "new")
     _require_card(prev, "baseline")
@@ -215,7 +215,9 @@ def iteration_bar(new: Mapping[str, Any], prev: Mapping[str, Any]) -> dict[str, 
     if gain is None or gain < ITER_RMS_GAIN - _TOL:
         fail.append("lane_rms")
     stop = new["stop"]
-    if int(stop["missed"]) != 0:
+    if type(stop.get("missed")) is not int:  # not bool, not 0.5, not "0" (same rule as the per-slice field)
+        fail.append("missed not reported")
+    elif stop["missed"] != 0:
         fail.append("missed_stop")
     for name in ("stop_side_angle", "red_light"):
         rec = (stop.get("slices") or {}).get(name)

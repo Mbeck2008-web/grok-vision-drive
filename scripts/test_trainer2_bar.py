@@ -536,6 +536,35 @@ def check_iteration_bar_requires_labelable_slices_and_missed() -> None:
     card["stop"]["slices"]["red_light"] = {"events": 6, "missed": 1}
     res = iteration_bar(card, _card(0.20))
     assert not res["pass"] and "red_light" in res["fail"] and "red_light: missed not reported" not in res["fail"], res
+    # Q5: a negative int is a counted miss, not "not reported" (`!= 0`, not `> 0`).
+    card = _card(0.15)
+    card["stop"]["slices"]["red_light"] = {"events": 6, "missed": -1}
+    res = iteration_bar(card, _card(0.20))
+    assert not res["pass"] and "red_light" in res["fail"] and "red_light: missed not reported" not in res["fail"], res
+    # Headline stop["missed"] uses the same strict int rule (0.5, "0", False used to pass via int(...)).
+    prev = _card(0.20)
+    for bad in (0.5, "0", False, True, 0.0, "1", None):
+        card = _card(0.15)
+        card["stop"]["missed"] = bad
+        try:
+            res = iteration_bar(card, prev)
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(f"headline missed {bad!r} raised {type(exc).__name__}: {exc}") from exc
+        assert not res["pass"] and "missed not reported" in res["fail"], (bad, res)
+        assert "missed_stop" not in res["fail"], (bad, res)
+    card = _card(0.15)
+    del card["stop"]["missed"]
+    res = iteration_bar(card, prev)
+    assert not res["pass"] and "missed not reported" in res["fail"], res
+    card = _card(0.15)
+    card["stop"]["missed"] = 0
+    assert iteration_bar(card, prev)["pass"]
+    card["stop"]["missed"] = 1
+    res = iteration_bar(card, prev)
+    assert not res["pass"] and "missed_stop" in res["fail"] and "missed not reported" not in res["fail"], res
+    card["stop"]["missed"] = -1
+    res = iteration_bar(card, prev)
+    assert not res["pass"] and "missed_stop" in res["fail"] and "missed not reported" not in res["fail"], res
     # P6b: missing from new but present in baseline is listed once, not twice (required-loop + prev-loop).
     res = iteration_bar(_card(0.15, slices=_slices(**{"yield": None})), _card(0.20))
     assert not res["pass"] and res["fail"].count("slice:yield") == 1, res

@@ -188,11 +188,45 @@ def check_aux_eval_only_on_recipe_runs() -> None:
     print("AuxEval keys are recorded on recipe runs only; a non-recipe aux-head run keeps main's holdout record OK")
 
 
+def _head_sha() -> str:
+    out = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip().lower()
+
+
+def check_manifest_records_real_git_sha() -> None:
+    """The pre-registered run manifest holds this checkout's real ``git rev-parse HEAD``, not a constant."""
+    if not _ready("check_manifest_records_real_git_sha", git=True):
+        return
+    from python.train import trainer2_recipe as rec
+    from python.train.trainer2_split import require_preregistered
+
+    head = _head_sha()
+    assert len(head) == 40 and set(head) <= set("0123456789abcdef") and head != "0" * 40, head
+    assert rec._repo_git_sha() == head, (rec._repo_git_sha(), head)
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        strips = base_tests._fixture(base)
+        ck = base / "ck"
+        # the CLI path: no git_sha given, so ensure_recipe_manifest reads the repo's commit
+        assert rec.ensure_recipe_manifest(ck, strip_roots=(strips,), holdout_root=strips, holdout_blocks=1, seed=0,
+                                          ssl_pretrain=False) is True
+        run = require_preregistered(ck)
+        assert run["git_sha"] == head, (run["git_sha"], head)
+        # an explicit sha is recorded as given (the override is for tests / replays, never the default)
+        ck2 = base / "other_arm" / "ck2"  # its own registry folder: a second seed in `ck`'s folder would be a re-roll
+        rec.ensure_recipe_manifest(ck2, strip_roots=(strips,), holdout_root=strips, holdout_blocks=1, seed=1,
+                                   ssl_pretrain=False, git_sha="a" * 40)
+        assert require_preregistered(ck2)["git_sha"] == "a" * 40
+    print("run manifest records the checkout's real git sha (CLI path), and only an explicit override replaces it OK")
+
+
 CHECKS = (
     check_aux_eval_gt_only_class,
     check_aux_eval_inf_gt_depth,
     check_stages_change_weights_at_real_lr,
     check_aux_eval_only_on_recipe_runs,
+    check_manifest_records_real_git_sha,
 )
 
 

@@ -14,6 +14,7 @@ Checks:
 - check_metric_boundaries              (inclusive thresholds, one step either side)
 - check_rubric_is_gt_named_only        (nothing outside GT-named files imports it)
 - check_spec_constants_match_doc       (module thresholds parse equal to the spec table)
+- check_ssim_reference                 (closed-form Wang SSIM; no library on this box)
 """
 from __future__ import annotations
 
@@ -653,6 +654,74 @@ def check_spec_constants_match_doc() -> None:
     print("PASS check_spec_constants_match_doc")
 
 
+def check_ssim_reference() -> None:
+    """Closed-form Wang SSIM checks. No reference library was present on this box.
+
+    Searched 2026-11-25: scikit-image, pytorch-msssim, piq, torchmetrics, and
+    kornia were all missing from /workspace/venv-pr87b-ci-torch (the suite
+    interpreter), /workspace/swarm/swarm-3/venv-bev, and the system Python.
+    OpenCV 5.0.0 is installed but has no SSIM entry point (no cv2.quality).
+    There is therefore no library cross-check; values below are analytic.
+
+    Formula (Wang et al.): uniform 7×7 window, valid region, no Gaussian,
+    K1=0.01, K2=0.03, L=255, population moments (E[x^2]−μ^2), per-channel
+    then averaged. C1=(K1 L)^2 = 6.5025, C2=(K2 L)^2 = 58.5225 (float64
+    of those expressions: 6.502500000000001 and 58.522499999999994).
+    """
+    # no library to import — if one appears later this still must not depend on it
+    import importlib
+    for name in ("skimage", "pytorch_msssim", "piq", "torchmetrics", "kornia"):
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            continue
+        # A library showed up; we still do not call it (not a dep). Record that.
+        break
+
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    assert rub.SSIM_WINDOW == 7
+
+    def rgb(fill) -> np.ndarray:
+        return np.full((16, 16, 3), fill, dtype=np.uint8)
+
+    # identical images -> 1.0 (already implied by the formula when x=y)
+    assert rub.ssim(rgb(80), rgb(80)) == 1.0
+
+    # constant vs constant reduces to (2ab + C1) / (a^2 + b^2 + C1); variances are 0
+    # provenance: analytic reduction of Wang SSIM, any window size, any image size >= 7
+    a, b = 100, 150
+    expect = (2 * a * b + c1) / (a * a + b * b + c1)  # 0.923092310530793
+    assert abs(expect - 0.923092310530793) < 1e-15
+    assert abs(rub.ssim(rgb(a), rgb(b)) - 0.923092310530793) < 1e-12
+
+    # near the 0.45 gate: constants 255 vs 61
+    # (2*255*61 + C1) / (255^2 + 61^2 + C1) = 0.45258719855324536
+    expect = (2 * 255 * 61 + c1) / (255 * 255 + 61 * 61 + c1)
+    assert abs(expect - 0.45258719855324536) < 1e-15
+    assert abs(rub.ssim(rgb(255), rgb(61)) - 0.45258719855324536) < 1e-12
+    assert 0.45 < 0.45258719855324536 < 0.46
+
+    # hand-computed 7×7 window stats (single window = the whole image).
+    # X is 0,1,...,48 in row-major order; Y is 24 everywhere.
+    # sum(X)=1176, μx=1176/49=24; μy=24.
+    # sum(X^2)=38024, E[X^2]=38024/49=776, σx^2=776-24^2=200.
+    # σy^2=0, σxy=0 (Y constant, μx=μy).
+    # SSIM = C2 / (σx^2 + C2) = 58.5225 / 258.5225 = 0.2263729462619308
+    x = np.arange(49, dtype=np.uint8).reshape(7, 7)
+    y = np.full((7, 7), 24, dtype=np.uint8)
+    xr = np.stack([x, x, x], axis=-1)
+    yr = np.stack([y, y, y], axis=-1)
+    expect = c2 / (200.0 + c2)
+    assert abs(expect - 0.2263729462619308) < 1e-15
+    assert abs(rub.ssim(xr, yr) - 0.2263729462619308) < 1e-12
+    print("PASS check_ssim_reference", {
+        "const_100_vs_150": 0.923092310530793,
+        "const_255_vs_61_near_0.45": 0.45258719855324536,
+        "ramp0_48_vs_24": 0.2263729462619308,
+    })
+
+
 def main() -> None:
     check_useful_view_metrics()
     check_useful_view_checklist()
@@ -660,6 +729,7 @@ def main() -> None:
     check_metric_boundaries()
     check_rubric_is_gt_named_only()
     check_spec_constants_match_doc()
+    check_ssim_reference()
     print("test_rv_rubric_gt: ok")
 
 

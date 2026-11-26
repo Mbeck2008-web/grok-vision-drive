@@ -210,7 +210,7 @@ def _expect_value_error(fn, needle: str | None = None) -> None:
         fn()
     except ValueError as exc:
         if needle is not None:
-            assert needle in str(exc), f"ValueError message {exc!s} lacks {needle!r}"
+            assert str(exc) == needle, f"ValueError message {exc!s} != {needle!r}"
         return
     raise AssertionError("expected ValueError")
 
@@ -263,47 +263,95 @@ def check_contract_errors_leave_state() -> None:
     good = dict(t_s=2.0, ego_xyz=ego)
     p, c = _pts((1, 1, 1)), _rgb(1)
     bad_calls = [
-        (lambda: m.merge(np.zeros((2, 2)), _rgb(2)[:, :2], **good), "points_xyz"),
-        (lambda: m.merge(np.zeros(3), np.zeros(3, np.uint8), **good), "points_xyz"),
-        (lambda: m.merge(np.zeros((1, 3), dtype=bool), c, **good), "points_xyz"),
-        (lambda: m.merge(np.zeros((1, 3), dtype=complex), c, **good), "points_xyz"),
-        (lambda: m.merge(p, c.astype(np.float32), **good), "rgb"),
-        (lambda: m.merge(p, _rgb(2), **good), "rgb"),
-        (lambda: m.merge(p, c, t_s=float("nan"), ego_xyz=ego), "t_s"),
-        (lambda: m.merge(p, c, t_s=float("inf"), ego_xyz=ego), "t_s"),
-        (lambda: m.merge(p, c, t_s=True, ego_xyz=ego), "t_s"),
-        (lambda: m.merge(p, c, t_s="x", ego_xyz=ego), "t_s"),
-        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(0.0, 0.0)), "ego_xyz"),
-        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(0.0, float("nan"), 0.0)), "ego_xyz"),
-        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(1e12, 0.0, 0.0)), "ego_xyz"),
-        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(0.0, -1e12, 0.0)), "ego_xyz"),
-        (lambda: m.merge(p, c, opacity=np.array([1.5]), **good), "opacity"),
-        (lambda: m.merge(p, c, opacity=np.array([0.5, 0.5]), **good), "opacity"),
-        (lambda: m.merge(p, c, opacity=np.array(["a"]), **good), "opacity"),
-        (lambda: m.merge(p, c, dynamic_boxes=[object()], **good), "DynamicBox"),
-        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 0.0, 1, 1)], **good), "dimensions"),
-        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, -1, 1)], **good), "dimensions"),
-        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, 0.0)], **good), "dimensions"),
-        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(float("nan"), 0, 0, 1, 1, 1)], **good), "cx"),
-        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, 1, float("inf"))], **good), "yaw_rad"),
-        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, 1)] * (rm.MAX_DYNAMIC_BOXES + 1), **good), "too many"),
+        (lambda: m.merge(np.zeros((2, 2)), _rgb(2)[:, :2], **good), "points_xyz must be an (N, 3) real array"),
+        (lambda: m.merge(np.zeros(3), np.zeros(3, np.uint8), **good), "points_xyz must be an (N, 3) real array"),
+        (lambda: m.merge(np.zeros((1, 3), dtype=bool), c, **good), "points_xyz must be an (N, 3) real array"),
+        (lambda: m.merge(np.zeros((1, 3), dtype=complex), c, **good), "points_xyz must be an (N, 3) real array"),
+        (lambda: m.merge(p, c.astype(np.float32), **good), "rgb must be a uint8 array shaped like points_xyz"),
+        (lambda: m.merge(p, _rgb(2), **good), "rgb must be a uint8 array shaped like points_xyz"),
+        (lambda: m.merge(p, c, t_s=float("nan"), ego_xyz=ego), "t_s must be finite"),
+        (lambda: m.merge(p, c, t_s=float("inf"), ego_xyz=ego), "t_s must be finite"),
+        (lambda: m.merge(p, c, t_s=True, ego_xyz=ego), "t_s must be a real number"),
+        (lambda: m.merge(p, c, t_s="x", ego_xyz=ego), "t_s must be a real number"),
+        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(0.0, 0.0)), "ego_xyz must be 3 finite floats"),
+        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(0.0, float("nan"), 0.0)), "ego_xyz must be 3 finite floats"),
+        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(1e12, 0.0, 0.0)), "ego_xyz outside the supported world range"),
+        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(0.0, -1e12, 0.0)), "ego_xyz outside the supported world range"),
+        (lambda: m.merge(p, c, opacity=np.array([1.5]), **good), "opacity must not exceed 1"),
+        (lambda: m.merge(p, c, opacity=np.array([0.5, 0.5]), **good), "opacity must be an (N,) real array"),
+        (lambda: m.merge(p, c, opacity=np.array(["a"]), **good), "opacity must be an (N,) real array"),
+        (lambda: m.merge(p, c, dynamic_boxes=[object()], **good), "dynamic_boxes must be DynamicBox instances"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 0.0, 1, 1)], **good), "dynamic box dimensions must be > 0"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, -1, 1)], **good), "dynamic box dimensions must be > 0"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, 0.0)], **good), "dynamic box dimensions must be > 0"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(float("nan"), 0, 0, 1, 1, 1)], **good), "cx must be finite"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, 1, float("inf"))], **good), "yaw_rad must be finite"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, 1)] * (rm.MAX_DYNAMIC_BOXES + 1), **good), "too many dynamic boxes"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 0.0, 1)], **good), "dynamic box dimensions must be > 0"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, -1, 1, 1)], **good), "dynamic box dimensions must be > 0"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, -1)], **good), "dynamic box dimensions must be > 0"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox("a", 0, 0, 1, 1, 1)], **good), "cx must be a real number"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, True)], **good), "height must be a real number"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, 1, float("inf"))], **good), "height must be finite"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, float("nan"), 1, 1, 1)], **good), "cz must be finite"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, float("nan"), 0, 1, 1, 1)], **good), "cy must be finite"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, float("nan"), 1, 1)], **good), "length must be finite"),
+        (lambda: m.merge(p, c, dynamic_boxes=[DynamicBox(0, 0, 0, 1, float("nan"), 1)], **good), "width must be finite"),
+        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(10**30, 0, 0)), "ego_xyz outside the supported world range"),
+        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=np.array([0.0, 0.0, 0.0, 0.0])), "ego_xyz must be 3 finite floats"),
+        (lambda: m.merge(p, c, t_s=2.0, ego_xyz=(0.0, 0.0, float("inf"))), "ego_xyz must be 3 finite floats"),
     ]
     for fn, needle in bad_calls:
         _expect_value_error(fn, needle)
         assert _snap_bytes(m.snapshot()) == before and m.t_s == 1.0, "contract error mutated state"
     # exactly MAX_DYNAMIC_BOXES boxes is accepted
     m.merge(p, c, dynamic_boxes=[DynamicBox(50, 50, 50, 1, 1, 1)] * rm.MAX_DYNAMIC_BOXES, **good)
-    # constructor validation
-    for kw in (dict(voxel_m=0.04), dict(voxel_m=8.1), dict(voxel_m=float("nan")), dict(radius_m=64.1), dict(radius_m=0.2),
-               dict(n_max=0), dict(n_max=300_001), dict(n_max=True), dict(n_max=1.5), dict(max_age_s=0.0),
-               dict(max_age_s=float("inf")), dict(alpha=0.0), dict(alpha=1.1), dict(beta=0.0), dict(beta=1.1),
-               dict(dyn_margin_m=-0.1), dict(backward_tol_s=-1.0), dict(alpha=True)):
-        _expect_value_error(lambda kw=kw: RollingMap(**kw))
+    # constructor validation (exact messages)
+    nan_ = float("nan")
+    for kw, msg in (
+        (dict(voxel_m=0.04), "voxel_m must be in [0.05, 8]"), (dict(voxel_m=8.1), "voxel_m must be in [0.05, 8]"),
+        (dict(voxel_m=nan_), "voxel_m must be finite"), (dict(voxel_m="x"), "voxel_m must be a real number"),
+        (dict(radius_m=64.1), "radius_m must be in [voxel_m, 64]"), (dict(radius_m=0.2), "radius_m must be in [voxel_m, 64]"),
+        (dict(radius_m=nan_), "radius_m must be finite"), (dict(radius_m=None), "radius_m must be a real number"),
+        (dict(n_max=0), "n_max must be in [1, 300000]"), (dict(n_max=300_001), "n_max must be in [1, 300000]"),
+        (dict(n_max=True), "n_max must be an int"), (dict(n_max=1.5), "n_max must be an int"),
+        (dict(n_max=np.bool_(True)), "n_max must be an int"),
+        (dict(max_age_s=0.0), "max_age_s must be > 0"), (dict(max_age_s=-1.0), "max_age_s must be > 0"),
+        (dict(max_age_s=float("inf")), "max_age_s must be finite"), (dict(max_age_s=nan_), "max_age_s must be finite"),
+        (dict(alpha=0.0), "alpha and beta must be in (0, 1]"), (dict(alpha=1.1), "alpha and beta must be in (0, 1]"),
+        (dict(beta=0.0), "alpha and beta must be in (0, 1]"), (dict(beta=1.1), "alpha and beta must be in (0, 1]"),
+        (dict(alpha=nan_), "alpha must be finite"), (dict(beta=nan_), "beta must be finite"),
+        (dict(alpha=True), "alpha must be a real number"), (dict(beta=False), "beta must be a real number"),
+        (dict(dyn_margin_m=-0.1), "dyn_margin_m and backward_tol_s must be >= 0"),
+        (dict(backward_tol_s=-1.0), "dyn_margin_m and backward_tol_s must be >= 0"),
+        (dict(dyn_margin_m=nan_), "dyn_margin_m must be finite"), (dict(backward_tol_s=nan_), "backward_tol_s must be finite"),
+    ):
+        _expect_value_error(lambda kw=kw: RollingMap(**kw), msg)
     RollingMap(voxel_m=0.05, radius_m=0.05, n_max=1, alpha=1.0, beta=1.0, dyn_margin_m=0.0, backward_tol_s=0.0)
     RollingMap(voxel_m=8.0, radius_m=64.0, n_max=300_000)
-    # too many points in one merge
-    _expect_value_error(lambda: m.merge(np.zeros((rm.MAX_MERGE_POINTS + 1, 3), dtype=np.float32),
-                                         np.zeros((rm.MAX_MERGE_POINTS + 1, 3), dtype=np.uint8), t_s=3.0, ego_xyz=ego), "too many")
+    RollingMap(n_max=np.int64(5))
+    # too many points in one merge: exactly the limit is fine, one more is not (limit patched down to keep this fast)
+    old_limit = rm.MAX_MERGE_POINTS
+    rm.MAX_MERGE_POINTS = 10
+    try:
+        m.merge(np.zeros((10, 3)) + 50.0, _rgb(10), t_s=3.0, ego_xyz=ego)  # all outside the window: accepted, dropped
+        _expect_value_error(lambda: m.merge(np.zeros((11, 3)), _rgb(11), t_s=3.0, ego_xyz=ego), "too many points in one merge")
+    finally:
+        rm.MAX_MERGE_POINTS = old_limit
+    assert old_limit == 4_000_000
+    # world-range limit is exact: (2**20 - 2) * voxel - radius; ego just inside works, just outside is refused
+    mw = RollingMap(voxel_m=0.25, radius_m=64.0)
+    lim = (2 ** 20 - 2) * 0.25 - 64.0
+    assert mw._world_limit_m == lim == 262079.5
+    mw.merge(_pts((lim + 63.9, 0.0, 0.0)), _rgb(1), t_s=0.0, ego_xyz=(lim, 0.0, 0.0))
+    assert len(mw) == 1
+    _expect_value_error(lambda: mw.merge(_pts((0, 0, 0)), _rgb(1), t_s=1.0, ego_xyz=(lim + 0.01, 0.0, 0.0)), "ego_xyz outside the supported world range")
+    mw.merge(_pts((-lim - 63.9, 0.0, 0.0)), _rgb(1), t_s=2.0, ego_xyz=(-lim, 0.0, 0.0))
+    assert len(mw) == 1
+    _expect_value_error(lambda: mw.merge(_pts((0, 0, 0)), _rgb(1), t_s=3.0, ego_xyz=(0.0, -lim - 0.01, 0.0)), "ego_xyz outside the supported world range")
+    _expect_value_error(lambda: mw.merge(_pts((0, 0, 0)), _rgb(1), t_s=3.0, ego_xyz=(0.0, 0.0, lim + 0.01)), "ego_xyz outside the supported world range")
+    mx = RollingMap(voxel_m=8.0, radius_m=64.0)
+    assert mx._world_limit_m == (2 ** 20 - 2) * 8.0 - 64.0
     print("check_contract_errors_leave_state: OK")
 
 
@@ -322,6 +370,9 @@ def check_empty_and_garbage_points() -> None:
     op = np.array([1.0, 1.0, 1.0, nan, inf, 0.0, -0.5])
     s1 = m.merge(garbage, _rgb(7), t_s=1.0, ego_xyz=ego, opacity=op)
     assert (s1.n_in, s1.n_nonfinite, s1.n_new, s1.count) == (7, 7, 0, 1), s1
+    mix = m.merge(_pts((nan, 0, 0), (2.5, 2.5, 2.5), (0, inf, 0), (3.5, 3.5, 3.5)), _rgb(4), t_s=1.0, ego_xyz=ego)
+    assert (mix.n_in, mix.n_nonfinite, mix.n_out_of_window, mix.n_dynamic, mix.n_new, mix.n_updated) == (4, 2, 0, 0, 2, 0), mix
+    m.merge(np.empty((0, 3)), np.empty((0, 3), np.uint8), t_s=1.0, ego_xyz=(0.0, 0.0, 0.0))
     # out of window: exactly on the boundary is kept, just outside is dropped (per axis, inclusive)
     s2 = m.merge(_pts((10.0, 0.0, 0.0), (10.0001, 0.0, 0.0), (0.0, -10.0, 0.0), (0.0, -10.0001, 0.0), (0.0, 0.0, 10.0001)),
                  _rgb(5), t_s=1.0, ego_xyz=ego)
@@ -381,6 +432,10 @@ def check_ema_and_opacity_numbers() -> None:
     assert tuple(int(x) for x in m3.snapshot().rgb[0]) == (10, 11, 255)  # 10.5 -> 10 (round half even)
     m3.merge(_pts((1.5, 1.5, 1.5)), np.array([[14, 11, 255]], dtype=np.uint8), t_s=2.0, ego_xyz=ego)
     assert tuple(int(x) for x in m3.snapshot().rgb[0]) == (12, 11, 255)  # 12.25 -> 12
+    m5 = RollingMap(voxel_m=1.0, radius_m=10.0)
+    m5.merge(_pts((1.5, 1.5, 1.5)), _rgb(1, 0), t_s=0.0, ego_xyz=ego)
+    m5.merge(_pts((1.5, 1.5, 1.5)), _rgb(1, 0), t_s=1.0, ego_xyz=ego)
+    assert tuple(int(x) for x in m5.snapshot().rgb[0]) == (0, 0, 0)  # black stays black
     # voxel assignment is floor (negative coordinates, exact boundaries)
     m4 = RollingMap(voxel_m=1.0, radius_m=10.0)
     m4.merge(_pts((-0.0001, 0.0, 0.0), (0.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.9999, 0.0, 0.0), (1.0, 0.0, 0.0)), _rgb(5), t_s=0.0, ego_xyz=ego)
@@ -498,8 +553,9 @@ def check_dynamic_boxes() -> None:
     m = RollingMap(voxel_m=8.0, radius_m=60.0, dyn_margin_m=0.0, alpha=0.5)
     thin = DynamicBox(4.0, 4.0, 4.0, 0.2, 0.2, 0.2)
     m.merge(_pts((1.0, 4.0, 4.0)), _rgb(1), t_s=0.0, ego_xyz=ego)
-    m.merge(_pts((7.0, 4.0, 4.0)), _rgb(1), t_s=0.1, ego_xyz=ego, dynamic_boxes=[thin])
+    s_thin = m.merge(_pts((7.0, 4.0, 4.0)), _rgb(1), t_s=0.1, ego_xyz=ego, dynamic_boxes=[thin])
     assert len(m) == 0, "EMA centre landed inside a dynamic box and was kept"
+    assert s_thin == MergeStats("ok", 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0), s_thin
     # a rejected-clock frame still must not skip a box (state unchanged, box ignored by contract)
     print("check_dynamic_boxes: OK")
 
@@ -517,7 +573,7 @@ def check_clock_semantics() -> None:
     before = _snap_bytes(m.snapshot())
     s = m.merge(_pts((3.5, 3.5, 3.5)), _rgb(1), t_s=4.7499, ego_xyz=(50.0, 0.0, 0.0), dynamic_boxes=[DynamicBox(1.5, 1.5, 1.5, 1, 1, 1)])
     assert s.status == "rejected_clock_backwards" and _snap_bytes(m.snapshot()) == before and m.t_s == 5.0
-    assert (s.n_in, s.n_new, s.count) == (1, 0, 2)
+    assert s == MergeStats("rejected_clock_backwards", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2), s
     # a restart from t=0 needs reset(): after reset the clock is open again
     m.reset()
     assert len(m) == 0 and m.t_s == -math.inf

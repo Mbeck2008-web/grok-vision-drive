@@ -7,10 +7,10 @@ no sim GT, no safety-path imports. The caller owns time (``t_s``) and ego pose.
 Design: one record per occupied ``voxel_m`` cell, kept sorted by packed cell key
 (deterministic). A frame's points are binned to cells; each hit cell moves its
 centre and colour toward the frame mean by an EMA (``alpha``) and its opacity
-``w`` toward 1 (``w += beta * o * (1 - w)``, so w is in (0, 1] and never falls
-on re-observation). A new cell starts at ``W_NEW * o`` (< 0.1): a splat is only
-"visible" (opacity >= 0.1) after a second hit, so a one-frame ghost is
-invisible. Points inside a dynamic box (inflated by ``dyn_margin_m``) never
+``w`` toward 1 (``w += beta * o * (1 - w)``; w stays in (0, 1] and never falls on
+re-observation: o <= 1 and fl(w + fl(1 - w)) <= 1 in IEEE doubles, no clamp
+needed). A new cell starts at ``W_NEW * o`` (< 0.1): a splat is only "visible"
+(opacity >= 0.1) after a second hit, so a one-frame ghost is invisible. Points inside a dynamic box (inflated by ``dyn_margin_m``) never
 enter the map, and cells already inside such a box are purged. Cells are evicted
 when older than ``max_age_s`` or outside the +/- ``radius_m`` window around the
 ego; when over ``n_max`` the oldest go first, ties farthest-first, then by key.
@@ -142,10 +142,10 @@ class RollingMap:
     # -- state -------------------------------------------------------------
     def reset(self) -> None:
         self._keys = np.empty((0,), dtype=np.int64)
-        self._pos = np.empty((0, 3), dtype=np.float64)
-        self._col = np.empty((0, 3), dtype=np.float64)
-        self._w = np.empty((0,), dtype=np.float64)
-        self._last_t = np.empty((0,), dtype=np.float64)
+        self._pos = np.empty((0, 3))
+        self._col = np.empty((0, 3))
+        self._w = np.empty((0,))
+        self._last_t = np.empty((0,))
         self._hits = np.empty((0,), dtype=np.int64)
         self._t = -math.inf
 
@@ -160,7 +160,7 @@ class RollingMap:
     def snapshot(self) -> MapSnapshot:
         return MapSnapshot(
             xyz=self._pos.copy(),
-            rgb=np.clip(np.rint(self._col), 0, 255).astype(np.uint8),
+            rgb=np.rint(self._col).astype(np.uint8),  # centres are convex mixes of uint8 inputs: already in [0, 255]
             opacity=self._w.astype(np.float32),
             last_t_s=self._last_t.copy(),
             hits=self._hits.copy(),
@@ -268,33 +268,31 @@ class RollingMap:
         use = in_win & ~dyn
         p_new, c_new, o_new = pts[use], col[use].astype(np.float64), op[use]
 
-        n_new = n_upd = 0
-        if p_new.shape[0] > 0:
-            k_new = self._cell_keys(p_new)
-            ukeys, inv, cnt = np.unique(k_new, return_inverse=True, return_counts=True)
-            inv = inv.reshape(-1)
-            cntf = cnt.astype(np.float64)
-            mp = np.stack([np.bincount(inv, weights=p_new[:, i], minlength=ukeys.shape[0]) for i in range(3)], axis=1) / cntf[:, None]
-            mc = np.stack([np.bincount(inv, weights=c_new[:, i], minlength=ukeys.shape[0]) for i in range(3)], axis=1) / cntf[:, None]
-            mo = np.bincount(inv, weights=o_new, minlength=ukeys.shape[0]) / cntf
-            idx = np.searchsorted(keys, ukeys)
-            idx_c = np.minimum(idx, max(keys.shape[0] - 1, 0))
-            exists = (idx < keys.shape[0]) & (keys[idx_c] == ukeys) if keys.shape[0] else np.zeros(ukeys.shape, dtype=bool)
-            ei = idx[exists]
-            pos[ei] = pos[ei] + self.alpha * (mp[exists] - pos[ei])
-            colr[ei] = colr[ei] + self.alpha * (mc[exists] - colr[ei])
-            w[ei] = np.minimum(1.0, w[ei] + self.beta * mo[exists] * (1.0 - w[ei]))
-            last_t[ei] = t_eff
-            hits[ei] += 1
-            n_upd = int(ei.shape[0])
-            fresh = ~exists
-            n_new = int(np.count_nonzero(fresh))
-            keys = np.concatenate([keys, ukeys[fresh]])
-            pos = np.concatenate([pos, mp[fresh]])
-            colr = np.concatenate([colr, mc[fresh]])
-            w = np.concatenate([w, W_NEW * mo[fresh]])
-            last_t = np.concatenate([last_t, np.full((n_new,), t_eff)])
-            hits = np.concatenate([hits, np.ones((n_new,), dtype=np.int64)])
+        # Bin the frame to cells (an empty frame yields empty arrays and falls through every line below).
+        k_new = self._cell_keys(p_new)
+        ukeys, inv, cnt = np.unique(k_new, return_inverse=True, return_counts=True)
+        cntf = cnt.astype(np.float64)
+        mp = np.stack([np.bincount(inv, weights=p_new[:, i]) for i in range(3)], axis=1) / cntf[:, None]
+        mc = np.stack([np.bincount(inv, weights=c_new[:, i]) for i in range(3)], axis=1) / cntf[:, None]
+        mo = np.bincount(inv, weights=o_new) / cntf
+        idx = np.searchsorted(keys, ukeys)
+        idx_c = np.minimum(idx, max(keys.shape[0] - 1, 0))
+        exists = (keys[idx_c] == ukeys) if keys.shape[0] else np.zeros(ukeys.shape, dtype=bool)
+        ei = idx[exists]
+        pos[ei] = pos[ei] + self.alpha * (mp[exists] - pos[ei])
+        colr[ei] = colr[ei] + self.alpha * (mc[exists] - colr[ei])
+        w[ei] = w[ei] + self.beta * mo[exists] * (1.0 - w[ei])
+        last_t[ei] = t_eff
+        hits[ei] += 1
+        n_upd = int(ei.shape[0])
+        fresh = ~exists
+        n_new = int(np.count_nonzero(fresh))
+        keys = np.concatenate([keys, ukeys[fresh]])
+        pos = np.concatenate([pos, mp[fresh]])
+        colr = np.concatenate([colr, mc[fresh]])
+        w = np.concatenate([w, W_NEW * mo[fresh]])
+        last_t = np.concatenate([last_t, np.full((n_new,), t_eff)])
+        hits = np.concatenate([hits, np.ones((n_new,), dtype=np.int64)])
 
         # An EMA step can in principle land a centre inside a box (voxel larger than the box): purge again.
         late_dyn = self._in_boxes(pos, boxes)
@@ -316,7 +314,7 @@ class RollingMap:
             keys, pos, colr, w, last_t, hits = keys[sel], pos[sel], colr[sel], w[sel], last_t[sel], hits[sel]
             n_cap = int(excess)
 
-        srt = np.argsort(keys, kind="stable")
+        srt = np.argsort(keys)  # keys are unique, so no tie order to pin
         self._keys, self._pos, self._col = keys[srt], pos[srt], colr[srt]
         self._w, self._last_t, self._hits = w[srt], last_t[srt], hits[srt]
         self._t = t_eff

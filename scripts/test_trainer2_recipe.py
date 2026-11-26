@@ -216,6 +216,27 @@ def check_curriculum_order_and_gates() -> None:
     else:
         raise AssertionError("lane_r drop just over 5% must reject")
 
+    # A zero baseline (a stage that missed nothing) that gets worse is rejected whatever its size: the 5% rule is
+    # relative to |old| and would divide by zero; improving or holding at zero is fine.
+    rec.check_non_regression({"missed_stop": 0.0, "false_brake": 0.0}, {"missed_stop": 0.0, "false_brake": 0.0})
+    rec.check_non_regression({"missed_stop": 2.0}, {"missed_stop": 1.0})
+    rec.check_non_regression({"missed_stop": 1.0}, {"missed_stop": 1.04})  # 4% worse, inside the 5%
+    for earlier, now, what in (({"missed_stop": 0.0}, {"missed_stop": 1.0}, "zero baseline"),
+                               ({"false_brake": 0.0}, {"false_brake": 0.001}, "zero baseline"),
+                               ({"lane_r": 0.0}, {"lane_r": -0.1}, "zero baseline"),  # higher is better: below zero is worse
+                               ({"missed_stop": 1.0}, {"missed_stop": 1.06}, "6")):
+        try:
+            rec.check_non_regression(earlier, now)
+        except rec.CheckpointRejected as exc:
+            assert what in str(exc), (earlier, now, exc)
+        else:
+            raise AssertionError(f"{earlier} -> {now} must be rejected")
+    rec.check_non_regression({"lane_r": 0.0}, {"lane_r": 0.3})  # higher-is-better metric rising from zero is not worse
+    assert rec._worse_frac(0.0, 2.0, metric="missed_stop") == float("inf")
+    assert rec._worse_frac(0.0, 0.0, metric="missed_stop") == 0.0
+    assert rec._worse_frac(0.0, 2.0, metric="lane_r") < 0.0 and rec._worse_frac(0.0, -2.0, metric="lane_r") == float("inf")
+    assert abs(rec._worse_frac(2.0, 3.0, metric="missed_stop") - 0.5) < 1e-12
+
     # Orchestrator: skip-logs 3-6, rejects a regressing ckpt, does not call train on skipped stages.
     trained: list[str] = []
     logs: list[str] = []
@@ -761,7 +782,7 @@ def check_stage_result_from_stats_is_real() -> None:
         assert "did not exit" in str(exc), exc
     else:
         raise AssertionError("sem mIoU still improving: stage 1 must not exit")
-    print("stage results come from real measurements (0 SSL loss, 1 AbsRel/mIoU, 2/7 lane + re-measured aux); 2b refused with its reason; chain gates 5% / 2% / re-measure OK")
+    print("stage results come from real measurements (0 SSL loss, 1 AbsRel/mIoU, 2/7 lane + re-measured aux); 2b result from the three stop metrics; chain gates 5% / 2% / re-measure OK")
 
 
 def check_deploy_real_export() -> None:

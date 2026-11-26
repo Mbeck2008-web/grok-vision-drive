@@ -333,7 +333,7 @@ def check_fit_motion_edges() -> None:
     base = stop_pred.fit_motion(good, holdout_ids=set())
     # a stretch recorded with the wrong clock (speeds stepped at 0.1 s but stamped 0.5 s or 0.015 s apart) is not a fit row
     for bad_dt in (0.5, 0.015):
-        extra = _brake_rows(60, 60, brake=0.2, v0=50.0, start=1000)
+        extra = _brake_rows(60, 60, brake=0.2, v0=15.0, start=1000)  # |accel| stays under the glitch cap even at 0.015 s
         for k, r in enumerate(extra):
             r["segment"] = "other"
             r["ego"] = {"sim_t": 500.0 + k * bad_dt, "speed_mps": r["ego"]["speed_mps"]}
@@ -427,6 +427,10 @@ def check_spans_and_profile_edges() -> None:
     stop_pred.add_predicted_speed(ev_rows, stop_pred.Motion(2.0, 4.0, 0.0))
     res = se.score(ev_rows, speed_key="pred_v")
     assert res["slices"]["stop_line"]["events"] == 1 and res["slices"]["stop_line"]["missed"] == 1, res["slices"]
+    line_pairs = [({"i": r["i"], "ego": {"sim_t": 100.0 + r["t"], "speed_mps": r["v"]}, "source": "S", "signs": list(r["stops"])},
+                   _ctl(0.0, 0.0)) for r in ev_rows]
+    got = stop_pred.measure(line_pairs, stop_pred.Motion(2.0, 4.0, 0.0))
+    assert got["stop_events"] == 1 and got["missed_stop"] == 1.0 and got["light_events"] == 0 and got["missed_light"] is None, got
 
     # the red -> green rule (a proposal, off by default) must never see the RECORDED speed: a lamp that turns green
     # while the recorded car drives on is still an event the MODEL is scored on
@@ -588,6 +592,7 @@ def check_preflight_on_recording() -> None:
             stop_pred.preflight(tr2, ho2, default_root=bare)
         except stop_pred.StopNotMeasured as exc:
             assert "stage 2b" in str(exc) and "0 stop-sign/line" in str(exc) and "0 red/yellow-light" in str(exc), exc
+            assert str(exc).count("stage 2b cannot be scored") == 1, exc
         else:
             raise AssertionError("no sign ids must refuse")
         # without the join root nothing is found either (single-root rows carry no source_root)
@@ -629,6 +634,7 @@ def check_preflight_on_recording() -> None:
             stop_pred.preflight(trn, hon, default_root=nobrake)
         except stop_pred.StopNotMeasured as exc:
             assert str(exc).startswith("stage 2b cannot be scored: the motion fit needs"), exc
+            assert str(exc).count("stage 2b cannot be scored") == 1, exc  # a message that already says it is not prefixed twice
         else:
             raise AssertionError("no braking rows in train must refuse")
     print("preflight: events + train-only fit answered from the manifest split; no sign ids / no join root / no stops refuse with the reason OK")

@@ -4684,6 +4684,16 @@ def _run_trainer2_recipe(
     train_rows, hold_rows = legacy_split_rows(
         strip_roots, holdout_root, holdout_blocks=resolve_holdout_blocks(args.holdout_blocks)
     )
+    if "2b" in live:
+        # Before SSL / stage 1 / stage 2 train for hours: can this split's holdout score stage 2b at all?
+        from python.train.stop_pred import StopNotMeasured, preflight
+
+        try:
+            pre = preflight(train_rows, hold_rows, default_root=holdout_root)
+        except StopNotMeasured as exc:
+            raise RecipeRefused(f"{exc}. Nothing was trained; drop 2b with --stage to run the other stages") from exc
+        print(f"[GVD] recipe trainer2: stage 2b preflight OK: holdout events {pre['events']}, motion fitted on "
+              f"{pre['motion'].n_rows} train row pairs", flush=True)
     wrote = ensure_recipe_manifest(
         getattr(args, "ckpt_dir", None), strip_roots=strip_roots, holdout_root=holdout_root,
         holdout_blocks=resolve_holdout_blocks(args.holdout_blocks), seed=int(args.seed), ssl_pretrain=ssl_on,

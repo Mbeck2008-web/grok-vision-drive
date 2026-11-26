@@ -296,3 +296,28 @@ def recorded_events(pairs: Iterable[tuple[Mapping[str, Any], Any]]) -> dict[str,
         r["pred_v"] = 0.0  # every approach counts as held: only the number of events is wanted here
     res = se.score(rows, speed_key="pred_v") if rows else {"slices": {}}
     return {"stop": _count(res, STOP_SLICES, "events"), "light": _count(res, LIGHT_SLICES, "events"), "rows": len(rows)}
+
+
+def preflight(train_rows: Iterable[Mapping[str, Any]], hold_rows: Iterable[Mapping[str, Any]], *,
+              default_root: Any = None) -> dict[str, Any]:
+    """Can stage 2b be scored on this split? Answered from the recorded rows alone, before any stage trains.
+
+    ``train_rows`` / ``hold_rows`` are the run's manifest split (``legacy_split_rows``). Joins the ``signs.jsonl`` ids
+    onto copies of the holdout rows (``default_root`` is the strip root of a single-root run), then needs >= 1
+    stop-sign/line and >= 1 red/yellow-light event in the holdout and a motion fit on the train rows. Raises
+    ``StopNotMeasured`` with the reason; a run whose plan has stage 2b calls this first so SSL / stage 1 / stage 2 are
+    not trained for hours before 2b finds the recording cannot be scored.
+    """
+    from python.train.intersection_labels import attach_sign_labels
+
+    held = [dict(r) for r in hold_rows]
+    held_ids = {r.get("i") for r in held}
+    attach_sign_labels(held, default_root=default_root)
+    found = recorded_events((r, np.zeros((3, 1))) for r in held)
+    if not found["stop"] or not found["light"]:
+        raise StopNotMeasured(
+            f"stage 2b cannot be scored on this holdout: {found['stop']} stop-sign/line and {found['light']} "
+            "red/yellow-light events (needs >= 1 of each: a miss count with no events would be a vacuous 0). "
+            "Record more intersections with signals.jsonl + export_signal_labels.py, or move the holdout")
+    motion = fit_motion([r for r in train_rows if r.get("i") not in held_ids], holdout_ids=held_ids)
+    return {"events": found, "motion": motion}

@@ -16,6 +16,10 @@ GT_Y6  Drift (GT, test-only) on the second unseen clip clip_008_sharp_curve_east
     bar as GT_E12: end-point drift <= 2.0 m and |yaw error| <= 2 deg per 100 m. The clip was
     copied before the fix was written and was not run until the fix was frozen. Skipped visibly
     when the clip data is missing (e.g. CI). clip_015 is dev-only and is only printed.
+GT_Y7  Integrator replay (GT, test-only): EgoOdometry fed GT yaw and GT step distance must
+    reproduce the GT path on clip_028 and clip_008 to <= 0.3 m and <= 0.3 deg per 100 m
+    (stated before any run; not a rescope of the 2.0/2.0 camera-yaw bar). Skipped when
+    the clip data is missing.
 """
 from __future__ import annotations
 
@@ -37,10 +41,15 @@ from gvd_test_env import skip_check  # noqa: E402
 from python.viz import rv_multicam as M  # noqa: E402
 
 DATA = Path(os.environ.get("GVD_RV_DATA_DIR", "/workspace/rv-preview"))
+CLIP_A = "clip_028_sharp_curve_west_coast_usa"
 CLIP_B = "clip_008_sharp_curve_east_coast_usa"
 DEV_CLIP = DATA / "v2src" / "clip015"
 DRIFT_MAX_M_PER_100M = 2.0
 YAW_MAX_DEG_PER_100M = 2.0
+# GT-replay bar: with perfect yaw and perfect step distance the integrator must
+# reconstruct the GT path this closely. Stated up front; not tuned after a run.
+REPLAY_MAX_M_PER_100M = 0.3
+REPLAY_MAX_DEG_PER_100M = 0.3
 MS_PER_FRAME_MAX = 100.0
 
 
@@ -176,6 +185,72 @@ def check_gt_y6_drift_clip008():
     print(f"  {CLIP_B}: travel {travel:.2f} m, end err {err_m:.2f} m ({m100:.2f} m/100m), "
           f"yaw err {yaw_deg:.2f} deg ({d100:.2f} deg/100m)")
     assert m100 <= DRIFT_MAX_M_PER_100M and d100 <= YAW_MAX_DEG_PER_100M, (m100, d100)
+
+
+def _gt_heading(g) -> float:
+    return math.atan2(g["dir"][1], g["dir"][0])
+
+
+def _score_end(o: M.EgoOdometry, gt, travel: float):
+    """End-point error in the ego-0 frame, same convention as test_rv_ego_motion GT_E12."""
+    h0 = _gt_heading(gt[0])
+    dx, dy = gt[-1]["pos"][0] - gt[0]["pos"][0], gt[-1]["pos"][1] - gt[0]["pos"][1]
+    gx = math.sin(h0) * dx - math.cos(h0) * dy
+    gy = math.cos(h0) * dx + math.sin(h0) * dy
+    gh = _wrap(_gt_heading(gt[-1]) - h0)
+    x, y, h = o.pose()
+    err_m = math.hypot(x - gx, y - gy)
+    yaw_err = _wrap(h - gh)
+    m100 = 100.0 * err_m / travel
+    d100 = 100.0 * math.degrees(abs(yaw_err)) / travel
+    return err_m, math.degrees(yaw_err), m100, d100
+
+
+def _load_gt_clip(name: str, subdir: str):
+    d = DATA / "drift_eval" / name
+    pose = d / "gt_eval_only" / "gt_pose_EVAL_ONLY.jsonl"
+    if not pose.exists():
+        return None
+    state = [json.loads(line) for line in (d / "state.jsonl").read_text().splitlines() if line.strip()]
+    gt = [json.loads(line) for line in pose.read_text().splitlines() if line.strip()]
+    assert len(state) == len(gt) and all(g["eval_only"] for g in gt)
+    return d, state, gt, subdir
+
+
+def check_gt_y7_integrator_replay():
+    """EgoOdometry(GT yaw, GT step distance) must reproduce the GT path.
+
+    Tolerance, stated before any run and not tuned: <= 0.3 m per 100 m and
+    <= 0.3 deg per 100 m on both clip_028 and clip_008. A miss is an
+    integrator or harness bug, not a reason to loosen the 2.0 / 2.0 camera-yaw bar.
+    """
+    clips = ((CLIP_A, "clip028"), (CLIP_B, "clip008"))
+    found = 0
+    results = []
+    for name, sub in clips:
+        pack = _load_gt_clip(name, sub)
+        if pack is None:
+            continue
+        found += 1
+        _d, state, gt, _sub = pack
+        o = M.EgoOdometry()
+        travel = 0.0
+        for i in range(1, len(gt)):
+            dist = math.dist(gt[i]["pos"][:2], gt[i - 1]["pos"][:2])
+            dyaw = _wrap(_gt_heading(gt[i]) - _gt_heading(gt[i - 1]))
+            # GT step distance as speed*dt (dt = 1, speed = dist). Unsigned path length.
+            o.step(dist, 1.0, dyaw)
+            travel += dist
+        assert travel >= 1.0, travel
+        err_m, yaw_deg, m100, d100 = _score_end(o, gt, travel)
+        print(f"  {name} GT-replay: travel {travel:.2f} m, end err {err_m:.3f} m "
+              f"({m100:.3f} m/100m), yaw err {yaw_deg:.3f} deg ({d100:.3f} deg/100m)")
+        results.append((name, m100, d100))
+    if not found:
+        skip_check("check_gt_y7_integrator_replay", f"no EVAL_ONLY GT clip under {DATA / 'drift_eval'}")
+        return
+    bad = [(n, m, d) for n, m, d in results if m > REPLAY_MAX_M_PER_100M or d > REPLAY_MAX_DEG_PER_100M]
+    assert not bad, bad
 
 
 def check_dev_clip015_info():

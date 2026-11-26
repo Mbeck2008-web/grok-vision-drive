@@ -66,11 +66,11 @@ def _rays(k: np.ndarray, t_ego_cam: np.ndarray):
     return t_ego_cam[:3, 3], d
 
 
-def raycast(k: np.ndarray, t_ego_cam: np.ndarray):
-    """Analytic GT: depth (NaN = sky), rgb, road/vehicle masks. Ground + box + wall."""
-    o, d = _rays(k, t_ego_cam)
+def _cast(o: np.ndarray, d: np.ndarray):
+    """Nearest hit along o + t d for each ray: (t, which) with which 0 ground, 1 box, 2 wall."""
     inf = np.inf
-    t_ground = np.where(d[..., 2] < -1e-9, -o[2] / np.where(d[..., 2] < -1e-9, d[..., 2], 1.0), inf)
+    down = d[..., 2] < -1e-9
+    t_ground = np.where(down, -o[2] / np.where(down, d[..., 2], 1.0), inf)
     with np.errstate(divide="ignore", invalid="ignore"):
         t1 = (VEH_MIN - o) / d
         t2 = (VEH_MAX - o) / d
@@ -80,13 +80,19 @@ def raycast(k: np.ndarray, t_ego_cam: np.ndarray):
     t_out = np.min(np.nan_to_num(tf, nan=inf), axis=-1)
     hit_box = (t_in <= t_out) & (t_out > 0) & (t_in > 0)
     t_box = np.where(hit_box, t_in, inf)
+    fwd = d[..., 0] > 1e-9
     with np.errstate(divide="ignore", invalid="ignore"):
-        t_wall = np.where(d[..., 0] > 1e-9, (WALL_X - o[0]) / d[..., 0], inf)
-    pw = o + d * t_wall[..., None]
+        t_wall = np.where(fwd, (WALL_X - o[0]) / np.where(fwd, d[..., 0], 1.0), inf)
+    pw = o + d * np.where(np.isfinite(t_wall), t_wall, 0.0)[..., None]
     t_wall = np.where((pw[..., 2] >= 0) & (pw[..., 2] <= 12.0), t_wall, inf)
     ts = np.stack([t_ground, t_box, t_wall], axis=-1)
-    which = np.argmin(ts, axis=-1)
-    t = np.min(ts, axis=-1)
+    return np.min(ts, axis=-1), np.argmin(ts, axis=-1)
+
+
+def raycast(k: np.ndarray, t_ego_cam: np.ndarray):
+    """Analytic GT: depth (NaN = sky), rgb, road/vehicle masks. Ground + box + wall."""
+    o, d = _rays(k, t_ego_cam)
+    t, which = _cast(o, d)
     hit = np.isfinite(t)
     depth = np.where(hit, t, np.nan)  # direction z_cam == 1, so t is z-depth
     p = o + d * np.where(hit, t, 0.0)[..., None]
@@ -113,7 +119,7 @@ def unproject(depth: np.ndarray, k: np.ndarray, t_ego_cam: np.ndarray):
     return pc @ t_ego_cam[:3, :3].T + t_ego_cam[:3, 3]
 
 
-FOG = np.array([128, 128, 128], dtype=np.uint8)
+FOG = np.array([170, 200, 235], dtype=np.uint8)  # background / fog fill = sky colour
 
 
 def splat_render(points_ego, colors, k, t_ego_cam, footprints_m):
@@ -150,10 +156,10 @@ def splat_render(points_ego, colors, k, t_ego_cam, footprints_m):
     return rgb, depth, covered.astype(np.float32)
 
 
-SRC_K = intrinsics(60.0)
-SRC_T = cam_pose([0.0, 0.0, 1.5], 5.0)
-CHASE_K = intrinsics(75.0)
-CHASE_T = cam_pose([-4.0, 0.0, 3.0], 12.0)
+SRC_K = intrinsics(45.0)                      # wide rig camera, ~122 deg hfov
+SRC_T = cam_pose([0.0, 0.0, 1.5], 15.0)
+CHASE_K = intrinsics(70.0)                    # chase / held-out camera behind and above the rig
+CHASE_T = cam_pose([-1.5, 0.0, 2.2], 8.0)
 
 
 def build_scene():
@@ -165,17 +171,17 @@ def build_scene():
     cols = srgb[valid]
     fp = (sd[valid] / SRC_K[0, 0]) * 1.5
     rgb, depth, opacity = splat_render(pts, cols, CHASE_K, CHASE_T, fp)
-    # unobserved = chase pixels whose world point the source camera never saw
+    # unobserved = chase pixels whose world point the source camera cannot see:
+    # outside its frustum, or occluded (exact analytic ray from the source camera).
     pw = unproject(np.where(np.isfinite(cd), cd, 1.0), CHASE_K, CHASE_T)
     inv = np.linalg.inv(SRC_T)
     ps = pw @ inv[:3, :3].T + inv[:3, 3]
     with np.errstate(divide="ignore", invalid="ignore"):
-        us = np.floor(ps[..., 0] / ps[..., 2] * SRC_K[0, 0] + SRC_K[0, 2]).astype(int)
-        vs = np.floor(ps[..., 1] / ps[..., 2] * SRC_K[1, 1] + SRC_K[1, 2]).astype(int)
+        us = ps[..., 0] / ps[..., 2] * SRC_K[0, 0] + SRC_K[0, 2]
+        vs = ps[..., 1] / ps[..., 2] * SRC_K[1, 1] + SRC_K[1, 2]
     inside = (ps[..., 2] > 0) & (us >= 0) & (us < W) & (vs >= 0) & (vs < H)
-    seen = np.zeros((H, W), dtype=bool)
-    sdv = sd[np.clip(vs, 0, H - 1), np.clip(us, 0, W - 1)]
-    seen[inside] = (np.abs(sdv[inside] - ps[..., 2][inside]) < 0.5)
+    t_first, _ = _cast(SRC_T[:3, 3], pw - SRC_T[:3, 3])  # p = o + 1 * (p - o)
+    seen = inside & (t_first >= 1.0 - 1e-6)
     unobserved = np.isfinite(cd) & ~seen
     gt = rub.GtFrame(
         depth=cd.astype(np.float32),
@@ -230,6 +236,8 @@ def check_useful_view_metrics() -> None:
     v = res.values
     assert v["abs_rel"] <= 0.20 and v["delta_125"] >= 0.70 and v["coverage"] >= 0.50, v
     assert v["psnr_db"] >= 16.0 and v["ssim"] >= 0.45, v
+    # regression pins on this deterministic fixture (my implementation's values, not spec numbers)
+    assert abs(v["ssim"] - 0.8506) < 0.005 and abs(v["psnr_db"] - 17.64) < 0.05 and abs(v["abs_rel"] - 0.0229) < 0.002, v
     # deterministic: same inputs -> identical values
     assert rub.score_metrics(view, gt).values == v
 
@@ -271,7 +279,7 @@ def check_useful_view_checklist() -> None:
     r = rub.score_checklist(rub.RenderedView(out=make_out(rgb, d), opacity=o), gt, harness, repo_root=ROOT)
     assert _items_failed(r) == ["road_surface"], _items_failed(r)
 
-    # 2. ego pose: one tick jumps 5.0 m laterally
+    # 2. ego pose: one tick jumps 5.0 m laterally (no overlap with the mesh any more)
     jump = good_harness()
     rp = jump.render_ego_poses.copy()
     rp[3, 1, 3] += 5.0
@@ -287,6 +295,24 @@ def check_useful_view_checklist() -> None:
     far = rub.GtFrame(**{**gt.__dict__, "vehicle_center_ego": gt.vehicle_center_ego + np.array([0.0, 3.5, 0.0])})
     r = rub.score_checklist(view, far, harness, repo_root=ROOT)
     assert _items_failed(r) == ["vehicle_placed_once"], (_items_failed(r), r.values)
+    # 3a'. the 3.0 m gate is inclusive and exact: put the GT centre 2.95 / 3.05 m from the rendered one
+    est = np.median(rub._unproject_px(depth.astype(np.float64), gt, gt.vehicle_mask & (opacity >= 0.1))[:, :2], axis=0)
+    for off_m, want_ok in ((2.95, True), (3.05, False)):
+        c = np.array([est[0] + off_m, est[1], gt.vehicle_center_ego[2]])
+        g3 = rub.GtFrame(**{**gt.__dict__, "vehicle_center_ego": c})
+        r = rub.score_checklist(view, g3, harness, repo_root=ROOT)
+        assert ("vehicle_placed_once" not in _items_failed(r)) is want_ok, (off_m, r.values)
+    # 3a''. robust centre: 20% of the vehicle's pixels far behind it must not drag the estimate out
+    d, vv = depth.copy(), np.argwhere(gt.vehicle_mask & (opacity >= 0.1))
+    for (yy_, xx_) in vv[: len(vv) // 5]:
+        d[yy_, xx_] += 30.0
+    r = rub.score_checklist(rub.RenderedView(out=make_out(rgb, d), opacity=opacity), gt, harness, repo_root=ROOT)
+    assert "vehicle_placed_once" not in _items_failed(r), r.values
+    # 1b. road is a surface only if its depth is right too: coverage kept, road depth 1.5x too far
+    d = depth.copy()
+    d[gt.road_mask] *= 1.5
+    r = rub.score_checklist(rub.RenderedView(out=make_out(rgb, d), opacity=opacity), gt, harness, repo_root=ROOT)
+    assert "road_surface" in _items_failed(r), r.values
     # 3b. drawn twice: a second copy of the vehicle splats 8 m to the side
     vm_src = (pts[:, 0] >= VEH_MIN[0] - 0.01) & (pts[:, 0] <= VEH_MAX[0] + 0.01) & (np.abs(pts[:, 1]) <= 0.96) & (pts[:, 2] > 0.01)
     ghost_pts = pts[vm_src] + np.array([0.0, 4.0, 0.0])
@@ -309,12 +335,33 @@ def check_useful_view_checklist() -> None:
     r = rub.score_checklist(rub.RenderedView(out=make_out(h_rgb, depth), opacity=opacity), gt, harness, repo_root=ROOT)
     assert "unobserved_not_wall" not in _items_failed(r), _items_failed(r)
 
+    # 4b. the opaque fraction gate is <= 1% of the (eroded) unobserved pixels
+    eroded = rub._erode(gt.unobserved_mask, rub.UNOBSERVED_EDGE_ERODE_PX)
+    idx = np.argwhere(eroded)
+    n_ok = int(0.01 * len(idx))
+    for n_paint, want_ok in ((n_ok, True), (n_ok + 1, False)):
+        d, o = depth.copy(), opacity.copy()
+        d[eroded], o[eroded] = 0.0, 0.0
+        for (yy_, xx_) in idx[:n_paint]:
+            d[yy_, xx_], o[yy_, xx_] = 5.0, 1.0
+        r = rub.score_checklist(rub.RenderedView(out=make_out(rgb, d), opacity=o), gt, harness, repo_root=ROOT)
+        assert ("unobserved_not_wall" not in _items_failed(r)) is want_ok, (n_paint, len(idx), r.values)
+
     # 5. GT on a non-GT-named path
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         (root / "python" / "viz").mkdir(parents=True)
         (root / "python" / "viz" / "live_renderer.py").write_text("from python.viz import rv_rubric_gt\n", encoding="utf-8")
         r = rub.score_checklist(view, gt, harness, repo_root=root)
+    assert _items_failed(r) == ["no_sim_gt_on_live_path"], _items_failed(r)
+
+    # 5b. a live input validator that accepts GT depth keys fails the item
+    orig_validate = rvc.validate_rv_input
+    rvc.validate_rv_input = lambda spec: None
+    try:
+        r = rub.score_checklist(view, gt, harness, repo_root=ROOT)
+    finally:
+        rvc.validate_rv_input = orig_validate
     assert _items_failed(r) == ["no_sim_gt_on_live_path"], _items_failed(r)
 
     # 6. stale indicator: a packer that never sets the stale flag
@@ -419,6 +466,39 @@ def check_metric_boundaries() -> None:
         assert run(np.full((H, W), 10.0, np.float32), rgb_=shifted).items["psnr_db"] is want, amp
     # SSIM of identical images is 1.0 (and in [-1, 1] always)
     assert abs(run(np.full((H, W), 10.0, np.float32)).values["ssim"] - 1.0) < 1e-12
+    # AbsRel is inclusive: exactly 0.20 passes (single scored pixel so the mean is exact)
+    one = np.zeros((H, W), np.float32)
+    one[5, 5] = 1.0
+    d_one = np.where(one > 0, 12.0, 0.0).astype(np.float32)
+    r = run(d_one, one)
+    assert r.values["abs_rel"] == 0.2 and r.items["abs_rel"], r.values
+    d_one = np.where(one > 0, 12.01, 0.0).astype(np.float32)
+    assert not run(d_one, one).items["abs_rel"]
+    # GT range edges, inclusive: AbsRel 0.5-80 m, coverage 0.5-40 m
+    for gv, absrel_scored, cov_scored in ((0.5, True, True), (0.49, False, False), (40.0, True, True),
+                                          (40.5, True, False), (80.0, True, False), (80.5, False, False)):
+        g2 = rub.GtFrame(**{**gt.__dict__, "depth": np.full((H, W), gv, np.float32)})
+        r = rub.score_metrics(rub.RenderedView(out=make_out(rgb, np.full((H, W), gv, np.float32)), opacity=ones), g2)
+        assert (r.values["abs_rel"] is not None) is absrel_scored, (gv, r.values)
+        assert (r.values["coverage"] is not None) is cov_scored, (gv, r.values)
+    # SSIM: perfect depth, same-mean images whose contrast is scaled; 0.2 -> ~0.42 fails, 0.25 -> ~0.50 passes
+    yy, xx = np.mgrid[0:H, 0:W]
+    base = 128 + 60 * np.sin(0.7 * xx) * np.cos(0.5 * yy)
+    g_rgb = np.round(np.stack([base] * 3, -1)).astype(np.uint8)
+    tex = rub.GtFrame(**{**gt.__dict__, "rgb": g_rgb})
+    flat10 = np.full((H, W), 10.0, np.float32)
+    for alpha, want, approx in ((0.2, False, 0.423), (0.25, True, 0.503)):
+        r_rgb = np.round(np.clip(128 + (g_rgb.astype(np.float64) - 128) * alpha, 0, 255)).astype(np.uint8)
+        r = rub.score_metrics(rub.RenderedView(out=make_out(r_rgb, flat10), opacity=ones), tex)
+        assert r.items["ssim"] is want and r.items["psnr_db"], (alpha, r.values)
+        assert abs(r.values["ssim"] - approx) < 0.003, (alpha, r.values["ssim"])
+    # morphology helpers must not wrap around the image border
+    m = np.zeros((6, 6), dtype=bool)
+    m[0, 0] = True
+    dil = rub._dilate(m, 1)
+    assert dil[:2, :2].all() and dil.sum() == 4, "dilation wrapped around the border"
+    full = np.ones((6, 6), dtype=bool)
+    assert rub._erode(full, 1).all(), "erosion treated the border as background"
     print("PASS check_metric_boundaries")
 
 

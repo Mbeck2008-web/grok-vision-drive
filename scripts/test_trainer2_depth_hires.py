@@ -9,6 +9,10 @@ Checks (python/train/depth_hires.py, opt-in ``--aux-depth --heads ...,depth_hire
   check_default_off_unchanged         default heads / nets carry no depth_hires; build_net round-trips the head
   check_cli_needs_aux_depth           --heads lane_gt,depth_hires without --aux-depth stops before any data read
   check_bench_within_live_budget      bench_depth_hires: 48x64 out, decoder < 50k params, est VRAM <= 4 GB (tiny, small)
+  check_hires_tie_cell_is_far_only    a cell exactly half near / half far is far-only (far >= 0.5), never metric and far
+  check_far_term_is_half_masked_bce   the far term is exactly FAR_LOSS_WEIGHT (0.5) x masked BCE on a known target
+  check_prediction_at_copies_keep_far per-row scene_loss through BOTH _prediction_at copies (train_scene, scene_net) is depth + far
+  check_train_directory_trains_hires  train_directory on a main_depth fixture: 48x64 labels, far head wired, ckpt carries the head
 Torch checks skip visibly without torch.
 """
 from __future__ import annotations
@@ -351,6 +355,208 @@ def check_bench_within_live_budget() -> None:
     print(f"bench: tiny/small decoder {row['decoder_params']} params, est VRAM {row['est_total_vram_gb']:.3f} GB <= 4 GB OK")
 
 
+def check_hires_tie_cell_is_far_only() -> None:
+    """Exactly half near / half far pixels in a cell: far (``>= 0.5``), and not also metric."""
+    from python.train.depth_hires import depth_hires_targets
+
+    cell = np.full((4, 4), 1000, np.uint16)  # 10 m
+    cell[:2] = 30000  # half the pixels far plane
+    t = depth_hires_targets(np.tile(cell, (48, 64)))
+    assert np.all(t["far"] == 1.0), "a 50/50 cell must be far"
+    assert np.all(t["depth_valid"] == 0.0), "a 50/50 cell must not also be a metric target"
+    assert np.all(t["far_valid"] == 1.0)
+    # One pixel either side of the tie.
+    more_near = cell.copy()
+    more_near[1, 0] = 1000  # 9 near, 7 far
+    n = depth_hires_targets(np.tile(more_near, (48, 64)))
+    assert np.all(n["far"] == 0.0) and np.all(n["depth_valid"] == 1.0), "9/16 near is metric"
+    more_far = cell.copy()
+    more_far[2, 0] = 30000  # 7 near, 9 far
+    f = depth_hires_targets(np.tile(more_far, (48, 64)))
+    assert np.all(f["far"] == 1.0) and np.all(f["depth_valid"] == 0.0), "9/16 far is far"
+    print("tie cell: 8 near / 8 far -> far-only, metric mask off; 9/16 near -> metric; 9/16 far -> far OK")
+
+
+def check_far_term_is_half_masked_bce() -> None:
+    torch = _torch()
+    if torch is None:
+        skip_check("check_far_term_is_half_masked_bce", "torch not installed")
+        return
+    from python.train.depth_hires import FAR_LOSS_WEIGHT, depth_hires_loss
+
+    assert FAR_LOSS_WEIGHT == 0.5
+    logits = np.array([[2.0, -1.0, 0.5, 3.0], [-2.0, 1.5, -0.25, 0.0]], np.float32)
+    goal = np.array([[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 1.0, 0.0]], np.float32)
+    mask = np.array([[1.0, 1.0, 1.0, 0.0], [1.0, 0.0, 1.0, 1.0]], np.float32)  # 6 of 8 cells
+    bce = np.maximum(logits, 0.0) - logits * goal + np.log1p(np.exp(-np.abs(logits)))
+    want = 0.5 * float((bce * mask).sum() / mask.sum())
+    ones = torch.ones(1, 2, 4)
+    target = {
+        "aux_depth": torch.ones(1, 2, 4), "aux_depth_valid": torch.zeros(1, 2, 4),
+        "aux_depth_far": torch.from_numpy(goal)[None], "aux_depth_far_valid": torch.from_numpy(mask)[None],
+    }
+    depth_term, far_term = depth_hires_loss(ones, torch.from_numpy(logits)[None], target)
+    assert float(depth_term) == 0.0, "no valid depth cells: the depth term is zero"
+    assert abs(float(far_term) - want) < 1e-6, (float(far_term), want)
+    assert abs(float(far_term) - float(0.5 * torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.from_numpy(logits)[None], torch.from_numpy(goal)[None], weight=torch.from_numpy(mask)[None], reduction="sum") / 6.0)) < 1e-6
+    # Masked cells carry no weight: changing their logits / goals changes nothing.
+    logits2, goal2 = logits.copy(), goal.copy()
+    logits2[mask == 0], goal2[mask == 0] = 9.0, 1.0 - goal2[mask == 0]
+    target2 = dict(target, aux_depth_far=torch.from_numpy(goal2)[None])
+    _d2, far2 = depth_hires_loss(ones, torch.from_numpy(logits2)[None], target2)
+    assert abs(float(far2) - want) < 1e-6, (float(far2), want)
+    # No far cells at all: a zero term, not NaN.
+    _d3, far3 = depth_hires_loss(ones, torch.from_numpy(logits)[None], dict(target, aux_depth_far_valid=torch.zeros(1, 2, 4)))
+    assert float(far3) == 0.0
+    print(f"far term: {float(far_term):.6f} == 0.5 x masked BCE ({want:.6f}); masked cells ignored; empty mask -> 0 OK")
+
+
+def _two_row_targets(torch):
+    from python.train.depth_hires import depth_hires_targets
+
+    near = _scene_depth_cm()
+    other = near.copy()
+    other[H // 2 :, :] = 2000  # a different scene for row 1: other road band ...
+    other[H // 8 : H // 4] = 1250  # ... and half the sky height, so the far targets differ too
+    rows = []
+    for cm in (near, other):
+        t = depth_hires_targets(cm)
+        rows.append({"aux_depth": torch.from_numpy(t["depth_m"]), "aux_depth_valid": torch.from_numpy(t["depth_valid"]),
+                     "aux_depth_far": torch.from_numpy(t["far"]), "aux_depth_far_valid": torch.from_numpy(t["far_valid"])})
+    return rows
+
+
+def check_prediction_at_copies_keep_far() -> None:
+    """Both per-row slicers (train_scene._prediction_at, scene_net._prediction_at) must carry aux_depth_far.
+
+    Dropping it silently falls back to a plain L1 on the 48x64 depth (shapes match), so the check is on the
+    VALUE of each row's aux_depth term: it must be the depth term plus the far term, and the far term must be > 0.
+    """
+    torch = _torch()
+    if torch is None:
+        skip_check("check_prediction_at_copies_keep_far", "torch not installed")
+        return
+    from python.train import scene_net, train_scene
+    from python.train.depth_hires import depth_hires_loss
+    from python.train.scene_net import scene_loss
+
+    net = _net(torch, True, 0.5).train()
+    img = _scene_image(torch, net)
+    img[1] = img[1].flip(-1)  # the two batch rows see different pictures
+    pred, _ = _run(net, img)
+    assert pred.aux_depth_far is not None and tuple(pred.aux_depth_far.shape) == (2, 1, 48, 64)
+    targets = _two_row_targets(torch)
+    zero_batch = _full_target(torch, pred, {})
+    seen_far = []
+    for copy_name, slicer in (("train_scene", train_scene._prediction_at), ("scene_net", scene_net._prediction_at)):
+        for b in (0, 1):
+            one = slicer(pred, b)
+            assert one.aux_depth_far is not None, f"{copy_name}._prediction_at(pred, {b}) dropped aux_depth_far"
+            assert tuple(one.aux_depth_far.shape) == (1, 48, 64), (copy_name, tuple(one.aux_depth_far.shape))
+            assert torch.equal(one.aux_depth_far, pred.aux_depth_far[b]) and torch.equal(one.aux_depth, pred.aux_depth[b])
+            full = {**{k: v[b] for k, v in zero_batch.items()}, **targets[b]}  # this row's zero scene targets + its depth targets
+            got = float(scene_loss(one, full, heads=("lane_gt",), aux_depth_weight=1.0)["aux_depth"].detach())
+            depth_part, far_part = depth_hires_loss(one.aux_depth, one.aux_depth_far, targets[b])
+            assert float(far_part) > 1e-3, "the fixture must give a non-trivial far term"
+            want = float((depth_part + far_part).detach())
+            assert abs(got - want) < 1e-5, f"{copy_name} row {b}: aux_depth term {got:.6f} != depth+far {want:.6f}"
+            assert abs(got - float(depth_part)) > 1e-4, f"{copy_name} row {b}: far term missing from the loss"
+            seen_far.append(float(far_part))
+    assert abs(seen_far[0] - seen_far[1]) > 1e-4, "rows must differ so a row mix-up is caught"
+    # SceneNet.forward (single tick) goes through the scene_net copy and returns the far logit too.
+    with torch.no_grad():
+        one, _s = net.eval().forward(img[0].permute(1, 2, 0).numpy(), 0.1, net.initial_state(batch=1))
+    assert one.aux_depth_far is not None and tuple(one.aux_depth_far.shape) == (1, 48, 64)
+    print(f"_prediction_at x2: per-row aux_depth term == depth + far (far {seen_far[0]:.3f} / {seen_far[1]:.3f}), far logit kept OK")
+
+
+def _hires_recording(base: Path, n_rows: int) -> Path:
+    import cv2
+    import test_pause_dir
+
+    strips = base / "data" / "scene_x"
+    strips.mkdir(parents=True)
+    old = test_pause_dir.N_ROWS
+    test_pause_dir.N_ROWS = n_rows
+    try:
+        test_pause_dir._fixture(strips)  # raw/main 48x64 PNGs + lane_gt
+    finally:
+        test_pause_dir.N_ROWS = old
+    depth_dir = strips / "raw" / "main_depth"
+    depth_dir.mkdir(parents=True)
+    for index in range(n_rows):
+        cm = np.full((48, 64), 1250 + 20 * (index % 7), np.uint16)
+        cm[:12] = 30000  # sky
+        cm[-4:, -8:] = 0
+        ok, buf = cv2.imencode(".png", cm)
+        assert ok
+        (depth_dir / f"{index:06d}.png").write_bytes(buf.tobytes())
+    return strips
+
+
+def check_train_directory_trains_hires() -> None:
+    """``train_directory --aux-depth --heads lane_gt,depth_hires`` on a main_depth recording trains the 48x64 head.
+
+    Wiring that unit tests of the head / loss / loader cannot see: the label loader gets ``depth_hires``, the net is
+    built with it, ``_prediction_at`` keeps the far logit, and the checkpoint carries the head and its arch token.
+    """
+    torch = _torch()
+    if torch is None:
+        skip_check("check_train_directory_trains_hires", "torch not installed")
+        return
+    import contextlib
+    import io
+
+    from python.train import train_scene
+    from python.train.depth_hires import ARCH_TOKEN, HEAD_PREFIX, depth_hires_loss
+    from python.train.epoch_ckpt import load_epoch_ckpt
+
+    calls: list[dict] = []
+    real_loss = train_scene.scene_loss
+
+    def spy(pred, target, heads, **kw):
+        out = real_loss(pred, target, heads, **kw)
+        if float(kw.get("aux_depth_weight", 0.0)) > 0.0:
+            far = getattr(pred, "aux_depth_far", None)
+            rec = {"far": far is not None, "tshape": tuple(target["aux_depth"].shape), "tfar": "aux_depth_far" in target,
+                   "term": float(out["aux_depth"].detach())}
+            if far is not None and rec["tfar"]:
+                d, f = depth_hires_loss(pred.aux_depth, far, target)
+                rec["want"], rec["far_term"] = float((d + f).detach()), float(f.detach())
+            calls.append(rec)
+        return out
+
+    train_scene.scene_loss = spy
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            strips = _hires_recording(base, 70)
+            ck = base / "ck"
+            with contextlib.redirect_stdout(io.StringIO()):
+                stats = train_scene.train_directory(
+                    strips, epochs=1, lr=1e-3, capability=None, export_path=None, free_vram_bytes=0, free_ram_bytes=8_000_000_000,
+                    resume=False, open_panel=False, autostart=True, cams=("main",), heads=("lane_gt", "depth_hires"),
+                    aux_depth=True, aux_depth_weight=1.0, augment=False, workers=0, min_valid=0.0, holdout_blocks=1, scale=1.0,
+                    status_root=base / "st", ckpt_dir=ck, exact_epochs=1)
+            files = sorted(ck.glob("*.npz"))
+            assert files and stats["windows"] > 0 and stats["supervised"] > 0, (stats, files)
+            for f in files:
+                loaded = load_epoch_ckpt(f)
+                keys = [k for k in loaded["weights"] if k.startswith(HEAD_PREFIX)]
+                assert keys, f"{f.name}: no {HEAD_PREFIX}* weights in the checkpoint"
+                assert ARCH_TOKEN in str(loaded["meta"]["arch"]), loaded["meta"]["arch"]
+    finally:
+        train_scene.scene_loss = real_loss
+    assert calls, "scene_loss never saw aux_depth_weight > 0: the aux depth path did not run"
+    for rec in calls:
+        assert rec["far"], "train/eval pred has no aux_depth_far: the net was built without the hires head"
+        assert rec["tshape"][-2:] == (48, 64) and rec["tfar"], f"labels are not 48x64 + far: {rec}"
+        assert abs(rec["term"] - rec["want"]) < 1e-5 and rec["far_term"] > 0.0, f"aux_depth term is not depth + far: {rec}"
+    print(f"train_directory: {len(calls)} scene_loss calls with 48x64 labels + far logit; aux_depth == depth + far; "
+          f"ckpt has {HEAD_PREFIX}* and {ARCH_TOKEN} OK")
+
+
 def main() -> int:
     checks = (
         check_hires_targets_far_and_masks,
@@ -360,6 +566,10 @@ def main() -> int:
         check_default_off_unchanged,
         check_cli_needs_aux_depth,
         check_bench_within_live_budget,
+        check_hires_tie_cell_is_far_only,
+        check_far_term_is_half_masked_bce,
+        check_prediction_at_copies_keep_far,
+        check_train_directory_trains_hires,
     )
     failed = 0
     for check in checks:

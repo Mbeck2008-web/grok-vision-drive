@@ -72,6 +72,7 @@ MAX_CLIP_S = 60.0
 SPAWN_KIND = {"merge": "ramp", "cut_in": "highway", "heavy_traffic": "highway", "sharp_curve": "city", "junction": "city"}
 CUT_IN_AHEAD_M = 25.0
 # Quality thresholds (quick check, not a training filter).
+STOP_FILE_REASON = "stop_file"  # session.json stop_reason when the pause/stop file is present
 MIN_MAIN_HZ = 5.0            # half the 10 Hz plan
 MIN_MOVING_MPS = 2.0         # median ego speed
 CLIP_CLASSES = ("train", "pretrain_only", "reject")
@@ -502,12 +503,17 @@ def run_clips(
     log: Callable[[str], None] = print,
     gfx: str = GFX,
     after_clip: Callable[..., str | None] | None = None,
+    stop_file: Path | str | None = None,
 ) -> Path:
     """Record ``clips`` clips into a new session folder. ``runner(argv)`` runs the collector.
 
     ``after_clip(clip, plan, code, qc)`` may return a ``stop_reason`` to halt
     the batch; that reason is written to ``session.json`` and remaining clips
     are not started.
+
+    ``stop_file``: checked before each clip. When it exists the batch ends with
+    ``stop_reason=stop_file``; a clip already recording finishes and is tagged
+    first. The file is never deleted here (remove it to resume).
     """
     maps = tuple(maps)
     cases = tuple(edge_cases or EDGE_CASES)
@@ -539,6 +545,11 @@ def run_clips(
 
     _save()
     for index in range(int(clips)):
+        if stop_file is not None and Path(stop_file).exists():
+            stop_reason = STOP_FILE_REASON
+            log(f"session stop reason={stop_reason} ({stop_file}); {index} clip(s) recorded")
+            _save()
+            break
         plan = plan_clip(index, seed, maps, max_traffic, min_s=min_s, max_s=max_s, edge_cases=cases)
         clip = new_clip_dir(session, plan)
         argv = clip_argv(plan, clip, chase=chase, extra=extra)

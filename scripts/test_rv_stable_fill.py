@@ -27,6 +27,8 @@ S12 road snap runs only on ROAD_SNAP_CAMS (all but narrow; switchable).
 S7b ground_clamp caps +inf on a downward ray at the ground hit; NaN stays NaN.
 S3b CamDepthFilter does not push on/above-road input below the road plane.
 S15 a road px the snap rejects renders at its raw depth (not deleted by snap / clamp / cap).
+S13 ground splats reach the next camera row: on-plane points' footprint grows to the ground row spacing past
+   the old 6*(d/fy) cap (rear/repeater holes); off-plane points keep the cap.
 S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
    (narrow 250, main/wide 250, 100 m cams 99.5); non-sky pixels beyond the cap or +inf are
    drawn AT the cap (kept, not dropped); sky stays sky; nearer depth is untouched.
@@ -450,6 +452,33 @@ def check_filter_keeps_ground() -> None:
     assert np.min(z[valid]) >= -1e-6, float(np.min(z[valid]))
 
 
+def check_ground_footprint() -> None:
+    """S13 (rear/side holes): a splat on the ground must cover the gap to the next camera row. Past ~6 h
+    (rear h 0.78 m, repeaters 0.90 m) ground row spacing beats the old 6*(d/fy) footprint cap, so the
+    chase view saw stripes of holes behind/beside the car. point_footprint lets on-plane points grow to
+    their ground row spacing; points off the plane (walls, cars) keep the 6*(d/fy) cap."""
+    cam = camera_from_angles("rear", (0.0, -2.25, 0.78), 180.0, -10.0, 80.0, 320, 180, near_m=0.05, far_m=100.0)
+    rays = sf._pixel_rays(cam); dz = rays[..., 2]; down = dz < -1e-6
+    hit = np.where(down, cam.pos[2] / np.where(down, -dz, 1.0), np.inf)
+    G = np.asarray(cam.pos) + np.where(down, hit, 0.0)[..., None] * rays
+    row_sp = np.full(hit.shape, np.inf); row_sp[:-1] = np.linalg.norm(G[1:] - G[:-1], axis=-1)
+    m = down[:-1] & down[1:]; m = np.vstack([m, np.zeros((1, m.shape[1]), bool)])
+    ground = np.where(down, hit, 80.0)
+    foot = sf.point_footprint(cam, ground)
+    base = ground / cam.fy
+    far = m & (hit > 6.0 * cam.pos[2]) & (hit < 60.0)
+    assert far.sum() > 200 and (row_sp[far] > 6.0 * base[far]).mean() > 0.5, "fixture: the old cap must bite"
+    assert np.all(foot[far] >= row_sp[far] * (1 - 1e-9)), "ground splat must reach the next row"
+    near = m & (hit < 3.0 * cam.pos[2])
+    assert np.all(foot[near] <= np.maximum(6.0 * base[near], row_sp[near]) + 1e-9)
+    # a wall 10 m behind: off the plane, keeps the 6*(d/fy) cap
+    wall = np.full(hit.shape, 10.0)
+    fw = sf.point_footprint(cam, wall)
+    zw = cam.pos[2] + wall * dz
+    off = zw > 0.30
+    assert off.sum() > 1000 and np.all(fw[off] <= 6.0 * wall[off] / cam.fy + 1e-9)
+
+
 def check_flag_and_deps() -> None:
     assert sf.STABLE_FILL_DEFAULT_ON is False
     tree = ast.parse(MOD.read_text(encoding="utf-8"))
@@ -515,6 +544,10 @@ def test_filter_keeps_ground() -> None:
     check_filter_keeps_ground()
 
 
+def test_ground_footprint() -> None:
+    check_ground_footprint()
+
+
 def test_flag_and_deps() -> None:
     check_flag_and_deps()
 
@@ -523,7 +556,8 @@ if __name__ == "__main__":
     for fn in (check_metrics, check_damped_view_less_jitter, check_damped_follows_turn,
                check_depth_filter_flicker_and_reset, check_compose_explains_every_pixel,
                check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership,
-               check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_rejected_road_px_render_raw, check_filter_keeps_ground, check_flag_and_deps):
+               check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_rejected_road_px_render_raw,
+               check_filter_keeps_ground, check_ground_footprint, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

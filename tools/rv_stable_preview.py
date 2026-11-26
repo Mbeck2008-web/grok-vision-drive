@@ -104,7 +104,7 @@ def cam_frame(cam, idx):
     # in front of a face would be pushed under the road, Breaker: -1.02 m at 29.9 m), keep the pixel's own depth
     cp_ = CAM_POSE[cam]; rz = S._pixel_rays(cp_)[..., 2]; dn = rz < -1e-6
     ghit = np.where(dn, float(cp_.pos[2]) / np.where(dn, -rz, 1.0), np.inf) * (a.clamp_margin if a.ground_clamp else 1.0)
-    depth = np.where(cut & ~sky & ~snapped & (far_side <= ghit), far_side, depth)
+    depth = np.where(cut & ~sky & (far_side <= ghit), far_side, depth)   # snapped px too (one-sided snap gate exists now)
     # and clamp after the cut, so nothing the cut touched can end up below the road
     if a.ground_clamp and a.depth_src != "gt":
         depth, cl = S.ground_clamp(CAM_POSE[cam], depth, margin=a.clamp_margin)
@@ -124,14 +124,7 @@ def cam_frame(cam, idx):
     return rgb, depth, valid, sky
 
 def footprint(cam, depth):
-    d = np.where(np.isfinite(depth), depth, 0.0); h, w = d.shape
-    ys, xs = np.mgrid[0:h, 0:w]
-    g = np.stack([((xs + 0.5 - cam.cx) / cam.fx) * d, -((ys + 0.5 - cam.cy) / cam.fy) * d, d], -1)
-    sp = np.zeros((h, w))
-    sp[:, :-1] = np.maximum(sp[:, :-1], np.linalg.norm(np.diff(g, axis=1), axis=-1))
-    sp[:-1] = np.maximum(sp[:-1], np.linalg.norm(np.diff(g, axis=0), axis=-1))
-    base = d / cam.fy
-    return np.clip(sp, base, 6.0 * base)
+    return S.point_footprint(cam, depth)   # on-plane points reach the next ground row (rear/side holes)
 
 def gt_pose(row, ref):
     d = row["ego"]["dir"]; hw = math.atan2(d[1], d[0]); p = np.array(row["ego"]["pos"][:2])

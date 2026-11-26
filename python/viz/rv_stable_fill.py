@@ -449,6 +449,43 @@ def yield_mask(cam: CameraPose, better: Sequence[CameraPose], *, margin_px: floa
     return out.reshape(cam.height, cam.width)
 
 
+FOOT_CAP_BASE: float = 6.0          # off-plane splat footprint cap, in units of the pixel's own footprint d/fy
+FOOT_GROUND_TOL_M: float = 0.30     # a point within this of the road plane counts as ground for its footprint
+
+
+def point_footprint(cam: CameraPose, depth: np.ndarray, *, ground_z: float = 0.0,
+                    ground_tol_m: float = FOOT_GROUND_TOL_M) -> np.ndarray:
+    """World-size splat footprint per pixel (m): the spacing to the next pixel's point, clipped to
+    [d/fy, FOOT_CAP_BASE * d/fy] so depth edges do not make huge splats. On the road plane that cap is
+    wrong past ~6 h: a grazing camera's next row lands ~d^2/(h*fy) away (rear h 0.78 m, repeaters 0.90 m),
+    so the chase view showed stripes of holes behind and beside the car. A point within ``ground_tol_m``
+    of the plane may grow to the analytic ground spacing to its next row/column (never more)."""
+    d = np.where(np.isfinite(depth), np.asarray(depth, np.float64), 0.0)
+    h, w = d.shape
+    ys, xs = np.mgrid[0:h, 0:w]
+    g = np.stack([((xs + 0.5 - cam.cx) / cam.fx) * d, -((ys + 0.5 - cam.cy) / cam.fy) * d, d], -1)
+    sp = np.zeros((h, w))
+    sp[:, :-1] = np.maximum(sp[:, :-1], np.linalg.norm(np.diff(g, axis=1), axis=-1))
+    sp[:-1] = np.maximum(sp[:-1], np.linalg.norm(np.diff(g, axis=0), axis=-1))
+    base = d / cam.fy
+    cap = FOOT_CAP_BASE * base
+    rays = _pixel_rays(cam)
+    dz = rays[..., 2]
+    hc = float(cam.pos[2]) - float(ground_z)
+    if hc > 0 and math.isfinite(hc):
+        down = dz < -1e-6
+        hit = np.where(down, hc / np.where(down, -dz, 1.0), 0.0)
+        G = hit[..., None] * rays
+        gsp = np.zeros((h, w))
+        both_r = down[:, :-1] & down[:, 1:]
+        both_c = down[:-1] & down[1:]
+        gsp[:, :-1] = np.maximum(gsp[:, :-1], np.where(both_r, np.linalg.norm(np.diff(G, axis=1), axis=-1), 0.0))
+        gsp[:-1] = np.maximum(gsp[:-1], np.where(both_c, np.linalg.norm(np.diff(G, axis=0), axis=-1), 0.0))
+        on_plane = down & (np.abs(hc + d * dz) <= float(ground_tol_m))
+        cap = np.where(on_plane, np.maximum(cap, gsp), cap)
+    return np.clip(sp, base, np.maximum(cap, base))
+
+
 def unproject(cam: CameraPose, depth: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
     d = np.asarray(depth, np.float64)[ys, xs]
     xc = ((xs + 0.5 - cam.cx) / cam.fx) * d

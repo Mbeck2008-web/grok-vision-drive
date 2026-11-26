@@ -74,6 +74,15 @@ def _main(argv, base: Path):
     return code, out.getvalue()
 
 
+# A toy net on a 14-frame fixture moves its holdout metrics by noise (sem mIoU is ~1e-3 here, so a 5% relative move is
+# a rounding-level change): the real, unchanged non-regression gate then rejects a stage on one run and not on the next
+# (seen on CI and on the box, same code). The full-curriculum run therefore uses a negligible lr so the held-out metrics
+# are the same from stage to stage and the gate decision cannot depend on thread / build noise. Nothing is mocked: every
+# stage still trains, measures and exits through the real code (the training signal itself is covered by
+# check_recipe_stages_train_on_fixture, which asserts real gradients at the default lr).
+FULL_RUN_LR = "1e-9"
+
+
 def _flags(strips, ck, stage, *extra):
     return ["--strips", str(strips), "--recipe", "trainer2", "--no-augment", "--cams", "main", "--no-panel", "--no-resume",
             "--ckpt-dir", str(ck), "--min-valid", "0", "--workers", "0", "--ssl-max-rows", "16", "--stage", stage, *extra]
@@ -107,7 +116,7 @@ def check_cli_full_curriculum_stages_0_1_2_7() -> None:
 
         rec.stage_exited_all = spy
         try:
-            code, text = _main(_flags(strips, ck, "0,1,2,7", "--export", str(export)), base)
+            code, text = _main(_flags(strips, ck, "0,1,2,7", "--export", str(export), "--lr", FULL_RUN_LR), base)
         finally:
             rec.stage_exited_all = real_exit
         assert code is None, (code, text[-2500:])
@@ -167,7 +176,7 @@ def check_cli_full_curriculum_stages_0_1_2_7() -> None:
         assert old.read_bytes() == b"an older run's checkpoint"
         # a second run into the same --export is refused up front and leaves the file alone
         before = export.read_bytes()
-        code2, text2 = _main(_flags(strips, base / "ck_b", "0,1,2,7", "--export", str(export)), base)
+        code2, text2 = _main(_flags(strips, base / "ck_b", "0,1,2,7", "--export", str(export), "--lr", FULL_RUN_LR), base)
         assert code2 == 2 and "create-only" in text2 and "Traceback" not in text2, (code2, text2[-800:])
         assert export.read_bytes() == before and not (base / "ck_b" / "run_manifest.json").exists()
     print("CLI --recipe trainer2 --stage 0,1,2,7: manifests pre-registered, stages 0/1/2/7 exit on measured metrics, "

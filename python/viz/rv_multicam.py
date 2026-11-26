@@ -401,12 +401,18 @@ def unproject_camera(
 # ---------------------------------------------------------------- ego motion
 
 
-def phase_correlation_dx(prev_gray: np.ndarray, gray: np.ndarray) -> float:
-    """Horizontal shift (px) of ``gray`` relative to ``prev_gray`` (positive = content moved right)."""
+def _check_gray_pair(prev_gray: np.ndarray, gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     a = np.asarray(prev_gray, np.float64)
     b = np.asarray(gray, np.float64)
-    if a.shape != b.shape or a.ndim != 2:
-        raise ValueError("phase correlation needs two equal 2-D images")
+    if a.shape != b.shape or a.ndim != 2 or a.size == 0:
+        raise ValueError("phase correlation needs two equal, non-empty 2-D images")
+    if not (np.isfinite(a).all() and np.isfinite(b).all()):
+        raise ValueError("phase correlation refuses non-finite pixels")
+    return a, b
+
+
+def _phase_peak_dx(a: np.ndarray, b: np.ndarray) -> float:
+    """Single-pass windowed phase correlation (sub-pixel parabola on x). Inputs already validated."""
     win = np.hanning(a.shape[0])[:, None] * np.hanning(a.shape[1])[None, :]
     fa = np.fft.fft2((a - a.mean()) * win)
     fb = np.fft.fft2((b - b.mean()) * win)
@@ -415,7 +421,6 @@ def phase_correlation_dx(prev_gray: np.ndarray, gray: np.ndarray) -> float:
     c = np.fft.ifft2(r).real
     iy, ix = np.unravel_index(int(np.argmax(c)), c.shape)
     w = c.shape[1]
-    # sub-pixel parabola on x
     l = c[iy, (ix - 1) % w]
     m = c[iy, ix]
     rr = c[iy, (ix + 1) % w]
@@ -427,10 +432,44 @@ def phase_correlation_dx(prev_gray: np.ndarray, gray: np.ndarray) -> float:
     return float(dx)
 
 
-def camera_yaw_delta(prev_gray: np.ndarray, gray: np.ndarray, fx: float) -> float:
-    """Yaw change (rad, + = left / CCW about +Z) from the far-field image shift of a forward camera."""
-    dx = phase_correlation_dx(prev_gray, gray)
-    return float(math.atan2(dx, float(fx)))
+def phase_correlation_dx(prev_gray: np.ndarray, gray: np.ndarray) -> float:
+    """Horizontal shift (px) of ``gray`` relative to ``prev_gray`` (positive = content moved right).
+
+    Refuses non-finite pixels, mismatched shapes, non-2-D and empty input (``ValueError``).
+    """
+    a, b = _check_gray_pair(prev_gray, gray)
+    return _phase_peak_dx(a, b)
+
+
+# Yaw is read from the rows ABOVE the horizon (sky line, far scenery): near-field road and walls
+# move with the car's translation, not its yaw, and pull the shift towards zero. The horizon row
+# of a level-ish forward camera is ``h/2 + fx * tan(pitch)`` (pitch < 0 looks down, horizon up).
+MAIN_PITCH_DEG: float = -6.0  # config/cameras.yaml main camera pitch
+MIN_BAND_ROWS: int = 64  # below this a band is too thin to correlate; use the whole frame
+
+
+def far_field_rows(height: int, fx: float, pitch_deg: float = MAIN_PITCH_DEG) -> int:
+    """Number of top rows above the horizon (0 when the horizon is off the top of the frame)."""
+    row = height / 2.0 + float(fx) * math.tan(math.radians(float(pitch_deg)))
+    return int(max(0.0, min(float(height), math.floor(row))))
+
+
+def camera_yaw_delta(prev_gray: np.ndarray, gray: np.ndarray, fx: float, *,
+                     pitch_deg: float = MAIN_PITCH_DEG, min_band_rows: int = MIN_BAND_ROWS) -> float:
+    """Yaw change (rad, + = left / CCW about +Z) from the far-field image shift of a forward camera.
+
+    The shift is measured on the rows above the horizon (whole frame when that band would be
+    under ``min_band_rows`` rows) and converted with ``atan2(dx, fx)``. ``fx`` must be finite
+    and > 0; non-finite pixels are refused (``ValueError``). Camera-only: no IMU, no GT.
+    """
+    fxf = float(fx)
+    if not math.isfinite(fxf) or fxf <= 0.0:
+        raise ValueError("fx must be finite and > 0")
+    a, b = _check_gray_pair(prev_gray, gray)
+    rows = far_field_rows(a.shape[0], fxf, pitch_deg)
+    if rows >= min_band_rows:
+        a, b = a[:rows], b[:rows]
+    return float(math.atan2(phase_correlation_dx(a, b), fxf))
 
 
 @dataclass
@@ -452,9 +491,12 @@ class EgoOdometry:
             raise ValueError("non-finite odometry input")
         mid = self.heading + 0.5 * dyaw_rad
         dist = float(speed_mps) * float(dt_s)
-        self.x += -math.sin(mid) * dist
-        self.y += math.cos(mid) * dist
-        self.heading += dyaw_rad
+        x = self.x + -math.sin(mid) * dist
+        y = self.y + math.cos(mid) * dist
+        heading = self.heading + dyaw_rad
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(heading)):
+            raise ValueError("odometry step would make the pose non-finite; pose unchanged")
+        self.x, self.y, self.heading = x, y, heading
 
     def pose(self) -> tuple[float, float, float]:
         return (self.x, self.y, self.heading)

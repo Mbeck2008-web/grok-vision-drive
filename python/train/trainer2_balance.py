@@ -143,6 +143,7 @@ class GradNorm:
         unweighted ``||dL_i / dW_shared||``. A head's first active loss is its
         ``L_i(0)``. Weights of inactive heads are left as they are; the active
         ones are projected to ``sum == n_active`` inside the clamp.
+        The returned dict is always a copy of ``self.weights`` (every branch).
         """
         names = [str(n) for n in active]
         for name in names:
@@ -159,7 +160,7 @@ class GradNorm:
             # earned while more heads were active is not carried over); no step is taken.
             if names:
                 self.weights.update(project_weights({n: self.weights[n] for n in names}, float(len(names))))
-            return dict(self.weights)
+            return dict(self.weights)  # always a copy (lone-head and empty-active branches)
         g = {n: float(grad_norms[n]) for n in names}
         big_g = {n: self.weights[n] * g[n] for n in names}
         g_bar = sum(big_g.values()) / len(names)
@@ -173,7 +174,7 @@ class GradNorm:
             grad = (1.0 if diff > 0 else -1.0 if diff < 0 else 0.0) * g[n]
             new[n] = self.weights[n] - self.lr * grad
         self.weights.update(project_weights(new, float(len(names))))
-        return dict(self.weights)
+        return dict(self.weights)  # a copy; mutating it must not change balancer state
 
 
 def per_task_grad_norms(losses: Mapping[str, Any], shared: Any) -> dict[str, float]:

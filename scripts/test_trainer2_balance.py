@@ -5,6 +5,7 @@ Checks: check_per_task_grad_norm_logged, check_gradnorm_weights_sum_and_clamp,
 check_head_ramp_linear, check_gradnorm_one_step_hand_computed (hand-computed weights),
 check_project_weights_clamp_exact, check_combine_losses_ramp_and_inactive,
 check_gradnorm_lone_head_renormalizes_to_active_count,
+check_gradnorm_update_returns_a_copy,
 check_grad_norm_record_weights_after_update, check_combine_refuses_balanced_head_as_fixed_term. Torch parts skip visibly without torch.
 """
 from __future__ import annotations
@@ -304,6 +305,36 @@ def check_combine_refuses_balanced_head_as_fixed_term() -> None:
     print("combine_losses: a GradNorm-balanced head offered as a fixed term is refused; a real fixed term still adds OK")
 
 
+
+def check_gradnorm_update_returns_a_copy() -> None:
+    """Both the lone-head and the multi-head branches return a copy, not the live weights dict."""
+    gn = _gn(["a", "b"], lr=0.1)
+    gn.weights["a"] = 1.4
+    out = gn.update({"a": 1.0}, {"a": 9.0}, active=["a"])
+    assert out["a"] == 1.0 and gn.weights["a"] == 1.0
+    assert out is not gn.weights, "lone-head branch returned the live weights dict (Y4)"
+    assert out == dict(gn.weights)
+    out["a"] = 99.0
+    out["b"] = 99.0
+    assert gn.weights["a"] == 1.0 and gn.weights["b"] == 1.0, gn.weights
+
+    gn = _gn(["a", "b"], lr=0.1)
+    empty = gn.update({}, {}, active=[])
+    assert empty is not gn.weights and empty == dict(gn.weights)
+    empty["a"] = 99.0
+    assert gn.weights["a"] == 1.0
+
+    gn = _gn(["a", "b"], lr=0.1)
+    out = gn.update({"a": 1.0, "b": 1.0}, {"a": 4.0, "b": 1.0}, active=["a", "b"])
+    assert out is not gn.weights, "multi-head branch returned the live weights dict"
+    saved = dict(gn.weights)
+    assert out == saved
+    out["a"] = 99.0
+    out.clear()
+    assert gn.weights == saved and 99.0 not in gn.weights.values()
+    print("gradnorm: update returns a copy on the lone-head and multi-head branches; mutating it leaves balancer state OK")
+
+
 def main() -> int:
     checks = (
         check_head_ramp_linear,
@@ -312,6 +343,7 @@ def main() -> int:
         check_project_weights_clamp_exact,
         check_combine_losses_ramp_and_inactive,
         check_gradnorm_lone_head_renormalizes_to_active_count,
+        check_gradnorm_update_returns_a_copy,
         check_grad_norm_record_weights_after_update,
         check_combine_refuses_balanced_head_as_fixed_term,
         check_per_task_grad_norm_logged,

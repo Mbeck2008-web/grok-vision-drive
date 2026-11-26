@@ -95,6 +95,10 @@ class CheckpointRejected(ValueError):
     """Non-regression (or joint-head) gate rejected this stage's checkpoint; the run stops."""
 
 
+class MetricNotMeasured(RecipeRefused):
+    """A stage's exit metric is not measured offline in PR 6; the runner does not claim exit or advance."""
+
+
 @dataclass(frozen=True)
 class StageSpec:
     id: str
@@ -143,6 +147,8 @@ class PlannedStage:
 
 @dataclass
 class StageResult:
+    """One trained stage. ``metrics`` / ``evals`` must be real measurements (never placeholders)."""
+
     ckpt: str | None
     metrics: dict[str, float]
     evals: list[float]
@@ -188,7 +194,7 @@ def validate_recipe_args(args: Any) -> None:
     recipe = getattr(args, "recipe", "") or ""
     validate_live_export_recipe(
         recipe=recipe,
-        scale=float(getattr(args, "scale", 1.0) or 1.0),
+        scale=1.0 if getattr(args, "scale", None) is None else float(args.scale),
         augment=bool(getattr(args, "augment", False)),
         kd=bool(getattr(args, "kd", False)),
     )
@@ -332,7 +338,7 @@ def metric_gain(old: float, new: float, *, metric: str) -> float:
     higher = METRIC_HIGHER_IS_BETTER.get(metric, False)
     old_f, new_f = float(old), float(new)
     if not math.isfinite(old_f) or not math.isfinite(new_f):
-        return 0.0
+        return float("nan")  # not measured: never a gain, never "no worse"
     if old_f == 0.0:
         if new_f == old_f:
             return 0.0
@@ -357,6 +363,8 @@ def stage_exited(stage_id: str, evals: list[float], *, epochs: int, metric: str 
         return False
     name = metric or STAGE_PRIMARY_METRICS.get(stage_id, ("lane_rms",))[0]
     window = [float(x) for x in evals[-(EXIT_PATIENCE_EVALS + 1) :]]
+    if not all(math.isfinite(x) for x in window):
+        return False  # a NaN / inf eval is not a plateau
     for prev, cur in zip(window, window[1:]):
         if metric_gain(prev, cur, metric=name) > EXIT_GAIN:
             return False
@@ -372,8 +380,14 @@ def check_non_regression(
     """Reject the checkpoint if any earlier-stage metric is > ``frac`` relative worse.  Exactly ``frac`` is allowed."""
     for name, old in earlier.items():
         if name not in current:
-            continue
+            raise CheckpointRejected(
+                f"stage checkpoint rejected: earlier-stage metric {name} was not measured by this stage"
+            )
         worse = _worse_frac(float(old), float(current[name]), metric=name)
+        if not math.isfinite(worse):
+            raise CheckpointRejected(
+                f"stage checkpoint rejected: {name} is not finite ({old} -> {current[name]})"
+            )
         # "> frac": exact frac (and 0.05-vs-1.05/1.0 binary residue) is allowed.
         if worse - float(frac) > 1e-12:
             raise CheckpointRejected(
@@ -409,19 +423,108 @@ def student_export_fits_deploy(*, preset: str, student_param_count: int, exporte
     if int(student_param_count) != int(exported_param_count):
         raise RecipeRefused(
             f"exported ONNX param count {int(exported_param_count)} != student "
-            f"architecture_parameter_count {int(student_param_count)}"
+            f"param count {int(student_param_count)} (both counted by export_param_counts)"
         )
 
 
+def deployed_parameters(net: Any) -> list[Any]:
+    """Parameters the exported graph uses: those reached from the ``_OnnxScene`` forward the exporter traces.
+
+    Training-only heads (``aux_depth_head``, ``aux_sem_head``) are not in the
+    export. Leaves ``net`` on CPU in eval mode, as the export itself does.
+    """
+    import torch
+
+    from python.train.scene_net import _OnnxScene, cpu_export_inputs
+
+    model, args = cpu_export_inputs(net, torch.zeros)
+    params = list(model.parameters())
+    wrapper = _OnnxScene(model).eval()
+    with torch.enable_grad():
+        out = wrapper(*args)
+        leaves = [t for t in _tensors(out) if t.requires_grad]
+        if not leaves:
+            raise RecipeRefused("the export forward reached no parameter")
+        total = sum(t.float().sum() for t in leaves)
+        grads = torch.autograd.grad(total, params, allow_unused=True)
+    return [prm for prm, g in zip(params, grads) if g is not None]
+
+
+def _tensors(obj: Any) -> list[Any]:
+    import torch
+
+    if isinstance(obj, torch.Tensor):
+        return [obj]
+    if isinstance(obj, Mapping):
+        return [t for v in obj.values() for t in _tensors(v)]
+    if isinstance(obj, (list, tuple)):
+        return [t for v in obj for t in _tensors(v)]
+    return []
+
+
+def deduplicated_parameter_count(params: Iterable[Any]) -> int:
+    """Elements of ``params`` with byte-identical tensors counted once.
+
+    The ONNX exporter stores one initializer for identical tensors (a fresh
+    net's GroupNorm scales are all 1, for example) and reshapes GroupNorm /
+    GRU tensors without changing their size, so this is the count the ONNX
+    initializers must add up to.
+    """
+    seen: set[tuple[int, bytes]] = set()
+    total = 0
+    for param in params:
+        data = param.detach().cpu().contiguous().numpy().tobytes()
+        key = (int(param.numel()), data)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += int(param.numel())
+    return total
+
+
+def onnx_initializer_count(path: Path | str) -> int:
+    """Sum of ONNX initializer elements. Refuses (never passes) when the file cannot be read."""
+    try:
+        import onnx  # type: ignore
+    except ImportError as exc:
+        raise RecipeRefused("deploy check needs the onnx package to read the export; not passing it unread") from exc
+    try:
+        model = onnx.load(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise RecipeRefused(f"deploy check cannot read the export {Path(path).name}: {exc}") from exc
+    total = 0
+    for init in model.graph.initializer:
+        size = 1
+        for dim in init.dims:
+            size *= int(dim)
+        total += size
+    if total <= 0:
+        raise RecipeRefused(f"deploy check: export {Path(path).name} has no initializers")
+    return total
+
+
+def export_param_counts(net: Any, path: Path | str) -> tuple[int, int]:
+    """``(student, exported)`` element counts for the deploy check, counted the same way."""
+    return deduplicated_parameter_count(deployed_parameters(net)), onnx_initializer_count(path)
+
+
+def check_export_fits_deploy(net: Any, path: Path | str, *, preset: str) -> dict[str, Any]:
+    """Deploy check on a real export: preset fits 4 GB, ONNX initializers match the student net."""
+    student, exported = export_param_counts(net, path)
+    student_export_fits_deploy(preset=preset, student_param_count=student, exported_param_count=exported)
+    return {"ok": True, "preset": str(preset), "params": int(student), "onnx": str(path)}
+
+
 def may_unlink_checkpoint(path: Path | str, *, owned_partials: Iterable[Path | str] | None = None) -> bool:
-    """The trainer may only unlink its own ``.partial`` files, never an existing checkpoint."""
+    """The trainer may only unlink its own ``.partial`` files, never an existing checkpoint.
+
+    With ``owned_partials`` this is ``epoch_ckpt.may_unlink_partial`` (the rule the real writer uses).
+    """
+    from python.train.epoch_ckpt import may_unlink_partial
+
     p = Path(path)
     if owned_partials is not None:
-        owned = {Path(x).resolve() for x in owned_partials}
-        try:
-            return p.resolve() in owned
-        except OSError:
-            return False
+        return may_unlink_partial(p, owned_partials=owned_partials)
     return ".partial" in p.name
 
 
@@ -546,6 +649,44 @@ def recipe_run_config(**extra: Any) -> dict[str, Any]:
     return cfg
 
 
+def stage_result_from_stats(stage_id: str, stats: Mapping[str, Any]) -> StageResult:
+    """Real per-stage metrics from a ``train_directory`` stats dict, or ``MetricNotMeasured``.
+
+    Only lane stages (2 and 7) have an offline exit metric today: the 8 m holdout
+    ``rms`` / ``r`` that ``train_directory`` scores every eval (``holdout_evals``).
+    Stage 1 (depth AbsRel / sem mIoU) and 2b (missed / false brakes, PR 6b) are not
+    scored offline yet, and stage 0 records only the SSL last loss, not a plateau.
+    Those raise: the runner never reports an exit it did not measure.
+    """
+    if stage_id not in ("2", "7"):
+        what = {
+            "0": "SSL pretext-loss plateau (exp_ssl records only the last loss)",
+            "1": "holdout depth AbsRel / sem mIoU",
+            "2b": "holdout missed / false brakes (PR 6b)",
+        }.get(stage_id, "the stage exit metric")
+        raise MetricNotMeasured(
+            f"stage {stage_id} trained, but its exit metric ({what}) is not measured offline in PR 6; "
+            "not claiming exit and not advancing (real metrics land with PR 6b / PR 7)"
+        )
+    evals_raw = list(stats.get("holdout_evals") or [])
+    rms = [e.get("lane_rms") for e in evals_raw]
+    if not rms or any(v is None or not math.isfinite(float(v)) for v in rms):
+        raise MetricNotMeasured(
+            f"stage {stage_id}: no finite 8 m holdout rms on every eval ({rms!r}); not claiming exit"
+        )
+    last = evals_raw[-1]
+    metrics = {"lane_rms": float(last["lane_rms"])}
+    if last.get("lane_r") is not None and math.isfinite(float(last["lane_r"])):
+        metrics["lane_r"] = float(last["lane_r"])
+    ckpts = list(stats.get("epoch_ckpts") or [])
+    return StageResult(
+        ckpt=str(ckpts[-1]) if ckpts else None,
+        metrics=metrics,
+        evals=[float(v) for v in rms],
+        epochs=int(stats.get("epochs_run") or len(rms)),
+    )
+
+
 def run_curriculum(
     train_fn: Callable[[PlannedStage, str | None], StageResult],
     *,
@@ -555,8 +696,17 @@ def run_curriculum(
     data_exist: Mapping[str, bool] | None = None,
     stages: Iterable[str] | None = None,
     earlier_metrics: Mapping[str, float] | None = None,
+    start_ckpt: str | None = None,
+    ckpt_root: Path | str | None = None,
 ) -> CurriculumResult:
-    """Run live stages in order, skip-log 3-6 until Reality View, reject a regressing checkpoint."""
+    """Run live stages in order, skip-log 3-6 until Reality View, reject a regressing checkpoint.
+
+    A start after stage 0 (``--stage 2``) needs ``earlier_metrics`` and ``start_ckpt``
+    (the previous stage's exit); without them it is refused. Stage 7 (joint) uses the
+    2% ``JOINT_HEAD_REGRESSION_FRAC`` cap (spec proposal) instead of 5%. With
+    ``ckpt_root`` every existing checkpoint there is hashed before the first stage and
+    re-checked after each stage (none removed or changed).
+    """
     notes: list[str] = []
 
     def _log(msg: str) -> None:
@@ -570,11 +720,18 @@ def run_curriculum(
         data_exist=data_exist,
         stages=stages,
     )
+    live = [s for s in plan if s.action == "run"]
+    if live and live[0].id != "0" and (not earlier_metrics or not start_ckpt):
+        raise RecipeRefused(
+            f"--stage starts at {live[0].id}: a mid-curriculum start needs the previous stage's exit "
+            "checkpoint and its holdout metrics as the non-regression baseline; refusing"
+        )
+    before = snapshot_checkpoints(ckpt_root) if ckpt_root is not None else None
     trained: list[str] = []
     skipped: list[str] = []
     kept = dict(earlier_metrics or {})
     prev_exited = True
-    prev_ckpt: str | None = None
+    prev_ckpt: str | None = start_ckpt
     for stage in plan:
         if stage.action == "skip":
             skipped.append(stage.id)
@@ -595,10 +752,20 @@ def run_curriculum(
         )
         if not ok:
             raise RecipeRefused(f"stage {stage.id} entry refused: {reason}")
-        result = train_fn(stage, prev_ckpt)
-        trained.append(stage.id)
         try:
-            check_non_regression(kept, result.metrics)
+            result = train_fn(stage, prev_ckpt)
+        except MetricNotMeasured as exc:
+            trained.append(stage.id)
+            _log(f"[GVD] recipe trainer2: stop after stage {stage.id}: {exc}")
+            if before is not None:
+                assert_old_checkpoints_untouched(before, snapshot_checkpoints(ckpt_root))
+            raise
+        trained.append(stage.id)
+        if before is not None:
+            assert_old_checkpoints_untouched(before, snapshot_checkpoints(ckpt_root))
+        frac = JOINT_HEAD_REGRESSION_FRAC if stage.id == "7" else NON_REGRESSION_FRAC
+        try:
+            check_non_regression(kept, result.metrics, frac=frac)
         except CheckpointRejected as exc:
             _log(f"[GVD] recipe trainer2: stage {stage.id} checkpoint rejected (non-regression): {exc}")
             raise
@@ -612,3 +779,95 @@ def run_curriculum(
             )
         _log(f"[GVD] recipe trainer2: stage {stage.id} ({stage.name}) exited, ckpt={result.ckpt}")
     return CurriculumResult(trained=trained, skipped=skipped, metrics=kept, last_ckpt=prev_ckpt, logs=notes)
+
+
+# --- split / run manifest (every stage reads the one manifest) ---------------
+
+PINNED_CONFIG_KEYS = (
+    "recipe",
+    "exit_gain",
+    "exit_patience_evals",
+    "stage_max_epochs",
+    "non_regression_frac",
+    "joint_head_regression_frac",
+    "reality_view_built_and_integrated",
+    "stage_order",
+)
+
+
+def _tag_source(rows: Iterable[Mapping[str, Any]], source: str) -> list[dict[str, Any]]:
+    """A single-root row has no ``source``; give it the recording root so manifest keys name it."""
+    out = []
+    for row in rows:
+        item = dict(row)
+        if not str(item.get("source") or ""):
+            item["source"] = source
+        out.append(item)
+    return out
+
+
+def legacy_split_rows(strip_roots: Iterable[Path | str], holdout_root: Path | str, *, holdout_blocks: int) -> tuple[list, list]:
+    """``(train, holdout)`` rows of the #187 split ``train_directory`` uses, tagged with ``source``."""
+    from python.train.exp_distill import split_tagged_rows
+    from python.train.strip_sources import load_multi_source_rows
+
+    roots = tuple(Path(r) for r in strip_roots)
+    rows, meta = load_multi_source_rows(roots, holdout_source=Path(holdout_root))
+    train, hold = split_tagged_rows(rows, meta, holdout_blocks=int(holdout_blocks))
+    src = str(Path(holdout_root).resolve())
+    return _tag_source(train, src), _tag_source(hold, src)
+
+
+def build_recipe_split(strip_roots: Iterable[Path | str], holdout_root: Path | str, *, holdout_blocks: int,
+                       heldout_map: str | None = None) -> dict[str, Any]:
+    """Split manifest from the same #187 split the trainer uses (``trainer2_split.build_split_manifest``)."""
+    from python.train.trainer2_split import build_split_manifest
+
+    train, hold = legacy_split_rows(strip_roots, holdout_root, holdout_blocks=holdout_blocks)
+    return build_split_manifest([{"kind": "train", "rows": train}, {"kind": "holdout", "rows": hold}],
+                                heldout_map=heldout_map)
+
+
+def preregister_recipe_run(out_dir: Path | str, *, split_path: Path | str, git_sha: str, seed: int,
+                           ssl_pretrain: bool, registry: Path | str, decision_tier: str = "iteration") -> dict[str, Any]:
+    """``trainer2_split.preregister`` with ``recipe_run_config()`` as the pinned config."""
+    from python.train.trainer2_split import preregister
+
+    return preregister(out_dir, split_path=split_path, git_sha=git_sha, config=recipe_run_config(),
+                       seed=int(seed), ssl_pretrain=bool(ssl_pretrain), decision_tier=decision_tier,
+                       registry=registry)
+
+
+def require_recipe_manifest(ckpt_dir: Path | str | None, *, seed: int, ssl_pretrain: bool,
+                            train_rows: Iterable[Mapping[str, Any]], holdout_rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Refuse a recipe run without a pre-registered run + split manifest that matches this run.
+
+    Checks: the run manifest and split hash (``require_preregistered``), the pinned recipe
+    values, seed and SSL on/off, every train row the trainer will use is a manifest train
+    row, and every holdout row it scores is a manifest holdout row. Raises ``SplitError``
+    or ``RecipeRefused``.
+    """
+    from python.train.trainer2_split import _load, check_subset_of_train, filter_rows, require_preregistered
+
+    if not ckpt_dir:
+        raise RecipeRefused("--recipe trainer2 needs --ckpt-dir holding a pre-registered run_manifest.json")
+    run = require_preregistered(ckpt_dir)
+    cfg = dict(run.get("config") or {})
+    want = recipe_run_config()
+    drift = [k for k in PINNED_CONFIG_KEYS if cfg.get(k) != want[k]]
+    if drift:
+        raise RecipeRefused(f"run manifest pins differ from this recipe for {drift}; pre-register a new run")
+    if int(run.get("seed", -1)) != int(seed):
+        raise RecipeRefused(f"run manifest seed {run.get('seed')} != --seed {seed}")
+    if bool(run.get("ssl_pretrain")) != bool(ssl_pretrain):
+        raise RecipeRefused(f"run manifest ssl_pretrain={run.get('ssl_pretrain')} but this run has SSL {'on' if ssl_pretrain else 'off'}")
+    split = _load(Path(run["split_path"]), "split manifest")
+    check_subset_of_train(train_rows, split, what="recipe train")
+    hold = list(holdout_rows)
+    kept = filter_rows(hold, split, "holdout")
+    if len(kept) != len(hold):
+        raise RecipeRefused(
+            f"{len(hold) - len(kept)} holdout row(s) the trainer scores are not manifest holdout rows "
+            "(held-out map or purge); the exit / selection holdout must be the manifest's"
+        )
+    return run

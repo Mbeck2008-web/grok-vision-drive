@@ -1519,6 +1519,72 @@ def check_cut_then_clamp_order_and_nothing_under_road() -> None:
     assert not bad, "; ".join(bad)
 
 
+# Fixed synthetic edge scenes (flat ground + upright faces, plus two near blocks): NOT clip frames, so nothing here reads
+# the sealed pred idxs 63-107 / 163-207. Same object list on every snap cam; only faces in a cam's view cut.
+EDGE_CUT_OBJECTS = (("car", 2.5, 0.0), ("pole", 3.0, 1.0), ("curb", 3.5, -3.0), ("car", -2.5, -1.0), ("car", 2.5, 6.0),
+                    ("car", -2.5, -6.0), ("pole", -3.0, 3.0), ("pole", 3.0, -4.0), ("car", 3.0, -8.0), ("pole", 2.0, 4.0),
+                    ("pole", -2.0, -2.0))
+EDGE_CUT_BLOCK_Q = (0.75, 0.5)   # a near block (rows 55-90%, cols 30-70%) at q x the ground depth
+
+
+def edge_cut_scenes(cid):
+    cam = pv().cam[cid]
+    depth, fine, net, gt_road, g = ground_scene(cam)
+    H, W = g["hit"].shape
+    ys, xs = np.mgrid[0:H, 0:W]
+    out = []
+    for kind, x0, y0 in EDGE_CUT_OBJECTS:
+        gt, fine2, face, _ = side_object_scene(cam, kind, x0, y0)
+        out.append((f"{kind}@x{x0:g},y{y0:g}", np.where(np.isfinite(gt), gt, 1e4), coarse(fine2)))
+    blk = (ys >= int(H * 0.55)) & (ys < int(H * 0.9)) & (xs >= int(W * 0.3)) & (xs < int(W * 0.7))
+    for q in EDGE_CUT_BLOCK_Q:
+        out.append((f"block q{q:g}", np.where(g["down"], g["hit"] * np.where(blk, q, 1.0), 1e4), net))
+    return out
+
+
+def edge_cut_runs(cams=None):
+    """{cam: [(scene, sky, depth_in, depth_out)]} for every snap cam through the real cam_frame (edge cut tapped)."""
+    res = {}
+    for cid in sorted(cams or resolve_road_snap_cams()):
+        rows = []
+        for name, raw, lab in edge_cut_scenes(cid):
+            fr, log = run_tapped(cid, raw, lab)
+            cuts = [e for e in log if e[0] == "cut"]
+            assert len(cuts) == 1, f"{cid} {name}: {len(cuts)} edge cut calls"
+            rows.append((name, fr[3], cuts[0][1], cuts[0][4]))
+        res[cid] = rows
+    return res
+
+
+def _moved(d_in, d_out):
+    return ~np.isclose(d_in, d_out, equal_nan=True)
+
+
+def sky_moves(rows, cut_fn=None):
+    """Sky px whose depth the cut changed, summed over the scenes; ``cut_fn`` replays the cut with another sky mask."""
+    n = 0
+    for _, sky, d_in, d_out in rows:
+        out = d_out if cut_fn is None else cut_fn(d_in, sky)
+        n += int((_moved(d_in, out) & sky).sum())
+    return n
+
+
+def check_edge_cut_never_touches_sky() -> None:
+    """The depth-edge cut never changes a sky px (its depth stays what it was going in; a sky px is a 2-D backdrop, never
+    moved onto a far side). Real cam_frame on the fixed synthetic edge scenes, all snap cams. Fixture: the cut does move
+    px (otherwise nothing is tested), and the positive control (a cut that ignores the sky mask) moves sky px."""
+    runs = edge_cut_runs()
+    moved = {cid: sum(int(_moved(di, do).sum()) for _, _, di, do in rows) for cid, rows in runs.items()}
+    assert sum(moved.values()) > 500, f"fixture: the edge cut must move px, moved {moved}"
+    bad = {cid: sky_moves(rows) for cid, rows in runs.items() if sky_moves(rows)}
+    ctl = {cid: sky_moves(rows, lambda d, sky: sf.edge_cut_far_side(d, np.zeros_like(sky), np.full(d.shape, np.inf)))
+           for cid, rows in runs.items()}
+    assert any(ctl.values()), f"positive control (cut ignoring the sky mask) moved no sky px: {ctl}"
+    print(f"  sky px changed by the cut {sum(bad.values())} (px moved by the cut per cam {moved}); "
+          f"control cut without the sky mask changes {ctl}", flush=True)
+    assert not bad, f"the edge cut changed sky px: {bad}"
+
+
 def pose_a_chase():
     n = pv().ns
     d = pv().defaults
@@ -3833,6 +3899,7 @@ CHECKS = [
     check_side_objects_keep_height_pins,
     check_snapped_pixels_not_exempt_from_edge_cut,
     check_cut_then_clamp_order_and_nothing_under_road,
+    check_edge_cut_never_touches_sky,
     check_road_labelled_object_top_stays_put,
     check_behind_car_strip_holes,
     check_clip015_render_edge_and_holes,

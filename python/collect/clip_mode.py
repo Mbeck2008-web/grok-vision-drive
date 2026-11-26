@@ -259,7 +259,7 @@ def apply_long_highway(
     hwy = highway_maps(pool)
     highway_first = bool(hwy) and (rng.random() < frac)
     if highway_first:
-        map_name = rng.choice(hwy)
+        map_name = plan.map if plan.map in hwy else rng.choice(hwy)
         route = "highway_loop"
         spawn_kind: str | None = HIGHWAY
         tagged_highway = True
@@ -752,6 +752,8 @@ def run_clips(
             "long_min_s": float(long_min_s),
             "long_max_s": float(long_max_s),
             "long_highway_frac": float(long_highway_frac),
+            "long_clips_delivered": int(long_delivered["highway_loop"] + long_delivered["varied"]),
+            "long_clips_by_route": dict(long_delivered),
             "results": results,
         }
         if stop_reason:
@@ -759,8 +761,14 @@ def run_clips(
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         tmp.replace(manifest)
 
+    long_delivered = {"highway_loop": 0, "varied": 0}
     _save()
     long_at = set(long_clip_indices(int(clips), int(long_clips), int(seed)))
+    if int(long_clips) > 0 and not highway_maps(maps):
+        log(
+            "long clips: no highway map in the pool; falling back to varied "
+            "drive-around routes (maps are not skipped)"
+        )
     for index in range(int(clips)):
         if stop_file is not None and Path(stop_file).exists():
             stop_reason = STOP_FILE_REASON
@@ -773,6 +781,11 @@ def run_clips(
                 plan, min_s=long_min_s, max_s=long_max_s, maps=maps,
                 highway_frac=long_highway_frac,
             )
+            if plan.long:
+                key = plan.long_route if plan.long_route in long_delivered else "varied"
+                long_delivered[key] += 1
+            else:
+                log(f"long clips: index {index} was not applied")
         clip = new_clip_dir(session, plan)
         argv = clip_argv(plan, clip, chase=chase, extra=extra)
         log(f"clip {index + 1}/{clips} {clip.name}: {plan.edge_case} map={plan.map} traffic={plan.traffic} "

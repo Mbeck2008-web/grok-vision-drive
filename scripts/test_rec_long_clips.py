@@ -594,6 +594,105 @@ def check_disk_guards_unchanged_for_long_clips() -> None:
     print("disk guards: 20 GiB floor and 3.5 GiB/file unchanged; ceiling 43 GiB per 900 s clip")
 
 
+
+def check_no_highway_pool_delivers_drive_around_long_clips() -> None:
+    """A pool with no highway map still delivers all requested long clips as varied routes."""
+    from python.collect.clip_mode import long_clip_indices, run_clips
+    from scripts.gvd_test_env import collect_root
+
+    logs: list[str] = []
+    no_hwy = ("east_coast_usa", "small_island")
+
+    def runner(argv: list[str]) -> int:
+        out = Path(argv[argv.index("--out") + 1])
+        _fake_recording(out, rows=50)
+        return 0
+
+    with collect_root() as root:
+        session = run_clips(
+            root, clips=6, seed=3, maps=no_hwy, max_traffic=2, runner=runner,
+            min_s=30.0, max_s=60.0, long_clips=3, long_min_s=600.0, long_max_s=900.0,
+            long_highway_frac=1.0, log=logs.append,
+        )
+        want = set(long_clip_indices(6, 3, seed=3))
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["long_clips"] == 3
+        assert manifest["long_clips_delivered"] == 3, manifest
+        by_route = manifest["long_clips_by_route"]
+        assert by_route.get("varied") == 3 and by_route.get("highway_loop", 0) == 0, by_route
+        tagged = 0
+        for i, row in enumerate(manifest["results"]):
+            tags = json.loads((session / row["dir"] / "clip_tags.json").read_text(encoding="utf-8"))
+            if i in want:
+                assert tags["long"] is True
+                assert tags["long_highway"] is False
+                assert tags["long_route"] == "varied"
+                assert 600.0 <= tags["duration_s"] <= 900.0
+                tagged += 1
+            else:
+                assert tags.get("long") is not True
+        assert tagged == 3
+        text = "\n".join(str(x) for x in logs)
+        assert "no highway" in text.lower() or "falling back" in text.lower(), logs
+    print("no-highway pool: all long clips delivered as varied drive-around; warning logged; counts in session.json")
+
+
+def check_keep_planned_highway_map_and_remap_varies() -> None:
+    """N05: do not remap a plan already on a highway map. N06: a remap is not always the first highway map."""
+    from python.collect.clip_mode import apply_long_highway, plan_clip
+
+    pool = ("west_coast_usa", "italy", "east_coast_usa")
+    # Planned map already has a highway: stay on it (not always remapped).
+    for seed in range(30):
+        base = plan_clip(0, seed=seed, maps=("west_coast_usa",), max_traffic=0)
+        assert base.map == "west_coast_usa"
+        plan = apply_long_highway(base, min_s=600.0, max_s=900.0, maps=pool, highway_frac=1.0)
+        assert plan.long_highway is True
+        assert plan.map == "west_coast_usa", (seed, plan.map)
+    # Planned map has no highway: remap, but not always to pool[0] (west_coast_usa).
+    remapped = set()
+    for seed in range(40):
+        base = plan_clip(0, seed=seed, maps=("east_coast_usa",), max_traffic=0)
+        plan = apply_long_highway(base, min_s=600.0, max_s=900.0, maps=pool, highway_frac=1.0)
+        assert plan.long_highway is True
+        assert plan.map in ("west_coast_usa", "italy"), plan.map
+        remapped.add(plan.map)
+    assert remapped == {"west_coast_usa", "italy"}, remapped
+    print("remap: keep a planned highway map; otherwise vary, not always the first highway map")
+
+
+def check_unreadable_road_dump_is_not_a_highway_map() -> None:
+    """N10: a missing or unreadable road dump is not a highway map."""
+    import gzip
+    from python.collect import clip_mode
+
+    clip_mode.map_has_highway_pool.cache_clear()
+    assert clip_mode.map_has_highway_pool("map_that_has_no_dump_zzz") is False
+
+    from scripts.gvd_test_env import collect_root
+
+    real = clip_mode.spawn_roads_path
+    try:
+        with collect_root() as root:
+            bad = root / "bogus.json.gz"
+            bad.write_bytes(b"this is not gzip")
+            clip_mode.spawn_roads_path = lambda name: bad if name == "bogus_unreadable_map" else real(name)
+            clip_mode.map_has_highway_pool.cache_clear()
+            assert clip_mode.map_has_highway_pool("bogus_unreadable_map") is False
+            # Also a readable gzip with no JSON road network is not a highway map,
+            # but the mutant is the exception path: a truncated gzip must stay False.
+            trunc = root / "trunc.json.gz"
+            with gzip.open(trunc, "wb") as fh:
+                fh.write(b"{")
+            clip_mode.spawn_roads_path = lambda name: trunc if name == "bogus_truncated_map" else real(name)
+            clip_mode.map_has_highway_pool.cache_clear()
+            assert clip_mode.map_has_highway_pool("bogus_truncated_map") is False
+    finally:
+        clip_mode.spawn_roads_path = real
+        clip_mode.map_has_highway_pool.cache_clear()
+    print("unreadable or missing road dump is not a highway map")
+
+
 def main() -> None:
 
     check_default_off_unchanged()
@@ -610,6 +709,9 @@ def main() -> None:
     check_long_clip_highway_frac_mix()
     check_long_clip_routes_direction_and_maps()
     check_disk_guards_unchanged_for_long_clips()
+    check_no_highway_pool_delivers_drive_around_long_clips()
+    check_keep_planned_highway_map_and_remap_varies()
+    check_unreadable_road_dump_is_not_a_highway_map()
     print("test_rec_long_clips: OK")
 
 

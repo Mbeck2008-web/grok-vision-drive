@@ -29,6 +29,16 @@ S  snap on is no worse than snap off for 0-15 m |z_render - z_GT| (median and p9
    side cam and rear (and wide). Catches a rig-wide z0 that pushes side edges in.
 P  footprint coverage: on snapped ground px at 0-15 m, row-to-row 3D spacing <= the
    preview footprint() clipped size (6*d/fy) for >= 95% of those px, per cam.
+B  behind-car strip holes (report-only, no threshold; cause unverified — candidate is the
+   5x5 edge-cut dilate / splat radius 8 px vs 3): GT-road cells 0.25 m, |x|<=12, y<0, r<=30,
+   |z|<1, net road at GT depth, outside the ego box; hole = the cell centre projects onto a
+   chase pixel with no splat (3x3 dilate, no gap fill). Pose A (preview CHASE_POS) and pose B
+   (f110 still). Dev frames f40/f160 (pose A) and f110 (pose A and B); f60/f130 untouched.
+   v2 10893ee reference (Historian): pose A rear 0.146 / 0.000 (f40/f160, n~158/159);
+   b017d12 0.279 / 0.371; 783fedd 0.222 / 0.277.
+I  snapped pixels are not exempt from the depth-edge cut (tools/rv_stable_preview.py
+   ``cut & ~sky & ~snapped``): an off-plane road-labelled pixel at a depth edge must still
+   be cut (moved to the 5x5 far-side). NEW vs a56f514 (no preview/snap).
 I  objects above the road keep their height; a wall/car/curb top labelled road stays put
    (snap must not move it outward; it keeps height and depth); sky stays sky; no NaN.
 F  fuzz: side-cam depth NaN/inf/0/negative, empty masks, extreme extrinsic yaw.
@@ -108,6 +118,13 @@ POSE_B_POS = (0.0, -9.0, 4.5)
 POSE_B_PITCH = -16.0
 POSE_B_FOV = 70.0
 POSE_B_FRAME = 110
+# Historian (v2 10893ee, pose A rear strip, n~158/159 GT cells): report-only reference.
+V2_POSE_A_REAR_HOLES = {40: 0.146, 160: 0.000}
+B017D12_POSE_A_REAR_HOLES = {40: 0.279, 160: 0.371}
+HIST_783FEDD_POSE_A_REAR_HOLES = {40: 0.222, 160: 0.277}
+BEHIND_X_M = 12.0
+BEHIND_R_M = 30.0
+BEHIND_Z_M = 1.0
 DEFAULT_CLIP = Path("/workspace/rv-preview/v2src/clip015")
 DEFAULT_PREDS = Path("/workspace/rv-preview/v2/preds_clip015.npz")
 DEFAULT_GT = Path("/workspace/rv-preview/v2src/gt_eval_only")
@@ -1197,6 +1214,152 @@ def check_clip015_rear_holes_poseB() -> None:
     hole_gate(m["holes"], f"pose B f{POSE_B_FRAME}")
 
 
+
+def check_snapped_pixels_not_exempt_from_edge_cut() -> None:
+    """Snapped pixels must still take the depth-edge cut.
+
+    tools/rv_stable_preview.py does ``depth = np.where(cut & ~sky & ~snapped, far_side, depth)``,
+    so a snapped pixel at a cut is left at the ground-plane hit. An off-plane road-labelled
+    pixel at a depth edge must still be cut. NEW vs a56f514 (no rv_stable_preview / road_snap).
+    """
+    p = pv()
+    cam = p.cam["wide"]
+    g = geom(cam)
+    H, W = g["hit"].shape
+    ys, xs = np.mgrid[0:H, 0:W]
+    # Left: road-labelled, 2.5x too far (snaps onto the plane). Right: not road, also 2.5x
+    # (clamp leaves a depth step vs the snapped hit). The 5x5 far-side of snapped edge
+    # pixels is the unsnapped far depth; they must still be cut, not left at the plane hit.
+    raw = np.where(g["down"], g["hit"] * 2.5, 1e4)
+    road = g["down"] & (xs < W // 2)
+    sem = np.where(~g["down"], sf_sky(), np.where(road, ROAD_ID, NONROAD_ID))
+    _, d, v, sky = p.run("wide", raw, sem)
+    snap = p.last_snap
+    assert snap is not None and snap.any() and snap[:, : W // 2].any()
+    # Replay snap+clamp, then the cut, to identify snapped pixels that sit on a depth edge.
+    pre, snapped = sf.road_snap(cam, raw, (sem == ROAD_ID) & (sem != sf_sky()), max_hit_m=sf.ROAD_SNAP_MAX_M)
+    pre, _ = sf.ground_clamp(cam, pre, margin=float(p.a.clamp_margin or 1.0))
+    inv = 1.0 / np.maximum(pre, 1e-3)
+    gy, gx = np.gradient(inv)
+    cut = np.hypot(gx, gy) > 0.12 * inv
+    far_side = cv2.dilate(pre.astype(np.float32), np.ones((5, 5), np.uint8))
+    need = cut & ~sky & snapped & (np.abs(far_side - pre) > 1e-3)
+    assert need.any(), "fixture must place a snapped pixel on a depth edge"
+    kept = need & (np.abs(d - pre) <= 1e-3)
+    n_need, n_kept = int(need.sum()), int(kept.sum())
+    assert not kept.any(), (
+        f"{n_kept}/{n_need} snapped px at a depth edge were exempt from the cut "
+        f"(tools/rv_stable_preview.py: `cut & ~sky & ~snapped`); NEW vs a56f514"
+    )
+
+
+def pose_a_chase():
+    n = pv().ns
+    d = pv().defaults
+    return sf.chase_camera(n["CHASE_POS"], n["CHASE_PITCH"], n["CHASE_FOV"],
+                           int(d["width"]), int(d["height"]), 0.0)
+
+
+def behind_car_strip_frac(chase, rend_pts, gt_pts):
+    """Hole fraction of behind-car GT-road cells (0.25 m, |x|<=12, y<0, r<=30, |z|<1).
+
+    Hole = the cell centre projects onto a chase pixel with no splat (3x3 dilate, no gap fill).
+    Current-frame points only (no ground-grid memory, no f-10..f+10 window).
+    Returns (hole_frac, n_visible_cells).
+    """
+    g = np.asarray(gt_pts, np.float64).reshape(-1, 3)
+    if g.shape[0] == 0:
+        return float("nan"), 0
+    sel = (np.abs(g[:, 0]) <= BEHIND_X_M) & (g[:, 1] < 0.0) & (np.hypot(g[:, 0], g[:, 1]) <= BEHIND_R_M) & (np.abs(g[:, 2]) < BEHIND_Z_M)
+    g = g[sel]
+    if g.shape[0] == 0:
+        return float("nan"), 0
+    ix = np.floor(g[:, 0] / sf.GRID_CELL_M).astype(np.int64)
+    iy = np.floor(g[:, 1] / sf.GRID_CELL_M).astype(np.int64)
+    keys = np.unique(np.stack([ix, iy], 1), axis=0)
+    centres = (keys + 0.5) * sf.GRID_CELL_M
+    zc = np.zeros(len(centres))
+    r = sf.compose(chase, np.asarray(rend_pts).reshape(-1, 3) if len(rend_pts) else np.zeros((0, 3)),
+                   np.full((max(len(rend_pts), 0), 3), 128, np.uint8) if len(rend_pts) else np.zeros((0, 3), np.uint8),
+                   np.full(len(rend_pts), 0.3) if len(rend_pts) else np.zeros(0),
+                   sky_rgb=None, ground_rgb=None, fill=False)
+    obs = cv2.dilate(r.masks["observed"].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    u, v, z = sf.project(chase, np.c_[centres, zc])
+    vis = np.isfinite(z) & (z > chase.near_m) & (u >= 0) & (u < chase.width) & (v >= 0) & (v < chase.height)
+    if not vis.any():
+        return float("nan"), 0
+    ui, vi = np.floor(u[vis]).astype(np.int64), np.floor(v[vis]).astype(np.int64)
+    ui = np.clip(ui, 0, chase.width - 1)
+    vi = np.clip(vi, 0, chase.height - 1)
+    n = int(vis.sum())
+    return float((~obs[vi, ui]).mean()), n
+
+
+def clip_behind_car_strip(targets, poses):
+    """Load clip frames (nearest sparse index) and measure the behind-car strip on each pose."""
+    clip, preds, gt_root = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    P = np.load(preds)
+    p = Preview(root=clip, P=P, cams=cams)
+    out = {}
+    for target in targets:
+        rend, gtp = [], []
+        used = {}
+        for cid in p.cam:
+            idx = nearest_idx(pred_frames(P, cid), target)
+            if idx is None:
+                continue
+            used[cid] = idx
+            fr = p.run(cid, None, None, idx=idx)
+            if fr is None:
+                continue
+            _, d, v, sky = fr
+            cam = p.cam[cid]
+            c = cams[cid]
+            pw, ph = p.ns["proc_res"](c)
+            W0, _ = c["resolution"]
+            gtd = _load_gt_depth(gt_root, cid, idx, c, pw, ph)
+            net = _net_road(P, cid, idx, W0, pw, ph)
+            ys, xs = np.nonzero(v & np.isfinite(d))
+            if ys.size:
+                q = sf.unproject(cam, d, ys, xs)
+                rend.append(q[ego_box_filter(q)])
+            if gtd is not None:
+                ys, xs = np.nonzero(net & np.isfinite(gtd))
+                if ys.size:
+                    q = sf.unproject(cam, gtd, ys, xs)
+                    q = q[np.abs(q[:, 2]) < BEHIND_Z_M]
+                    if q.size:
+                        gtp.append(q[ego_box_filter(q)])
+        R = np.concatenate(rend) if rend else np.zeros((0, 3))
+        G = np.concatenate(gtp) if gtp else np.zeros((0, 3))
+        out[target] = {"used": used}
+        for name, ch in poses:
+            frac, n = behind_car_strip_frac(ch, R, G)
+            out[target][name] = (frac, n)
+    return out
+
+
+def check_behind_car_strip_holes_report() -> None:
+    """Report-only: behind-car strip hole fraction on pose A (f40/f160) and pose A+B (f110). No gate.
+
+    v2 10893ee pose A rear: 0.146 / 0.000 (f40/f160). b017d12: 0.279 / 0.371. 783fedd (Historian, with grid): 0.222 / 0.277.
+    This measurement uses current-frame points only (no ground-grid memory).
+    """
+    if not _need_clip("behind_car_strip_holes_report"):
+        return SKIPPED
+    poses = (("poseA", pose_a_chase()), ("poseB", pose_b_chase()))
+    m = clip_behind_car_strip((40, 160, POSE_B_FRAME), poses)
+    for f, rec in m.items():
+        v2 = V2_POSE_A_REAR_HOLES.get(f)
+        hist = HIST_783FEDD_POSE_A_REAR_HOLES.get(f)
+        print(f"behind-car strip f{f} nearest {rec['used']}: "
+              + ", ".join(f"{k} {rec[k][0]:.3f} (n={rec[k][1]})" for k in ("poseA", "poseB") if k in rec)
+              + (f"; v2 poseA ref {v2}" if v2 is not None else "")
+              + (f"; Historian 783fedd poseA {hist}" if hist is not None else ""),
+              flush=True)
+
+
 def check_road_labelled_object_top_stays_put() -> None:
     """A wall / car / curb top labelled road stays put: snap must not move it outward, and it keeps height and depth."""
     p = pv()
@@ -1329,7 +1492,9 @@ CHECKS = [
     check_synthetic_edge_overshoot,
     check_synthetic_rear_holes,
     check_side_objects_keep_height_pins,
+    check_snapped_pixels_not_exempt_from_edge_cut,
     check_road_labelled_object_top_stays_put,
+    check_behind_car_strip_holes_report,
     check_clip015_snap_misplace,
     check_holdout_snap_misplace,
     check_clean_holdout_snap_misplace,
@@ -1360,6 +1525,7 @@ KNOWN_FAILING: dict[str, str] = {
     "check_synthetic_width": "L+E: pillarL/R 0-5 m median 14.8% p90 47.3%; repeatL/R 0-5 m 16.6%/23.0%, 5-15 m 28.1%/48.2%; rear 15-30 m",
     "check_synthetic_edge_overshoot": "L: road 0.35 m (pillars) / 0.71 m (repeats) past the GT edge at 0-5 m (12x16 label bleed)",
     "check_side_objects_keep_height_pins": "N: pillarR parked car x2.5 lost 1.07 m on 88 px; pole x3 lost 1.07 m on 351/391 px; curbs lost 0.11 m",
+    "check_snapped_pixels_not_exempt_from_edge_cut": "NEW vs a56f514: 456/456 snapped px at a depth edge were exempt from the cut (tools/rv_stable_preview.py: `cut & ~sky & ~snapped`, added at 4df1176). wide, left-half road 2.5x / right unsnapped 2.5x, clamp on.",
     "prop_side_objects_keep_height": "N: pillarL pole at x=-2.0, y0=0.0: lost 0.592 m",
     "check_road_labelled_object_top_stays_put": "N: pillarR car top 218 px moved outward (GT z 1.50 m); curb top 1487 px, height lost 0.15 m; main car top also snapped outward",
     "check_clip015_snap_misplace": "f40/f160: pillarR 18.10% (f40 36.90%/f160 3.50%), repeatR 4.65% (f40 9.99%), wide 15.00% at 0-15 m; wide 59.35% at 15-30 m (GT z>0.30)",

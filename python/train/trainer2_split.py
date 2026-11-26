@@ -33,6 +33,7 @@ SPLIT_MANIFEST = "split_manifest.json"
 RUN_MANIFEST = "run_manifest.json"
 SPLITS = ("train", "holdout")
 DECISION_TIERS = ("iteration", "2.0")
+KEY_FIELDS = ("source", "i", "t", "map", "session")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 __all__ = [
@@ -184,7 +185,7 @@ def check_split_manifest(manifest: Mapping[str, Any]) -> None:
         raise SplitError("split manifest sha256 does not match its content")
     for split in SPLITS:
         for key in manifest.get(split) or []:
-            if not isinstance(key, (list, tuple)) or len(key) != 5:
+            if not isinstance(key, (list, tuple)) or len(key) != len(KEY_FIELDS):
                 raise SplitError(f"{split} key {key!r} is not [source, i, t, map, session]")
         keys = _keys(manifest, split)
         if keys != sorted(set(keys)):

@@ -25,7 +25,8 @@ python scripts/migrate_ckpt_classes.py OLD.ckpt_ep11_step86808.npz NEW.migrated5
   `meta["migration"]` is the hash of exactly those bytes.
 * The write keeps the trainer's low-disk floor (`ensure_free_space` in `python/train/epoch_ckpt.py`, shared with
   `write_epoch_ckpt`): refused if it would leave under 8 GB free on the output volume. `--min-free-gb N` changes the
-  floor for this run (the trainer's `--ckpt-min-free-gb` equivalent).
+  floor for this run (the trainer's `--ckpt-min-free-gb` equivalent). `0` disables the floor. Non-finite or negative
+  values (`nan`, `inf`, `-1`) are refused with exit 2 (an argument error, no traceback).
 * The file is written to a temp name and linked into place create-only, so a file that appears at the output path
   during the run is refused, not replaced. Any other OS error while creating the output is also a refusal (exit 2) and
   the temp file is removed.

@@ -47,6 +47,7 @@ trained with the people class removed, so treat its class logits accordingly.
 from __future__ import annotations
 
 import argparse
+import math
 import errno
 import hashlib
 import io
@@ -306,11 +307,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument(
         "--min-free-gb",
-        type=float,
+        type=_min_free_gb,
         default=DEFAULT_MIN_FREE_GB,
-        help=f"refuse if the write would leave less than this many GB free on the output volume (default {DEFAULT_MIN_FREE_GB:g}, the trainer's epoch-ckpt floor)",
+        help=f"refuse if the write would leave less than this many GB free on the output volume (default {DEFAULT_MIN_FREE_GB:g}, the trainer's epoch-ckpt floor; 0 disables the floor). Non-finite or negative values are an error (exit 2).",
     )
     return p
+
+
+def _min_free_gb(text: str) -> float:
+    """argparse type: a finite number >= 0. 0 means the low-disk floor is off."""
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid --min-free-gb {text!r}") from exc
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            f"--min-free-gb must be a finite number >= 0 (0 disables the floor); got {text!r}"
+        )
+    return value
 
 
 def main(argv: Sequence[str] | None = None) -> int:

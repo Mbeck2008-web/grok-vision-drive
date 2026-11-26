@@ -195,10 +195,18 @@ def load_epoch_ckpt(path: Path | str, data: bytes | None = None) -> dict[str, An
     path = Path(path)
     with np.load(io.BytesIO(data) if data is not None else path, allow_pickle=False) as blob:
         meta = json.loads(str(blob["meta"].item() if blob["meta"].shape == () else blob["meta"]))
+        if not isinstance(meta, dict):
+            raise ValueError(f"{path.name}: meta must be a JSON object, not {type(meta).__name__}")
         if meta.get("format") != FORMAT:
             raise ValueError(f"{path.name}: not a {FORMAT} file")
         meta.setdefault("exact_epochs", None)  # written by --exact-epochs runs; older files read as null
-        names = list(meta.get("weight_names") or [])
+        raw_names = meta.get("weight_names")
+        if raw_names is None:
+            names = []
+        elif not (isinstance(raw_names, list) and all(isinstance(name, str) for name in raw_names)):
+            raise ValueError(f"{path.name}: weight_names must be a list of str")
+        else:
+            names = list(raw_names)
         weights = {name: np.array(blob[f"w{index}"], copy=True) for index, name in enumerate(names)}
     parsed = parse_ckpt_name(path)
     if parsed is not None and (parsed["epoch"] != int(meta.get("epoch", -1)) or parsed["step"] != int(meta.get("step", -1))):

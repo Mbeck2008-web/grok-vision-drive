@@ -282,53 +282,54 @@ def check_live_path_is_separate_process() -> None:
             except OSError:
                 pass
 
-    # Case B: intermediate parent spawns --serve with stdin kept open by grandparent pipe (so EOF cannot trigger).
-    r_fd, w_fd = os.pipe()
-    os.set_inheritable(r_fd, True)
-    parent_b = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import subprocess, sys, time; "
-                "from python.viz.rv_contract import RV_RENDERER_MODULE, pdeathsig_preexec; "
-                f"p = subprocess.Popen([sys.executable, '-m', RV_RENDERER_MODULE, '--serve'], stdin={r_fd}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=pdeathsig_preexec()); "
-                "print(p.pid, flush=True); "
-                "time.sleep(60)"
-            ),
-        ],
-        cwd=str(ROOT),
-        pass_fds=(r_fd,),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    os.close(r_fd)
-    stub_pid_b: int | None = None
-    try:
-        assert parent_b.stdout is not None
-        line_b = parent_b.stdout.readline().strip()
-        assert line_b.isdigit(), f"unexpected parent_b output: {line_b!r} stderr={parent_b.stderr.read() if parent_b.stderr else ''}"
-        stub_pid_b = int(line_b)
-        assert _pid_alive(stub_pid_b), f"stub_pid_b {stub_pid_b} not alive"
-        parent_b.kill()
-        parent_b.wait(timeout=5)
-        assert _wait_pid_exit(stub_pid_b, timeout_s=4.0), (
-            f"stub_pid_b {stub_pid_b} orphaned after parent SIGKILL with open stdin"
+    # Case B (POSIX): intermediate parent spawns --serve with stdin kept open by grandparent pipe (so EOF cannot trigger).
+    if sys.platform != "win32":
+        r_fd, w_fd = os.pipe()
+        os.set_inheritable(r_fd, True)
+        parent_b = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess, sys, time; "
+                    "from python.viz.rv_contract import RV_RENDERER_MODULE, pdeathsig_preexec; "
+                    f"p = subprocess.Popen([sys.executable, '-m', RV_RENDERER_MODULE, '--serve'], stdin={r_fd}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=pdeathsig_preexec()); "
+                    "print(p.pid, flush=True); "
+                    "time.sleep(60)"
+                ),
+            ],
+            cwd=str(ROOT),
+            pass_fds=(r_fd,),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-    finally:
+        os.close(r_fd)
+        stub_pid_b: int | None = None
         try:
-            os.close(w_fd)
-        except OSError:
-            pass
-        if parent_b.poll() is None:
+            assert parent_b.stdout is not None
+            line_b = parent_b.stdout.readline().strip()
+            assert line_b.isdigit(), f"unexpected parent_b output: {line_b!r} stderr={parent_b.stderr.read() if parent_b.stderr else ''}"
+            stub_pid_b = int(line_b)
+            assert _pid_alive(stub_pid_b), f"stub_pid_b {stub_pid_b} not alive"
             parent_b.kill()
             parent_b.wait(timeout=5)
-        if stub_pid_b is not None and _pid_alive(stub_pid_b):
+            assert _wait_pid_exit(stub_pid_b, timeout_s=4.0), (
+                f"stub_pid_b {stub_pid_b} orphaned after parent SIGKILL with open stdin"
+            )
+        finally:
             try:
-                os.kill(stub_pid_b, signal.SIGKILL)
+                os.close(w_fd)
             except OSError:
                 pass
+            if parent_b.poll() is None:
+                parent_b.kill()
+                parent_b.wait(timeout=5)
+            if stub_pid_b is not None and _pid_alive(stub_pid_b):
+                try:
+                    os.kill(stub_pid_b, signal.SIGKILL)
+                except OSError:
+                    pass
 
     # Case C (Linux): verify prctl PR_SET_PDEATHSIG(SIGTERM) is armed by both pdeathsig_preexec and stub._install_pdeathsig.
     if sys.platform.startswith("linux"):

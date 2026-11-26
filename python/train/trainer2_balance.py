@@ -155,6 +155,10 @@ class GradNorm:
         for name in names:
             self.initial.setdefault(name, max(float(losses[name]), 1e-12))
         if len(names) < 2:
+            # Spec: sum(w_i) == n_active. One active head is projected to 1.0 (a weight
+            # earned while more heads were active is not carried over); no step is taken.
+            if names:
+                self.weights.update(project_weights({n: self.weights[n] for n in names}, float(len(names))))
             return dict(self.weights)
         g = {n: float(grad_norms[n]) for n in names}
         big_g = {n: self.weights[n] * g[n] for n in names}

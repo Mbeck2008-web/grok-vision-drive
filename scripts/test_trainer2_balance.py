@@ -4,7 +4,8 @@
 Checks: check_per_task_grad_norm_logged, check_gradnorm_weights_sum_and_clamp,
 check_head_ramp_linear, check_gradnorm_one_step_hand_computed (hand-computed weights),
 check_project_weights_clamp_exact, check_combine_losses_ramp_and_inactive,
-check_gradnorm_lone_head_keeps_weight. Torch parts skip visibly without torch.
+check_gradnorm_lone_head_renormalizes_to_active_count,
+check_grad_norm_record_weights_after_update, check_combine_refuses_balanced_head_as_fixed_term. Torch parts skip visibly without torch.
 """
 from __future__ import annotations
 
@@ -239,13 +240,68 @@ def check_combine_losses_ramp_and_inactive() -> None:
     print("combine_losses: ramp x weight x loss summed over active heads only, fixed term added OK")
 
 
-def check_gradnorm_lone_head_keeps_weight() -> None:
+def check_gradnorm_lone_head_renormalizes_to_active_count() -> None:
+    # Spec (docs/specs/trainer_2.md, GradNorm): renormalized so sum(w_i) == n_active.
+    # With one active head that is 1.0, whatever it earned while more heads were active.
+    for earned in (1.4, 0.3, 10.0, 0.1):
+        gn = _gn(["a", "b"], lr=0.1)
+        gn.weights["a"] = earned
+        gn.weights["b"] = 0.7  # inactive: must not be touched
+        out = gn.update({"a": 1.0}, {"a": 9.0}, active=["a"])
+        assert out["a"] == 1.0 and gn.weights["a"] == 1.0, (earned, out)
+        assert gn.weights["b"] == 0.7 and out["b"] == 0.7, "an inactive head's weight changed"
+        assert gn.initial == {"a": 1.0}, "the lone head's first loss must still be recorded as L(0)"
+    # The weight is 1.0 whatever the grad norm: no gradient step is taken with one head.
+    for g in (0.0, 1e-6, 1e6):
+        gn = _gn(["a"], lr=0.5)
+        assert gn.update({"a": 3.0}, {"a": g}, active=["a"]) == {"a": 1.0}
+    # No active head: nothing changes.
     gn = _gn(["a", "b"], lr=0.1)
-    gn.weights["a"] = 1.4  # earned while two heads were active; PINS CURRENT BEHAVIOUR for one active head
-    out = gn.update({"a": 1.0}, {"a": 9.0}, active=["a"])
-    assert out["a"] == 1.4 and gn.weights["a"] == 1.4, out  # no renormalization to 1.0 and no step with one head
-    assert gn.initial == {"a": 1.0}
-    print("gradnorm: a lone active head keeps its weight and records L(0) OK")
+    gn.weights["a"] = 1.4
+    assert gn.update({}, {}, active=[]) == {"a": 1.4, "b": 1.0}
+    # Two active heads still sum to 2 (the lone-head rule is the n = 1 case of the same projection).
+    gn = _gn(["a", "b"], lr=0.1)
+    out = gn.update({"a": 1.0, "b": 1.0}, {"a": 4.0, "b": 1.0}, active=["a", "b"])
+    assert math.isclose(out["a"] + out["b"], 2.0, abs_tol=1e-9), out
+    print("gradnorm: a lone active head is projected to 1.0 (sum == n_active), inactive weights and L(0) kept OK")
+
+
+def check_grad_norm_record_weights_after_update() -> None:
+    from python.train.trainer2_balance import HeadRamp, grad_norm_record
+
+    gn = _gn(["a", "b", "c"], lr=0.1, fixed={"kd": 0.25})
+    gn.update({"a": 1.0, "b": 1.0}, {"a": 4.0, "b": 1.0}, active=["a", "b"])
+    gn.update({"a": 0.5, "b": 1.5}, {"a": 4.0, "b": 1.0}, active=["a", "b"])
+    assert gn.weights["a"] != 1.0 and gn.weights["b"] != 1.0, gn.weights  # the update moved them
+    ramp = HeadRamp({"a": 0, "b": 0, "c": 100})
+    rec = grad_norm_record(10, {"a": 4.0, "b": 1.0}, gn, ramp)
+    assert rec["weight"] == {"a": gn.weights["a"], "b": gn.weights["b"]}, (rec["weight"], gn.weights)
+    assert rec["weight"]["a"] != 1.0 and rec["weight"]["b"] != 1.0
+    assert rec["ramp"] == {"a": 10 / 2000, "b": 10 / 2000} and rec["grad_norm"] == {"a": 4.0, "b": 1.0}
+    print(f"grad_norm_record: weights after two updates {rec['weight']} == GradNorm.weights OK")
+
+
+def check_combine_refuses_balanced_head_as_fixed_term() -> None:
+    try:
+        import torch
+    except ImportError:
+        skip_check("check_combine_refuses_balanced_head_as_fixed_term", "torch not installed")
+        return
+    from python.train.trainer2_balance import HeadRamp, combine_losses
+
+    gn = _gn(["a", "b"], lr=0.1, fixed={"kd": 0.5})
+    ramp = HeadRamp({"a": 0, "b": 0})
+    losses = {"a": torch.tensor(1.0), "b": torch.tensor(2.0)}
+    for balanced in ("a", "b"):
+        try:
+            combine_losses(losses, gn, ramp, step=2000, fixed_losses={balanced: torch.tensor(3.0)})
+        except ValueError as exc:
+            assert balanced in str(exc) and "GradNorm-balanced" in str(exc), exc
+        else:
+            raise AssertionError(f"balanced head {balanced!r} offered as a fixed term was accepted (double-counted)")
+    ok = combine_losses(losses, gn, ramp, step=2000, fixed_losses={"kd": torch.tensor(4.0)})
+    assert math.isclose(float(ok.detach()), 1.0 + 2.0 + 0.5 * 4.0), float(ok.detach())
+    print("combine_losses: a GradNorm-balanced head offered as a fixed term is refused; a real fixed term still adds OK")
 
 
 def main() -> int:
@@ -255,7 +311,9 @@ def main() -> int:
         check_gradnorm_one_step_hand_computed,
         check_project_weights_clamp_exact,
         check_combine_losses_ramp_and_inactive,
-        check_gradnorm_lone_head_keeps_weight,
+        check_gradnorm_lone_head_renormalizes_to_active_count,
+        check_grad_norm_record_weights_after_update,
+        check_combine_refuses_balanced_head_as_fixed_term,
         check_per_task_grad_norm_logged,
     )
     failed = 0

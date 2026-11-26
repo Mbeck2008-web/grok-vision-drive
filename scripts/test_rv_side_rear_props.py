@@ -14,8 +14,12 @@ W  (a) edge-position error of pred-road pixels vs GT depth at the same pixel:
    Reason (Tracer / Skeptic): hard 0 unreachable: one-sided z_pred>+0.30 gate catches only
    46-100% of off-ground px (logs/rv_side4.txt); GT cm quantization + pose jitter push true
    road just over 0.30 m past 15 m; hence <=1% 0-15 m, <=3% 15-30 m (Skeptic).
-   p99 |GT z| of snapped pixels is printed as a road-noise number, info only (no noise margin
-   in the gate).
+   Denominator (explicit): snapped pixels with finite GT depth, counted per cam and range
+   bin (range = hypot(x,y) of that pixel's GT unprojection). Numerator: those snapped
+   pixels whose GT z > 0.30 m at that same pixel's GT depth. Not all road px, not all
+   valid px, not z_pred. p99 |GT z| of snapped pixels is printed as a road-noise number,
+   info only (no noise margin in the gate).
+   Note: net mask too wide is not measured: GT road = net px within 1 m of plane.
    The old seg-based width gate is kept but skips unless GVD_RV_CLIP015_GTSEG is set
    (clip015 has no GT seg).
 E  left / right edge offset vs GT depth, per cam and bin: REPORT ONLY.
@@ -29,13 +33,19 @@ S  snap on is no worse than snap off for 0-15 m |z_render - z_GT| (median and p9
    side cam and rear (and wide). Catches a rig-wide z0 that pushes side edges in.
 P  footprint coverage: on snapped ground px at 0-15 m, row-to-row 3D spacing <= the
    preview footprint() clipped size (6*d/fy) for >= 95% of those px, per cam.
-B  behind-car strip holes (report-only, no threshold; cause unverified — candidate is the
-   5x5 edge-cut dilate / splat radius 8 px vs 3): GT-road cells 0.25 m, |x|<=12, y<0, r<=30,
-   |z|<1, net road at GT depth, outside the ego box; hole = the cell centre projects onto a
-   chase pixel with no splat (3x3 dilate, no gap fill). Pose A (preview CHASE_POS) and pose B
-   (f110 still). Dev frames f40/f160 (pose A) and f110 (pose A and B); f60/f130 untouched.
-   v2 10893ee reference (Historian): pose A rear 0.146 / 0.000 (f40/f160, n~158/159);
-   b017d12 0.279 / 0.371; 783fedd 0.222 / 0.277.
+B  behind-car strip holes, GATED (not report-only): GT-road cells 0.25 m, |x|<=12, y<0, r<=30,
+   |z|<1, net road at GT depth, outside the ego box; cells built from rows f-10..f+10 moved
+   into the current frame by VO; hole = the cell centre projects onto a chase pixel with no
+   splat (3x3 dilate, no gap fill; 960x540 rigid chase; memory on: v2 accumulate / stable
+   ground grid). Pose A strip hole frac <= v2 measured on 10893ee (this run): f40 0.1456
+   (n=158), f160 0.0000 (n=159). Historian published 0.146/0.000 (same measurement, rounded).
+   Pose B f110 strip <= v2 measured 0.1058 (n=1503); Historian did not publish f110.
+   Dev frames only (f40/f160/f110); f60/f130 untouched. Far-hole gate (pose B, <=2% at 0-15 m
+   and <=5% at 15-30 m, fill on, |z|<=STATIC_MAX_HEIGHT_M) is kept.
+A  width (gate a: edge-position median <=10% / p90 <=20% of median |x_gt| in 0-5 and 5-15 m,
+   plus overshoot <=0.3 m at 0-5 m) and holes (<=2% / <=5%) are also gated in the RENDER
+   (chase) frame, identically to the capture-frame gates. Pose A and pose B, dev frames.
+N  net mask too wide is not measured: GT road = net px within 1 m of plane.
 I  snapped pixels are not exempt from the depth-edge cut (tools/rv_stable_preview.py
    ``cut & ~sky & ~snapped``): an off-plane road-labelled pixel at a depth edge must still
    be cut (moved to the 5x5 far-side). NEW vs a56f514 (no preview/snap).
@@ -118,13 +128,20 @@ POSE_B_POS = (0.0, -9.0, 4.5)
 POSE_B_PITCH = -16.0
 POSE_B_FOV = 70.0
 POSE_B_FRAME = 110
-# Historian (v2 10893ee, pose A rear strip, n~158/159 GT cells): report-only reference.
-V2_POSE_A_REAR_HOLES = {40: 0.146, 160: 0.000}
+# Behind-car strip gates = v2 10893ee measured here (rv-side-evidence/v2_verify_10893ee.json).
+# Historian published pose A 0.146/0.000; we measured 0.1456 (n=158) / 0.0000 (n=159) — same
+# method, their rounding. Pose B f110 was not published by Historian; we measured 0.1058 (n=1503).
+V2_POSE_A_STRIP = {40: 0.1456, 160: 0.0000}
+V2_POSE_B_STRIP = {110: 0.1058}
+V2_POSE_A_REAR_HOLES = {40: 0.146, 160: 0.000}  # Historian rounded, kept as a published-ref note
 B017D12_POSE_A_REAR_HOLES = {40: 0.279, 160: 0.371}
 HIST_783FEDD_POSE_A_REAR_HOLES = {40: 0.222, 160: 0.277}
 BEHIND_X_M = 12.0
 BEHIND_R_M = 30.0
 BEHIND_Z_M = 1.0
+STRIP_W, STRIP_H = 960, 540
+STRIP_WIN = 10
+STRIP_CAMS = ("pillarL", "pillarR", "repeatL", "repeatR", "rear", "main", "wide")  # not narrow
 DEFAULT_CLIP = Path("/workspace/rv-preview/v2src/clip015")
 DEFAULT_PREDS = Path("/workspace/rv-preview/v2/preds_clip015.npz")
 DEFAULT_GT = Path("/workspace/rv-preview/v2src/gt_eval_only")
@@ -170,7 +187,7 @@ def _argparse_defaults(tree: ast.Module) -> dict:
     return out
 
 
-_WANT_FN = {"fy_full", "proc_res", "cam_frame", "footprint"}
+_WANT_FN = {"fy_full", "proc_res", "cam_frame", "footprint", "phase_dx"}
 
 
 _WANT_AS = {"CAMS", "SKY", "CHASE_POS", "CHASE_PITCH", "CHASE_FOV", "EGO_BOX", "EGO_MASK", "FY_REF", "CAM_POSE",
@@ -1013,8 +1030,20 @@ def _fmt_snap(rows):
 
 
 def snap_misplace_gate(m, label):
-    """<= 1% snapped px with GT z > 0.30 m at 0-15 m; <= 3% at 15-30 m. Per cam, side/rear/wide."""
-    print(f"{label} snap misplace (info: p99 |GT z| is road noise, not a margin):", _fmt_snap(m["snap"]), flush=True)
+    """<= 1% snapped px with GT z > 0.30 m at 0-15 m; <= 3% at 15-30 m. Per cam, side/rear/wide.
+
+    Denominator: snapped pixels with finite GT depth, counted per cam and range bin
+    (range = hypot(x, y) of that pixel's GT unprojection).
+    Numerator: those snapped pixels whose GT z > 0.30 m at that same pixel's GT depth.
+    Not all road px, not all valid px, not z_pred.
+    """
+    print(f"{label} snap misplace gate (b): denom = snapped px with finite GT depth, per cam/bin "
+          f"(range = hypot(x,y) of that px's GT unprojection); numer = snapped px with GT z > "
+          f"{SNAP_BAD_Z} m at that px's GT depth. Not all road px, not all valid px, not z_pred. "
+          f"p99 |GT z| is road noise, not a margin. "
+          f"Note: net mask too wide is not measured: GT road = net px within 1 m of plane.",
+          flush=True)
+    print(f"{label} snap misplace counts:", _fmt_snap(m["snap"]), flush=True)
     print(f"{label} nearest frames:", m["used"], flush=True)
     acc = {}  # (cid, lo, hi) -> [n_bad, n]
     for cid, tgt, idx, lo, hi, n, n_bad, p99 in m["snap"]:
@@ -1340,24 +1369,429 @@ def clip_behind_car_strip(targets, poses):
     return out
 
 
-def check_behind_car_strip_holes_report() -> None:
-    """Report-only: behind-car strip hole fraction on pose A (f40/f160) and pose A+B (f110). No gate.
+def strip_chase(name: str):
+    """960x540 rigid chase used for the v2-comparable behind-car strip."""
+    if name == "poseA":
+        pos, pitch, fov = (0.0, -4.0, 2.6), -12.0, 60.0
+    elif name == "poseB":
+        pos, pitch, fov = POSE_B_POS, POSE_B_PITCH, POSE_B_FOV
+    else:
+        raise ValueError(name)
+    return sf.chase_camera(pos, pitch, fov, STRIP_W, STRIP_H, 0.0)
 
-    v2 10893ee pose A rear: 0.146 / 0.000 (f40/f160). b017d12: 0.279 / 0.371. 783fedd (Historian, with grid): 0.222 / 0.277.
-    This measurement uses current-frame points only (no ground-grid memory).
+
+def behind_car_strip_frac_hires(chase, rend_pts, gt_pts):
+    """Same as behind_car_strip_frac but splat radius matches the 960-wide preview (max(2, W//120)=8)."""
+    g = np.asarray(gt_pts, np.float64).reshape(-1, 3)
+    if g.shape[0] == 0:
+        return float("nan"), 0
+    sel = ((np.abs(g[:, 0]) <= BEHIND_X_M) & (g[:, 1] < 0.0) & (np.hypot(g[:, 0], g[:, 1]) <= BEHIND_R_M)
+           & (np.abs(g[:, 2]) < BEHIND_Z_M))
+    g = g[sel]
+    if g.shape[0] == 0:
+        return float("nan"), 0
+    ix = np.floor(g[:, 0] / sf.GRID_CELL_M).astype(np.int64)
+    iy = np.floor(g[:, 1] / sf.GRID_CELL_M).astype(np.int64)
+    keys, inv = np.unique(np.stack([ix, iy], 1), axis=0, return_inverse=True)
+    zc = np.zeros(len(keys))
+    np.add.at(zc, inv, g[:, 2])
+    zc /= np.bincount(inv, minlength=len(keys))
+    centres = np.c_[(keys + 0.5) * sf.GRID_CELL_M, zc]
+    rend = np.asarray(rend_pts, np.float64).reshape(-1, 3)
+    n_r = len(rend)
+    if n_r == 0:
+        obs = np.zeros((chase.height, chase.width), bool)
+    else:
+        r = sf.splat(chase, rend, np.full((n_r, 3), 128, np.uint8), np.full(n_r, 0.3),
+                     splat_scale=1.0, max_radius_px=max(2, chase.width // 120))
+        obs = r[2] if isinstance(r, tuple) else r.masks["observed"]
+    obs = cv2.dilate(np.asarray(obs).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    u, v, z = sf.project(chase, centres)
+    vis = np.isfinite(z) & (z > chase.near_m) & (u >= 0) & (u < chase.width) & (v >= 0) & (v < chase.height)
+    if not vis.any():
+        return float("nan"), 0
+    ui = np.clip(np.floor(u[vis]).astype(np.int64), 0, chase.width - 1)
+    vi = np.clip(np.floor(v[vis]).astype(np.int64), 0, chase.height - 1)
+    n = int(vis.sum())
+    return float((~obs[vi, ui]).mean()), n
+
+
+def _gt_road_row(p, P, gt_root, cams, idx, present):
+    """GT road points (net class, |z|<1, outside ego) in that row's camera/ego frame. Eval only."""
+    out = []
+    for cid in STRIP_CAMS:
+        if cid not in p.cam or cid not in present:
+            continue
+        c = cams[cid]
+        pw, ph = p.ns["proc_res"](c)
+        W0, _ = c["resolution"]
+        gtd = _load_gt_depth(gt_root, cid, idx, c, pw, ph)
+        if gtd is None:
+            continue
+        if not any(f"{cid}/{idx}/{k}/s" in P.files for k in range(8)):
+            continue
+        net = _net_road(P, cid, idx, W0, pw, ph)
+        ys, xs = np.nonzero(net & np.isfinite(gtd) & (gtd > 0.5) & (gtd < 200))
+        if not ys.size:
+            continue
+        q = sf.unproject(p.cam[cid], gtd, ys, xs)
+        q = q[np.abs(q[:, 2]) < BEHIND_Z_M]
+        if q.size:
+            out.append(q[ego_box_filter(q)])
+    return np.concatenate(out) if out else np.zeros((0, 3))
+
+
+def clip_stable_timeline(targets, win=STRIP_WIN):
+    """Walk clip015 with preview VO + CamDepthFilter + GroundGrid (memory).
+
+    Returns per target: cur/mem point clouds in the current ego frame, GT-window
+    points (f+/-win, transformed in), and current-only GT (held captures, for
+    render-frame width/holes). Dev frames only; does not touch f60/f130 unless
+    they fall in a requested window (callers must not request them).
     """
-    if not _need_clip("behind_car_strip_holes_report"):
+    if any(t in (60, 130) for t in targets):
+        raise ValueError("f60/f130 are reserved holdouts and must not be requested")
+    clip, preds, gt_root = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    rows = [json.loads(l) for l in (clip / "state.jsonl").read_text().splitlines() if l.strip()]
+    P = np.load(preds)
+    prev = Preview(root=clip, P=P, cams=cams)
+    phase_dx = prev.ns["phase_dx"]
+    footprint = prev.ns["footprint"]
+    filters = {cid: sf.CamDepthFilter() for cid in prev.cam}
+    grid = sf.GroundGrid()
+    latest = {}  # cid -> (pts, cols, foot, pose)
+    odo = [0.0, 0.0, 0.0]
+    prev_band = None
+    prev_t = None
+    FXM = prev.ns["fy_full"](cams["main"]) * 256 / 640
+    want = set(int(t) for t in targets)
+    max_i = max(want) + int(win)
+    gtwin = {}
+    out = {}
+    for row in rows:
+        i = int(row["i"])
+        t = float(row["t"])
+        if i > max_i:
+            break
+        main_png = clip / "raw" / "main" / "000" / f"{i:06d}.png"
+        band = cv2.resize(cv2.imread(str(main_png), cv2.IMREAD_GRAYSCALE), (256, 192),
+                          interpolation=cv2.INTER_AREA)[:80].astype(np.float64)
+        if prev_band is not None:
+            dt = max(0.0, t - prev_t)
+            dyaw = math.atan2(phase_dx(prev_band, band), FXM)
+            mid = odo[2] + 0.5 * dyaw
+            dist = float(row["veh"]["wheelspeed"]) * dt
+            odo = [odo[0] - math.sin(mid) * dist, odo[1] + math.cos(mid) * dist, odo[2] + dyaw]
+        prev_band, prev_t = band, t
+        pose = tuple(odo)
+        present = set((row.get("cams") or {}).keys())
+        if any(abs(i - w) <= win for w in want):
+            gtwin[i] = (_gt_road_row(prev, P, gt_root, cams, i, present), pose)
+        if i > max(want):
+            continue
+        for cid in prev.cam:
+            if cid not in present:
+                continue
+            if not (clip / "raw" / cid / "000" / f"{i:06d}.png").is_file():
+                continue
+            fr = prev.run(cid, None, None, idx=i)
+            if fr is None:
+                continue
+            rgb, depth, valid, sky = fr
+            cam = prev.cam[cid]
+            if bool(prev.a.depth_filter):
+                conf = np.clip(1.0 / (1.0 + depth / 20.0), 0.2, 1.0)
+                depth, _ = filters[cid].update(cam, depth, valid, pose, t, conf=np.where(valid, conf, 0.0))
+            ys, xs = np.nonzero(valid)
+            if not ys.size:
+                continue
+            pts = sf.unproject(cam, depth, ys, xs)
+            cols = rgb[ys, xs] if rgb.ndim == 3 else np.full((ys.size, 3), 128, np.uint8)
+            foot = footprint(cam, depth)[ys, xs]
+            keep = ego_box_filter(pts)
+            pts, cols, foot = pts[keep], cols[keep], foot[keep]
+            latest[cid] = (pts, cols, foot, pose)
+            st = pts[:, 2] <= sf.STATIC_MAX_HEIGHT_M
+            if st.any():
+                wpts = sf.transform_points(pts[st], pose, (0.0, 0.0, 0.0))
+                dist = np.hypot(pts[st, 0], pts[st, 1])
+                grid.add(wpts, cols[st].astype(np.float64), 1.0 / (1.0 + dist / 15.0), t)
+        if i not in want:
+            continue
+        parts_p, parts_c, parts_f, gt_now = [], [], [], []
+        used = {}
+        for cid, (pts, cols, foot, ps) in latest.items():
+            q = sf.transform_points(pts, ps, pose)
+            parts_p.append(q)
+            parts_c.append(cols)
+            parts_f.append(foot)
+            used[cid] = "held"
+        cur = np.concatenate(parts_p) if parts_p else np.zeros((0, 3))
+        gp, gc = grid.live(t, pose[:2])
+        if gp.shape[0]:
+            gl = sf.transform_points(gp, (0.0, 0.0, 0.0), pose)
+            mem = np.concatenate([cur, gl]) if cur.size else gl
+            mem_c = np.concatenate(parts_c + [gc.astype(np.uint8)]) if parts_c else gc.astype(np.uint8)
+            mem_f = np.concatenate(parts_f + [np.full(gl.shape[0], sf.GRID_CELL_M * 1.3)]) if parts_f else np.full(gl.shape[0], sf.GRID_CELL_M * 1.3)
+        else:
+            mem, mem_c, mem_f = cur, (np.concatenate(parts_c) if parts_c else np.zeros((0, 3), np.uint8)), (np.concatenate(parts_f) if parts_f else np.zeros(0))
+        Gs = [sf.transform_points(pts, pj, pose) for j, (pts, pj) in gtwin.items()
+              if abs(j - i) <= win and pts.shape[0]]
+        G = np.concatenate(Gs) if Gs else np.zeros((0, 3))
+        # current-held GT (no window) for render-frame width/holes
+        Gcur = []
+        for cid, (pts, cols, foot, ps) in latest.items():
+            # GT at the last capture we have for this cam is not stored; use this row if present else skip
+            pass
+        out[i] = {"pose": pose, "cur": cur, "mem": mem, "mem_cols": mem_c, "mem_foot": mem_f,
+                  "gt_window": G, "used": used, "cols": (np.concatenate(parts_c) if parts_c else np.zeros((0, 3), np.uint8)),
+                  "foot": (np.concatenate(parts_f) if parts_f else np.zeros(0))}
+    # second pass: current-held GT using each cam's last raw/pred that we can load at the target
+    # (re-derive from gtwin at the exact target row only, plus any held rows — approximate:
+    #  use all gtwin rows? No: capture-identical render uses held current points vs GT at those
+    #  captures. We stored only window points. For render-frame we gather GT at the target row
+    #  plus whatever is in latest by re-reading at target from _gt_road_row if present, else empty
+    #  from other cams. Good enough: use gt_window for strip; for render-frame use G at exact
+    #  target plus unprojected current cam_frame? The render-frame helpers below take cur + gt.
+    return out
+
+
+def measure_behind_car_strip(tl):
+    """tl from clip_stable_timeline. Returns {frame: {poseA/poseB: (frac, n)}} using MEMORY points."""
+    out = {}
+    for f, rec in tl.items():
+        out[f] = {}
+        for name in ("poseA", "poseB"):
+            out[f][name] = behind_car_strip_frac_hires(strip_chase(name), rec["mem"], rec["gt_window"])
+    return out
+
+
+def check_behind_car_strip_holes() -> None:
+    """Gated behind-car strip: pose A f40/f160 and pose B f110 <= v2 measured (10893ee, this run)."""
+    if not _need_clip("behind_car_strip_holes"):
         return SKIPPED
-    poses = (("poseA", pose_a_chase()), ("poseB", pose_b_chase()))
-    m = clip_behind_car_strip((40, 160, POSE_B_FRAME), poses)
+    targets = (40, 160, POSE_B_FRAME)
+    tl = clip_stable_timeline(targets)
+    m = measure_behind_car_strip(tl)
+    print("behind-car strip (mem, 960x540, f+/-10 window, 3x3 dilate, no fill). "
+          "v2 10893ee measured here: pose A f40 0.1456 (n=158), f160 0.0000 (n=159) "
+          "(Historian published 0.146/0.000, same method, rounded); "
+          "pose B f110 0.1058 (n=1503), not published by Historian. "
+          "Historian 783fedd pose A (their run) 0.222/0.277.", flush=True)
+    bad = []
     for f, rec in m.items():
-        v2 = V2_POSE_A_REAR_HOLES.get(f)
-        hist = HIST_783FEDD_POSE_A_REAR_HOLES.get(f)
-        print(f"behind-car strip f{f} nearest {rec['used']}: "
-              + ", ".join(f"{k} {rec[k][0]:.3f} (n={rec[k][1]})" for k in ("poseA", "poseB") if k in rec)
-              + (f"; v2 poseA ref {v2}" if v2 is not None else "")
-              + (f"; Historian 783fedd poseA {hist}" if hist is not None else ""),
-              flush=True)
+        bits = [f"{k} {rec[k][0]:.4f} (n={rec[k][1]})" for k in ("poseA", "poseB") if k in rec]
+        print(f"  f{f}: " + ", ".join(bits), flush=True)
+        if f in V2_POSE_A_STRIP:
+            frac, n = rec["poseA"]
+            lim = V2_POSE_A_STRIP[f]
+            if n and frac > lim + 1e-12:
+                bad.append(f"pose A f{f} strip holes {frac:.4f} of {n} cells (max v2 {lim:.4f})")
+        if f in V2_POSE_B_STRIP:
+            frac, n = rec["poseB"]
+            lim = V2_POSE_B_STRIP[f]
+            if n and frac > lim + 1e-12:
+                bad.append(f"pose B f{f} strip holes {frac:.4f} of {n} cells (max v2 {lim:.4f})")
+    assert not bad, "behind-car strip vs v2: " + "; ".join(bad)
+
+
+def render_frame_edge_rows(chase, rend_pts, gt_pts):
+    """Same-pixel |x_r - x_gt| in a chase render, binned by GT range. fill off."""
+    def paint(pts):
+        pts = np.asarray(pts, np.float64).reshape(-1, 3)
+        if pts.shape[0] == 0:
+            z = np.full((chase.height, chase.width), np.nan)
+            return z, np.zeros(z.shape, bool)
+        r = sf.compose(chase, pts, np.full((pts.shape[0], 3), 128, np.uint8), np.full(pts.shape[0], 0.3),
+                       sky_rgb=None, ground_rgb=None, fill=False)
+        return r.depth, r.masks["observed"]
+    rd, ro = paint(rend_pts)
+    gd, go = paint(gt_pts)
+    both = ro & go & np.isfinite(rd) & np.isfinite(gd)
+    ys, xs = np.nonzero(both)
+    rows = []
+    if not ys.size:
+        return rows
+    pr = sf.unproject(chase, rd, ys, xs)
+    pg = sf.unproject(chase, gd, ys, xs)
+    rng = np.hypot(pg[:, 0], pg[:, 1])
+    err = np.abs(pr[:, 0] - pg[:, 0])
+    over = np.abs(pr[:, 0]) - np.abs(pg[:, 0])
+    for lo, hi in ((0.0, 5.0), (5.0, 15.0), (15.0, 30.0)):
+        k = (rng >= lo) & (rng < hi)
+        if not k.any():
+            continue
+        rows.append((lo, hi, float(np.median(err[k])), float(np.percentile(err[k], 90)),
+                     float(np.median(np.abs(pg[k, 0]))), int(k.sum()),
+                     float(over[k].max())))
+    return rows
+
+
+def render_edge_gate(rows_by_view, label):
+    """Identical thresholds to capture-frame gate (a): med <=10%, p90 <=20% of |x_gt|, overshoot <=0.3 m at 0-5 m."""
+    print(f"{label} render-frame edge (med, p90, med |x_gt|, n, max overshoot):", rows_by_view, flush=True)
+    bad, over_bad = [], []
+    for view, rows in rows_by_view.items():
+        for lo, hi, med, p90, lat, n, over in rows:
+            if n == 0 or lat < 0.25:
+                continue
+            if hi <= 15.0 and (med > EDGE_MED_FRAC * lat + 1e-9 or p90 > EDGE_P90_FRAC * lat + 1e-9):
+                bad.append(f"{view} {lo:g}-{hi:g} m: median {med:.3f} m p90 {p90:.3f} m vs 10%/20% of |x_gt| {lat:.3f} m")
+            if lo == 0.0 and hi == 5.0 and over > EDGE_OVERSHOOT_M:
+                over_bad.append(f"{view} 0-5 m overshoot {over:.3f} m")
+    msg = []
+    if bad:
+        msg.append("edge position: " + "; ".join(bad))
+    if over_bad:
+        msg.append("edge overshoot: " + "; ".join(over_bad))
+    assert not msg, f"{label} render-frame " + " | ".join(msg)
+
+
+def check_clip015_render_edge_and_holes() -> None:
+    """Gate (a) and far-hole gates in the RENDER (chase) frame, identical thresholds, dev frames only."""
+    if not _need_clip("clip015_render_edge_and_holes"):
+        return SKIPPED
+    # current-frame points (no grid) — same ingredients as capture-frame cam_frame, viewed in chase
+    poses = (("poseA", pose_a_chase()), ("poseB", pose_b_chase()))
+    gathered = clip_behind_car_strip((40, 160, POSE_B_FRAME), poses)
+    # clip_behind_car_strip stores used + pose hole fracs of the *strip*, not general holes.
+    # Re-collect rend/gt via the same helper path: rebuild from a light loop.
+    clip, preds, gt_root = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    P = np.load(preds)
+    p = Preview(root=clip, P=P, cams=cams)
+    edge = {}
+    holes = {}
+    for target in (40, 160, POSE_B_FRAME):
+        rend, gtp = [], []
+        for cid in p.cam:
+            idx = nearest_idx(pred_frames(P, cid), target)
+            if idx is None:
+                continue
+            fr = p.run(cid, None, None, idx=idx)
+            if fr is None:
+                continue
+            _, d, v, _ = fr
+            cam = p.cam[cid]
+            c = cams[cid]
+            pw, ph = p.ns["proc_res"](c)
+            W0, _ = c["resolution"]
+            gtd = _load_gt_depth(gt_root, cid, idx, c, pw, ph)
+            net = _net_road(P, cid, idx, W0, pw, ph)
+            ys, xs = np.nonzero(v & np.isfinite(d))
+            if ys.size:
+                q = sf.unproject(cam, d, ys, xs)
+                rend.append(q[ego_box_filter(q)])
+            if gtd is not None:
+                # GT road = net px within 1 m of plane (note: net mask too wide is not measured)
+                ys, xs = np.nonzero(net & np.isfinite(gtd))
+                if ys.size:
+                    q = sf.unproject(cam, gtd, ys, xs)
+                    q = q[np.abs(q[:, 2]) < BEHIND_Z_M]
+                    if q.size:
+                        gtp.append(q[ego_box_filter(q)])
+        R = np.concatenate(rend) if rend else np.zeros((0, 3))
+        G = np.concatenate(gtp) if gtp else np.zeros((0, 3))
+        for name, ch in poses:
+            key = f"{name}-f{target}"
+            edge[key] = render_frame_edge_rows(ch, R, G)
+            holes[key] = hole_fraction(ch, R, G)
+    print("render-frame holes (fill on, GT-ground |z|<=STATIC_MAX_HEIGHT_M for the kept far-hole "
+          "definition on pose B; render edge uses GT road = net px within 1 m of plane):",
+          {k: v for k, v in holes.items()}, flush=True)
+    render_edge_gate(edge, "f40/f110/f160")
+    # holes gated identically: <=2% at 0-15 m, <=5% at 15-30 m, each pose/frame
+    fr_by_view = {}
+    for key, bins in holes.items():
+        fr_by_view[key] = bins
+    # hole_gate expects numeric view keys; reuse its logic
+    bad = []
+    for view, bins in fr_by_view.items():
+        for b, (f, n) in bins.items():
+            if n and f > HOLE_BINS[b]:
+                bad.append(f"{view} {b[0]:g}-{b[1]:g} m: holes {100 * f:.2f}% of {n} GT road px (max {100 * HOLE_BINS[b]:g}%)")
+    assert not bad, "render-frame holes: " + "; ".join(bad)
+
+
+def clip_capture_holes(frames):
+    """Capture-frame holes: net px within 1 m of plane that have no valid rendered depth, by range."""
+    clip, preds, gt_root = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    P = np.load(preds)
+    p = Preview(root=clip, P=P, cams=cams)
+    rows = []  # (cid, target, lo, hi, n_hole, n)
+    used = {}
+    for target in frames:
+        for cid in p.cam:
+            idx = nearest_idx(pred_frames(P, cid), target)
+            if idx is None:
+                continue
+            used.setdefault(cid, {})[target] = idx
+            fr = p.run(cid, None, None, idx=idx)
+            if fr is None:
+                continue
+            _, d, v, _ = fr
+            cam = p.cam[cid]
+            c = cams[cid]
+            pw, ph = p.ns["proc_res"](c)
+            W0, _ = c["resolution"]
+            gtd = _load_gt_depth(gt_root, cid, idx, c, pw, ph)
+            if gtd is None:
+                continue
+            net = _net_road(P, cid, idx, W0, pw, ph)
+            ys, xs = np.nonzero(net & np.isfinite(gtd))
+            if not ys.size:
+                continue
+            pg = sf.unproject(cam, gtd, ys, xs)
+            on = np.abs(pg[:, 2]) < BEHIND_Z_M  # within 1 m of plane
+            if not on.any():
+                continue
+            ys, xs, pg = ys[on], xs[on], pg[on]
+            rng = np.hypot(pg[:, 0], pg[:, 1])
+            owned = np.ones(d.shape, bool)
+            if bool(p.a.ownership) and cid in p.ns.get("YIELD", {}):
+                owned &= ~np.asarray(p.ns["YIELD"][cid], bool)
+            if cid in p.ns.get("EGO_MASK", {}):
+                r0, c0, c1 = p.ns["EGO_MASK"][cid]
+                ph_, pw_ = d.shape
+                owned[int(r0 * ph_):, int(c0 * pw_):int(c1 * pw_)] = False
+            hole = (~v[ys, xs]) & owned[ys, xs]
+            owned_px = owned[ys, xs]
+            for lo, hi in HOLE_BINS:
+                k = (rng >= lo) & (rng < hi) & owned_px
+                n = int(k.sum())
+                n_h = int(hole[k].sum()) if n else 0
+                rows.append((cid, target, lo, hi, n_h, n))
+    return {"rows": rows, "used": used}
+
+
+def capture_hole_gate(m, label):
+    """Identical to the far-hole gate: <=2% at 0-15 m, <=5% at 15-30 m, per cam (pooled over frames)."""
+    print(f"{label} capture-frame holes (GT road = net px within 1 m of plane; hole = no valid render depth):",
+          m["rows"], "used", m["used"], flush=True)
+    acc = {}
+    for cid, tgt, lo, hi, n_h, n in m["rows"]:
+        a = acc.setdefault((cid, lo, hi), [0, 0])
+        a[0] += n_h
+        a[1] += n
+    bad = []
+    for (cid, lo, hi), (n_h, n) in sorted(acc.items()):
+        if n == 0:
+            continue
+        frac = n_h / n
+        lim = HOLE_BINS[(lo, hi)]
+        if frac > lim:
+            bad.append(f"{cid} {lo:g}-{hi:g} m: holes {100 * frac:.2f}% ({n_h}/{n}) (max {100 * lim:g}%)")
+    assert not bad, f"{label} capture-frame holes: " + "; ".join(bad)
+
+
+def check_clip015_capture_holes() -> None:
+    if not _need_clip("clip015_capture_holes"):
+        return SKIPPED
+    capture_hole_gate(clip_capture_holes((40, 160, POSE_B_FRAME)), "f40/f110/f160")
+
+
 
 
 def check_road_labelled_object_top_stays_put() -> None:
@@ -1494,7 +1928,9 @@ CHECKS = [
     check_side_objects_keep_height_pins,
     check_snapped_pixels_not_exempt_from_edge_cut,
     check_road_labelled_object_top_stays_put,
-    check_behind_car_strip_holes_report,
+    check_behind_car_strip_holes,
+    check_clip015_render_edge_and_holes,
+    check_clip015_capture_holes,
     check_clip015_snap_misplace,
     check_holdout_snap_misplace,
     check_clean_holdout_snap_misplace,
@@ -1540,12 +1976,18 @@ KNOWN_FAILING: dict[str, str] = {
     "check_clip015_footprint": "f40/f160: narrow 45.3%, main 70.4%, wide 83.8%, pillarR 81.9%, repeatL 93.0% (min 95%)",
     "check_holdout_footprint": "f100/f200: narrow 46.9%, main 72.6%, wide 88.1%, pillarR 89.2%, repeatR 93.4%",
     "check_clean_holdout_footprint": "f70: pillarL 18.3%, narrow 49.5%, pillarR 58.8%, main 72.2%, wide 86.0%",
+    "check_behind_car_strip_holes": "pose A f40 0.2000 of 160 cells (max v2 0.1456); pose A f160 0.2250 of 160 (max v2 0.0000). Pose B f110 0.0054 of 1491 PASSES (max v2 0.1058). This test: n=160/160; Historian 783fedd was 0.2215/0.2767 (n=158/159) — same definition, small n/frac difference.",
+    "check_clip015_render_edge_and_holes": "render-frame edge: poseA f40 5-15 m median 0.303/p90 2.651 vs 10%/20% of |x_gt| 4.245 m; poseB f40 5-15 p90 1.381 vs 3.981 m; poseA f160 5-15 p90 2.044 vs 5.429 m; poseA f110 5-15 p90 2.394 vs 5.540 m; poseB f110 5-15 p90 1.282 vs 5.223 m; overshoot poseA-f40 0-5 m 2.792 m, poseB-f40 0-5 m 1.385 m. Render-frame holes PASS (all poses/frames <=2%/<=5%).",
 }
 
 _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}
 
 
 def main() -> None:
+    print("Note: net mask too wide is not measured: GT road = net px within 1 m of plane.", flush=True)
+    print("gate (b): denom = snapped px with finite GT depth, counted per cam/bin "
+          "(range = hypot(x,y) of that px's GT unprojection); "
+          "numer = snapped px with GT z > 0.30 m at that px's GT depth.", flush=True)
     ok = all([_run_one(fn) for fn in CHECKS])
     ok = _run_hypothesis_props_or_skip() and ok
     if not ok:

@@ -263,7 +263,7 @@ def check_main_only_input_is_gone() -> None:
             raise AssertionError("a grayscale cam_main was accepted")
         # (c) an empty (0-size) array is a missing camera, not a shape error: the tick still predicts
         emptied = dict(frames)
-        emptied["wide"] = np.zeros((0, 640, 3), dtype=np.uint8)
+        emptied["wide"] = np.zeros((0,), dtype=np.uint8)  # ndim 1: only the empty-array skip keeps it from the shape error
         part = rt.observe(emptied, 0.1)
         assert part.lane_gt is not None, "an empty wide array must be treated as missing, not refused"
         assert tuple(part.missing_cams) == ("wide",), part.missing_cams
@@ -383,7 +383,7 @@ def check_missing_cams_flagged_each_of_8() -> None:
             assert apply_scene_ckpt_lane(_pout(), pred, drive=False) == "shadow"
         # an empty (0-size) array and the cam_main alias
         empty = dict(frames)
-        empty["rear"] = np.zeros((0, 0, 3), dtype=np.uint8)
+        empty["rear"] = np.zeros((0, 0), dtype=np.uint8)
         assert tuple(rt.observe(empty, 0.1).missing_cams) == ("rear",)
         aliased = {k: v for k, v in frames.items() if k != "main"}
         aliased["cam_main"] = frames["main"]

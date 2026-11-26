@@ -265,9 +265,12 @@ def check_supervisor_shadow_default_and_drive_opt_in() -> None:
     net = SceneNet(cams=("main",)).cpu().eval()
     with tempfile.TemporaryDirectory() as tmp:
         path = _write_ckpt(Path(tmp), net)
+        # echo=True: without a session echo the stub never engages, so "engaged=0" would
+        # hold even if the --scene-ckpt shadow block were removed.
         text, states = run_supervisor(
             ["--scene-ckpt", str(path), "--force-engage", "--run-seconds", "2"],
             seconds=2.0,
+            echo=True,
         )
         assert states and all(not st.get("engaged") for st in states), [st.get("engaged") for st in states[:5]]
         for st in states:

@@ -178,10 +178,24 @@ def check_shadow_cannot_actuate() -> None:
     net = SceneNet(cams=("main",)).cpu().eval()
     with tempfile.TemporaryDirectory() as tmp:
         path = _write_ckpt(Path(tmp), net)
+        # echo=True plays a fresh session echo: without it the stub never engages for ANY reason, so
+        # "engaged=0" alone would hold even with the block removed (it is not allowed to be vacuous).
         text, states = run_supervisor(
             ["--scene-ckpt", str(path), "--force-engage", "--run-seconds", "2"],
             seconds=2.0,
+            echo=True,
         )
+        # control: the same ckpt with the explicit drive opt-in DOES engage in this harness
+        text_d, states_d = run_supervisor(
+            ["--scene-ckpt", str(path), "--scene-ckpt-drive", "--force-engage", "--run-seconds", "2"],
+            seconds=2.0,
+            echo=True,
+        )
+    assert any(st.get("engaged") for st in states_d), (
+        "control: the harness cannot engage, so this check proves nothing",
+        [st.get("engaged") for st in states_d[:8]],
+        text_d[-2000:],
+    )
     assert "scene-ckpt" in text.lower() or "SHADOW" in text or "shadow" in text.lower(), text[-2000:]
     assert states, text[-2000:]
     assert all(not st.get("engaged") for st in states), [st.get("engaged") for st in states[:5]]
@@ -194,8 +208,9 @@ def check_shadow_cannot_actuate() -> None:
         if ckpt.get("lane_x") is not None:
             assert hold.get("lateral_m") != ckpt.get("lane_x") or hold.get("source") != "scene"
     print(
-        f"shadow cannot actuate: {len(states)} stub states engaged=0 with --force-engage "
-        f"and --scene-ckpt (no --no-engage on CLI) OK"
+        f"shadow cannot actuate: {len(states)} stub states engaged=0 with --force-engage + session echo "
+        f"and --scene-ckpt (no --no-engage on CLI); control --scene-ckpt-drive engaged "
+        f"on {sum(1 for st in states_d if st.get('engaged'))}/{len(states_d)} OK"
     )
 
 

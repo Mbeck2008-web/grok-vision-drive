@@ -18,8 +18,8 @@ S7 ground clamp: a camera cannot see below the road. Depth farther than the down
    ground-plane hit (wide cam 88.7 deg vFOV, pitch -8, 1.24 m up) is capped there (x margin);
    true road, nearer surfaces (hood, walls) and rays at/above the horizon are untouched.
 S9 road is flat: net-labelled road pixels (>= 4 px inside the label, downward ray hitting within
-   25 m) are placed exactly on the ground plane, whatever the coarse net depth says, so the near road
-   cannot bend down/up and two cameras' road meets; road label edges, road beyond 25 m, non-road and
+   60 m) are placed exactly on the ground plane, whatever the coarse net depth says, so the near road
+   cannot bend down/up and two cameras' road meets; road label edges, road beyond 60 m, non-road and
    upward rays are left alone.
 S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
    (narrow 250, main/wide 250, 100 m cams 99.5); non-sky pixels beyond the cap or +inf are
@@ -265,9 +265,11 @@ def check_road_snap() -> None:
     # net-like bent road: 2.5x too far at the bottom, 0.5x too near mid-way (the clip015 tunnel shape)
     bend = np.interp(ys, [0, 45, 89], [1.0, 0.5, 2.5])
     raw = np.where(np.isfinite(hit), hit * bend, 80.0)
-    road = (ys >= 40) & (xs >= 30) & (xs < 130)
-    out, m = sf.road_snap(cam, raw, road)
-    core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= sf.ROAD_SNAP_MAX_M)
+    road = (ys >= 20) & (xs >= 30) & (xs < 130)  # reaches past ROAD_SNAP_MAX_M near the horizon
+    assert sf.ROAD_SNAP_MAX_M == 60.0
+    R = 20.0  # this small fixture's horizon is only ~60 m out, so test the range gate at 20 m
+    out, m = sf.road_snap(cam, raw, road, max_hit_m=R)
+    core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= R)
     assert m.tolist() == core.tolist() and core.sum() > 1000
     z = cam.pos[2] + out * dz
     assert np.max(np.abs(z[m])) < 1e-9, "snapped road must lie on the ground plane"
@@ -276,13 +278,41 @@ def check_road_snap() -> None:
     assert np.array_equal(out[~m], raw[~m]), "non-road / label edge / far road untouched"
     edge = road & ~sf._erode(road, sf.ROAD_SNAP_ERODE_PX)
     assert edge.any() and not m[edge].any(), "label edge is not snapped"
-    far_road = road & (hit > sf.ROAD_SNAP_MAX_M) & np.isfinite(hit)
-    assert far_road.any() and not m[far_road].any(), "road beyond 25 m is not snapped"
+    far_road = road & (hit > R) & np.isfinite(hit)
+    assert far_road.any() and not m[far_road].any(), "road beyond the range gate is not snapped"
     try:
         sf.road_snap(cam, raw, road[:, :10])
         raise AssertionError("shape mismatch must raise")
     except ValueError:
         pass
+
+
+def check_ownership() -> None:
+    # each direction is drawn by one camera: a wide pixel yields exactly when its ray lands >= margin
+    # inside the better (main) image; outside main's view the wide keeps its pixels
+    wide = camera_from_angles("wide", (0.0, 1.5, 1.24), 0.0, 0.0, 120.0, 120, 60, near_m=0.05, far_m=300.0)
+    main = camera_from_angles("main", (0.0, 1.5, 1.26), 0.0, 0.0, 50.0, 80, 40, near_m=0.05, far_m=300.0)
+    y = sf.yield_mask(wide, [main], margin_px=2.0)
+    assert y.shape == (60, 120) and 0.05 < y.mean() < 0.5
+    assert y[30, 60] and not y[30, 2] and not y[30, 117], "centre yields, edges keep"
+    rays = sf._pixel_rays(wide).reshape(-1, 3)
+    u, v, z = sf.project(main, np.asarray(wide.pos) + rays * 200.0 / np.linalg.norm(rays, axis=1, keepdims=True))
+    inside = (z > 0) & (u >= 2) & (u <= 78) & (v >= 2) & (v <= 38)
+    assert np.array_equal(y.ravel(), inside), "yield must equal 'ray covered by main'"
+    assert not sf.yield_mask(wide, []).any(), "no better camera, nothing yields"
+    # end to end: with ownership the overlap draws main's (correct) surface, not wide's too-near copy
+    S = 12
+    ys, xs = np.nonzero(y)
+    wpts = sf.unproject(wide, np.full((60, 120), 4.0), ys, xs)   # wide's too-near copy of a wall at 10 m
+    my, mx = np.nonzero(np.ones((40, 80), bool))
+    mpts = sf.unproject(main, np.full((40, 80), 10.0), my, mx)
+    chase = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 160, 90, 0.0)
+    def draw(own):
+        pts = mpts if own else np.vstack([mpts, wpts])
+        col = np.vstack([np.tile([0, 255, 0], (len(mpts), 1)), np.tile([255, 0, 0], (0 if own else len(wpts), 1))]).astype(np.uint8)
+        return sf.compose(chase, pts, col, np.full(len(pts), 3.0), sky_rgb=None, ground_rgb=None, fill=False).rgb
+    red = lambda im: int(((im[..., 0] > 200) & (im[..., 1] < 50)).sum())
+    assert red(draw(False)) > S and red(draw(True)) == 0
 
 
 def check_flag_and_deps() -> None:
@@ -331,6 +361,7 @@ def test_far_drawn_at_cap() -> None:
 
 def test_road_snap() -> None:
     check_road_snap()
+    check_ownership()
 
 
 def test_flag_and_deps() -> None:
@@ -340,7 +371,7 @@ def test_flag_and_deps() -> None:
 if __name__ == "__main__":
     for fn in (check_metrics, check_damped_view_less_jitter, check_damped_follows_turn,
                check_depth_filter_flicker_and_reset, check_compose_explains_every_pixel,
-               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_flag_and_deps):
+               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

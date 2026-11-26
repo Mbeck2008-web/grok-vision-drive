@@ -350,7 +350,7 @@ def ground_clamp(cam: CameraPose, depth: np.ndarray, *, ground_z: float = 0.0, m
 
 
 ROAD_CLASS_IDS: tuple[int, ...] = (2,)   # net semantic id for drivable road (clip015: GT/ground-hit 0.86-1.04)
-ROAD_SNAP_MAX_M: float = 25.0           # beyond this the flat-ground assumption and the coarse class grid get unsafe
+ROAD_SNAP_MAX_M: float = 60.0           # beyond this a 0.1 m mount-height error is > 5% depth; clip015: 25->60 m cuts tunnel far-road float 0.51->0.15 m (main)
 ROAD_SNAP_ERODE_PX: int = 4             # stay this many px inside the road class (12x16 class grid edges are blocky)
 
 
@@ -393,6 +393,25 @@ def road_snap(cam: CameraPose, depth: np.ndarray, road: np.ndarray, *, ground_z:
     hit = np.where(down, h / np.where(down, -dz, 1.0), np.inf)
     snap = _erode(rd, int(erode_px)) & down & (hit <= float(max_hit_m))
     return np.where(snap, hit, d), snap
+
+
+def yield_mask(cam: CameraPose, better: Sequence[CameraPose], *, margin_px: float = 4.0, probe_m: float = 200.0) -> np.ndarray:
+    """Pixels of ``cam`` whose viewing direction a better camera also covers (static, per rig).
+
+    Two cameras drawing the same surface with different depth errors leave a doubled, stepped
+    surface, and the nearer (usually wrong) copy wins the z-buffer: on clip015 the wide cam's too-near
+    points painted over almost all of main's view. Each direction is drawn by one camera only: a
+    pixel yields when its ray, probed ``probe_m`` out (the rig baseline is cm, so parallax is
+    negligible), lands at least ``margin_px`` inside a better camera's image.
+    """
+    rays = _pixel_rays(cam).reshape(-1, 3)
+    pts = np.asarray(cam.pos)[None, :] + rays * (probe_m / np.linalg.norm(rays, axis=1, keepdims=True))
+    out = np.zeros(rays.shape[0], bool)
+    for b in better:
+        u, v, z = project(b, pts)
+        m = float(margin_px)
+        out |= np.isfinite(u) & (z > 0) & (u >= m) & (u <= b.width - m) & (v >= m) & (v <= b.height - m)
+    return out.reshape(cam.height, cam.width)
 
 
 def unproject(cam: CameraPose, depth: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:

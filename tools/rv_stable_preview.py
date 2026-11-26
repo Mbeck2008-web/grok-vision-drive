@@ -21,6 +21,9 @@ ap.add_argument("--depth-filter", type=int, default=1); ap.add_argument("--grid"
 ap.add_argument("--fill", type=int, default=1); ap.add_argument("--sky", type=int, default=1); ap.add_argument("--prior", type=int, default=1)
 ap.add_argument("--ground-clamp", type=int, default=1); ap.add_argument("--clamp-margin", type=float, default=1.0)
 ap.add_argument("--road-snap", type=int, default=1)
+ap.add_argument("--road-snap-max-m", type=float, default=None, help="road snap range gate (default: module ROAD_SNAP_MAX_M)")
+ap.add_argument("--ownership", type=int, default=1, help="each direction drawn by one camera: wide and pillars yield to main")
+ap.add_argument("--debug-color", default="none", choices=["none", "cam", "height"], help="eval only: colour points by source camera or by height")
 ap.add_argument("--max-depth", choices=["v2", "cap"], default="cap", help="v2: drop depth >= 120 m (old). cap: per-cam cap, far drawn at cap")
 ap.add_argument("--pose-src", default="vo", choices=["vo", "gt"]); ap.add_argument("--depth-src", default="pred", choices=["pred", "gt"])
 ap.add_argument("--classify-dir", default=""); ap.add_argument("--classify-crop", default="0,0,960,540")
@@ -44,12 +47,16 @@ def proc_res(c):
     w, h = c["resolution"]; return (256, 192) if abs(w / h - 4 / 3) < 0.01 else (320, 180)
 CAM_POSE = {}
 CLAMP_STATS: dict = {}
+YIELD_TO = {"wide": ["main"], "pillarL": ["main"], "pillarR": ["main"]}
 FAR_STATS: dict = {}
 SNAP_STATS: dict = {}
+CAM_COLOR = {"narrow": (255, 255, 0), "main": (0, 200, 0), "wide": (255, 0, 0), "pillarL": (0, 120, 255), "pillarR": (255, 0, 255), "repeatL": (0, 255, 255), "repeatR": (255, 140, 0), "rear": (128, 128, 128)}
 for cid, c in cams_json.items():
     if cid in CAMS:
         pw, ph = proc_res(c)
         CAM_POSE[cid] = camera_from_angles(cid, c["pos_m"], c.get("yaw_deg") or 0.0, c["pitch_deg"], c["fov_v"], pw, ph, near_m=0.05, far_m=400.0)
+
+YIELD = {c: S.yield_mask(CAM_POSE[c], [CAM_POSE[b] for b in bs]) for c, bs in YIELD_TO.items() if c in CAM_POSE}
 
 def phase_dx(prev, cur):
     win = np.hanning(prev.shape[0])[:, None] * np.hanning(prev.shape[1])[None, :]
@@ -86,7 +93,7 @@ def cam_frame(cam, idx):
     clamp_frac = 0.0
     snapped = np.zeros((ph, pw), bool)
     if a.road_snap and a.depth_src != "gt":
-        depth, snapped = S.road_snap(CAM_POSE[cam], depth, road & ~sky)
+        depth, snapped = S.road_snap(CAM_POSE[cam], depth, road & ~sky, max_hit_m=a.road_snap_max_m or S.ROAD_SNAP_MAX_M)
     SNAP_STATS.setdefault(cam, []).append(float(np.mean(snapped)))
     if a.ground_clamp and a.depth_src != "gt":
         depth, cl = S.ground_clamp(CAM_POSE[cam], depth, margin=a.clamp_margin)
@@ -105,6 +112,8 @@ def cam_frame(cam, idx):
         valid = ~sky & np.isfinite(depth) & (depth > 0.3) & (depth <= cap)
     else:
         valid = ~sky & np.isfinite(depth) & (depth > 0.3) & (depth < S.FAR_M)
+    if a.ownership and cam in YIELD_TO:
+        valid &= ~YIELD[cam]
     if cam in EGO_MASK:
         r0, c0, c1 = EGO_MASK[cam]; valid[int(r0 * ph):, int(c0 * pw):int(c1 * pw)] = False
     return rgb, depth, valid, sky
@@ -169,6 +178,11 @@ for n_row, row in enumerate(rows):
         hw, y0, y1, z0, z1 = EGO_BOX
         inside = (np.abs(pts[:, 0]) <= hw) & (pts[:, 1] >= y0) & (pts[:, 1] <= y1) & (pts[:, 2] >= z0) & (pts[:, 2] <= z1)
         pts, cols, foot = pts[~inside], cols[~inside], foot[~inside]
+        if a.debug_color == "cam":
+            cols = np.tile(np.array(CAM_COLOR[cam], np.uint8), (len(pts), 1))
+        elif a.debug_color == "height":
+            hz = np.clip((pts[:, 2] + 0.5) / 1.5, 0, 1)   # -0.5 m blue .. 0 green .. +1 m red
+            cols = (cv2.applyColorMap((hz * 255).astype(np.uint8).reshape(-1, 1), cv2.COLORMAP_JET).reshape(-1, 3)[:, ::-1]).copy()
         latest[cam] = (pts, cols, foot, pose)
         if a.grid:
             st = pts[:, 2] <= S.STATIC_MAX_HEIGHT_M
@@ -232,6 +246,7 @@ fr = sorted((out / "frames").glob("f*.png"))
 if len(fr) >= 3:
     res["temporal_jitter"] = round(S.temporal_jitter([cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB) for f in fr]), 4)
 res["ground_clamp_frac_by_cam"] = {c: round(float(np.mean(v)), 5) for c, v in CLAMP_STATS.items()}
+res["yield_frac_by_cam"] = {c: round(float(m.mean()), 4) for c, m in YIELD.items()}
 res["road_snap_frac_by_cam"] = {c: round(float(np.mean(v)), 5) for c, v in SNAP_STATS.items()}
 res["far_at_cap_frac_by_cam"] = {c: round(float(np.mean(v)), 5) for c, v in FAR_STATS.items()}
 res["depth_cap_m_by_cam"] = {c: round(S.depth_cap_m(cams_json[c]["far_m"]), 2) for c in CAMS}

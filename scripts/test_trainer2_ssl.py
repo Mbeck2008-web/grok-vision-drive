@@ -7,6 +7,7 @@ stem (momentum 0.996) and a collapse guard (per-dim token std on a fixed train
 probe < 0.01 aborts) are spec proposals.
 
 Checks: check_ssl_default_on, check_ssl_ema_no_collapse, check_ssl_rows_train_only,
+check_ssl_reads_numpy_frames, check_ssl_empty_split_defers_to_trainer,
 check_recipe_off_is_bit_identical (argparse part: every pre-existing default
 equals the main 8ce34d5 pin; only the new SSL flags are added).
 """
@@ -34,9 +35,11 @@ NEW_FLAGS = {"no_ssl_pretrain": False, "ssl_epochs": 1, "ssl_max_rows": 4000}
 
 def _torch():
     try:
-        import torch  # noqa: F401
+        import torch
     except ImportError:
         return None
+    # Small nets: extra intra-op threads only oversubscribe a shared CI / box CPU.
+    torch.set_num_threads(2)
     return torch
 
 
@@ -225,6 +228,31 @@ def check_ssl_reads_numpy_frames() -> None:
     print("ssl numpy: uint8 HWC canvases from _frame_row are converted (crashed on main) OK")
 
 
+def check_ssl_empty_split_defers_to_trainer() -> None:
+    """0 train rows: SSL is skipped (None) so train_directory's own data errors still surface."""
+    torch = _torch()
+    if torch is None:
+        skip_check("check_ssl_empty_split_defers_to_trainer", "torch not installed (train_scene imports torch)")
+        return
+    import python.train.exp_ssl as exp_ssl
+    import python.train.strip_sources as strip_sources
+    from python.train import train_scene
+
+    calls = []
+    saved = (strip_sources.load_multi_source_rows, exp_ssl.ssl_rows_from_split, exp_ssl.default_ssl_stem)
+    strip_sources.load_multi_source_rows = lambda roots, holdout_source=None: ([], {})
+    exp_ssl.ssl_rows_from_split = lambda rows, meta, holdout_blocks=None: []
+    exp_ssl.default_ssl_stem = lambda *a, **k: calls.append(1)
+    try:
+        args = SimpleNamespace(holdout_blocks=None, scale=SCALE, lr=1e-3, seed=0, ssl_epochs=1, ssl_max_rows=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            got = train_scene._default_ssl_stage(args, [Path(tmp)], Path(tmp), ("main",), {})
+    finally:
+        strip_sources.load_multi_source_rows, exp_ssl.ssl_rows_from_split, exp_ssl.default_ssl_stem = saved
+    assert got is None and not calls, (got, calls)
+    print("empty split: SSL skipped (None, no stem written); trainer keeps its own refusal OK")
+
+
 def check_recipe_off_is_bit_identical() -> None:
     torch = _torch()
     if torch is None:
@@ -244,7 +272,7 @@ def check_recipe_off_is_bit_identical() -> None:
 
 def main() -> int:
     checks = (check_ssl_default_on, check_ssl_ema_no_collapse, check_ssl_rows_train_only, check_ssl_reads_numpy_frames,
-              check_recipe_off_is_bit_identical)
+              check_ssl_empty_split_defers_to_trainer, check_recipe_off_is_bit_identical)
     failed = 0
     for check in checks:
         try:

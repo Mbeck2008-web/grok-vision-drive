@@ -3958,8 +3958,11 @@ def heads_for_run(text: str | None, roots: Any = None) -> tuple[str, ...]:
     return resolve_train_heads(text, curb_palette_for_training(roots))
 
 
-def _default_ssl_stage(args: Any, strip_roots: Any, holdout_root: Path, cam_names: Any, net_kw: dict) -> str:
-    """Default-on SSL (docs/specs/trainer_2.md): train-frame stem, cached by content key. Returns its path."""
+def _default_ssl_stage(args: Any, strip_roots: Any, holdout_root: Path, cam_names: Any, net_kw: dict) -> str | None:
+    """Default-on SSL (docs/specs/trainer_2.md): train-frame stem, cached by content key.
+
+    Returns its path, or None when the split has no train rows (the trainer then reports why).
+    """
     from python.data.data_root import cache_dir
     from python.data.raw_frames import refuse_lossy
     from python.train.exp_ssl import default_ssl_stem, ssl_rows_from_split
@@ -3974,6 +3977,11 @@ def _default_ssl_stage(args: Any, strip_roots: Any, holdout_root: Path, cam_name
         source_meta,
         holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
     )
+    if not train_rows:
+        # Nothing to pretrain on. train_directory owns the data errors (bad mask
+        # files, empty split, ...) and reports them; SSL must not pre-empt them.
+        print("[GVD] ssl-pretrain: 0 train rows; skipped (the trainer reports the data problem)", flush=True)
+        return None
     import torch
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

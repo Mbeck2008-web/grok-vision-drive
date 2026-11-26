@@ -13,6 +13,8 @@ Checks (python/train/depth_hires.py, opt-in ``--aux-depth --heads ...,depth_hire
   check_far_term_is_half_masked_bce   the far term is exactly FAR_LOSS_WEIGHT (0.5) x masked BCE on a known target
   check_prediction_at_copies_keep_far per-row scene_loss through BOTH _prediction_at copies (train_scene, scene_net) is depth + far
   check_train_directory_trains_hires  train_directory on a main_depth fixture: 48x64 labels, far head wired, ckpt carries the head
+  check_fpn_stride4_skip_matters      the stride-4 skip (lat[0](c2)) changes the 48x64 output and gets a nonzero grad
+  check_depth_floor_on_negative_logits  aux_depth >= 0.1 (MIN_DEPTH_M) even for large negative logits
 Torch checks skip visibly without torch.
 """
 from __future__ import annotations
@@ -557,6 +559,56 @@ def check_train_directory_trains_hires() -> None:
     print(f"train_directory: {len(calls)} scene_loss calls with 48x64 labels + far logit; aux_depth == depth + far; "
           f"ckpt has {HEAD_PREFIX}* and {ARCH_TOKEN} OK")
 
+def check_fpn_stride4_skip_matters() -> None:
+    """The stride-4 skip ``+ self.lat[0](c2)`` must affect the 48x64 output (not just a bilinear upsample of 24x32)."""
+    torch = _torch()
+    if torch is None:
+        skip_check("check_fpn_stride4_skip_matters", "torch not installed")
+        return
+    from python.train.depth_hires import stem_pyramid
+
+    net = _net(torch, True, 1.0).train()
+    img = _image(torch, net)
+    with torch.no_grad():
+        pyr = [m.detach().clone() for m in stem_pyramid(net.stem, img[:, :, :, net.sectors[0].x0 : net.sectors[0].x1])]
+    # Perturbing only the stride-4 map (pyramid[-3] == c2) must change metres and/or the far logit.
+    with torch.no_grad():
+        base_d, base_f = net.depth_hires_head(pyr)
+        tweaked = [m.clone() for m in pyr]
+        tweaked[-3] = tweaked[-3] + 1.0
+        d2, f2 = net.depth_hires_head(tweaked)
+    assert not torch.allclose(base_d, d2) or not torch.allclose(base_f, f2), "stride-4 stem map did not change the 48x64 output"
+    # And lat[0] (the 1x1 on c2) must receive a nonzero gradient.
+    net.depth_hires_head.zero_grad(set_to_none=True)
+    depth, far = net.depth_hires_head([m.requires_grad_(False) for m in pyr])
+    (depth.sum() + far.sum()).backward()
+    grad = net.depth_hires_head.lat[0].weight.grad
+    assert grad is not None and float(grad.abs().sum()) > 0.0, "lat[0] (stride-4 skip) got no gradient"
+    print(f"fpn stride-4 skip: c2 perturbation changes output (max |d| {float((base_d-d2).abs().max()):.4f}); lat[0] grad sum {float(grad.abs().sum()):.3g} OK")
+
+
+def check_depth_floor_on_negative_logits() -> None:
+    """Metres stay at least MIN_DEPTH_M (0.1) when the depth logit is a large negative (softplus ~ 0)."""
+    torch = _torch()
+    if torch is None:
+        skip_check("check_depth_floor_on_negative_logits", "torch not installed")
+        return
+    from python.train.depth_hires import MIN_DEPTH_M
+
+    assert MIN_DEPTH_M == 0.1
+    net = _net(torch, True, 1.0).eval()
+    with torch.no_grad():
+        net.depth_hires_head.out.weight.zero_()
+        net.depth_hires_head.out.bias.zero_()
+        net.depth_hires_head.out.bias[0] = -80.0
+        pred, _ = _run(net, _image(torch, net))
+    lo, hi = float(pred.aux_depth.min()), float(pred.aux_depth.max())
+    assert lo >= MIN_DEPTH_M - 1e-6, lo
+    assert hi <= MIN_DEPTH_M + 1e-5, hi
+    print(f"depth floor: aux_depth in [{lo:.6f}, {hi:.6f}] at logit -80 (>= {MIN_DEPTH_M}) OK")
+
+
+
 
 def main() -> int:
     checks = (
@@ -571,6 +623,8 @@ def main() -> int:
         check_far_term_is_half_masked_bce,
         check_prediction_at_copies_keep_far,
         check_train_directory_trains_hires,
+        check_fpn_stride4_skip_matters,
+        check_depth_floor_on_negative_logits,
     )
     failed = 0
     for check in checks:

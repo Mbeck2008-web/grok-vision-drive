@@ -464,9 +464,13 @@ def _load_linux_prctl() -> Any:
 _LINUX_PRCTL = _load_linux_prctl()
 
 
+# Test-only hook. Never read from env or config. Production launch leaves this False.
+_TEST_DISABLE_PDEATHSIG = False
+
+
 def pdeathsig_preexec(parent_pid: int | None = None) -> Callable[[], None] | None:
     """Return a Linux preexec_fn setting PR_SET_PDEATHSIG(SIGTERM); None off Linux."""
-    if not sys.platform.startswith("linux") or _LINUX_PRCTL is None:
+    if _TEST_DISABLE_PDEATHSIG or not sys.platform.startswith("linux") or _LINUX_PRCTL is None:
         return None
     expected_ppid = os.getpid() if parent_pid is None else int(parent_pid)
     prctl_fn = _LINUX_PRCTL
@@ -504,12 +508,12 @@ class RvClient:
         if self.is_alive():
             return self.child_pid
         try:
-            popen_kw: dict[str, Any] = {}
+            popen_kw: dict[str, Any] = {"close_fds": True}
             preexec = pdeathsig_preexec(os.getpid())
             if preexec is not None:
                 popen_kw["preexec_fn"] = preexec
             self._proc = subprocess.Popen(
-                [sys.executable, "-m", self.module, "--serve"],
+                [sys.executable, "-m", self.module, "--serve", "--parent-pid", str(os.getpid())],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

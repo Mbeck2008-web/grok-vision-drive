@@ -382,6 +382,30 @@ where noted):
   (`check_no_sim_gt_on_live_path`).
 - The stale indicator is present when the harness sets age > 200 ms.
 
+**Step 8(1) scoring rules — spec proposal (Redesigner, not Michael's).**
+These pins say how the published table and checklist above are applied.
+They do not change any number already in that table (AbsRel ≤ 0.20,
+δ < 1.25 fraction ≥ 0.70, coverage ≥ 50% with opacity ≥ 0.1, PSNR ≥ 16 dB,
+SSIM ≥ 0.45, vehicle centre error ≤ 3 m, stale age 200 ms, GT ranges
+0.5–80 m and 0.5–40 m).
+
+| Topic | Proposed rule |
+| --- | --- |
+| AbsRel / δ pixel set | Scored only on **covered** pixels: opacity ≥ 0.1 AND valid rendered depth (finite, > 0) AND finite GT depth in 0.5–80 m. Holes are left to the coverage gate. (`ABS_REL_MAX`, `DELTA_125_MIN`, `COVERAGE_OPACITY_MIN`, `GT_DEPTH_RANGE_M`) |
+| Vacuous scores | Zero scored pixels **fails** AbsRel and δ (never a pass). A missing rendered-depth buffer also fails those two metrics and does not skip them (already in the table notes). |
+| Range edges | Inclusive: 0.5 m and 80 m count for AbsRel / δ (`GT_DEPTH_RANGE_M`); 0.5 m and 40 m count for coverage (`GT_COVERAGE_RANGE_M`). |
+| δ < 1.25 | Strict `< 1.25`. A ratio of exactly 1.25 is not a hit. The 0.70 fraction gate itself is `≥` (`DELTA_125_MIN`). |
+| Other inclusive gates | AbsRel ≤ 0.20, coverage ≥ 50%, opacity ≥ 0.1, PSNR ≥ 16 dB, SSIM ≥ 0.45, vehicle centre error ≤ 3 m, as written (`ABS_REL_MAX`, `COVERAGE_MIN`, `COVERAGE_OPACITY_MIN`, `PSNR_MIN_DB`, `SSIM_MIN`, `VEHICLE_CENTER_ERR_MAX_M`). |
+| Stale indicator | Required when photon age **> 200 ms**. Age of exactly 200 ms is not stale. Matches `rv_contract.pack_output_slot` (`age_ms > RV_STALE_AGE_MS`). (`STALE_AGE_MS`) |
+| Road surface (checklist) | Scripted: fraction of GT-road pixels (valid GT depth in 0.5–40 m) that are covered ≥ 50%, **and** AbsRel on those covered road pixels ≤ 0.20. A dense but wrong-depth road fails. Same numbers as the table, applied to the road mask (`ROAD_MIN_COVERAGE`, `ROAD_ABS_REL_MAX`). |
+| Ego pose (checklist) | The scripted test is ego-footprint overlap with the mesh / ribbon projection. A tick with no overlap fails. A 4.9 m lateral offset of a 1.9 m-wide footprint has no overlap and fails; overlapping footprints of width *w* cannot be 5 m apart laterally, so no separate 5 m numeric gate is applied. |
+| Vehicle centre | Median of the covered vehicle-mask pixels, ego-frame xy. Error ≤ 3 m inclusive (`VEHICLE_CENTER_ERR_MAX_M`). |
+| Drawn twice | Fails if an elevated off-surface blob exists: height ≥ 0.5 m above the GT road plane (`GHOST_HEIGHT_MIN_M`), \|d − d\*\| > max(1 m, 20% of d\*) (`GHOST_DEPTH_TOL_M`), after 2 px dilation of the vehicle mask (`GHOST_EDGE_DILATE_PX`) and a 1 px morphological opening (`GHOST_OPEN_PX`), whose pixel count is ≥ 25% of the vehicle's pixels (`GHOST_MIN_FRAC_OF_VEHICLE`). Thin silhouette bleed is ignored. |
+| Fake wall (unobserved) | Fails if more than 1% of the **2 px-eroded** unobserved mask is opaque (opacity ≥ 0.1 and valid depth) (`UNOBSERVED_OPAQUE_MAX_FRAC`, `UNOBSERVED_EDGE_ERODE_PX`). Hatch / fog / empty (RGB paint with opacity 0) is allowed. The 2 px erosion ignores billboard bleed at the region border. |
+| Missing opacity | `RvOutputSpec` has no opacity channel. `opacity=None` means every valid-depth pixel is treated as opaque. |
+| Camera / ego conventions | OpenCV camera frame (x right, y down, z forward). Depth is z-depth in metres. `t_ego_cam` is camera → ego. Ego is x forward, y left, z up. A rendered-depth hole is non-finite or ≤ 0. |
+| SSIM definition | Wang *et al.* mean SSIM, uniform **box 7×7** window (`SSIM_WINDOW`; valid region, no padding, **not a Gaussian** — this window choice is a spec proposal, Redesigner, not Michael's), per-channel then averaged, K1 = 0.01, K2 = 0.03, L = 255, population moments (E[x²] − μ²). No new dependency. A library cross-check would call `skimage.metrics.structural_similarity(..., gaussian_weights=False, win_size=7, use_sample_covariance=True)`; scikit-image was not installed on the box that implemented this, so there is no library number in the tests. Note: that skimage flag uses sample covariance (/N−1); this scorer uses population moments, which agree on constant images (zero variance) and differ on textured ones. |
+
 ## Acceptance criteria (eventual implementation)
 
 Fail-first offline tests (box CPU) before any IQU45 run:

@@ -398,11 +398,66 @@ def check_brake_zero_behaviour() -> None:
     print("brake = 0: coasts on the fitted drag, a stopped car stays stopped, throttle ends the hold; written in the spec OK")
 
 
+def check_preflight_on_recording() -> None:
+    """``stop_pred.preflight``: the manifest split of a recording with sign ids answers 'can 2b be scored' before training."""
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        print("SKIP check_preflight_on_recording: cv2 not installed")
+        return
+    import tempfile
+
+    import stage2b_fixture as fx
+    from python.train import stop_pred
+    from python.train.trainer2_recipe import legacy_split_rows
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        good = fx.build(base / "good", fx.N_ROWS, fx.intersections(fx.N_ROWS))
+        train, hold = legacy_split_rows((good,), good, holdout_blocks=1)
+        out = stop_pred.preflight(train, hold, default_root=good)
+        assert out["events"] == {"stop": 1, "light": 1, "rows": len(hold)}, out
+        m = out["motion"]
+        assert abs(m.k_thr - fx.K_THR) < 0.05 and abs(m.k_brk - fx.K_BRK) < 0.05 and abs(m.k_drag - fx.K_DRAG) < 0.01, m.as_dict()
+        hold_ids = {r["i"] for r in hold}
+        assert not (set(m.ids) & {str(i) for i in hold_ids}), "the fit saw a holdout row"
+        assert m.n_rows < fx.SPLIT  # only the train segment's pairs
+        # a holdout row that is also in the train rows is still kept out of the fit
+        leaky = train + [dict(hold[0])]
+        assert str(hold[0]["i"]) not in stop_pred.preflight(leaky, hold, default_root=good)["motion"].ids
+        # without the sidecar there are no events: refused, saying so (never a vacuous 0)
+        bare = fx.build(base / "bare", fx.N_ROWS, fx.intersections(fx.N_ROWS), with_signs=False)
+        tr2, ho2 = legacy_split_rows((bare,), bare, holdout_blocks=1)
+        try:
+            stop_pred.preflight(tr2, ho2, default_root=bare)
+        except stop_pred.StopNotMeasured as exc:
+            assert "stage 2b" in str(exc) and "0 stop-sign/line" in str(exc) and "0 red/yellow-light" in str(exc), exc
+        else:
+            raise AssertionError("no sign ids must refuse")
+        # without the join root nothing is found either (single-root rows carry no source_root)
+        try:
+            stop_pred.preflight(train, hold)
+        except stop_pred.StopNotMeasured as exc:
+            assert "0 stop-sign/line" in str(exc), exc
+        else:
+            raise AssertionError("no root, no sidecar join")
+        # a holdout with no stop but a train segment that never brakes: nothing to fit
+        flat = fx.build(base / "flat", fx.N_ROWS, [], with_signs=True)
+        tr3, ho3 = legacy_split_rows((flat,), flat, holdout_blocks=1)
+        try:
+            stop_pred.preflight(tr3, ho3, default_root=flat)
+        except stop_pred.StopNotMeasured as exc:
+            assert str(exc).startswith("stage 2b cannot be scored"), exc
+        else:
+            raise AssertionError("a recording with no intersections must refuse")
+    print("preflight: events + train-only fit answered from the manifest split; no sign ids / no join root / no stops refuse with the reason OK")
+
 
 def main() -> int:
     checks = (check_sign_ids_are_stable, check_stop_rows_inputs, check_predicted_speed_profile, check_measure_known_counts,
               check_side_angle_slice_and_empty_metrics, check_fit_motion_train_rows_only,
-              check_profile_never_reads_recorded_speed_after_t0, check_brake_zero_behaviour)
+              check_profile_never_reads_recorded_speed_after_t0, check_brake_zero_behaviour,
+              check_preflight_on_recording)
     failed = 0
     for check in checks:
         try:

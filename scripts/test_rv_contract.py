@@ -12,11 +12,15 @@ Tests:
 from __future__ import annotations
 
 import ast
+import ctypes
 import hashlib
 import os
+import signal
 import struct
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +30,110 @@ if str(ROOT) not in sys.path:
 
 def _sha256(arr) -> str:
     return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+_STILL_ACTIVE = 259
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROCESS_TERMINATE = 0x0001
+
+
+def _win_kernel32() -> ctypes.WinDLL:
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    k.GetExitCodeProcess.restype = ctypes.c_int
+    k.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    k.TerminateProcess.restype = ctypes.c_int
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    k.CloseHandle.restype = ctypes.c_int
+    return k
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if pid is still running. Windows uses GetExitCodeProcess (STILL_ACTIVE=259)."""
+    if sys.platform == "win32":
+        k = _win_kernel32()
+        handle = k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return int(code.value) == _STILL_ACTIVE
+        finally:
+            k.CloseHandle(handle)
+    # Treat a zombie as not alive so a late reaper cannot fail the check.
+    try:
+        with open(f"/proc/{int(pid)}/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("State:"):
+                    return not line.split()[1].startswith("Z")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _force_kill_pid(pid: int) -> None:
+    """Hard-kill a pid without referencing signal.SIGKILL on win32."""
+    if sys.platform == "win32":
+        k = _win_kernel32()
+        handle = k.OpenProcess(_PROCESS_TERMINATE, 0, int(pid))
+        if handle:
+            try:
+                k.TerminateProcess(handle, 1)
+            finally:
+                k.CloseHandle(handle)
+        return
+    sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+def _wait_pid_exit(pid: int, timeout_s: float = 4.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _pid_alive(pid)
+
+
+def _readline_timeout(proc: subprocess.Popen[str], timeout_s: float = 5.0) -> str:
+    """Read one stdout line; fail with an assert rather than hang."""
+    lines: list[str] = []
+
+    def _read() -> None:
+        assert proc.stdout is not None
+        lines.append(proc.stdout.readline())
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    reader.join(timeout=timeout_s)
+    assert not reader.is_alive(), f"timed out waiting for child pid line after {timeout_s:.1f}s"
+    assert lines, "child produced no stdout line"
+    return lines[0].strip()
+
+
+def _hard_kill_proc(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.kill()  # SIGKILL on POSIX, TerminateProcess on Windows
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def check_flag_off_is_placeholder() -> None:
@@ -222,28 +330,46 @@ def check_live_path_is_separate_process() -> None:
         client.close()
     assert client.is_alive() is False
 
-    # 6. Intermediate parent SIGKILL must not orphan the --serve stub (PDEATHSIG on Linux, ppid poll fallback).
-    import signal
-    import time
+    # 6. Intermediate parent hard-kill must not orphan the --serve stub.
+    # Runs on win32 (no skips). Windows liveness is GetExitCodeProcess, never signal.SIGKILL.
+    # IQU45 @ 551e602 fail-first: getppid() stays on the dead parent, so the ppid poll never
+    # fires and stdin EOF was late (~6 s); also cleanup crashed on signal.SIGKILL.
 
-    def _pid_alive(pid: int) -> bool:
+    def _run_orphan_case(mode: str, parent: subprocess.Popen[str], stdin_hold: int | None = None) -> None:
+        stub_pid: int | None = None
         try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
+            line = _readline_timeout(parent, timeout_s=5.0)
+            err = ""
+            if parent.stderr is not None and not line.isdigit():
+                try:
+                    err = parent.stderr.read()
+                except OSError:
+                    err = ""
+            assert line.isdigit(), f"{mode}: unexpected parent output {line!r} stderr={err!r}"
+            stub_pid = int(line)
+            assert _pid_alive(stub_pid), f"{mode}: stub_pid {stub_pid} not alive"
+            # Hard-kill the intermediate: Popen.kill() is TerminateProcess on Windows, SIGKILL on POSIX.
+            t0 = time.monotonic()
+            parent.kill()
+            try:
+                parent.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            exited = _wait_pid_exit(stub_pid, timeout_s=4.0)
+            elapsed = time.monotonic() - t0
+            print(f"orphan_check platform={sys.platform} mode={mode} exited_in={elapsed:.3f}s", flush=True)
+            assert exited, f"{mode}: stub_pid {stub_pid} orphaned after parent hard-kill ({elapsed:.3f}s)"
+        finally:
+            if stdin_hold is not None:
+                try:
+                    os.close(stdin_hold)
+                except OSError:
+                    pass
+            _hard_kill_proc(parent)
+            if stub_pid is not None and _pid_alive(stub_pid):
+                _force_kill_pid(stub_pid)
 
-    def _wait_pid_exit(pid: int, timeout_s: float = 4.0) -> bool:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if not _pid_alive(pid):
-                return True
-            time.sleep(0.05)
-        return not _pid_alive(pid)
-
-    # Case A: intermediate parent launches stub via RvClient, then gets SIGKILLed.
+    # Case A (always, including win32): intermediate parent uses RvClient.launch (stdin pipe held by it).
     parent_a = subprocess.Popen(
         [
             sys.executable,
@@ -261,75 +387,79 @@ def check_live_path_is_separate_process() -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        close_fds=True,
     )
-    stub_pid_a: int | None = None
-    try:
-        assert parent_a.stdout is not None
-        line_a = parent_a.stdout.readline().strip()
-        assert line_a.isdigit(), f"unexpected parent_a output: {line_a!r}"
-        stub_pid_a = int(line_a)
-        assert _pid_alive(stub_pid_a), f"stub_pid_a {stub_pid_a} not alive"
-        parent_a.kill()
-        parent_a.wait(timeout=5)
-        assert _wait_pid_exit(stub_pid_a, timeout_s=4.0), f"stub_pid_a {stub_pid_a} orphaned after parent SIGKILL"
-    finally:
-        if parent_a.poll() is None:
-            parent_a.kill()
-            parent_a.wait(timeout=5)
-        if stub_pid_a is not None and _pid_alive(stub_pid_a):
-            try:
-                os.kill(stub_pid_a, signal.SIGKILL)
-            except OSError:
-                pass
+    _run_orphan_case("rvclient", parent_a)
 
-    # Case B (POSIX): intermediate parent spawns --serve with stdin kept open by grandparent pipe (so EOF cannot trigger).
+    # Case W (always, including win32): PDEATHSIG disabled via a private module attribute
+    # (not env/config). Grandparent holds the stdin write end so EOF cannot trigger;
+    # only the stub's parent-watch fallback can exit the child (WaitForSingleObject on
+    # win32, pidfd_open on Linux). close_fds so the stub is the only copy of the read end.
+    r_fd, w_fd = os.pipe()
+    os.set_inheritable(r_fd, True)
+    os.set_inheritable(w_fd, False)
+    intermediate_w = (
+        "import os, subprocess, sys, time\n"
+        "ppid = os.getpid()\n"
+        "child_src = ("
+        "\"import python.viz.rv_renderer_stub as _s; \" "
+        "\"_s._TEST_DISABLE_PDEATHSIG = True; \" "
+        "\"raise SystemExit(_s.main(['--serve', '--parent-pid', '%d']))\" % ppid)\n"
+        "p = subprocess.Popen([sys.executable, '-c', child_src], "
+        "stdin=sys.stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)\n"
+        "time.sleep(0.2)\n"  # arm parent-watch while this intermediate is still alive
+        "print(p.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    parent_w = subprocess.Popen(
+        [sys.executable, "-c", intermediate_w],
+        cwd=str(ROOT),
+        stdin=r_fd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        close_fds=True,
+    )
+    try:
+        os.close(r_fd)
+    except OSError:
+        pass
+    else:
+        r_fd = -1
+    _run_orphan_case("fallback_parent_watch", parent_w, stdin_hold=w_fd)
+
+    # Case B (POSIX): production stub + pdeathsig_preexec, stdin kept open by grandparent.
     if sys.platform != "win32":
-        r_fd, w_fd = os.pipe()
-        os.set_inheritable(r_fd, True)
+        r_fd_b, w_fd_b = os.pipe()
+        os.set_inheritable(r_fd_b, True)
+        os.set_inheritable(w_fd_b, False)
         parent_b = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
                 (
-                    "import subprocess, sys, time; "
+                    "import os, subprocess, sys, time; "
                     "from python.viz.rv_contract import RV_RENDERER_MODULE, pdeathsig_preexec; "
-                    f"p = subprocess.Popen([sys.executable, '-m', RV_RENDERER_MODULE, '--serve'], stdin={r_fd}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=pdeathsig_preexec()); "
+                    "p = subprocess.Popen([sys.executable, '-m', RV_RENDERER_MODULE, '--serve', '--parent-pid', str(os.getpid())], "
+                    "stdin=sys.stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, "
+                    "close_fds=True, preexec_fn=pdeathsig_preexec()); "
+                    "time.sleep(0.2); "
                     "print(p.pid, flush=True); "
                     "time.sleep(60)"
                 ),
             ],
             cwd=str(ROOT),
-            pass_fds=(r_fd,),
+            stdin=r_fd_b,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            close_fds=True,
         )
-        os.close(r_fd)
-        stub_pid_b: int | None = None
         try:
-            assert parent_b.stdout is not None
-            line_b = parent_b.stdout.readline().strip()
-            assert line_b.isdigit(), f"unexpected parent_b output: {line_b!r} stderr={parent_b.stderr.read() if parent_b.stderr else ''}"
-            stub_pid_b = int(line_b)
-            assert _pid_alive(stub_pid_b), f"stub_pid_b {stub_pid_b} not alive"
-            parent_b.kill()
-            parent_b.wait(timeout=5)
-            assert _wait_pid_exit(stub_pid_b, timeout_s=4.0), (
-                f"stub_pid_b {stub_pid_b} orphaned after parent SIGKILL with open stdin"
-            )
-        finally:
-            try:
-                os.close(w_fd)
-            except OSError:
-                pass
-            if parent_b.poll() is None:
-                parent_b.kill()
-                parent_b.wait(timeout=5)
-            if stub_pid_b is not None and _pid_alive(stub_pid_b):
-                try:
-                    os.kill(stub_pid_b, signal.SIGKILL)
-                except OSError:
-                    pass
+            os.close(r_fd_b)
+        except OSError:
+            pass
+        _run_orphan_case("pdeathsig_open_stdin", parent_b, stdin_hold=w_fd_b)
 
     # Case C (Linux): verify prctl PR_SET_PDEATHSIG(SIGTERM) is armed by both pdeathsig_preexec and stub._install_pdeathsig.
     if sys.platform.startswith("linux"):

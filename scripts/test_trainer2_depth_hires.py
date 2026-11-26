@@ -15,7 +15,7 @@ Checks (python/train/depth_hires.py, opt-in ``--aux-depth --heads ...,depth_hire
   check_train_directory_trains_hires  train_directory on a main_depth fixture: 48x64 labels, far head wired, ckpt carries the head
   check_fpn_laterals_and_smooth      every FPN lateral (lat[0..2] on c2/c3/c4) and the 3x3 smooth conv change the 48x64 output / get a nonzero grad
   check_depth_floor_on_negative_logits  aux_depth >= 0.1 (MIN_DEPTH_M) even for large negative logits
-  check_fpn_norm_relu_bilinear        GroupNorm + post-smooth ReLU + bilinear upsample: module types/order, mode, non-neg pre-head, 2x upsamples not 2x2-constant
+  check_fpn_norm_relu_bilinear        GroupNorm(num_groups=4) + post-smooth ReLU + bilinear upsample at scale 1 and 0.5: types/order, every interpolate is bilinear, 2x not 2x2-constant, non-neg pre-head
 Torch checks skip visibly without torch.
 """
 from __future__ import annotations
@@ -636,8 +636,10 @@ def check_depth_floor_on_negative_logits() -> None:
 def check_fpn_norm_relu_bilinear() -> None:
     """GroupNorm, the post-smooth ReLU, and bilinear upsampling are all in the FPN path.
 
-    Structural: ``lat`` / ``smooth`` / ``norm`` / ``out`` types and order; every
-    ``interpolate`` call uses ``mode="bilinear"``. Behavioural: ``norm`` gets a
+    Structural: ``lat`` / ``smooth`` / ``norm`` / ``out`` types and order;
+    ``norm.num_groups == 4``; every ``interpolate(`` in ``depth_hires.py`` uses
+    ``mode="bilinear"`` (call count == bilinear count). Behavioural, at scale 1
+    *and* 0.5 (0.5 is what runs the final 48x64 interpolate): ``norm`` gets a
     nonzero gradient; the tensor entering ``out`` is non-negative (ReLU); a 2x
     upsample is not piecewise-constant over 2x2 blocks (bilinear, not nearest).
     """
@@ -646,10 +648,12 @@ def check_fpn_norm_relu_bilinear() -> None:
         skip_check("check_fpn_norm_relu_bilinear", "torch not installed")
         return
     import inspect
+    import re
 
     import torch.nn as nn
     import torch.nn.functional as functional
 
+    import python.train.depth_hires as depth_hires
     from python.train.depth_hires import stem_pyramid
 
     net = _net(torch, True, 1.0).train()
@@ -661,54 +665,79 @@ def check_fpn_norm_relu_bilinear() -> None:
         assert isinstance(conv, nn.Conv2d) and conv.kernel_size == (1, 1), (type(conv), getattr(conv, "kernel_size", None))
     assert isinstance(head.smooth, nn.Conv2d) and head.smooth.kernel_size == (3, 3) and head.smooth.padding == (1, 1)
     assert isinstance(head.norm, nn.GroupNorm)
+    assert int(head.norm.num_groups) == 4, f"GroupNorm num_groups={head.norm.num_groups}, expected 4"
     assert isinstance(head.out, nn.Conv2d) and head.out.kernel_size == (1, 1)
-    src = inspect.getsource(head.forward)
-    assert 'mode="bilinear"' in src or "mode='bilinear'" in src
-    assert "self.norm(" in src
-    assert "torch.relu(" in src or "functional.relu(" in src
+    src = inspect.getsource(depth_hires)
+    n_interp = len(re.findall(r"interpolate\s*\(", src))
+    n_bilinear = len(re.findall(r"mode\s*=\s*[\"']bilinear[\"']", src))
+    assert n_interp == n_bilinear and n_interp >= 3, (
+        f"every interpolate() in depth_hires.py must use mode='bilinear' "
+        f"(found {n_interp} interpolate( calls, {n_bilinear} mode='bilinear')"
+    )
+    fwd = inspect.getsource(head.forward)
+    assert "self.norm(" in fwd
+    assert "torch.relu(" in fwd or "functional.relu(" in fwd
 
-    img = _image(torch, net)
-    with torch.no_grad():
-        pyr = [m.detach().clone() for m in stem_pyramid(net.stem, img[:, :, :, net.sectors[0].x0 : net.sectors[0].x1])]
-
-    ups: list[tuple] = []
-    real_interp = functional.interpolate
-
-    def spy(x, size=None, scale_factor=None, mode="nearest", align_corners=None, **kw):
-        y = real_interp(x, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners, **kw)
-        ups.append((mode, y.detach(), tuple(x.shape[-2:]), tuple(y.shape[-2:])))
-        return y
-
-    pre_out: dict = {}
-
-    def on_out(_mod, inp, _out):
-        pre_out["x"] = inp[0].detach()
-
-    hook = head.out.register_forward_hook(on_out)
-    functional.interpolate = spy
-    try:
-        head.zero_grad(set_to_none=True)
-        depth, far = head([m.requires_grad_(False) for m in pyr])
-        (depth.sum() + far.sum()).backward()
-    finally:
-        functional.interpolate = real_interp
-        hook.remove()
-
-    assert ups and all(mode == "bilinear" for mode, *_ in ups), ups
-    for mode, y, src_hw, dst_hw in ups:
+    def _not_2x2_constant(y, src_hw, dst_hw, mode) -> None:
         if dst_hw == (src_hw[0] * 2, src_hw[1] * 2) and dst_hw[0] >= 2 and dst_hw[1] >= 2:
             a = y[..., 0::2, 0::2]
             blocks = torch.stack((y[..., 0::2, 1::2], y[..., 1::2, 0::2], y[..., 1::2, 1::2]), dim=0)
             assert not torch.allclose(blocks, a.unsqueeze(0), atol=1e-6), (
                 f"2x upsample {src_hw}->{dst_hw} is piecewise-constant over 2x2 blocks (nearest-like), mode={mode}"
             )
-    ng = head.norm.weight.grad
-    assert ng is not None and float(ng.abs().sum()) > 0.0, "GroupNorm got no gradient (self.norm was not in the forward path)"
-    feat = pre_out["x"]
-    assert bool((feat >= -1e-6).all()), f"pre-head feature has negatives (post-smooth ReLU missing); min={float(feat.min()):.4g}"
+
+    n_ups = {}
+    for scale in (1.0, 0.5):
+        net_s = _net(torch, True, scale).train()
+        head_s = net_s.depth_hires_head
+        assert int(head_s.norm.num_groups) == 4, head_s.norm.num_groups
+        img = _image(torch, net_s)
+        with torch.no_grad():
+            pyr = [m.detach().clone() for m in stem_pyramid(net_s.stem, img[:, :, :, net_s.sectors[0].x0 : net_s.sectors[0].x1])]
+
+        ups: list[tuple] = []
+        real_interp = functional.interpolate
+
+        def spy(x, size=None, scale_factor=None, mode="nearest", align_corners=None, **kw):
+            y = real_interp(x, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners, **kw)
+            ups.append((mode, y.detach(), tuple(x.shape[-2:]), tuple(y.shape[-2:])))
+            return y
+
+        pre_out: dict = {}
+
+        def on_out(_mod, inp, _out):
+            pre_out["x"] = inp[0].detach()
+
+        hook = head_s.out.register_forward_hook(on_out)
+        functional.interpolate = spy
+        try:
+            head_s.zero_grad(set_to_none=True)
+            depth, far = head_s([m.requires_grad_(False) for m in pyr])
+            (depth.sum() + far.sum()).backward()
+        finally:
+            functional.interpolate = real_interp
+            hook.remove()
+
+        assert ups and all(mode == "bilinear" for mode, *_ in ups), (scale, ups)
+        for mode, y, src_hw, dst_hw in ups:
+            _not_2x2_constant(y, src_hw, dst_hw, mode)
+        if scale == 0.5:
+            finals = [u for u in ups if u[3] == (48, 64) and u[2] != (48, 64)]
+            assert finals, f"scale 0.5 never interpolated to 48x64 (final branch did not run); spy={[(m, a, b) for m, _, a, b in ups]}"
+            assert all(m == "bilinear" for m, *_ in finals)
+            for mode, y, src_hw, dst_hw in finals:
+                _not_2x2_constant(y, src_hw, dst_hw, mode)
+        ng = head_s.norm.weight.grad
+        assert ng is not None and float(ng.abs().sum()) > 0.0, f"scale {scale}: GroupNorm got no gradient (self.norm was not in the forward path)"
+        feat = pre_out["x"]
+        assert bool((feat >= -1e-6).all()), f"scale {scale}: pre-head feature has negatives (post-smooth ReLU missing); min={float(feat.min()):.4g}"
+        n_ups[scale] = (len(ups), float(ng.abs().sum()), float(feat.min()))
+
     print(
-        f"fpn norm/relu/bilinear: children {names}; {len(ups)} interpolate(s) all bilinear and not 2x2-constant; "
-        f"norm grad {float(ng.abs().sum()):.3g}; pre-head min {float(feat.min()):.4g} (>=0) OK"
+        f"fpn norm/relu/bilinear: children {names}; GroupNorm num_groups=4; "
+        f"{n_interp} interpolate(s) in depth_hires.py all bilinear; "
+        f"scale 1: {n_ups[1.0][0]} interp(s); scale 0.5: {n_ups[0.5][0]} interp(s) incl. 48x64; "
+        f"norm grad {n_ups[1.0][1]:.3g}/{n_ups[0.5][1]:.3g}; pre-head min {n_ups[1.0][2]:.4g} (>=0) OK"
     )
 
 

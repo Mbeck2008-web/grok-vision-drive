@@ -441,6 +441,52 @@ def check_run_clips_with_fake_collector() -> None:
     print("run_clips: 3 clips, 3 new folders, tags + session manifest")
 
 
+def check_run_clips_stop_file_pauses_between_clips() -> None:
+    """A stop file ends the batch between clips: the running clip finishes and is tagged, none starts after."""
+    from python.collect.clip_mode import STOP_FILE_REASON, run_clips
+    from scripts.gvd_test_env import collect_root
+
+    with collect_root() as root:
+        stop = root / "STOP"
+        calls = []
+
+        def runner(argv: list[str]) -> int:
+            out = Path(argv[argv.index("--out") + 1])
+            calls.append(out)
+            _fake_recording(out, rows=50)
+            if len(calls) == 2:
+                stop.write_text("pause\n", encoding="utf-8")  # owner asks to pause mid-clip 2
+            return 0
+
+        session = run_clips(root, clips=5, seed=5, maps=MAPS, max_traffic=4, runner=runner,
+                            min_s=4.0, max_s=5.0, stop_file=stop)
+        dirs = sorted(p for p in session.iterdir() if p.is_dir())
+        assert len(calls) == 2 and len(dirs) == 2, (calls, dirs)
+        for d in dirs:
+            assert (d / "clip_tags.json").is_file(), d
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["stop_reason"] == STOP_FILE_REASON == "stop_file", manifest
+        assert len(manifest["results"]) == 2
+        assert stop.is_file()  # never deleted by the recorder
+
+    with collect_root() as root:
+        stop = root / "STOP"
+        stop.write_text("", encoding="utf-8")
+        called = []
+        session = run_clips(root, clips=3, seed=5, maps=MAPS, max_traffic=4,
+                            runner=lambda argv: called.append(argv) or 0, min_s=4.0, max_s=5.0, stop_file=stop)
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert not called and manifest["stop_reason"] == "stop_file" and manifest["results"] == []
+        assert not [p for p in session.iterdir() if p.is_dir()]
+
+    from scripts.collect_clips import parse_args
+
+    a = parse_args(["--out", "X:/rec"])
+    assert Path(a.stop_file) == Path("X:/rec") / "STOP", a.stop_file
+    assert parse_args(["--out", "X:/rec", "--stop-file", ""]).stop_file is None
+    print("run_clips: a stop file pauses the batch between clips (running clip finishes and is tagged)")
+
+
 def check_cli() -> None:
     """scripts/collect_clips.py: 30-60 s bounds, one collector subprocess per clip."""
     import importlib.util
@@ -627,6 +673,7 @@ def main() -> None:
     check_session_never_overwrites()
     check_tags_never_overwritten()
     check_run_clips_with_fake_collector()
+    check_run_clips_stop_file_pauses_between_clips()
     check_cli()
     check_default_clip_maps_have_a_dump()
     check_cut_in_bend_speed_floor()

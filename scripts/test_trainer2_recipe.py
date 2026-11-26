@@ -631,13 +631,51 @@ def check_stage_result_from_stats_is_real() -> None:
             assert "not claiming exit" in str(exc), exc
         else:
             raise AssertionError(f"{bad} must not yield a stage-1 result")
-    # stage 2b: refused with the precise reason, never a made-up number
+    # stage 2b: the three stop metrics from the holdout pass (python/train/stop_pred.py), every one finite on every eval
+    ok2b = {"lane_rms": 0.5, "lane_r": 0.9, "depth_absrel": 0.4, "sem_miou": 0.3, "missed_stop": 2.0, "missed_light": 1.0,
+            "false_brake": 0.75}
+    res = rec.stage_result_from_stats("2b", _stats([dict(ok2b, missed_stop=4.0, missed_light=3.0, false_brake=2.0),
+                                                    dict(ok2b, missed_stop=3.0, missed_light=2.0, false_brake=1.0), ok2b]))
+    assert res.metrics == ok2b, res.metrics  # the LAST eval, with the lane and aux metrics it keeps measuring
+    assert res.evals_by == {"missed_stop": [4.0, 3.0, 2.0], "missed_light": [3.0, 2.0, 1.0], "false_brake": [2.0, 1.0, 0.75]}, res.evals_by
+    assert res.evals == [4.0, 3.0, 2.0] and res.epochs == 3
+    for key in ("missed_stop", "missed_light", "false_brake"):
+        for bad in (None, nan, float("inf")):
+            try:
+                rec.stage_result_from_stats("2b", _stats([ok2b, dict(ok2b, **{key: bad})]))
+            except rec.MetricNotMeasured as exc:
+                assert key in str(exc) and "not claiming exit" in str(exc), exc
+            else:
+                raise AssertionError(f"2b with {key}={bad} must not yield a result")
+        gone = dict(ok2b)
+        del gone[key]
+        try:
+            rec.stage_result_from_stats("2b", _stats([ok2b, gone]))
+        except rec.MetricNotMeasured:
+            pass
+        else:
+            raise AssertionError(f"2b without {key} must not yield a result")
+    # stage 7 re-measures the stop metrics when the pass produced them (a 2b ran before) and does not need them otherwise
+    r7 = rec.stage_result_from_stats("7", _stats([ok2b]))
+    assert r7.metrics == ok2b, r7.metrics
+    r7 = rec.stage_result_from_stats("7", _stats([{k: v for k, v in ok2b.items() if k not in rec.STOP_METRICS}]))
+    assert set(r7.metrics) == {"lane_rms", "lane_r", "depth_absrel", "sem_miou"}, r7.metrics
+    # the guard for a stage that cannot be measured is still there (nothing is in it today)
+    assert rec.UNMEASURABLE_STAGES == {}
+    saved = dict(rec.UNMEASURABLE_STAGES)
+    rec.UNMEASURABLE_STAGES["2b"] = "because"
     try:
-        rec.stage_result_from_stats("2b", _stats([{"lane_rms": 1.0}] * 4))
-    except rec.MetricNotMeasured as exc:
-        assert "PR 6b" in str(exc) and "stop ids" in str(exc) and "pred_v" in str(exc), exc
-    else:
-        raise AssertionError("stage 2b has no offline exit metric; must not pass")
+        for fn, args in ((rec.stage_result_from_stats, ("2b", _stats([ok2b]))), (rec.require_measurable_stages, (["0", "2b"],))):
+            try:
+                fn(*args)
+            except rec.MetricNotMeasured as exc:
+                assert "because" in str(exc), exc
+            else:
+                raise AssertionError("an unmeasurable stage must be refused")
+        rec.require_measurable_stages(["0", "1", "2"])
+    finally:
+        rec.UNMEASURABLE_STAGES.clear()
+        rec.UNMEASURABLE_STAGES.update(saved)
     # stages 2 and 7: the 8 m lane score, plus the re-measured aux metrics when the net kept its aux heads
     for sid in ("2", "7"):
         for bad in ({}, {"holdout_evals": []}, {"holdout_evals": [{"lane_rms": None}]},
@@ -1703,7 +1741,6 @@ def check_runner_refuses_before_training() -> None:
             ("--no-ssl-pretrain with stage 0", dict(extra=("--no-ssl-pretrain",)), rec.RecipeRefused, "--no-ssl-pretrain"),
             ("--init-stem with stage 0", dict(extra=("--init-stem", str(env.base / "x.npz"))), rec.RecipeRefused, "--init-stem"),
             ("--holdout-cells with stage 0", dict(extra=("--holdout-cells",)), rec.RecipeRefused, "cell"),
-            ("default plan (stage 2b)", dict(stage=""), rec.MetricNotMeasured, "PR 6b"),
         )
         for k, (label, kw, kind, word) in enumerate(cases):
             res, err, ck = env.run(ck_name=f"ck{k}", **kw)

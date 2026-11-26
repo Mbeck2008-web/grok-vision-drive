@@ -18,6 +18,13 @@ for p in (str(ROOT), str(ROOT / "scripts")):
         sys.path.insert(0, p)
 
 DT = 0.1
+K_THR, K_BRK, K_DRAG = 2.0, 4.5, 0.0
+
+
+def _motion(k_thr=K_THR, k_brk=K_BRK, k_drag=K_DRAG):
+    from python.train.stop_pred import Motion
+
+    return Motion(k_thr, k_brk, k_drag)
 
 
 def _ctl(thr: float, brk: float):
@@ -98,27 +105,27 @@ def check_predicted_speed_profile() -> None:
     # recorded 10 m/s, sign 40 m ahead. The model brakes 0.5 (decel 4.5 * 0.5 = 2.25 m/s^2): v_k = 10 - 0.225 k
     pairs = _approach("A", n=20, v=lambda k: 10.0, brake=lambda k: 0.5, target="stop_sign")
     rows, _ = stop_pred.stop_rows(pairs)
-    stop_pred.add_predicted_speed(rows)
+    stop_pred.add_predicted_speed(rows, _motion())
     for k in (0, 1, 5, 19):
         assert abs(rows[k]["pred_v"] - (10.0 - 0.225 * k)) < 1e-9, (k, rows[k]["pred_v"])
     # throttle adds 2.0 m/s^2 at full throttle: brake .5 + throttle .5 -> (1.0 - 2.25) = -1.25 m/s^2 -> 10 - 0.125 k
     rows, _ = stop_pred.stop_rows(_approach("A", n=20, v=lambda k: 10.0, brake=lambda k: 0.5, thr=0.5, target="stop_sign"))
-    stop_pred.add_predicted_speed(rows)
+    stop_pred.add_predicted_speed(rows, _motion())
     assert abs(rows[8]["pred_v"] - (10.0 - 0.125 * 8)) < 1e-9, rows[8]["pred_v"]
     # never below 0: brake 1 from 10 m/s stops in 10/4.5 = 2.22 s and stays at 0
     rows, _ = stop_pred.stop_rows(_approach("A", n=40, v=lambda k: 10.0, brake=lambda k: 1.0, target="stop_sign"))
-    stop_pred.add_predicted_speed(rows)
+    stop_pred.add_predicted_speed(rows, _motion())
     assert rows[23]["pred_v"] == 0.0 and rows[39]["pred_v"] == 0.0 and rows[22]["pred_v"] > 0.0, [r["pred_v"] for r in rows[20:25]]
     # the recorded stop never credits the model: the car stops at k=10 (recorded v 0 from there) and the model does not brake
     pairs = _approach("A", n=30, v=lambda k: 10.0 if k < 10 else 0.0, brake=lambda k: 0.0, target="stop_sign")
     rows, _ = stop_pred.stop_rows(pairs)
-    stop_pred.add_predicted_speed(rows)
+    stop_pred.add_predicted_speed(rows, _motion())
     assert rows[0]["pred_v"] == 10.0 and rows[9]["pred_v"] == 10.0 and rows[12]["pred_v"] == 10.0, [r["pred_v"] for r in rows[:14]]
-    # outside any approach pred_v is the recorded speed
+    # outside any approach there is no profile: a speed that is not a stop, never the recorded speed
     pairs = _approach("A", n=10, v=lambda k: 4.0 + k, brake=lambda k: 1.0, target=None)
     rows, _ = stop_pred.stop_rows(pairs)
-    stop_pred.add_predicted_speed(rows)
-    assert [r["pred_v"] for r in rows] == [r["v"] for r in rows]
+    stop_pred.add_predicted_speed(rows, _motion())
+    assert [r["pred_v"] for r in rows] == [stop_pred.NOT_SCORED_V] * 10, [r["pred_v"] for r in rows]  # never the recorded speed
     print("predicted speed: dv/dt = 2.0 throttle - 4.5 brake from the entry speed, floored at 0, not re-anchored to the recorded stop OK")
 
 
@@ -128,7 +135,7 @@ def _metrics(sources):
     pairs = []
     for p in sources:
         pairs.extend(p)
-    return stop_pred.measure(pairs)
+    return stop_pred.measure(pairs, _motion())
 
 
 def check_measure_known_counts() -> None:
@@ -180,18 +187,18 @@ def check_side_angle_slice_and_empty_metrics() -> None:
         for s in row["signs"]:
             s["x"] = s["y"] * np.tan(np.radians(30.0))
     pairs += _approach("F", n=50, v=lambda k: 10.0, brake=lambda k: 0.0, target=None)
-    m = stop_pred.measure(pairs)
+    m = stop_pred.measure(pairs, _motion())
     assert m["stop_side_angle_events"] == 1 and m["stop_side_angle_missed"] == 0 and m["missed_stop"] == 0.0, m
     # no light events -> missed_light is None (not 0): the stage cannot claim a pass it did not measure
     assert m["light_events"] == 0 and m["missed_light"] is None, m
     # nothing at all
-    m = stop_pred.measure(_approach("F", n=50, v=lambda k: 10.0, brake=lambda k: 0.0, target=None))
+    m = stop_pred.measure(_approach("F", n=50, v=lambda k: 10.0, brake=lambda k: 0.0, target=None), _motion())
     assert m["missed_stop"] is None and m["missed_light"] is None and m["false_brake"] == 0.0, m
     # a recording that never moves has no km: the false-brake rate is None, never 0 or NaN
-    m = stop_pred.measure(_approach("F", n=10, v=lambda k: 0.0, brake=lambda k: 0.0, target=None))
+    m = stop_pred.measure(_approach("F", n=10, v=lambda k: 0.0, brake=lambda k: 0.0, target=None), _motion())
     assert m["false_brake"] is None, m
     try:
-        stop_pred.measure([])
+        stop_pred.measure([], _motion())
     except stop_pred.StopNotMeasured:
         pass
     else:
@@ -201,9 +208,201 @@ def check_side_angle_slice_and_empty_metrics() -> None:
     print("measure: side-angle slice reported on its own; a class with no events is None; no distance -> None OK")
 
 
+def _train_rows(k_thr=1.5, k_brk=5.0, k_drag=0.05, n=400, seg="s", start_i=0, v0=14.0):
+    """Recorded train rows from a known car: dv/dt = k_thr*thr - k_brk*brk - k_drag*v, controls vary, v stays > 0."""
+    rows, v = [], v0
+    for k in range(n):
+        thr = 0.5 + 0.5 * np.sin(k / 7.0) if (k % 40) >= 8 else 0.0
+        brk = 0.6 if (k % 40) < 8 and k % 40 >= 3 else 0.0
+        rows.append({"i": start_i + k, "segment": seg, "ego": {"sim_t": 50.0 + k * DT, "speed_mps": v},
+                     "pedals": {"throttle_ai": float(thr), "brake_ai": float(brk), "parkingbrake_ai": 0.0}, "veh": {"reverse": 0}})
+        v = max(0.0, v + (k_thr * thr - k_brk * brk - k_drag * v) * DT)
+    return rows
+
+
+def check_fit_motion_train_rows_only() -> None:
+    from python.train import stop_pred
+
+    rows = _train_rows()
+    assert min(r["ego"]["speed_mps"] for r in rows) > 0.5, "the fixture must not floor"
+    m = stop_pred.fit_motion(rows, holdout_ids={9999, 10000})
+    assert abs(m.k_thr - 1.5) < 1e-6 and abs(m.k_brk - 5.0) < 1e-6 and abs(m.k_drag - 0.05) < 1e-6, m.as_dict()
+    assert m.n_rows == len(rows) - 1 and m.n_brake_rows > 10, m.as_dict()
+    # a holdout id in the fit set is refused, naming it (not dropped): the fit never sees holdout rows
+    try:
+        stop_pred.fit_motion(rows, holdout_ids={17})
+    except stop_pred.StopNotMeasured as exc:
+        assert "holdout row id" in str(exc) and "17" in str(exc), exc
+    else:
+        raise AssertionError("a holdout id in the fit set must be refused")
+    # ids compare as text: 17 and "17" are the same row
+    try:
+        stop_pred.fit_motion(rows, holdout_ids={"17"})
+    except stop_pred.StopNotMeasured:
+        pass
+    else:
+        raise AssertionError("string holdout ids must match int row ids")
+    # the fit uses only the rows it is given: dropping the rows after i=200 changes nothing about the rows before
+    half = stop_pred.fit_motion(rows[:200], holdout_ids=set())
+    assert abs(half.k_brk - 5.0) < 1e-6
+    # no braking in the train rows -> no brake map: refused, not defaulted
+    flat = [dict(r, pedals=dict(r["pedals"], brake_ai=0.0)) for r in rows]
+    for thing, why in ((flat, "braking"), (rows[:10], "needs")):
+        try:
+            stop_pred.fit_motion(thing, holdout_ids=set())
+        except stop_pred.StopNotMeasured as exc:
+            assert why in str(exc), exc
+        else:
+            raise AssertionError("an unfittable train set must be refused")
+    # braking that does not slow the car (brake_ai pressed, speed constant) -> k_brk 0 -> refused
+    stuck = [dict(r, ego={"sim_t": r["ego"]["sim_t"], "speed_mps": 10.0}) for r in rows]
+    try:
+        stop_pred.fit_motion(stuck, holdout_ids=set())
+    except stop_pred.StopNotMeasured as exc:
+        assert "no deceleration" in str(exc), exc
+    else:
+        raise AssertionError("no deceleration under braking must be refused")
+    # a hole, a segment change, reverse and the parking brake do not make accelerations
+    holed = [dict(r) for r in rows]
+    for k in range(60, 120):
+        holed[k] = dict(holed[k], segment=f"seg{k}")  # every pair in 60..120 crosses a segment
+    assert stop_pred.fit_motion(holed, holdout_ids=set()).n_rows < len(rows) - 60
+    rev = [dict(r, veh={"reverse": 1}) for r in rows]
+    try:
+        stop_pred.fit_motion(rev, holdout_ids=set())
+    except stop_pred.StopNotMeasured:
+        pass
+    else:
+        raise AssertionError("reverse rows are not fit rows")
+    pb = [dict(r, pedals=dict(r["pedals"], parkingbrake_ai=0.9)) for r in rows]
+    try:
+        stop_pred.fit_motion(pb, holdout_ids=set())
+    except stop_pred.StopNotMeasured:
+        pass
+    else:
+        raise AssertionError("parking-brake rows are not fit rows")
+    # non-negative: a car whose throttle seems to slow it (k_thr = -0.5 in the data) gets k_thr = 0, never a negative gain
+    odd = _train_rows(k_thr=-0.5, k_brk=5.0, k_drag=0.0, n=150, v0=80.0)
+    assert min(r["ego"]["speed_mps"] for r in odd) > 1.0
+    m = stop_pred.fit_motion(odd, holdout_ids=set())
+    assert m.k_thr == 0.0 and m.k_brk > 0.0 and m.k_drag >= 0.0, m.as_dict()
+    print("motion fit: recovers k_thr / k_brk / k_drag from train rows, refuses holdout ids, unfittable sets and k_brk <= 0 OK")
+
+
+def check_profile_never_reads_recorded_speed_after_t0() -> None:
+    """Poison the recorded speed, a wheel speed and an acceleration after t0 (NaN, 0, permuted): same profile, same score."""
+    from python.train import stop_pred
+
+    def build():
+        # the model brakes fully from k=2 (4.5 m/s^2 from 12 m/s: stopped by k=29), a sign 40 m ahead, window to k=34
+        pairs = _approach("A", n=50, v=lambda k: 12.0, brake=lambda k: 1.0 if 2 <= k < 30 else 0.0, target="stop_sign")
+        for row, _c in pairs:
+            row["wheel_speed"] = row["ego"]["speed_mps"]
+            row["ego"]["accel_mps2"] = 0.3
+            row["tech"] = {"speed_mps": row["ego"]["speed_mps"], "accel": 0.3}
+        pairs += _approach("F", n=60, v=lambda k: 12.0, brake=lambda k: 0.0, target=None)
+        return pairs
+
+    def profile(pairs):
+        rows, _ = stop_pred.stop_rows(pairs)
+        stop_pred.add_predicted_speed(rows, _motion())
+        return [(r["source"], r["t"], r["pred_v"]) for r in rows]
+
+    base_pairs = build()
+    base = profile(base_pairs)
+    t0 = 100.0  # the first row of source A is the approach start: 12 m/s, target at 40 m
+    assert abs(base[0][2] - 12.0) < 1e-12 and base[10][2] < 12.0 and base[31][2] == 0.0 and base[34][2] == 0.0, [b[2] for b in base[:36]]
+
+    def poison(kind):
+        pairs = build()
+        rng = np.random.RandomState(1)
+        for row, _c in pairs:
+            if row["source"] == "A" and row["ego"]["sim_t"] > t0 + 1e-9:
+                vals = {"nan": float("nan"), "zero": 0.0, "perm": float(rng.uniform(0, 30))}[kind]
+                row["ego"]["speed_mps"] = vals
+                row["wheel_speed"] = vals
+                row["ego"]["accel_mps2"] = vals
+                row["tech"] = {"speed_mps": vals, "accel": vals}
+        return pairs
+
+    import struct
+
+    def raw(x):
+        return [struct.pack("<d", v[2]) for v in x]
+
+    for kind in ("nan", "zero", "perm"):
+        pairs = poison(kind)
+        if kind == "nan":
+            # the stop events need a finite recorded speed to exist, so NaN is poisoned straight into the profile step
+            rows, _ = stop_pred.stop_rows(base_pairs)
+            for r in rows:
+                if r["source"] == "A" and r["t"] > t0 + 1e-9:
+                    r["v"] = float("nan")
+            stop_pred.add_predicted_speed(rows, _motion())
+            got = [(r["source"], r["t"], r["pred_v"]) for r in rows]
+        else:
+            got = profile(pairs)
+        assert raw(got) == raw(base), (kind, [g[2] for g in got[:12]], [b[2] for b in base[:12]])
+    # the same score with speed_key = pred_v: misses, held stops and the stop distance do not move with the poison
+    ref = stop_pred.measure(base_pairs, _motion())
+    for kind in ("zero", "perm"):
+        got = stop_pred.measure(poison(kind), _motion())
+        for key in ("missed_stop", "missed_light", "stop_events", "light_events", "stop_distance_m", "stop_side_angle_missed"):
+            assert got[key] == ref[key], (kind, key, got[key], ref[key])
+    assert ref["missed_stop"] == 0.0 and ref["stop_events"] == 1, ref
+    # entry (t0) does read the recorded speed: a car below 2 m/s at entry makes no event at all
+    slow = _approach("A", n=50, v=lambda k: 1.0, brake=lambda k: 1.0, target="stop_sign") + _approach("F", n=60, v=lambda k: 12.0, brake=lambda k: 0.0, target=None)
+    assert stop_pred.measure(slow, _motion())["stop_events"] == 0
+    print("profile: byte-identical when the recorded speed / wheel speed / accel after t0 are NaN, 0 or random; same score OK")
+
+
+def check_brake_zero_behaviour() -> None:
+    """brake = 0: the car coasts on the fitted drag, a stopped car stays stopped, throttle ends the hold."""
+    from python.train import stop_pred
+
+    drag = _motion(2.0, 4.5, 0.2)
+
+    def run(v0, thr, brk, n=30):
+        rows, _ = stop_pred.stop_rows(_approach("A", n=n, v=lambda k: v0, brake=lambda k: brk, thr=thr, target="stop_sign"))
+        stop_pred.add_predicted_speed(rows, drag)
+        return [r["pred_v"] for r in rows]
+
+    coast = run(10.0, 0.0, 0.0)
+    # dv/dt = -0.2 v, stepped at 0.1 s: v_k = 10 * (1 - 0.02)^k
+    assert all(abs(coast[k] - 10.0 * 0.98 ** k) < 1e-9 for k in (0, 1, 7, 29)), coast[:5]
+    assert coast[-1] > 5.0  # a coast is not a stop
+    # a stopped car: brake it to 0 (stay at brake 1), then release with throttle 0 -> stays 0 (hold needs no brake)
+    # (sign 40 m ahead at 10 m/s recorded: the approach window is rows 0..40)
+    held = run(10.0, 0.0, 1.0, n=40)
+    assert held[-1] == 0.0
+    rows, _ = stop_pred.stop_rows(_approach("A", n=40, v=lambda k: 10.0, brake=lambda k: 1.0 if k < 30 else 0.0, thr=0.0, target="stop_sign"))
+    stop_pred.add_predicted_speed(rows, drag)
+    assert rows[29]["pred_v"] == 0.0 and rows[39]["pred_v"] == 0.0 and rows[34]["pred_v"] == 0.0, [r["pred_v"] for r in rows[26:40]]
+    # throttle after the stop: the car moves again (k_thr 2.0 * 0.5 = 1 m/s^2) -> the hold ends
+    rows, _ = stop_pred.stop_rows(_approach("A", n=40, v=lambda k: 10.0, brake=lambda k: 1.0 if k < 30 else 0.0,
+                                            thr=lambda k: 0.5 if k >= 30 else 0.0, target="stop_sign"))
+    stop_pred.add_predicted_speed(rows, drag)
+    assert rows[29]["pred_v"] == 0.0 and rows[31]["pred_v"] > 0.0 and rows[38]["pred_v"] > rows[31]["pred_v"], [r["pred_v"] for r in rows[28:40]]
+    # and that decides the score: braked-then-released stays a held stop; braked-then-throttle is a miss
+    still = _approach("A", n=45, v=lambda k: 10.0, brake=lambda k: 1.0 if k < 22 else 0.0, thr=0.0, target="stop_sign") + \
+        _approach("F", n=60, v=lambda k: 10.0, brake=lambda k: 0.0, target=None)
+    # (with the drag the car is at 0.09 m/s at k=18; throttle from k=19 lifts it past 0.5 m/s at k=21: 0.3 s below 0.5, no hold)
+    go = _approach("A", n=45, v=lambda k: 10.0, brake=lambda k: 1.0 if k < 19 else 0.0, thr=lambda k: 1.0 if k >= 19 else 0.0, target="stop_sign") + \
+        _approach("F", n=60, v=lambda k: 10.0, brake=lambda k: 0.0, target=None)
+    assert stop_pred.measure(still, drag)["missed_stop"] == 0.0
+    assert stop_pred.measure(go, drag)["missed_stop"] == 1.0
+    # the spec says so
+    spec = (ROOT / "docs" / "specs" / "trainer_2.md").read_text(encoding="utf-8")
+    for phrase in ("dv/dt = K_THR * throttle - K_BRK * brake - K_DRAG * v", "coasts", "stays stopped", "train rows only"):
+        assert phrase in spec, phrase
+    print("brake = 0: coasts on the fitted drag, a stopped car stays stopped, throttle ends the hold; written in the spec OK")
+
+
+
 def main() -> int:
     checks = (check_sign_ids_are_stable, check_stop_rows_inputs, check_predicted_speed_profile, check_measure_known_counts,
-              check_side_angle_slice_and_empty_metrics)
+              check_side_angle_slice_and_empty_metrics, check_fit_motion_train_rows_only,
+              check_profile_never_reads_recorded_speed_after_t0, check_brake_zero_behaviour)
     failed = 0
     for check in checks:
         try:

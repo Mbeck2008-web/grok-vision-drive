@@ -13,6 +13,7 @@ Checks:
 - check_depth_buffer_required          (no rendered-depth buffer => fail, not skip)
 - check_metric_boundaries              (inclusive thresholds, one step either side)
 - check_rubric_is_gt_named_only        (nothing outside GT-named files imports it)
+- check_spec_constants_match_doc       (module thresholds parse equal to the spec table)
 """
 from __future__ import annotations
 
@@ -525,12 +526,140 @@ def check_rubric_is_gt_named_only() -> None:
     print("PASS check_rubric_is_gt_named_only")
 
 
+# Constants whose values are the published Step 8 table / checklist numbers,
+# plus the Redesigner proposal pins. Each name must appear in the proposal.
+_SPEC_CONSTANTS: tuple[str, ...] = (
+    "ABS_REL_MAX",
+    "DELTA_125_MIN",
+    "COVERAGE_MIN",
+    "COVERAGE_OPACITY_MIN",
+    "PSNR_MIN_DB",
+    "SSIM_MIN",
+    "GT_DEPTH_RANGE_M",
+    "GT_COVERAGE_RANGE_M",
+    "VEHICLE_CENTER_ERR_MAX_M",
+    "STALE_AGE_MS",
+    "SSIM_WINDOW",
+    "UNOBSERVED_OPAQUE_MAX_FRAC",
+    "GHOST_MIN_FRAC_OF_VEHICLE",
+    "GHOST_HEIGHT_MIN_M",
+    "GHOST_DEPTH_TOL_M",
+    "GHOST_EDGE_DILATE_PX",
+    "GHOST_OPEN_PX",
+    "UNOBSERVED_EDGE_ERODE_PX",
+    "ROAD_MIN_COVERAGE",
+    "ROAD_ABS_REL_MAX",
+)
+
+
+def _spec_sections() -> tuple[str, str]:
+    """Published Step 8 rubric (table + checklist) and the Redesigner proposal."""
+    text = (ROOT / "docs/specs/reality_view_3dgs.md").read_text(encoding="utf-8")
+    _, found, rest = text.partition("## Step 8 quality rubric (proposed, unmeasured)")
+    assert found, "missing Step 8 quality rubric section"
+    published, found, proposal = rest.partition("spec proposal (Redesigner, not Michael's)")
+    assert found, "missing Redesigner step 8(1) spec proposal"
+    proposal = proposal.split("\n## ", 1)[0]
+    return published, proposal
+
+
+def _table_row(section: str, prefix: str) -> list[str]:
+    for line in section.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if cells and prefix in cells[0]:
+            return cells
+    raise AssertionError(f"missing table row starting with {prefix!r}")
+
+
+def check_spec_constants_match_doc() -> None:
+    """Module thresholds equal the published spec table; every constant is named in the proposal."""
+    published, proposal = _spec_sections()
+
+    absrel = _table_row(published, "AbsRel")
+    assert "0.5–80 m" in absrel[0], absrel
+    assert "0.20" in absrel[1], absrel
+    assert rub.ABS_REL_MAX == 0.20
+
+    delta = _table_row(published, "δ < 1.25")
+    assert "0.70" in delta[1], delta
+    assert rub.DELTA_125_MIN == 0.70
+
+    cov = _table_row(published, "Coverage")
+    assert "0.5–40 m" in cov[0], cov
+    assert "0.1" in cov[0], cov  # opacity ≥ 0.1
+    assert "50%" in cov[1], cov
+    assert rub.COVERAGE_MIN == 0.50
+    assert rub.COVERAGE_OPACITY_MIN == 0.1
+
+    psnr = _table_row(published, "Held-out view PSNR")
+    assert "16 dB" in psnr[1] and "0.45" in psnr[1], psnr
+    assert rub.PSNR_MIN_DB == 16.0
+    assert rub.SSIM_MIN == 0.45
+
+    rate = _table_row(published, "Rate / age")
+    assert "200 ms" in rate[1], rate
+    assert rub.STALE_AGE_MS == 200.0
+
+    assert "≤ **3 m**" in published
+    assert rub.VEHICLE_CENTER_ERR_MAX_M == 3.0
+    assert rub.GT_DEPTH_RANGE_M == (0.5, 80.0)
+    assert rub.GT_COVERAGE_RANGE_M == (0.5, 40.0)
+    assert rub.SSIM_WINDOW == 7
+    assert rub.ROAD_MIN_COVERAGE == rub.COVERAGE_MIN == 0.50
+    assert rub.ROAD_ABS_REL_MAX == rub.ABS_REL_MAX == 0.20
+    assert rub.UNOBSERVED_OPAQUE_MAX_FRAC == 0.01
+    assert rub.GHOST_MIN_FRAC_OF_VEHICLE == 0.25
+    assert rub.GHOST_HEIGHT_MIN_M == 0.5
+    assert rub.GHOST_DEPTH_TOL_M == 1.0
+    assert rub.GHOST_EDGE_DILATE_PX == 2
+    assert rub.GHOST_OPEN_PX == 1
+    assert rub.UNOBSERVED_EDGE_ERODE_PX == 2
+
+    # proposal repeats the published numbers unchanged and names every constant
+    for needle in (
+        "covered",
+        "opacity ≥ 0.1",
+        "Zero scored pixels",
+        "Inclusive",
+        "Strict `< 1.25`",
+        "> 200 ms",
+        "rv_contract.pack_output_slot",
+        "≥ 50%",
+        "≤ 0.20",
+        "footprint overlap",
+        "Median",
+        "≤ 3 m",
+        "0.5 m",
+        "max(1 m, 20%",
+        "2 px dilation",
+        "1 px morphological opening",
+        "25%",
+        "1%",
+        "2 px-eroded",
+        "opacity=None",
+        "OpenCV",
+        "Wang",
+        "7×7",
+        "K1 = 0.01",
+        "K2 = 0.03",
+        "L = 255",
+    ):
+        assert needle in proposal, needle
+    for name in _SPEC_CONSTANTS:
+        assert hasattr(rub, name), name
+        assert name in proposal, name
+    print("PASS check_spec_constants_match_doc")
+
+
 def main() -> None:
     check_useful_view_metrics()
     check_useful_view_checklist()
     check_depth_buffer_required()
     check_metric_boundaries()
     check_rubric_is_gt_named_only()
+    check_spec_constants_match_doc()
     print("test_rv_rubric_gt: ok")
 
 

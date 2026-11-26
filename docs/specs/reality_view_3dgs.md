@@ -89,6 +89,12 @@ gate (`check_iqu45_sort_render_p95`). The antimatter15 README figure of
 (working cap 300k, unmeasured overdraw) and the sort lives only in the
 viz process.
 
+Splat depth sort uses 16-bit quantized keys (`python/viz/rv_splat_sort.py`);
+same-quantum ties go to input order; depth moves at most 1 quantum
+(`(far-near)/65535` = 3.05 mm at 0.05–200 m); colour can change where
+splats overlap inside one quantum; this is well under the 0.50 m depth
+residual so it does not touch the honesty metric.
+
 **Render cap vs `viz_cpp.md`.** `docs/specs/viz_cpp.md` caps allocated GL
 memory at **200 MB** via a CPU-side `gl_bytes()` formula (FBO / MSAA /
 targets), "not a measured GPU VRAM figure," and it does not yet include

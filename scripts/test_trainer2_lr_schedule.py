@@ -131,6 +131,16 @@ def check_param_groups_lr_mult() -> None:
     assert thawed_ids == {id(p) for p in net.parameters() if p.requires_grad}
     for p in net.parameters():
         p.requires_grad_(True)
+    # A group missing from mults trains at 1.0 (not 0.3, not 0.0): only lane_head is listed here.
+    partial = {g["name"]: g for g in scene_param_groups(net, 2e-3, {"lane_head": 0.3})}
+    assert partial["lane_head"]["lr_mult"] == 0.3 and math.isclose(partial["lane_head"]["lr"], 6e-4)
+    for name, g in partial.items():
+        if name != "lane_head":
+            assert g["lr_mult"] == 1.0 and g["lr"] == 2e-3, (name, g["lr_mult"], g["lr"])
+    assert {"stem", "trunk"} <= set(partial)
+    assert scene_param_groups(net, 2e-3, {}) and all(
+        g["lr_mult"] == 1.0 and g["lr"] == 2e-3 for g in scene_param_groups(net, 2e-3, {})
+    ), "an empty mults mapping must leave every group at 1.0"
     opt = torch.optim.AdamW(groups, lr=1e-3)
     assert [g["lr_mult"] for g in opt.param_groups] == [g["lr_mult"] for g in groups]
     print(f"param groups: {len(groups)} groups, every param once, stem x0.1 / trained x0.3 / entering x1.0 OK")

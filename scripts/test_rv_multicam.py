@@ -19,6 +19,9 @@ M8  Determinism + no GT: identical inputs give byte-identical renders; GT / trai
 M9  Edge-aware upsampling: guided upsampling keeps a sharp depth edge sharper than
     plain bilinear; inverse-depth upsampling keeps a flat ground plane flat.
 M10 Ego mask: the wide camera's hood region is masked; other cameras are untouched.
+M11 Focal scale: Z correction is f_cam/f_ref (not inverted); zero, negative, and NaN focals are refused.
+M12 Ego-box cull: points inside EGO_BOX_SBR are dropped; points outside (X, Y, or Z) are kept.
+M13 Fused-point cap: MAX_FUSED_POINTS is 1_200_000; over-cap concat downsamples deterministically to the cap.
 """
 from __future__ import annotations
 
@@ -82,11 +85,31 @@ def check_multicam_fusion():
     both = M.render_splats(M.concat_points([_ground_points(front, (200, 0, 0)), _ground_points(rear, (0, 0, 200))]), ch)
     assert both.painted_fraction > max(a.painted_fraction, b.painted_fraction) + 0.05, (a.painted_fraction, b.painted_fraction, both.painted_fraction)
     # Round trip: a single pixel at known depth lands where geometry says.
+    # A level forward camera at (0, 0, 1.3) puts every pixel of a constant
+    # 10 m depth map at ego-Y = 10, so asserting Y alone cannot catch a
+    # camera-Y sign flip (median X and Z also stay 0 and 1.3 by symmetry).
     cam = _cam("main", 0.0, w=8, h=8, pitch=0.0)
     d = np.full((8, 8), 10.0, np.float32)
     rgb = np.full((8, 8, 3), 255, np.uint8)
     p = M.unproject_camera(cam, rgb, d)
-    assert np.allclose(np.median(p.pts[:, 1]), 10.0, atol=1e-4)
+    assert np.allclose(np.median(p.pts, axis=0), [0.0, 10.0, 1.3], atol=1e-4)
+    # Pixel (row=2, col=5): sample (5.5, 2.5) is 1.5 px right of and 1.5 px
+    # above the principal point (cx=cy=4). Image-y is down, so a row above
+    # the principal point has positive camera-Y (up) and must land at higher
+    # ego-Z. A Y-sign flip in unproject inverts Z around the camera height.
+    col, row, depth = 5, 2, 10.0
+    u, v = col + 0.5, row + 0.5
+    xc = (u - cam.cx) / cam.fx * depth
+    yc = -(v - cam.cy) / cam.fy * depth
+    expected = (
+        np.asarray(cam.pos)
+        + xc * np.asarray(cam.right)
+        + yc * np.asarray(cam.up)
+        + depth * np.asarray(cam.fwd)
+    )
+    got = p.pts[row * cam.width + col]
+    assert np.allclose(got, expected, atol=1e-5), (got, expected)
+    assert expected[0] > 0.0 and abs(expected[1] - 10.0) < 1e-6 and expected[2] > cam.pos[2]
 
 
 def check_discontinuity_cut():
@@ -127,8 +150,22 @@ def check_backdrop():
     assert np.allclose(rng, 150.0, atol=1e-3)
     pts = M.unproject_camera(cam, np.full((24, 32, 3), 9, np.uint8), dd, backdrop=back)
     assert pts.n == 24 * 32, "backdrop pixels must be painted, not dropped"
-    assert not pts.static[: 8 * 32].any() if False else True
+    assert not pts.static[: 8 * 32].any()
     assert pts.static.sum() <= (~back).sum()
+    # The top-row fixture sits above the horizon, so those dome points are
+    # already tall and would pass the static assert even without the backdrop
+    # flag. A below-horizon far band lands at ego-Z <= STATIC_MAX_HEIGHT_M
+    # and would be labelled static if the flag were ignored.
+    d2 = np.full((24, 32), 10.0, np.float32)
+    sky2 = np.zeros((24, 32), bool)
+    sky2[-6:] = True
+    dd2, back2 = M.apply_backdrop(cam, d2, sky2, far_m=120.0, dome_m=150.0)
+    pts2 = M.unproject_camera(cam, np.full((24, 32, 3), 9, np.uint8), dd2, backdrop=back2)
+    n_back = 6 * 32
+    assert back2[-6:].all() and not back2[:-6].any()
+    assert pts2.n == 24 * 32
+    assert (pts2.pts[-n_back:, 2] <= M.STATIC_MAX_HEIGHT_M).all(), "fixture: backdrop pts would otherwise be static"
+    assert not pts2.static[-n_back:].any()
 
 
 def check_footprint_splats():
@@ -225,6 +262,109 @@ def check_ego_mask():
     m = M.ego_image_mask("wide", 180, 320)
     assert m[-1, 160] and not m[0, 160] and not m[-1, 0]
     assert not M.ego_image_mask("main", 48, 64).any()
+
+
+def check_focal_depth_scale():
+    # Canonical-camera rule: Z = Z_ref * f_cam / f_ref. An inverted ratio
+    # (f_ref / f_cam) is the mutant this locks out.
+    assert M.focal_depth_scale(200.0, 100.0) == 2.0
+    assert M.focal_depth_scale(100.0, 200.0) == 0.5
+    assert M.focal_depth_scale(47.0, 47.0) == 1.0
+    for a, b in (
+        (0.0, 100.0),
+        (100.0, 0.0),
+        (-10.0, 100.0),
+        (100.0, -10.0),
+        (float("nan"), 100.0),
+        (100.0, float("nan")),
+        (float("inf"), 100.0),
+        (100.0, float("inf")),
+    ):
+        try:
+            M.focal_depth_scale(a, b)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted invalid focals {(a, b)}")
+
+
+def check_ego_box_cull():
+    assert M.EGO_BOX_SBR == (1.0, -2.45, 2.4, -0.5, 1.6)
+    cam = _cam("main", 0.0, w=8, h=8, pitch=0.0)
+    d = np.ones((8, 8), np.float32)
+    rgb = np.zeros((8, 8, 3), np.uint8)
+    valid = np.zeros((8, 8), bool)
+    # Inside: near centre pixel, depth 1 m -> ~(0.07, 1.0, 1.23)
+    valid[4, 4] = True
+    d[4, 4] = 1.0
+    rgb[4, 4] = (255, 0, 0)
+    # Outside in +Y: depth 10 m -> Y = 10
+    valid[4, 3] = True
+    d[4, 3] = 10.0
+    rgb[4, 3] = (0, 255, 0)
+    # Outside in +Z only: top row, depth 2 m -> Z > 1.6, Y = 2 in range
+    valid[0, 4] = True
+    d[0, 4] = 2.0
+    rgb[0, 4] = (0, 0, 255)
+    # Outside in |X| only: left edge, depth 2.2 m -> |X| > 1, Y = 2.2 in range
+    valid[4, 0] = True
+    d[4, 0] = 2.2
+    rgb[4, 0] = (255, 255, 0)
+    raw = M.unproject_camera(cam, rgb, d, valid)
+    kept = M.unproject_camera(cam, rgb, d, valid, ego_box=M.EGO_BOX_SBR)
+    assert raw.n == 4 and kept.n == 3
+    assert not np.any(np.all(kept.cols == (255, 0, 0), axis=1))
+    for col in ((0, 255, 0), (0, 0, 255), (255, 255, 0)):
+        assert np.any(np.all(kept.cols == col, axis=1)), col
+    hw, y0, y1, z0, z1 = M.EGO_BOX_SBR
+
+    def _inside(pts):
+        return (
+            (np.abs(pts[:, 0]) <= hw)
+            & (pts[:, 1] >= y0)
+            & (pts[:, 1] <= y1)
+            & (pts[:, 2] >= z0)
+            & (pts[:, 2] <= z1)
+        )
+
+    assert int(_inside(raw.pts).sum()) == 1
+    assert not _inside(kept.pts).any()
+
+
+def check_fused_point_cap():
+    assert M.MAX_FUSED_POINTS == 1_200_000
+    assert M.concat_points.__defaults__ == (M.MAX_FUSED_POINTS,)
+
+    def _blob(n, seed):
+        rng = np.random.default_rng(seed)
+        return M.FusedPoints(
+            pts=rng.normal(size=(n, 3)).astype(np.float32),
+            cols=rng.integers(0, 256, size=(n, 3), dtype=np.uint8),
+            foot=rng.random(n).astype(np.float32),
+            static=rng.random(n) > 0.5,
+        )
+
+    a, b = _blob(80, 0), _blob(50, 1)
+    raw = M.concat_points([a, b], cap=10**9)
+    assert raw.n == 130
+    cap = 100
+    out = M.concat_points([a, b], cap=cap)
+    out2 = M.concat_points([a, b], cap=cap)
+    assert out.n == cap
+    assert out.pts.tobytes() == out2.pts.tobytes()
+    assert out.cols.tobytes() == out2.cols.tobytes()
+    assert out.foot.tobytes() == out2.foot.tobytes()
+    assert out.static.tobytes() == out2.static.tobytes()
+    keep = np.linspace(0, raw.n - 1, cap, dtype=np.int64)
+    assert np.array_equal(out.pts, raw.pts[keep])
+    assert np.array_equal(out.cols, raw.cols[keep])
+    assert np.array_equal(out.foot, raw.foot[keep])
+    assert np.array_equal(out.static, raw.static[keep])
+    small = M.concat_points([a], cap=cap)
+    assert small.n == 80
+    assert np.array_equal(small.pts, a.pts)
+    # Equal-to-cap is kept as-is (the downsample is strict-greater).
+    exact = M.concat_points([_blob(cap, 2)], cap=cap)
+    assert exact.n == cap
 
 
 def main() -> None:

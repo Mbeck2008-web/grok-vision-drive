@@ -435,7 +435,13 @@ def camera_yaw_delta(prev_gray: np.ndarray, gray: np.ndarray, fx: float) -> floa
 
 @dataclass
 class EgoOdometry:
-    """Planar dead reckoning from wheel speed + camera yaw. World frame = ego frame at t0."""
+    """Planar dead reckoning from wheel speed + camera yaw. World frame = ego frame at t0.
+
+    ``step`` takes ``dyaw_rad`` in the ego convention (left / CCW about +Z is
+    positive). BeamNG ``imu.yaw_rate`` has the opposite sign, so anyone wiring
+    IMU into ``step`` later must flip it and add a test for that flip. This
+    class does not read the IMU.
+    """
 
     x: float = 0.0
     y: float = 0.0

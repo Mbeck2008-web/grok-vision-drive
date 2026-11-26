@@ -72,6 +72,9 @@ def check_n_cap() -> None:
     """A generator cannot exceed N_max; the cap is hard and validated."""
     from python.viz import rv_a_gen as g
 
+    # spec working cap: N_max 300k (docs/specs/reality_view_3dgs.md); kills M7 (300k->400k).
+    assert g.N_MAX_HARD == 300_000, g.N_MAX_HARD
+
     # 640x480 all-valid: the default cap must hold and never exceed the hard cap.
     big_d = np.full((480, 640), 10.0, dtype=np.float32)
     big_rgb = np.full((480, 640, 3), 128, dtype=np.uint8)

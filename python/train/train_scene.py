@@ -647,6 +647,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where --exp-ssl-pretrain writes stem weights (npz). Required with that flag.",
     )
     parser.add_argument(
+        "--no-ssl-pretrain",
+        action="store_true",
+        help=(
+            "Turn off the default SSL stem pretraining (A/B baselines only). SSL is ON for "
+            "every training run (docs/specs/trainer_2.md): train frames only, EMA target, "
+            "collapse guard; the stem is cached under the GVD cache and reused."
+        ),
+    )
+    parser.add_argument(
+        "--ssl-epochs",
+        type=int,
+        default=1,
+        help="Epochs of the default SSL stem pretraining (default 1).",
+    )
+    parser.add_argument(
+        "--ssl-max-rows",
+        type=int,
+        default=4000,
+        help="Evenly spaced train frames for the default SSL stage (default 4000; 0 = all).",
+    )
+    parser.add_argument(
         "--exp-active-subset",
         action="store_true",
         help=(
@@ -2389,6 +2410,47 @@ def train_amp_enabled(
     return applied in ("fp16", "bf16")
 
 
+def ssl_record_for(ssl_meta: Mapping[str, Any] | None, init_stem: Any) -> dict[str, Any]:
+    """What a run records about its SSL stem: ``on``, ``why``, ``key`` (the stem cache key), ``rows``, ``reused``.
+
+    ``train_scene`` main passes the stage's meta. A direct ``train_directory`` caller
+    that passes none is recorded as off, with the stem file name when ``init_stem`` is set.
+    """
+    if ssl_meta is None:
+        record = {"on": False, "why": "not requested", "key": None, "rows": 0, "reused": None, "empty_split": False}
+        if init_stem:
+            record["stem"] = Path(str(init_stem)).name
+        return record
+    return {
+        "on": bool(ssl_meta.get("on", False)),
+        "why": str(ssl_meta.get("why", "")),
+        "key": None if ssl_meta.get("key") is None else str(ssl_meta["key"]),
+        "rows": int(ssl_meta.get("rows") or 0),
+        "reused": None if ssl_meta.get("reused") is None else bool(ssl_meta["reused"]),
+        "empty_split": bool(ssl_meta.get("empty_split", False)),
+        **({"stem": str(ssl_meta["stem"])} if ssl_meta.get("stem") else {}),
+    }
+
+
+def ssl_empty_split_refusal(record: Mapping[str, Any], plan: Any) -> str | None:
+    """Default SSL found 0 train rows but the trainer's own plan has some: refuse, do not train SSL-off silently.
+
+    Returns None when SSL did not hit an empty split, or when the trainer has
+    0 train rows too (it then reports its own data problem).
+    """
+    if not record.get("empty_split"):
+        return None
+    from python.data.cam_hold import plan_labels
+
+    n_train = sum(1 for label in plan_labels(plan).values() if label == "train")
+    if n_train <= 0:
+        return None
+    return (
+        f"default SSL pretraining has 0 train rows (its split keeps a 4 s purge before the holdout) "
+        f"but the trainer has {n_train} train rows; pass --no-ssl-pretrain to train without SSL"
+    )
+
+
 def train_directory(
     root: Path,
     *,
@@ -2451,6 +2513,7 @@ def train_directory(
     val_worst: int = VAL_WORST_N,
     val_worst_png: bool = False,
     init_stem: str | Path | None = None,
+    ssl_meta: Mapping[str, Any] | None = None,
     exp_active_subset: bool = False,
     exp_active_hard_frac: float = 0.3,
     exp_active_random_floor: float = 0.1,
@@ -2717,6 +2780,11 @@ def train_directory(
     else:
         startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
     mix = holdout_mix(startup_plan)
+    ssl_record = ssl_record_for(ssl_meta, init_stem)
+    refusal = ssl_empty_split_refusal(ssl_record, startup_plan)
+    if refusal:
+        print(f"[GVD] scene train: {refusal}", flush=True)
+        raise SystemExit(2)
     if use_cam_age:
         from python.data.cam_hold import HOLD_CAP_S, HOLD_TICK_HZ, annotate_hold
 
@@ -2810,6 +2878,7 @@ def train_directory(
             "free_ram_bytes": int(free_ram_bytes),
             "requested_epochs": requested_epochs,
             "exact_epochs": exact_n,
+            "ssl": ssl_record,
         }
 
     if not rows:
@@ -3146,6 +3215,7 @@ def train_directory(
             "batch": int(batch),
             "exact_epochs": exact_n,
             "preset": str(model_preset or "small"),
+            "ssl": ssl_record,
         }
         weights = {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()}
         try:
@@ -3885,6 +3955,7 @@ def train_directory(
         "lr": float(holder.get("lr", lr)),
         "sanity_ok": sanity_ok,
         "dry_run": bool(dry_run),
+        "ssl": ssl_record,
     }
 
 
@@ -3935,6 +4006,131 @@ def heads_for_run(text: str | None, roots: Any = None) -> tuple[str, ...]:
     from python.train.scene_net import curb_palette_for_training, resolve_train_heads
 
     return resolve_train_heads(text, curb_palette_for_training(roots))
+
+
+def _ssl_train_rows_and_reader(
+    args: Any, strip_roots: Any, holdout_root: Path, cam_names: Any
+) -> tuple[list[dict[str, Any]], Any]:
+    """Train rows for SSL (#187 split, never holdout) and the reader of one row's canvas.
+
+    Shared by ``--exp-ssl-pretrain`` and the default-on stage, so both read the
+    same rows and decode the same canvas.
+    """
+    from python.data.raw_frames import refuse_lossy
+    from python.train.exp_ssl import ssl_rows_from_split
+    from python.train.strip_sources import load_multi_source_rows
+
+    for one in strip_roots:
+        refuse_lossy(one)
+    state_rows, source_meta = load_multi_source_rows(strip_roots, holdout_source=holdout_root)
+    train_rows = ssl_rows_from_split(
+        state_rows,
+        source_meta,
+        holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+    )
+
+    def _ssl_image(row):
+        loaded = _frame_row(
+            Path(row["source_root"]) if row.get("source_root") else holdout_root,
+            row,
+            cams=tuple(cam_names),
+            scale=float(args.scale),
+        )
+        if loaded is None:
+            return None
+        frame, _meta = loaded
+        return frame
+
+    return train_rows, _ssl_image
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    import torch
+
+    oom = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom is not None and isinstance(exc, oom):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def _release_ssl_cuda(device: Any) -> None:
+    """Hand the SSL stage's cached CUDA blocks back before ``train_directory`` reads free VRAM."""
+    import gc
+
+    gc.collect()
+    if getattr(device, "type", "") == "cuda":
+        import torch
+
+        torch.cuda.empty_cache()
+
+
+def _default_ssl_stage(
+    args: Any, strip_roots: Any, holdout_root: Path, cam_names: Any, net_kw: dict
+) -> tuple[str | None, dict[str, Any]]:
+    """Default-on SSL (docs/specs/trainer_2.md): train-frame stem, cached by content key.
+
+    Returns ``(stem path or None, ssl meta)``. The meta is what the run records
+    (``on``, ``why``, ``key``, ``rows``, ``reused``, ``empty_split``). With 0
+    SSL train rows the stem is None and ``empty_split`` is True: ``train_directory``
+    then refuses (exit 2, naming ``--no-ssl-pretrain``) when its own plan still
+    has train rows, and reports its own data error when it has none. A CUDA
+    out-of-memory in this stage raises ``SslError`` (main exits 2); the CUDA
+    cache is released on every path.
+    """
+    from python.data.data_root import cache_dir
+    from python.train.exp_ssl import SslError, default_ssl_stem
+    from python.train.scene_net import SceneNet
+
+    train_rows, _ssl_image = _ssl_train_rows_and_reader(args, strip_roots, holdout_root, cam_names)
+    meta: dict[str, Any] = {"on": True, "why": "on (default)", "key": None, "rows": 0, "reused": None, "empty_split": False}
+    if not train_rows:
+        # Nothing to pretrain on. train_directory decides whether that is fatal.
+        print("[GVD] ssl-pretrain: 0 train rows; no stem (train_directory checks its own plan)", flush=True)
+        meta.update(on=False, why="off (0 SSL train rows)", empty_split=True)
+        return None, meta
+    import torch
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = None
+    try:
+        net = SceneNet(cams=cam_names, scale=float(args.scale), **net_kw).to(device).train()
+        print(f"[GVD] ssl-pretrain: {len(train_rows)} train rows, device={device.type}", flush=True)
+        path, info = default_ssl_stem(
+            net,
+            train_rows,
+            image_fn=_ssl_image,
+            out_dir=Path(cache_dir()) / "ssl",
+            lr=float(args.lr),
+            seed=int(args.seed),
+            epochs=max(1, int(args.ssl_epochs)),
+            max_rows=int(args.ssl_max_rows),
+            key_extra={
+                "roots": [str(r) for r in strip_roots],
+                "holdout_root": str(holdout_root),
+                "holdout_blocks": resolve_holdout_blocks(args.holdout_blocks),
+                "cams": list(cam_names),
+                "scale": float(args.scale),
+                "net_kw": dict(net_kw),
+            },
+        )
+    except RuntimeError as exc:
+        if not _is_cuda_oom(exc):
+            raise
+        raise SslError(f"the SSL stage ran out of GPU memory on {device.type} ({exc})") from exc
+    finally:
+        net = None
+        _release_ssl_cuda(device)
+    if info.get("reused"):
+        print(f"[GVD] ssl-pretrain: reused {path} (key {info['key']}, rows={info['rows']})", flush=True)
+    else:
+        print(
+            f"[GVD] ssl-pretrain: wrote {path} rows={info['rows']} n={int(info.get('n', 0))} "
+            f"loss={float(info.get('last_loss', 0.0)):.6f} probe_std {float(info.get('probe_std_start', float('nan'))):.4f}"
+            f"->{float(info.get('probe_std_end', float('nan'))):.4f} ema={info.get('ema')}",
+            flush=True,
+        )
+    meta.update(key=str(info["key"]), rows=int(info["rows"]), reused=bool(info.get("reused")))
+    return str(path), meta
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -4100,6 +4296,7 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[GVD] scene train: pause-dir refused: {exc}", flush=True)
                 sys.exit(2)
             pause_dir = Path(args.pause_dir).resolve()
+        saved = None
         if not args.no_resume and not args.build_cache:
             # Before any write: a pause file from another --exact-epochs setting is refused.
             try:
@@ -4188,10 +4385,8 @@ def main(argv: list[str] | None = None) -> None:
             )
             return
         if bool(getattr(args, "exp_ssl_pretrain", False)):
-            from python.data.raw_frames import refuse_lossy
-            from python.train.exp_ssl import SslError, run_ssl_pretrain, ssl_rows_from_split
+            from python.train.exp_ssl import SslError, run_ssl_pretrain
             from python.train.scene_net import SceneNet
-            from python.train.strip_sources import load_multi_source_rows
 
             out = str(getattr(args, "exp_ssl_out", "") or "")
             if not out:
@@ -4201,27 +4396,8 @@ def main(argv: list[str] | None = None) -> None:
                 print("[GVD] scene train needs PyTorch")
                 sys.exit(2)
             try:
-                for one in strip_roots:
-                    refuse_lossy(one)
-                state_rows, source_meta = load_multi_source_rows(strip_roots, holdout_source=holdout_root)
-                train_rows = ssl_rows_from_split(
-                    state_rows,
-                    source_meta,
-                    holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
-                )
+                train_rows, _ssl_image = _ssl_train_rows_and_reader(args, strip_roots, holdout_root, cam_names)
                 net = SceneNet(cams=cam_names, scale=float(args.scale), **net_kw).train()
-
-                def _ssl_image(row):
-                    loaded = _frame_row(
-                        Path(row["source_root"]) if row.get("source_root") else holdout_root,
-                        row,
-                        cams=tuple(cam_names),
-                        scale=float(args.scale),
-                    )
-                    if loaded is None:
-                        return None
-                    frame, _meta = loaded
-                    return frame
 
                 stats = run_ssl_pretrain(
                     net,
@@ -4248,6 +4424,24 @@ def main(argv: list[str] | None = None) -> None:
         if not open_panel:
             print("[GVD] scene train: no panel", flush=True)
         drop_wrong_way, require_road_dump, max_road_clip, road_dump = frame_quality_from_args(args)
+        init_stem_arg = str(getattr(args, "init_stem", "") or "") or None
+        from python.train.exp_ssl import SslError as _SslError, ssl_plan
+
+        try:
+            ssl_on, ssl_why = ssl_plan(args, resuming=saved is not None)
+        except ValueError as exc:
+            print(f"[GVD] scene train: ssl-pretrain: {exc}", flush=True)
+            sys.exit(2)
+        print(f"[GVD] ssl-pretrain: {ssl_why}", flush=True)
+        ssl_meta: dict[str, Any] = {"on": False, "why": ssl_why, "key": None, "rows": 0, "reused": None, "empty_split": False}
+        if init_stem_arg:
+            ssl_meta["stem"] = Path(init_stem_arg).name
+        if ssl_on:
+            try:
+                init_stem_arg, ssl_meta = _default_ssl_stage(args, strip_roots, holdout_root, cam_names, net_kw)
+            except (_SslError, LossyFramesError) as exc:
+                print(f"[GVD] scene train: ssl-pretrain: {exc}; pass --no-ssl-pretrain to train without SSL", flush=True)
+                sys.exit(2)
         try:
             stats = train_directory(
                 holdout_root,
@@ -4304,7 +4498,8 @@ def main(argv: list[str] | None = None) -> None:
                 exp_active_hard_frac=float(getattr(args, "exp_active_hard_frac", 0.3)),
                 exp_active_random_floor=float(getattr(args, "exp_active_random_floor", 0.1)),
                 grad_ckpt=bool(args.grad_ckpt),
-                init_stem=str(getattr(args, "init_stem", "") or "") or None,
+                init_stem=init_stem_arg,
+                ssl_meta=ssl_meta,
                 pause_dir=pause_dir,
                 exact_epochs=args.exact_epochs,
                 val_worst=int(args.val_worst),

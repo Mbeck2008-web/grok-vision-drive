@@ -145,6 +145,16 @@ def psnr_db(a: np.ndarray, b: np.ndarray) -> float:
     return math.inf if mse == 0.0 else 10.0 * math.log10(255.0 ** 2 / mse)
 
 
+def psnr_passes(value: float) -> bool:
+    """Inclusive published gate: PSNR >= 16 dB. Exact 16.0 must pass."""
+    return float(value) >= PSNR_MIN_DB
+
+
+def ssim_passes(value: float) -> bool:
+    """Inclusive published gate: SSIM >= 0.45. Exact 0.45 must pass."""
+    return float(value) >= SSIM_MIN
+
+
 def ssim(a: np.ndarray, b: np.ndarray, win: int = SSIM_WINDOW) -> float:
     """Mean SSIM over per-channel uniform windows (K1=0.01, K2=0.03, L=255)."""
     if a.shape != b.shape or a.ndim != 3 or min(a.shape[0], a.shape[1]) < win:
@@ -204,8 +214,8 @@ def score_metrics(view: RenderedView, gt: GtFrame) -> RubricResult:
     else:
         values["psnr_db"] = psnr_db(rgb, gt.rgb)
         values["ssim"] = ssim(rgb, gt.rgb)
-        items["psnr_db"] = values["psnr_db"] >= PSNR_MIN_DB
-        items["ssim"] = values["ssim"] >= SSIM_MIN
+        items["psnr_db"] = psnr_passes(values["psnr_db"])
+        items["ssim"] = ssim_passes(values["ssim"])
 
     failures.extend(f"{k} failed: {values[k]}" for k in METRIC_ITEMS if not items[k] and values[k] is not None)
     return RubricResult(all(items.values()), items, values, failures)

@@ -14,6 +14,7 @@ Checks:
 - check_metric_boundaries              (inclusive thresholds, one step either side)
 - check_rubric_is_gt_named_only        (nothing outside GT-named files imports it)
 - check_spec_constants_match_doc       (module thresholds parse equal to the spec table)
+- check_psnr_ssim_inclusive_edges      (exact 16.0 dB / 0.45 pass; next-below fails)
 - check_ssim_reference                 (closed-form Wang SSIM; no library on this box)
 """
 from __future__ import annotations
@@ -243,11 +244,28 @@ def check_useful_view_metrics() -> None:
     # deterministic: same inputs -> identical values
     assert rub.score_metrics(view, gt).values == v
 
-    # each metric must be able to fail on its own
-    # AbsRel only: constant 25% over-estimate keeps coverage; delta stays 1.25 boundary -> use 1.3
-    bad = rub.score_metrics(rub.RenderedView(out=make_out(rgb, depth * 1.3), opacity=opacity), gt)
-    assert not bad.passed and not bad.items["abs_rel"] and not bad.items["delta_125"], bad.items
-    assert bad.items["coverage"] and bad.items["psnr_db"], bad.items
+    # each metric must be able to fail on its own.
+    # Isolated AbsRel / delta cases use a flat GT so the scale is exact: a 1.3x
+    # scale of the canned clip also fails delta (some fixture pixels already
+    # sit near the 1.25 ratio).
+    def _failed_metrics(res):
+        return [k for k, ok in res.items.items() if not ok]
+
+    flat = _flat_gt(10.0)
+    ones = np.ones((H, W), dtype=np.float32)
+    d_ok = np.full((H, W), 10.0, np.float32)
+    # AbsRel only: 1.23x => AbsRel=0.23>0.20, ratio 1.23<1.25 so delta still passes
+    only_abs = rub.score_metrics(rub.RenderedView(out=make_out(flat.rgb, d_ok * 1.23), opacity=ones), flat)
+    assert _failed_metrics(only_abs) == ["abs_rel"], (only_abs.items, only_abs.values)
+    assert 0.20 < only_abs.values["abs_rel"] < 0.24
+    assert only_abs.values["delta_125"] == 1.0
+    # delta only: 50% of scored pixels at 1.26x => delta=0.50<0.70, AbsRel=0.13<=0.20
+    d_del = d_ok.copy()
+    d_del.ravel()[: (H * W) // 2] = 12.6
+    only_del = rub.score_metrics(rub.RenderedView(out=make_out(flat.rgb, d_del), opacity=ones), flat)
+    assert _failed_metrics(only_del) == ["delta_125"], (only_del.items, only_del.values)
+    assert 0.12 < only_del.values["abs_rel"] < 0.14
+    assert only_del.values["delta_125"] == 0.5
     # coverage only: blank every other column of the render (depth + opacity), RGB untouched
     d2, o2 = depth.copy(), opacity.copy()
     d2[:, 1::2] = 0.0
@@ -643,6 +661,8 @@ def check_spec_constants_match_doc() -> None:
         "OpenCV",
         "Wang",
         "7×7",
+        "not a Gaussian",
+        "box 7×7",
         "K1 = 0.01",
         "K2 = 0.03",
         "L = 255",
@@ -654,6 +674,58 @@ def check_spec_constants_match_doc() -> None:
     print("PASS check_spec_constants_match_doc")
 
 
+def check_psnr_ssim_inclusive_edges() -> None:
+    """Flipping PSNR/SSIM >= to > must be killed: exact 16.0 dB and 0.45 pass.
+
+    Exact equality cannot be hit by uint8 RGB construction. For PSNR, MSE
+    would have to be 255^2 / 10^1.6, which is not a mean of integer squared
+    errors over an integer pixel count. For SSIM, two uint8 constants jump
+    from 0.4459541374604177 (255 vs 60, fail) to 0.45258719855324536
+    (255 vs 61, pass), skipping 0.45. The inclusive comparison is therefore
+    tested directly on ``psnr_passes`` / ``ssim_passes``, which
+    ``score_metrics`` uses. Nearby uint8 pairs are also scored end-to-end.
+    """
+    # direct gate: exact threshold passes; the next float below fails
+    assert rub.psnr_passes(16.0) is True
+    assert rub.psnr_passes(float("inf")) is True
+    assert rub.psnr_passes(__import__("math").nextafter(16.0, 0.0)) is False
+    assert rub.ssim_passes(0.45) is True
+    assert rub.ssim_passes(1.0) is True
+    assert rub.ssim_passes(__import__("math").nextafter(0.45, 0.0)) is False
+
+    # uint8 constructions nearest the gates, via score_metrics (uses the helpers)
+    flat = _flat_gt(10.0)
+    ones = np.ones((H, W), dtype=np.float32)
+    d_ok = np.full((H, W), 10.0, np.float32)
+    # PSNR: uniform integer error; 16 dB <=> RMSE = 255 / 10^0.8 ≈ 40.429
+    mse16 = 255.0 ** 2 / 10 ** 1.6
+    amp_pass, amp_fail = int(np.floor(np.sqrt(mse16))), int(np.ceil(np.sqrt(mse16)))
+    assert amp_fail == amp_pass + 1
+    for amp, want in ((amp_pass, True), (amp_fail, False)):
+        shifted = np.clip(flat.rgb.astype(int) + amp, 0, 255).astype(np.uint8)
+        r = rub.score_metrics(rub.RenderedView(out=make_out(shifted, d_ok), opacity=ones), flat)
+        assert r.items["psnr_db"] is want, (amp, r.values["psnr_db"])
+        assert r.values["psnr_db"] != 16.0  # cannot land on the inclusive edge with uint8
+        assert rub.psnr_passes(r.values["psnr_db"]) is want
+    # SSIM uint8 constants around 0.45 (values pinned in check_ssim_reference)
+    def const_pair(a, b):
+        g = np.full((H, W, 3), a, dtype=np.uint8)
+        r = np.full((H, W, 3), b, dtype=np.uint8)
+        gf = rub.GtFrame(**{**flat.__dict__, "rgb": g})
+        return rub.score_metrics(rub.RenderedView(out=make_out(r, d_ok), opacity=ones), gf)
+
+    near_ok, near_bad = const_pair(255, 61), const_pair(255, 60)
+    assert near_ok.items["ssim"] is True and near_ok.values["ssim"] > 0.45
+    assert near_bad.items["ssim"] is False and near_bad.values["ssim"] < 0.45
+    print("PASS check_psnr_ssim_inclusive_edges", {
+        "psnr_passes(16.0)": True,
+        "ssim_passes(0.45)": True,
+        "uint8_psnr_amp_pass": amp_pass,
+        "uint8_ssim_255_vs_61": near_ok.values["ssim"],
+        "uint8_ssim_255_vs_60": near_bad.values["ssim"],
+    })
+
+
 def check_ssim_reference() -> None:
     """Closed-form Wang SSIM checks. No reference library was present on this box.
 
@@ -662,8 +734,14 @@ def check_ssim_reference() -> None:
     interpreter), /workspace/swarm/swarm-3/venv-bev, and the system Python.
     OpenCV 5.0.0 is installed but has no SSIM entry point (no cv2.quality).
     There is therefore no library cross-check; values below are analytic.
+    The call we would have used, and did not, is
+    ``skimage.metrics.structural_similarity(..., gaussian_weights=False,
+    win_size=7, use_sample_covariance=True)`` (uniform 7×7, not a Gaussian).
+    That flag uses sample covariance (/N-1). This scorer uses population
+    moments, which agree with that call on constant images (zero variance)
+    and would differ on the 7×7 ramp pair below.
 
-    Formula (Wang et al.): uniform 7×7 window, valid region, no Gaussian,
+    Formula (Wang et al.): uniform box 7×7 window, valid region, no Gaussian,
     K1=0.01, K2=0.03, L=255, population moments (E[x^2]−μ^2), per-channel
     then averaged. C1=(K1 L)^2 = 6.5025, C2=(K2 L)^2 = 58.5225 (float64
     of those expressions: 6.502500000000001 and 58.522499999999994).
@@ -729,6 +807,7 @@ def main() -> None:
     check_metric_boundaries()
     check_rubric_is_gt_named_only()
     check_spec_constants_match_doc()
+    check_psnr_ssim_inclusive_edges()
     check_ssim_reference()
     print("test_rv_rubric_gt: ok")
 

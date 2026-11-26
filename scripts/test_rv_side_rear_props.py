@@ -871,8 +871,17 @@ CHECKS = [
     check_holdout_rear_holes,
 ]
 
-# name -> counterexample on 783fedd (filled from real runs after the thresholds commit).
-KNOWN_FAILING: dict[str, str] = {}
+# name -> counterexample on 783fedd (real runs after thresholds commit 8b53e6b;
+# rv-side-evidence/props_report_783fedd.log). E = depth-edge cut in tools/rv_stable_preview.py cam_frame
+# (after ground_clamp: far rows pushed below the road, out of the ground band); L = the net's 12x16 class
+# grid (road label bleeds past the edge); N = road_snap flattens objects inside a road-majority cell.
+KNOWN_FAILING: dict[str, str] = {
+    "check_synthetic_width_exact_labels": "E: exact depth + exact labels: repeatL/R 15-30 m median |err| 30.8% p90 100%; rear 15-30 m 96.8%/100%",
+    "check_synthetic_width": "L+E: pillarL/R 0-5 m median 14.8% p90 47.3%; repeatL/R 0-5 m 16.6%/23.0%, 5-15 m 28.1%/48.2%; rear 15-30 m",
+    "check_synthetic_edge_overshoot": "L: road 0.35 m (pillars) / 0.71 m (repeats) past the GT edge at 0-5 m (12x16 label bleed)",
+    "check_side_objects_keep_height_pins": "N: pillarR parked car x2.5 lost 1.07 m on 88 px; pole x3 lost 1.07 m on 351/391 px; curbs lost 0.11 m",
+    "prop_side_objects_keep_height": "N: pillarL pole at x=-2.0, y0=0.0: lost 0.592 m",
+}
 
 _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}
 

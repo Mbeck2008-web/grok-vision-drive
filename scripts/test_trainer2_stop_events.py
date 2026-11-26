@@ -14,7 +14,8 @@ check_hand_rule_untouched, check_missing_gt_row_does_not_end_the_window,
 check_speed_key_scores_the_predicted_profile, check_side_angle_uses_first_visibility_not_entry,
 check_km_counts_holdout_rows_only, check_no_nan_in_scores,
 check_red_to_green_proceed_current_behaviour and
-check_red_to_green_flag_false_drops_the_approach (PROPOSAL pending Michael).
+check_red_to_green_flag_false_drops_the_approach and
+check_red_to_green_flag_false_only_same_lamp_ahead_of_the_line (PROPOSAL pending Michael).
 Pure Python (no torch).
 """
 from __future__ import annotations
@@ -480,7 +481,67 @@ def check_red_to_green_flag_false_drops_the_approach() -> None:
     print("red->green flag: False drops a red/yellow approach released before the line; late green, steady red, held stop and signs unchanged OK")
 
 
+
+def check_red_to_green_flag_false_only_same_lamp_ahead_of_the_line() -> None:
+    """flag=False drops only when THIS approach's lamp is green at y > 0 (Z4 / Z7 / Z8)."""
+    from python.train import stop_events as se
+
+    def light(state="red", **kw):
+        return approach(cls="traffic_light", state=state, stop_at_y=kw.pop("stop_at_y", None), v0=6.0, y0=45.0, brake=0.0, **kw)
+
+    def run(rows, flag):
+        saved = se.RED_TO_GREEN_PROCEED_IS_MISS
+        se.RED_TO_GREEN_PROCEED_IS_MISS = flag
+        try:
+            return se.score(rows)
+        finally:
+            se.RED_TO_GREEN_PROCEED_IS_MISS = saved
+
+    assert se.RED_TO_GREEN_PROCEED_IS_MISS is True
+
+    # Z4: a *different* light id turning green must not drop this red approach; it is still a miss.
+    other = light("red")
+    for r in other:
+        y = r["stops"][0]["y"]
+        extra = {"id": "other", "cls": "traffic_light", "x": 3.0, "y": y, "state": "green" if y <= 15.0 else "red"}
+        r["stops"].append(extra)
+        assert r["stops"][0]["id"] == "s1" and r["stops"][0]["state"] == "red"
+    res = run(other, False)
+    assert res["events"] == 1 and res["missed"] == 1 and res["detail"][0]["id"] == "s1", res
+
+    # Z7: this lamp going to "unknown" (not green) is still a miss, not a release.
+    unk = light("red")
+    for r in unk:
+        if r["stops"][0]["y"] <= 15.0:
+            r["stops"][0]["state"] = "unknown"
+    assert unk[0]["stops"][0]["state"] == "red" and any(r["stops"][0]["state"] == "unknown" for r in unk)
+    res = run(unk, False)
+    assert res["events"] == 1 and res["missed"] == 1, res
+
+    # Z8: green at y = 0.5 (in (0, 1]) drops the approach; a y > 1 cutoff would miss this release.
+    mid = light("red")
+    bumped = 0
+    for r in mid:
+        y = r["stops"][0]["y"]
+        if 0.0 < y <= 1.0 and bumped == 0:
+            r["stops"][0]["y"] = 0.5
+            r["stops"][0]["state"] = "green"
+            bumped += 1
+        # every other row stays red, including y > 1 and y <= 0
+    assert bumped == 1
+    assert any(r["stops"][0]["y"] == 0.5 and r["stops"][0]["state"] == "green" for r in mid)
+    assert not any(r["stops"][0]["state"] == "green" and r["stops"][0]["y"] > 1.0 for r in mid)
+    res = run(mid, False)
+    assert res["events"] == 0 and res["missed"] == 0 and res["detail"] == [], res
+    # default True still scores it as a missed red light (the flag is the release, not the typing).
+    res = run(mid, True)
+    assert res["events"] == 1 and res["missed"] == 1, res
+    assert se.RED_TO_GREEN_PROCEED_IS_MISS is True
+    print("red->green flag=False: other id green still a miss, unknown still a miss, green at y=0.5 drops the approach OK")
+
+
 def main() -> int:
+
     checks = (
         check_stop_event_requires_hold,
         check_stop_side_angle_slice,
@@ -496,6 +557,7 @@ def main() -> int:
         check_no_nan_in_scores,
         check_red_to_green_proceed_current_behaviour,
         check_red_to_green_flag_false_drops_the_approach,
+        check_red_to_green_flag_false_only_same_lamp_ahead_of_the_line,
     )
     failed = 0
     for check in checks:

@@ -101,6 +101,7 @@ def load_sensor_aux_targets(
     cam: str = "main",
     aux_cache: Any = None,
     source: str | None = None,
+    depth_hires: bool = False,
 ) -> dict[str, Any]:
     """Load train-only depth/sem for one tick into fixed AUX_H x AUX_W targets.
 
@@ -108,10 +109,15 @@ def load_sensor_aux_targets(
     files with bad dtype/shape or a bad ``sem_classes.json`` raise
     ``AuxTargetError``. When ``aux_cache`` holds this tick, the stored 12x16
     tensors are returned and the raw PNGs are not read.
+
+    ``depth_hires`` (Trainer 2.0 Reality View): also return ``depth_hi_m`` /
+    ``depth_hi_valid`` / ``depth_hi_far`` / ``depth_hi_far_valid`` at
+    ``depth_hires.DEPTH_HI_H x DEPTH_HI_W``. The 12x16 cache cannot serve that, so
+    it is bypassed and the raw PNGs are read.
     """
     from python.data.raw_frames import is_train_only_cam, load_raw_camera
 
-    if aux_cache is not None:
+    if aux_cache is not None and not depth_hires:
         cached = aux_cache.get(int(index), source=source, cam=cam)
         if cached is not None:
             return cached
@@ -132,6 +138,12 @@ def load_sensor_aux_targets(
         "sem_valid": empty_v.copy(),
         "sem_classes": {},
     }
+    if depth_hires:
+        from python.train.depth_hires import empty_targets
+
+        blank = empty_targets()
+        out["depth_hi_m"], out["depth_hi_valid"] = blank["depth_m"], blank["depth_valid"]
+        out["depth_hi_far"], out["depth_hi_far_valid"] = blank["far"], blank["far_valid"]
 
     depth = load_raw_camera(root, depth_cam, int(index))
     sem = load_raw_camera(root, sem_cam, int(index))
@@ -170,6 +182,12 @@ def load_sensor_aux_targets(
     if depth is not None:
         d, v = _downsample_u16_depth_m(depth)
         out["depth_m"], out["depth_valid"] = d, v
+        if depth_hires:
+            from python.train.depth_hires import depth_hires_targets
+
+            hi = depth_hires_targets(depth)
+            out["depth_hi_m"], out["depth_hi_valid"] = hi["depth_m"], hi["depth_valid"]
+            out["depth_hi_far"], out["depth_hi_far_valid"] = hi["far"], hi["far_valid"]
     if sem is not None:
         s, v = _downsample_sem(sem)
         if int(s.max()) >= SEM_CLASS_MAX:
@@ -265,6 +283,7 @@ def attach_aux_to_labels(
     want_sem: bool = False,
     want_road_edge: bool = False,
     aux_cache: Any = None,
+    want_depth_hires: bool = False,
 ) -> dict[str, np.ndarray]:
     """Optionally attach aux / road_edge tensors onto a labels dict (copy)."""
     out = dict(labels)
@@ -274,9 +293,16 @@ def attach_aux_to_labels(
             raw_source = row.get("source")
             source = str(raw_source) if raw_source is not None else None
         aux = load_sensor_aux_targets(
-            root, int(index), cam=cam, aux_cache=aux_cache, source=source
+            root, int(index), cam=cam, aux_cache=aux_cache, source=source,
+            depth_hires=bool(want_depth and want_depth_hires),
         )
-        if want_depth:
+        if want_depth and want_depth_hires:
+            # Trainer 2.0: the 48x64 map replaces the 12x16 grid as the depth target.
+            out["aux_depth"] = aux["depth_hi_m"]
+            out["aux_depth_valid"] = aux["depth_hi_valid"]
+            out["aux_depth_far"] = aux["depth_hi_far"]
+            out["aux_depth_far_valid"] = aux["depth_hi_far_valid"]
+        elif want_depth:
             out["aux_depth"] = aux["depth_m"]
             out["aux_depth_valid"] = aux["depth_valid"]
         if want_sem:

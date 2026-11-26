@@ -236,6 +236,7 @@ def build_net(meta: Mapping[str, Any], weights: Mapping[str, Any] | None = None)
     road = _arch_flag(meta, weights, "road_edge", ("road_edge_head.",), ":road_edge=")
     stop_line_on = _arch_flag(meta, weights, "stop_line", ("stop_line_head.",), ":stop_line=")
     route = _arch_flag(meta, weights, "route_cond", ("route_proj.",), ":route_cond=")
+    depth_hi = _arch_flag(meta, weights, "depth_hires", ("depth_hires_head.",), ":depth_hi=")
     if backbone in ("", "scratch"):
         from python.train.model_size import checkpoint_preset, scene_net_kwargs
         from python.train.scene_net import SceneNet
@@ -250,6 +251,7 @@ def build_net(meta: Mapping[str, Any], weights: Mapping[str, Any] | None = None)
             road_edge=road,
             stop_line=stop_line_on,
             route_cond=route,
+            depth_hires=depth_hi,
             **scene_net_kwargs(checkpoint_preset(meta)),
         )
     if meta.get("cam_age") or meta.get("ctl") or aux or road or route or stop_line_on:

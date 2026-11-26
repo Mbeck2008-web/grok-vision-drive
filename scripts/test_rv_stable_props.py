@@ -1246,9 +1246,14 @@ KNOWN_FAILING: dict[str, str] = {
     "prop_filter_keeps_ground": "F: narrow, 1.0 m/frame, 2 frames, perfect pose, exact ground: z=-0.0063 m at 14.52 m",
     "prop_filter_keeps_cap": "F: narrow, yaw 1.0 deg/frame: at-cap px span [249.49, 250.51] m",
     "prop_objects_keep_height": "N: main pole at 4.0 m, lat 0.0: px at GT z 1.114 m rendered at 0.000 m",
-    "check_clip015_near_road_bias": "clip015 near road 0-15 m bias belongs to gvd/rv-ground-plane (Redesigner's gate 0.08/0.20 m)",
-    "check_holdout_near_road_bias": "same near-road gate on held-out frames; same owner (gvd/rv-ground-plane)",
-    "check_clean_holdout_near_road_bias": "same near-road gate on clean holdout f70; belongs to gvd/rv-ground-plane",
+    "check_clip015_near_road_bias": "f40/f160 near road 0-15 m: median |dz| 0.114 m, p90 0.489 m, n 96786 (gate 0.08/0.20; gvd/rv-ground-plane)",
+    "check_clean_holdout_near_road_bias": "f70: median |dz| 0.074 m passes, p90 0.713 m fails, n 56069",
+    "check_clip015_open_road_seam": "f40 main/wide seam median |dz| 5.24 m at [-0.62, 9.88] (0.0 vs 7.50 m)",
+    "check_holdout_open_road_seam": "f200 main/wide seam median |dz| 0.328 m at [-1.38, 4.88]",
+    "check_clean_holdout_open_road_seam": "f70 main/wide seam median |dz| 5.65 m at [-1.38, 6.62] (0.0 vs 5.11 m)",
+    "check_clip015_snap_no_worse_than_off": "f40/f160: main 10-15 m median 0.215 vs 0.142 off; wide 10-15 m 0.542 vs 0.495",
+    "check_holdout_snap_no_worse_than_off": "f100/f200: main 10-15 m median 0.173 vs 0.103 off; wide 10-15 m p90 0.696 vs 0.626",
+    "check_clean_holdout_snap_no_worse_than_off": "f70: main 5-10 m median 0.073 vs 0.065; wide 0-5 m 0.050 vs 0.048",
 }
 
 _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}

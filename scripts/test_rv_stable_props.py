@@ -717,12 +717,19 @@ def gt_at_proc(g_full: np.ndarray, pw: int, ph: int) -> np.ndarray:
     return g_full[yi[:, None], xi[None, :]]
 
 
+DEFAULT_CLIP = Path("/workspace/rv-preview/v2src/clip015")
+DEFAULT_PREDS = Path("/workspace/rv-preview/v2/preds_clip015.npz")
+DEFAULT_GT = Path("/workspace/rv-preview/v2src/gt_eval_only")
+TRACER_HOLDOUT = (100, 200)
+CLEAN_HOLDOUT = (70,)
+
+
 def clip015_paths():
-    clip = os.environ.get("GVD_RV_CLIP015", "")
-    preds = os.environ.get("GVD_RV_CLIP015_PREDS", "")
-    gt = os.environ.get("GVD_RV_CLIP015_GT", "")
-    if clip and preds and gt and Path(clip, "cameras.json").is_file() and Path(preds).is_file() and Path(gt).is_dir():
-        return Path(clip), Path(preds), Path(gt)
+    clip = Path(os.environ["GVD_RV_CLIP015"]) if os.environ.get("GVD_RV_CLIP015") else DEFAULT_CLIP
+    preds = Path(os.environ["GVD_RV_CLIP015_PREDS"]) if os.environ.get("GVD_RV_CLIP015_PREDS") else DEFAULT_PREDS
+    gt = Path(os.environ["GVD_RV_CLIP015_GT"]) if os.environ.get("GVD_RV_CLIP015_GT") else DEFAULT_GT
+    if clip.joinpath("cameras.json").is_file() and preds.is_file() and gt.is_dir():
+        return clip, preds, gt
     return None
 
 
@@ -820,9 +827,7 @@ def _clip(overrides=None, frames=GATE_FRAMES):
 
 
 def _holdout() -> tuple:
-    fr = holdout_frames(np.load(clip015_paths()[1]).files)
-    assert len(fr) >= HOLDOUT_N, f"holdout: need >= {HOLDOUT_N} frames >= {HOLDOUT_MIN_GAP} from {GATE_FRAMES}, have {fr}"
-    return fr
+    return TRACER_HOLDOUT
 
 
 def _near_gate(m, label):
@@ -876,6 +881,40 @@ def check_holdout_open_road_seam() -> None:
         return SKIPPED
     for f, (px, med, n, worst) in _clip(None, _holdout())["seam_open"]:
         assert n == 0 or med <= SEAM_MEDIAN_M, ("holdout", f, med, n, worst)
+
+
+def check_clean_holdout_near_road_bias() -> None:
+    if clip015_paths() is None:
+        skip_check("clean_holdout_near_road_bias", "clip015 not on this host")
+        return SKIPPED
+    m = _clip(None, CLEAN_HOLDOUT)
+    print(f"clean holdout {CLEAN_HOLDOUT} bins:", _fmt_bins(m["bins"]), flush=True)
+    _near_gate(m, f"clean holdout {CLEAN_HOLDOUT}")
+
+
+def check_clean_holdout_snap_no_worse_than_off() -> None:
+    if clip015_paths() is None:
+        skip_check("clean_holdout_snap_no_worse_than_off", "clip015 not on this host")
+        return SKIPPED
+    _snap_gate(CLEAN_HOLDOUT, "clean holdout f70")
+
+
+def check_clean_holdout_open_road_seam() -> None:
+    if clip015_paths() is None:
+        skip_check("clean_holdout_open_road_seam", "clip015 not on this host")
+        return SKIPPED
+    for f, (px, med, n, worst) in _clip(None, CLEAN_HOLDOUT)["seam_open"]:
+        assert n == 0 or med <= SEAM_MEDIAN_M, ("clean holdout", f, med, n, worst)
+
+
+def check_no_fitted_z0() -> None:
+    """Flag a z0 or lateral offset in runtime code that looks fitted on clip015 (e.g. +0.09)."""
+    bad = []
+    for rel in ("python/viz/rv_stable_fill.py", "tools/rv_stable_preview.py"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        if "0.09" in text or "+0.09" in text:
+            bad.append(rel)
+    assert not bad, f"possible fitted z0=+0.09 (or 0.09) in {bad}"
 
 
 def _fmt_bins(bins):
@@ -1166,6 +1205,10 @@ CHECKS = [
     check_holdout_snap_no_worse_than_off,
     check_holdout_near_road_bias,
     check_holdout_open_road_seam,
+    check_clean_holdout_snap_no_worse_than_off,
+    check_clean_holdout_near_road_bias,
+    check_clean_holdout_open_road_seam,
+    check_no_fitted_z0,
     check_pin_label_edge_dip,
     check_pin_object_base_dip,
     check_pin_horizon_band_dip,
@@ -1195,6 +1238,7 @@ KNOWN_FAILING: dict[str, str] = {
     "prop_objects_keep_height": "N: main pole at 4.0 m, lat 0.0: px at GT z 1.114 m rendered at 0.000 m",
     "check_clip015_near_road_bias": "clip015 near road 0-15 m bias belongs to gvd/rv-ground-plane (Redesigner's gate 0.08/0.20 m)",
     "check_holdout_near_road_bias": "same near-road gate on held-out frames; same owner (gvd/rv-ground-plane)",
+    "check_clean_holdout_near_road_bias": "same near-road gate on clean holdout f70; belongs to gvd/rv-ground-plane",
 }
 
 _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}

@@ -13,6 +13,15 @@ One opt-in trainer recipe, `train_scene --recipe trainer2` (**new** flag in `pyt
 
 Inputs: **7-cam set**: `repeatL, pillarL, main, narrow, pillarR, repeatR, rear`. GVD is removing `wide` from the model inputs, the recorder and every wide-derived lane/polyline (`lanes.py:810` `src="wide"`, `path_predictor.py:564-590`, `pipeline.py:338`; see `/workspace/gvd-notes/wide_aeb_check.md`). Trainer 2.0 reads the cam list from `python/data/strip_writer.STRIP_ORDER` after that removal. It never names `wide`, and no input or target comes from wide. With 7 cams the sector token is 7×64 = 448 wide, not `TOKEN_DIM` 512. `SceneNet` already adds `self.skip = Linear(448, 512)` when `token_dim != gru_hidden`, so the arch tag changes and 8-cam heads/GRU checkpoints do not load. The `SharedStem` weights are cam-agnostic (one stem shared over every sector), so `--init-stem` from an 8-cam run is legal.
 
+## Train input = live input (Michael, 6:37 PM)
+
+Every head trains on the same stitched 7-cam strip the live model receives. The one stitch function is `python/data/strip_writer.compose_strip` (`SECTORS` from `STRIP_ORDER`, per-sector `place_sector`; canvas `CANVAS_H`=192 × `CANVAS_W`).
+- Train: `train_scene._frame_row` → `_load_bgr` → `scene_loader.load_canvas` → `raw_frames.load_training_bgr` → `compose_strip(load_raw_cameras(...))`. Hold-last rows go `held_canvas` → `compose_strip`. Then optional `cam_strip.extract_cams` / `scale_canvas`, and train-only `photometric_jitter` (`--augment`).
+- Live: `run_vision.py:1551` `compose_strip(frames)` → `scene_guard.observe` → `scene_lane_runtime._strip_nchw` (uint8 → float32 /255, HWC→NCHW).
+- **Gap found:** `scene_ckpt_runtime._main_canvas` (`--scene-ckpt`) builds `compose_strip({"main": frame})`, which is **main-only**. A 7-cam head would get a black canvas outside main there. Trainer 2.0 heads must not ship on that path until it feeds all 7 cams (a GVD runtime change, outside these PRs; Open question 5).
+- **Normalization** must be one function (**new** `python/train/strip_tensor.py::strip_to_nchw`, moved verbatim from `_strip_nchw`; `exp_ssl.frame_to_nchw` and the trainer call it).
+- `check_train_live_input_identical`: on the same recorded fixture frames (`tests/fixtures`), the train builder (augment off) and the live builder (`compose_strip` + `_strip_nchw`) give **byte-identical** float32 NCHW tensors. A sha256 is pinned per fixture, covering cam order (`STRIP_ORDER`, 7 names, no `wide`), sector crop/x0/x1, resolution and /255. Any drift fails the pin. `--scale` < 1 and `--augment` are train-only and are refused in a recipe meant for a live export.
+
 ## Non-goals
 
 - **Safety path untouched**: heartbeat, AEB and engage (`python/control/actuate.py`, `python/control/ego_speed.py`, `python/sensors/live_hold.py`, `python/control/echo_link.py`, `python/perception/cipv.py`, `beamng_mod/.../gvd/main.lua`). No trainer module is imported by them (`check_safety_path_no_trainer_imports`).
@@ -21,6 +30,7 @@ Inputs: **7-cam set**: `repeatL, pillarL, main, narrow, pillarR, repeatR, rear`.
 - No BEV/LSS, 3DGS or refiner *architecture* here. Those stages train heads that Phases 5/6/9 add. Until a head exists on main, its stage is **skipped and logged**, not faked.
 - No checkpoint is ever deleted: old 8-cam `.npz`/ONNX and epoch snapshots are kept. The trainer writes new files only.
 - No GT, sim depth or teacher on any live path.
+- **The hand-coded stop-sign rule is not changed**: `python/planning/path_predictor.py:1202-1207` (a `stop_sign` cut at `station − SIGN_STANDOFF_M`, 3.0 m, l.68), the comfort-decel target and hard brake in `_speed_flags` (l.1295-1349), then `fuse_planner_cipv` → `actuate.plan_command`. It stays as the backstop; see Learned stop braking.
 
 ## Teacher/student: three different things (kept separate)
 
@@ -39,6 +49,7 @@ Each stage resumes the previous stage's best checkpoint (written by `python/trai
 | 0 | SSL | `stem` only | Unlabeled frames via `exp_ssl.ssl_rows_from_split` (holdout and 4 s purge excluded) | pretext loss plateau, collapse guard holds |
 | 1 | depth/sem | `aux_depth_head`, `aux_sem_head` (`--aux-depth/--aux-sem`) | Recorded sim depth/sem via `python/train/sensor_aux.py`, train-only. Today `cam="main"`; extending to `narrow` + side cams is **new**. | depth AbsRel, sem mIoU (holdout) |
 | 2 | lanes | `lane_head`, `lane_valid_head`, `curb_head`, `curb_valid_head`, `lane_gt_head`, `road_edge` | `lane_gt` targets (`scene_net._lane_gt_loss`) from main/narrow, plus 7-cam context. No wide-derived polylines. | 8 m holdout `r`/`rms` (`scripts/eval_scene_ckpt.py`) |
+| 2b | stop (learned stop braking) | `sign_head`/`sign_class_head` (`SIGN_CLASSES` has `stop_sign`), `stop_line` (train-only, `intersection_labels.stop_line_arrays`), `ctl_head` → `ctl_brake` (offline only, `ctl_targets.CTL_FIELDS` `brake_ai`, horizons 0–5 s) | Camera strip in. Labels: recorded `brake_ai` + sim stop-line/sign GT, **training labels only** | missed / false brakes, stop distance (see below) |
 | 3 | BEV | **new** BEV head on the Phase 5 spatial path (`python/train/bev_lss.py` is absent on main; draft #241) | `python/train/occ_map_labels.py` / `occ_labels.py` from the 7 cams. Unknown/occluded cells are never a "free" target. | BEV IoU, free/unknown accuracy |
 | 4 | temporal | **new** future-BEV heads at 0.5/1/2 s | Same rows; targets are the future frame's BEV *within the same recording and split* | future BEV IoU per horizon |
 | 5 | 3DGS | **new**, per `docs/specs/reality_view_3dgs.md`. Only after RV step 0 (`check_live_depth_source_on_main`) passes: a depth-consistency / rendered-depth loss | Offline recorded frames + poses. GT only in tests named GT. | rendered-depth AbsRel, δ<1.25 (RV Outputs) |
@@ -62,6 +73,19 @@ Each stage resumes the previous stage's best checkpoint (written by `python/trai
 - `check_trainer2_split_no_overlap`: no (source, i) in both splits; within a recording, min |t_train − t_hold| ≥ 4 s; cells disjoint when on; temporal targets' source frames are in the same split; the SSL row set ⊆ train.
 - **Matched-holdout comparison**: baseline = today's `train_scene` default recipe (same `--cams` 7-cam set, same manifest, same epochs budget). Score both with `scripts/eval_scene_ckpt.py` (`n, r, rms` + per-head lines). New heads without a baseline counterpart are reported "no baseline", not as wins.
 - **Pre-registration** (`run_manifest.json`, **new**): git SHA, config sha256, seed, split sha256, decision rule. Written before training. **One run per arm, no seed re-rolls.** Trainer 2.0 wins iff holdout `rms` is ≤ baseline and no shared head is worse by > 2%. Otherwise trainer2 stays opt-in and the result is logged as a loss.
+
+## Learned stop braking (Michael, 6:37 PM)
+
+- **Goal:** the model learns stop-sign braking end to end from the camera strip. Planner-path AEB and the hand-coded rule above stay in place, unchanged, as the safety backstop.
+- **Inference:** camera-only (the 7-cam strip). **Sim GT** (stop-line position via `intersection_labels`, sign class/pose, the bot's recorded `brake_ai`) is used **only as a training label**: never an input, never on a live path. GT modules are in the `test_occ_runtime_imports.py`-style isolation set.
+- **Events (new, `python/train/stop_events.py`):** a holdout stop event is any approach where a GT stop sign/stop line lies on the ego path within 40 m and ego speed is ≥ 2 m/s. Thresholds are proposed and pinned in `run_manifest.json`.
+- **Metrics** (new `scripts/eval_stop_brake.py`, offline, recorded holdout):
+  - **missed brakes:** the predicted brake profile does not reach v < 0.5 m/s by stop line + 1 m. **Must be 0.**
+  - **false brakes:** `ctl_brake` > 0.3 with no stop event within 40 m, counted per km.
+  - **stop distance:** signed m from the stop line at v < 0.5 m/s, median and p95.
+- **Comparator:** the hand-coded rule replayed read-only (`predict_path` on the same recorded holdout frames' detections), on the same split manifest, metrics and events. One hashed run each, no re-rolls.
+- **Retirement rule:** the hand-coded rule and AEB are **never** removed or weakened in any Trainer 2.0 PR. Retiring the hand-coded stop rule needs all of: 0 missed brakes on the matched holdout, ≤ the rule's false-brake rate, and stop distance p95 no worse. Then **Michael's explicit OK** and a separate PR outside Trainer 2.0. AEB (`cipv.aeb`, `plan.aeb`) is not part of that retirement and stays as the backstop.
+- `ctl` and `stop_line` stay offline/not exported in Trainer 2.0. Using a learned brake live is a later, separately gated spec.
 
 ## VRAM budgets (two)
 
@@ -93,6 +117,8 @@ All live in `scripts/test_trainer2_*.py`. Torch parts use `gvd_test_env.skip_che
 - `check_trainer_no_wide_input`: the default trainer2 cam set has no `wide`; `SceneNet(cams=…)` sectors exclude it; a strip with a `wide` sector is refused.
 - `check_no_wide_targets`: every target builder used by the recipe refuses rows/polylines with `src == "wide"` or a wide-cam origin. AST check: no `"wide"` literal in the `trainer2_*` modules.
 - `check_safety_path_no_trainer_imports`: an AST walk from the safety modules listed in Non-goals never reaches `python.train.*`.
+- `check_train_live_input_identical` (hash pin, see Train input = live input), `check_strip_order_7cam`.
+- `check_stop_labels_train_only` (stop GT/`brake_ai` is never an input; GT modules are unreachable from live entry points), `check_stop_events_split_safe` (events are counted in holdout rows only), `check_stop_metrics_on_fixture` (a hand-built clip with 1 missed brake, 1 false brake and a known stop distance gives exactly those numbers), `check_hand_rule_untouched` (sha256 pin of `path_predictor.py`, `pipeline.py`, `actuate.py`, `cipv.py` at the base SHA; any Trainer 2.0 PR that changes them fails).
 - `check_ssl_ema_no_collapse`, `check_ssl_rows_train_only`.
 - `check_curriculum_order_and_gates`: stage order is fixed, a stage with a missing head is skipped and logged, and the non-regression gate rejects a checkpoint.
 - `check_head_ramp_linear`, `check_gradnorm_weights_sum_and_clamp`, `check_per_task_grad_norm_logged`.
@@ -107,6 +133,8 @@ All live in `scripts/test_trainer2_*.py`. Torch parts use `gvd_test_env.skip_che
 2. Is the baseline for the matched comparison the current default recipe on the 7-cam set (proposed), or the last shipped 8-cam checkpoint? The 8-cam checkpoint can't run on 7-cam inputs.
 3. OK to skip the BEV/temporal/3DGS/refine stages (logged) until Phases 5/6/9 land, rather than blocking Trainer 2.0 on them?
 4. Teacher = `xl` preset (proposed), or is a larger offline teacher worth an IQU45 VRAM measurement first?
+5. `--scene-ckpt` live input is main-only (`scene_ckpt_runtime._main_canvas`). Should GVD switch it to the full 7-cam `compose_strip` before any Trainer 2.0 head goes live?
+6. Stop-event thresholds (40 m, 2 m/s, 0.5 m/s, +1 m, brake 0.3): OK as the pinned definition?
 
 ## Appendix A: file touch list
 
@@ -121,13 +149,20 @@ All live in `scripts/test_trainer2_*.py`. Torch parts use `gvd_test_env.skip_che
 | `python/train/trainer2_recipe.py` | **new**: stage table, gates |
 | `python/train/trainer2_split.py` | **new**: manifest, hashes |
 | `python/train/trainer2_distill.py` | **new** (late PR) |
+| `python/train/strip_tensor.py` | **new**: single `strip_to_nchw` (moved from `scene_lane_runtime._strip_nchw`, behavior identical) |
+| `python/train/scene_lane_runtime.py` | **edit**: call `strip_to_nchw` (no behavior change, pinned by hash) |
+| `python/train/stop_events.py`, `scripts/eval_stop_brake.py` | **new**: offline stop events + metrics |
 | `scripts/test_trainer2_*.py` | **new** tests |
+| `python/planning/*`, `python/perception/pipeline.py`, `python/perception/cipv.py`, `python/control/*` | **not touched** (pinned) |
 
 ## Appendix B: verify steps (offline, box CPU)
 
 ```
 ps aux | grep -c "[r]un_offline_suite"             # must be 0 before starting
 python3 scripts/test_trainer2_split.py             # per-PR file, fail-first then pass
+python3 scripts/test_trainer2_input_parity.py      # train vs live tensor hash pin
+python3 scripts/eval_stop_brake.py --ckpt <student.npz> --manifest <split_manifest.json>  # learned vs hand rule, offline
+git diff --name-only origin/main...HEAD | grep -E '^python/(planning|control)/|perception/(pipeline|cipv)\.py' && echo FAIL-safety-touched
 python3 scripts/run_offline_suite.py               # full suite; paste the final line
 ```
 CI (torch CPU) runs the same suite on the draft PR. Skeptic re-runs it in `/workspace/skeptic`.
@@ -137,10 +172,12 @@ CI (torch CPU) runs the same suite on the draft PR. Skeptic re-runs it in `/work
 1. **PR 0**: this spec.
 2. **PR 1**: split manifest + pre-registration (`trainer2_split.py`). Tests: `check_trainer2_split_no_overlap`, `check_manifest_hashed_before_train`, `check_no_seed_reroll`.
 3. **PR 2**: 7-cam / no-wide guards + safety-import check. Tests: `check_trainer_no_wide_input`, `check_no_wide_targets`, `check_safety_path_no_trainer_imports`. Lands after GVD's wide removal.
+3b. **PR 2b**: one input builder. `strip_to_nchw` plus the train/live hash pin. Tests: `check_train_live_input_identical`, `check_strip_order_7cam`. No live behavior change.
 4. **PR 3**: LR schedule + `SceneNet.param_groups`. Tests: `check_warmup_cosine_shape`, `check_param_groups_lr_mult`, `check_resume_keeps_schedule`, `check_recipe_off_is_bit_identical`.
 5. **PR 4**: per-task grad norms, GradNorm, ramps. Tests: `check_per_task_grad_norm_logged`, `check_gradnorm_weights_sum_and_clamp`, `check_head_ramp_linear`.
 6. **PR 5**: SSL promotion (EMA + guard) as stage 0. Tests: `check_ssl_ema_no_collapse`, `check_ssl_rows_train_only`.
 7. **PR 6**: curriculum runner (stages 0–2 live; 3–6 skip-logged) + deploy check + ckpt retention. Tests: `check_curriculum_order_and_gates`, `check_student_export_fits_deploy`, `check_old_checkpoints_untouched`.
-8. **PR 7**: matched-holdout run (GVD schedules the GPU): one baseline and one trainer2 run, with manifest hashes posted before training. Evidence only, no code.
+7b. **PR 6b**: learned stop braking, stage 2b. Labels, events, metrics and the replay comparator. Tests: `check_stop_labels_train_only`, `check_stop_events_split_safe`, `check_stop_metrics_on_fixture`, `check_hand_rule_untouched`. The hand rule and AEB are not changed.
+8. **PR 7**: matched-holdout run (GVD schedules the GPU): one baseline and one trainer2 run, with manifest hashes posted before training, plus the stop-brake table (learned vs hand rule). Evidence only, no code. Any retirement of the hand rule is a separate post-Trainer-2.0 PR, with Michael's OK only.
 9. **PR 8 (optional, after PR 7 lands)**: teacher→student KD. Tests: `check_teacher_not_on_live_path`, `check_onnx_student_only`, `check_kd_bev_masks_unknown`, `check_kd_cache_train_only`. Then one `student_kd` run and one `student_nokd` run. KD is dropped if it does not win.
 10. BEV / temporal / 3DGS stages get enabled in the PR that lands each head (Phases 5/6), each with its own `check_*`.

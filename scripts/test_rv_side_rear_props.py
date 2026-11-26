@@ -3,28 +3,42 @@
 the near front) through the REAL per-camera render path (tools/rv_stable_preview.py ``cam_frame``,
 parsed and executed against fake preds, as in scripts/test_rv_stable_props.py on gvd/rv-stable-props).
 
-Thresholds (committed before any gvd/rv-side-rear fix commit exists):
-W  road lateral width, per cam in {pillarL, pillarR, repeatL, repeatR, rear, main} and per range bin
-   0-5 / 5-15 / 15-30 m: rendered road width minus GT road width, per 1 m longitudinal slice of the
-   cam's visible road; median |err| <= 10% of GT width and p90 |err| <= 20% (GVD gate, 2026-11-26).
-   Rendered road = valid points from pixels the NET labels road (runtime notion; it is what
-   road_snap uses); GT road = GT depth + GT road label on the same cam pixels (eval only).
-E  left / right road edge lateral offset vs GT, per cam and bin: REPORT ONLY.
-R  rear hole fraction: share of GT road pixels in the rear and rear-quarter chase views with no
-   rendered (observed or gap-filled) surface; the ground prior is a guess and counts as a hole.
-   <= 2% at 0-15 m, <= 5% at 15-30 m. Rear / rear-quarter view (judgment, the preview has none):
-   the preview chase (pose A, 480x270) swung about the ego origin by 180 / +-135 deg.
-I  invariants: rendered road never extends past the GT road edge by > 0.3 m at 0-5 m; objects
-   above the road keep their height (>= GT z - 0.05 m, > 2 px inside the silhouette); sky stays sky;
-   no NaN in any valid depth or rendered point.
-F  fuzz: side-cam depth NaN / inf / 0 / negative, empty masks (all sky, no road), extreme extrinsic
-   yaw (any yaw incl. +-180 and wrapped values).
-H  holdout (Skeptic): every clip gate also runs on >= 2 clip015 frames >= 40 frames from f40/f160
-   with the same thresholds; f40/f160 pass + holdout fail = overfit counterexample.
-Clip gates need GVD_RV_CLIP015 (clip dir), GVD_RV_CLIP015_PREDS, GVD_RV_CLIP015_GT (GT depth root)
-and GVD_RV_CLIP015_GTSEG (GT label root, <cam>_seg/000/%06d.png; road ids GVD_RV_GTSEG_ROAD_IDS,
-default 2); they skip visibly without them. Synthetic versions (flat ground, 7 m road, net depth =
-GT, net label = the 12x16 class grid majority of the GT label) always run.
+Thresholds (committed before any gvd/rv-side-rear fix commit exists; clip015 has GT depth only,
+no GT seg — GVD 2026-11-26, superseding the seg-based width gate):
+W  (a) edge-position error of pred-road pixels vs GT depth at the same pixel:
+   |x_rendered - x_GTdepth|, gated vs GT lateral distance |x_GTdepth|: median |err| <= 10% and
+   p90 |err| <= 20% of median |x_GTdepth| in bins 0-5 and 5-15 m (15-30 m is report-only);
+   plus edge overshoot (|x_r| - |x_gt|) <= 0.3 m at 0-5 m.
+   (b) snap misplacement, all of {wide, pillarL, pillarR, repeatL, repeatR, rear}, GATED:
+   <= 1% of snapped pixels with GT z > 0.30 m at 0-15 m, and <= 3% at 15-30 m.
+   Reason (Tracer / Skeptic): hard 0 unreachable: one-sided z_pred>+0.30 gate catches only
+   46-100% of off-ground px (logs/rv_side4.txt); GT cm quantization + pose jitter push true
+   road just over 0.30 m past 15 m; hence <=1% 0-15 m, <=3% 15-30 m (Skeptic).
+   p99 |GT z| of snapped pixels is printed as a road-noise number, info only (no noise margin
+   in the gate).
+   The old seg-based width gate is kept but skips unless GVD_RV_CLIP015_GTSEG is set
+   (clip015 has no GT seg).
+E  left / right edge offset vs GT depth, per cam and bin: REPORT ONLY.
+R  rear hole fraction on Michael's still, pose B, frame 110: share of GT-ground pixels
+   (|z| <= STATIC_MAX_HEIGHT_M; no GT seg) in the pose-B chase with no rendered (observed or
+   filled) surface; ground prior counts as a hole. <= 2% at 0-15 m, <= 5% at 15-30 m.
+   Pose B is not in tools/rv_stable_preview.py on this head (only pose A). Source:
+   /workspace/rv-preview/v2/abl/poseB/render_stats_B_full.json chase_pose
+   pos (0, -9, 4.5) m, pitch -16 deg, fov_v 70; still rv_v3_still_poseB_frame110.png.
+S  snap on is no worse than snap off for 0-15 m |z_render - z_GT| (median and p90), per
+   side cam and rear (and wide). Catches a rig-wide z0 that pushes side edges in.
+P  footprint coverage: on snapped ground px at 0-15 m, row-to-row 3D spacing <= the
+   preview footprint() clipped size (6*d/fy) for >= 95% of those px, per cam.
+I  objects above the road keep their height; a wall/car/curb top labelled road stays put
+   (snap must not move it outward; it keeps height and depth); sky stays sky; no NaN.
+F  fuzz: side-cam depth NaN/inf/0/negative, empty masks, extreme extrinsic yaw.
+H  holdout: the same gates on clip015 f100 and f200 (nearest sparse side/rear index;
+   Tracer printed numbers on these while tuning) AND on clean holdout f70 (nobody has
+   printed this frame). A pass on f40/f160 + fail on holdout = overfit counterexample.
+Default clip paths (override with GVD_RV_CLIP015 / _PREDS / _GT; read-only):
+  /workspace/rv-preview/v2src/clip015, /workspace/rv-preview/v2/preds_clip015.npz,
+  /workspace/rv-preview/v2src/gt_eval_only. Never write there. Never touch
+  /workspace/rv-preview/drift_eval/clip_005 (locked holdout).
 GT is eval-only: it never enters cam_frame (pred mode).
 """
 from __future__ import annotations
@@ -75,9 +89,28 @@ SLICE_M = 1.0
 MIN_SLICE_PTS = 3
 ROAD_HALF_M = 3.5        # synthetic road: x in [-3.5, 3.5] (one 7 m carriageway)
 GATE_FRAMES = (40, 160)
+TRACER_HOLDOUT = (100, 200)   # Tracer already printed numbers on these while tuning the gate
+CLEAN_HOLDOUT = (70,)         # nobody has printed this frame (clean holdout)
 HOLDOUT_MIN_GAP = 40
 HOLDOUT_N = 2
 REAR_VIEWS_DEG = (180.0, 135.0, -135.0)
+# (b) snap misplacement (GVD final gate, 2026-11-26). No noise-margin constant.
+SNAP_BAD_Z = 0.30
+SNAP_BAD_NEAR = 0.01          # <= 1% of snapped px with GT z > 0.30 m, at 0-15 m
+SNAP_BAD_FAR = 0.03           # <= 3% at 15-30 m
+SNAP_PLACE_CAMS = ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+EDGE_MED_FRAC = 0.10
+EDGE_P90_FRAC = 0.20
+FOOTPRINT_MIN_FRAC = 0.95
+# Pose B: not in tools/rv_stable_preview.py (only pose A = CHASE_POS). From
+# /workspace/rv-preview/v2/abl/poseB/render_stats_B_full.json "chase_pose".
+POSE_B_POS = (0.0, -9.0, 4.5)
+POSE_B_PITCH = -16.0
+POSE_B_FOV = 70.0
+POSE_B_FRAME = 110
+DEFAULT_CLIP = Path("/workspace/rv-preview/v2src/clip015")
+DEFAULT_PREDS = Path("/workspace/rv-preview/v2/preds_clip015.npz")
+DEFAULT_GT = Path("/workspace/rv-preview/v2src/gt_eval_only")
 
 CAM_SPECS = {  # config/cameras.yaml (check_cam_specs_match_config)
     "narrow": {"id": "narrow", "pos_m": [0.03, 1.20, 1.28], "yaw_deg": 0.0, "pitch_deg": -4.0, "fov_v": 21.4, "resolution": [640, 480], "far_m": 800.0},
@@ -167,6 +200,23 @@ class Preview:
         exec(compile(ast.Module(body=body, type_ignores=[]), str(PREVIEW), "exec"), self.ns)
         self.cam = self.ns["CAM_POSE"]
         self.has_yield = "YIELD" in self.ns
+        self.snap_hook = {"mask": None}
+
+        class _SHook:
+            def __init__(self, real, hook):
+                object.__setattr__(self, "_real", real)
+                object.__setattr__(self, "_hook", hook)
+
+            def __getattr__(self, name):
+                return getattr(object.__getattribute__(self, "_real"), name)
+
+            def road_snap(self, *a, **k):
+                out, m = object.__getattribute__(self, "_real").road_snap(*a, **k)
+                object.__getattribute__(self, "_hook")["mask"] = m
+                return out, m
+
+        self.ns["S"] = _SHook(sf, self.snap_hook)
+        self.last_snap = None
 
     def run(self, cid: str, depth: np.ndarray, sem: np.ndarray, idx: int = 0):
         """cam_frame(cid, idx) with the net's depth = ``depth`` (metres at proc res) and labels ``sem``."""
@@ -185,8 +235,11 @@ class Preview:
                 self.P[f"{cid}/{idx}/0/d"] = np.asarray(depth, np.float64) / fs
             self.P[f"{cid}/{idx}/0/x0"] = np.array([0, W0])
             self.P[f"{cid}/{idx}/0/s"] = np.asarray(sem)
+        self.snap_hook["mask"] = None
         with np.errstate(all="ignore"):
-            return self.ns["cam_frame"](cid, idx)
+            out = self.ns["cam_frame"](cid, idx)
+        self.last_snap = self.snap_hook.get("mask")
+        return out
 
     def chase(self):
         n = self.ns
@@ -599,11 +652,26 @@ def check_side_objects_keep_height_pins() -> None:
 
 # ------------------------------------------------------------------ clip015 (real data, optional)
 def clip_paths():
-    keys = ("GVD_RV_CLIP015", "GVD_RV_CLIP015_PREDS", "GVD_RV_CLIP015_GT", "GVD_RV_CLIP015_GTSEG")
-    v = [os.environ.get(k, "") for k in keys]
-    if all(v) and Path(v[0], "cameras.json").is_file() and Path(v[1]).is_file() and Path(v[2]).is_dir() and Path(v[3]).is_dir():
-        return tuple(Path(x) for x in v)
+    """(clip, preds, gt) if present. GTSEG is optional and is not required for the default gates."""
+    clip = Path(os.environ["GVD_RV_CLIP015"]) if os.environ.get("GVD_RV_CLIP015") else DEFAULT_CLIP
+    preds = Path(os.environ["GVD_RV_CLIP015_PREDS"]) if os.environ.get("GVD_RV_CLIP015_PREDS") else DEFAULT_PREDS
+    gt = Path(os.environ["GVD_RV_CLIP015_GT"]) if os.environ.get("GVD_RV_CLIP015_GT") else DEFAULT_GT
+    if clip.joinpath("cameras.json").is_file() and preds.is_file() and gt.is_dir():
+        return clip, preds, gt
     return None
+
+
+def clip_seg_path():
+    p = os.environ.get("GVD_RV_CLIP015_GTSEG", "")
+    return Path(p) if p and Path(p).is_dir() else None
+
+
+def pred_frames(P, cid):
+    return sorted({int(k.split("/")[1]) for k in P.files if k.startswith(cid + "/") and k.endswith("/d")})
+
+
+def nearest_idx(frames, target):
+    return min(frames, key=lambda i: (abs(i - target), i)) if frames else None
 
 
 def _road_ids():
@@ -694,19 +762,25 @@ _CLIP: dict = {}
 
 def _clip(frames):
     if frames not in _CLIP:
-        _CLIP[frames] = clip_measure(*clip_paths(), frames)
+        clip, preds, gt = clip_paths()
+        _CLIP[frames] = clip_measure(clip, preds, gt, clip_seg_path(), frames)
     return _CLIP[frames]
 
 
 def _clip_holdout():
-    fr = holdout_frames(np.load(clip_paths()[1]).files)
-    assert len(fr) >= HOLDOUT_N, f"holdout: need >= {HOLDOUT_N} frames >= {HOLDOUT_MIN_GAP} from {GATE_FRAMES}, have {fr}"
-    return fr
+    return TRACER_HOLDOUT
+
+
+def _clip_clean_holdout():
+    return CLEAN_HOLDOUT
 
 
 def _clip_check(name, frames_fn, gate):
     if clip_paths() is None:
-        skip_check(name, "clip015 + GT depth + GT labels not on this host (GVD_RV_CLIP015, _PREDS, _GT, _GTSEG)")
+        skip_check(name, "clip015 + GT depth not on this host")
+        return SKIPPED
+    if clip_seg_path() is None:
+        skip_check(name, "no GT seg on clip015 (GVD_RV_CLIP015_GTSEG not set); width is gated by edge-position vs GT depth instead")
         return SKIPPED
     frames = frames_fn()
     m = _clip(frames)
@@ -776,6 +850,398 @@ def check_clip_harness_selftest() -> None:
         t = m["width"][cid][(0.0, 5.0)]   # 0-5 m only: past ~10 m the rear's own edge-cut dip shows up
         assert t[4] > 0 and t[0] <= 0.05, (cid, t)
     assert holdout_frames(["main/0/0/d", "main/40/0/d", "main/100/0/d", "main/250/0/d"]) == (0, 100, 250)
+
+
+
+# ------------------------------------------------------------------ clip015 GT-depth gates (no GT seg)
+_DCLIP: dict = {}
+
+
+def _load_gt_depth(gt_root: Path, cid: str, idx: int, c: dict, pw: int, ph: int):
+    g = cv2.imread(str(gt_root / f"{cid}_depth" / "000" / f"{idx:06d}.png"), cv2.IMREAD_UNCHANGED)
+    if g is None:
+        return None
+    g = gt_at_proc(g.astype(np.float32) / 100.0, pw, ph)
+    return np.where((g > 0) & (g < min(c["far_m"] * sf.GT_NO_HIT_FRAC, 655.0)), g, np.nan)
+
+
+def _net_road(P, cid, idx, W0, pw, ph):
+    road = np.zeros((ph, pw), bool)
+    sx = pw / W0
+    k = 0
+    while f"{cid}/{idx}/{k}/s" in P.files:
+        x0, cw = P[f"{cid}/{idx}/{k}/x0"]
+        a0, a1 = int(round(x0 * sx)), int(round((x0 + cw) * sx))
+        road[:, a0:a1] |= cv2.resize(np.isin(P[f"{cid}/{idx}/{k}/s"], sf.ROAD_CLASS_IDS).astype(np.uint8),
+                                     (a1 - a0, ph), interpolation=cv2.INTER_NEAREST) > 0
+        k += 1
+    return road
+
+
+def clip_depth_metrics(frames, overrides=None):
+    """Per-cam measurements from pred-road / snap vs GT depth (no GT seg). Sparse cams use nearest i."""
+    clip, preds, gt_root = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    P = np.load(preds)
+    p = Preview(overrides, root=clip, P=P, cams=cams)
+    avail = {cid: pred_frames(P, cid) for cid in p.cam}
+    snap_rows = []          # (cid, target, used, lo, hi, n_snap, n_bad, p99_abs_z)
+    edge_rows = []          # (cid, target, lo, hi, med_err, p90_err, med_lat, n, max_overshoot)
+    dz_rows = []            # (cid, target, med_|dz|, p90_|dz|, n) in 0-15 m
+    foot_rows = []          # (cid, target, frac_ok, n)
+    used = {}
+    for target in frames:
+        for cid in list(p.cam):
+            idx = nearest_idx(avail.get(cid) or [], target)
+            if idx is None:
+                continue
+            used.setdefault(cid, {})[target] = idx
+            fr = p.run(cid, None, None, idx=idx)
+            if fr is None:
+                continue
+            _, d, v, sky = fr
+            snap = p.last_snap
+            if snap is None:
+                snap = np.zeros(d.shape, bool)
+            cam = p.cam[cid]
+            c = cams[cid]
+            W0, _ = c["resolution"]
+            pw, ph = p.ns["proc_res"](c)
+            gtd = _load_gt_depth(gt_root, cid, idx, c, pw, ph)
+            if gtd is None:
+                continue
+            net = _net_road(P, cid, idx, W0, pw, ph)
+            # (b) snap misplacement
+            ys, xs = np.nonzero(snap & np.isfinite(gtd))
+            if ys.size:
+                pg = sf.unproject(cam, gtd, ys, xs)
+                rng = np.hypot(pg[:, 0], pg[:, 1])
+                for lo, hi in ((0.0, 15.0), (15.0, 30.0)):
+                    k = (rng >= lo) & (rng < hi)
+                    n = int(k.sum())
+                    n_bad = int((pg[k, 2] > SNAP_BAD_Z).sum()) if n else 0
+                    p99 = float(np.percentile(np.abs(pg[k, 2]), 99)) if n else float("nan")
+                    snap_rows.append((cid, target, idx, lo, hi, n, n_bad, p99))
+            # (a) edge position of pred-road pixels vs GT depth
+            ys, xs = np.nonzero(v & net & np.isfinite(gtd) & np.isfinite(d))
+            if ys.size:
+                pr = sf.unproject(cam, d, ys, xs)
+                pg = sf.unproject(cam, gtd, ys, xs)
+                rng = np.hypot(pg[:, 0], pg[:, 1])
+                err = np.abs(pr[:, 0] - pg[:, 0])
+                over = np.abs(pr[:, 0]) - np.abs(pg[:, 0])
+                for lo, hi in ((0.0, 5.0), (5.0, 15.0), (15.0, 30.0)):
+                    k = (rng >= lo) & (rng < hi)
+                    if not k.any():
+                        continue
+                    edge_rows.append((cid, target, lo, hi,
+                                      float(np.median(err[k])), float(np.percentile(err[k], 90)),
+                                      float(np.median(np.abs(pg[k, 0]))), int(k.sum()),
+                                      float(over[k].max()) if k.any() else 0.0))
+            # snap-on vs off uses |dz| at 0-15 m (pred-road or any valid with GT)
+            ys, xs = np.nonzero(v & np.isfinite(gtd) & np.isfinite(d))
+            if ys.size:
+                pr = sf.unproject(cam, d, ys, xs)
+                pg = sf.unproject(cam, gtd, ys, xs)
+                k = np.hypot(pg[:, 0], pg[:, 1]) < 15.0
+                if k.any():
+                    adz = np.abs(pr[k, 2] - pg[k, 2])
+                    dz_rows.append((cid, target, float(np.median(adz)), float(np.percentile(adz, 90)), int(k.sum())))
+            # footprint coverage on snapped ground px at 0-15 m
+            if snap.any() and "footprint" in p.ns:
+                fp = p.ns["footprint"](cam, d)
+                ys, xs = np.nonzero(snap & np.isfinite(d) & np.isfinite(gtd))
+                if ys.size:
+                    pr = sf.unproject(cam, d, ys, xs)
+                    pg = sf.unproject(cam, gtd, ys, xs)
+                    near = np.hypot(pg[:, 0], pg[:, 1]) < 15.0
+                    # row-to-row: same column, next row also snapped with finite depth
+                    ok = 0
+                    n = 0
+                    H, W = d.shape
+                    for y, x, keep in zip(ys, xs, near):
+                        if not keep or y + 1 >= H or not snap[y + 1, x] or not np.isfinite(d[y + 1, x]):
+                            continue
+                        p0 = sf.unproject(cam, d, np.array([y]), np.array([x]))[0]
+                        p1 = sf.unproject(cam, d, np.array([y + 1]), np.array([x]))[0]
+                        n += 1
+                        if np.linalg.norm(p1 - p0) <= fp[y, x] + 1e-9:
+                            ok += 1
+                    if n:
+                        foot_rows.append((cid, target, ok / n, n))
+    return {"snap": snap_rows, "edge": edge_rows, "dz": dz_rows, "foot": foot_rows, "used": used}
+
+
+def _dclip(frames, overrides=None):
+    key = (tuple(frames), json.dumps(overrides or {}, sort_keys=True))
+    if key not in _DCLIP:
+        _DCLIP[key] = clip_depth_metrics(frames, overrides)
+    return _DCLIP[key]
+
+
+def _need_clip(name):
+    if clip_paths() is None:
+        skip_check(name, "clip015 + GT depth not on this host")
+        return False
+    return True
+
+
+def _fmt_snap(rows):
+    out = {}
+    for cid, tgt, idx, lo, hi, n, n_bad, p99 in rows:
+        frac = (n_bad / n) if n else 0.0
+        out.setdefault((cid, f"{lo:g}-{hi:g}"), []).append(
+            f"f{tgt}->i{idx} {100 * frac:.2f}% ({n_bad}/{n}) p99|z|={p99:.3f}m")
+    return out
+
+
+def snap_misplace_gate(m, label):
+    """<= 1% snapped px with GT z > 0.30 m at 0-15 m; <= 3% at 15-30 m. Per cam, side/rear/wide."""
+    print(f"{label} snap misplace (info: p99 |GT z| is road noise, not a margin):", _fmt_snap(m["snap"]), flush=True)
+    print(f"{label} nearest frames:", m["used"], flush=True)
+    acc = {}  # (cid, lo, hi) -> [n_bad, n]
+    for cid, tgt, idx, lo, hi, n, n_bad, p99 in m["snap"]:
+        if cid not in SNAP_PLACE_CAMS:
+            continue
+        a = acc.setdefault((cid, lo, hi), [0, 0])
+        a[0] += n_bad
+        a[1] += n
+    bad = []
+    for (cid, lo, hi), (n_bad, n) in sorted(acc.items()):
+        if n == 0:
+            continue
+        frac = n_bad / n
+        lim = SNAP_BAD_NEAR if hi <= 15.0 else SNAP_BAD_FAR
+        if frac > lim:
+            bad.append(f"{cid} {lo:g}-{hi:g} m: {100 * frac:.2f}% ({n_bad}/{n}) snapped px with GT z > {SNAP_BAD_Z} m (max {100 * lim:g}%)")
+    assert not bad, f"{label} snap misplace: " + "; ".join(bad)
+
+
+def edge_position_gate(m, label, report_far=True):
+    print(f"{label} edge position (med err, p90, med |x_gt|, n, max overshoot):",
+          [(r[0], r[1], f"{r[3]:g}-{r[4]:g}", tuple(round(x, 3) if isinstance(x, float) else x for x in r[5:]))
+           for r in m["edge"]], flush=True)
+    acc = {}
+    for cid, tgt, lo, hi, med, p90, lat, n, over in m["edge"]:
+        acc.setdefault((cid, lo, hi), []).append((med, p90, lat, n, over))
+    bad, over_bad = [], []
+    for (cid, lo, hi), rows in acc.items():
+        n = sum(r[3] for r in rows)
+        # re-weight is approximate; use worst frame in the set (each row is one frame)
+        for med, p90, lat, n_i, over in rows:
+            if n_i == 0 or lat < 0.25:
+                continue
+            if hi <= 15.0 and (med > EDGE_MED_FRAC * lat + 1e-9 or p90 > EDGE_P90_FRAC * lat + 1e-9):
+                bad.append(f"{cid} {lo:g}-{hi:g} m: median {med:.3f} m p90 {p90:.3f} m vs 10%/20% of |x_gt| {lat:.3f} m")
+            if lo == 0.0 and hi == 5.0 and over > EDGE_OVERSHOOT_M:
+                over_bad.append(f"{cid} 0-5 m overshoot {over:.3f} m")
+    assert not bad, f"{label} edge position: " + "; ".join(bad)
+    assert not over_bad, f"{label} edge overshoot: " + "; ".join(over_bad)
+
+
+def snap_no_worse_gate(on, off, label):
+    print(f"{label} |dz| 0-15 m snap ON:", on["dz"], "OFF:", off["dz"], flush=True)
+    def by_cam(rows):
+        d = {}
+        for cid, tgt, med, p90, n in rows:
+            d.setdefault(cid, []).append((med, p90, n))
+        return d
+    A, B = by_cam(on["dz"]), by_cam(off["dz"])
+    bad = []
+    for cid in SNAP_PLACE_CAMS:
+        if cid not in A or cid not in B:
+            continue
+        # compare per-frame paired by order (same targets)
+        for (m1, p1, n1), (m0, p0, n0) in zip(A[cid], B[cid]):
+            if n1 == 0 or n0 == 0:
+                continue
+            if m1 > m0 + 1e-3 or p1 > p0 + 1e-3:
+                bad.append(f"{cid}: snap on median {m1:.3f}/p90 {p1:.3f} vs off {m0:.3f}/{p0:.3f}")
+    assert not bad, f"{label} snap on worse than off (0-15 m |dz|): " + "; ".join(bad)
+
+
+def footprint_gate(m, label):
+    print(f"{label} footprint coverage:", m["foot"], flush=True)
+    acc = {}
+    for cid, tgt, frac, n in m["foot"]:
+        a = acc.setdefault(cid, [0, 0])
+        a[0] += frac * n
+        a[1] += n
+    bad = []
+    for cid, (ok, n) in acc.items():
+        if n and ok / n < FOOTPRINT_MIN_FRAC:
+            bad.append(f"{cid}: {100 * ok / n:.1f}% of {n} snapped 0-15 m px have row spacing <= footprint (min {100 * FOOTPRINT_MIN_FRAC:g}%)")
+    assert not bad, f"{label} footprint: " + "; ".join(bad)
+
+
+def pose_b_chase():
+    return sf.chase_camera(POSE_B_POS, POSE_B_PITCH, POSE_B_FOV,
+                           int(pv().defaults["width"]), int(pv().defaults["height"]), 0.0)
+
+
+def clip_poseB_holes(target=POSE_B_FRAME):
+    """Rear-hole fraction in pose B at frame 110 (nearest sparse index). GT-ground = |z| <= STATIC_MAX_HEIGHT_M."""
+    clip, preds, gt_root = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    P = np.load(preds)
+    p = Preview(root=clip, P=P, cams=cams)
+    rend, gtp = [], []
+    used = {}
+    for cid in p.cam:
+        idx = nearest_idx(pred_frames(P, cid), target)
+        if idx is None:
+            continue
+        used[cid] = idx
+        fr = p.run(cid, None, None, idx=idx)
+        if fr is None:
+            continue
+        _, d, v, _ = fr
+        cam = p.cam[cid]
+        c = cams[cid]
+        pw, ph = p.ns["proc_res"](c)
+        gtd = _load_gt_depth(gt_root, cid, idx, c, pw, ph)
+        ys, xs = np.nonzero(v & np.isfinite(d))
+        if ys.size:
+            q = sf.unproject(cam, d, ys, xs)
+            rend.append(q[ego_box_filter(q)])
+        if gtd is not None:
+            ys, xs = np.nonzero(np.isfinite(gtd))
+            q = sf.unproject(cam, gtd, ys, xs)
+            q = q[np.abs(q[:, 2]) <= sf.STATIC_MAX_HEIGHT_M]
+            if q.size:
+                gtp.append(q[ego_box_filter(q)])
+    chase = pose_b_chase()
+    holes = hole_fraction(chase, np.concatenate(rend) if rend else np.zeros((0, 3)),
+                          np.concatenate(gtp) if gtp else np.zeros((0, 3)))
+    return {"holes": {0.0: holes}, "used": used, "chase": "poseB"}  # one view, keyed like hole_gate expects? 
+
+
+def check_clip015_snap_misplace() -> None:
+    if not _need_clip("clip015_snap_misplace"):
+        return SKIPPED
+    snap_misplace_gate(_dclip(GATE_FRAMES), "f40/f160")
+
+
+def check_holdout_snap_misplace() -> None:
+    if not _need_clip("holdout_snap_misplace"):
+        return SKIPPED
+    snap_misplace_gate(_dclip(TRACER_HOLDOUT), "holdout f100/f200 (Tracer printed these while tuning)")
+
+
+def check_clean_holdout_snap_misplace() -> None:
+    if not _need_clip("clean_holdout_snap_misplace"):
+        return SKIPPED
+    snap_misplace_gate(_dclip(CLEAN_HOLDOUT), "clean holdout f70")
+
+
+def check_clip015_edge_position() -> None:
+    if not _need_clip("clip015_edge_position"):
+        return SKIPPED
+    edge_position_gate(_dclip(GATE_FRAMES), "f40/f160")
+
+
+def check_holdout_edge_position() -> None:
+    if not _need_clip("holdout_edge_position"):
+        return SKIPPED
+    edge_position_gate(_dclip(TRACER_HOLDOUT), "holdout f100/f200")
+
+
+def check_clean_holdout_edge_position() -> None:
+    if not _need_clip("clean_holdout_edge_position"):
+        return SKIPPED
+    edge_position_gate(_dclip(CLEAN_HOLDOUT), "clean holdout f70")
+
+
+def check_clip015_snap_no_worse_than_off() -> None:
+    if not _need_clip("clip015_snap_no_worse_than_off"):
+        return SKIPPED
+    snap_no_worse_gate(_dclip(GATE_FRAMES), _dclip(GATE_FRAMES, {"road_snap": 0}), "f40/f160")
+
+
+def check_holdout_snap_no_worse_than_off() -> None:
+    if not _need_clip("holdout_snap_no_worse_than_off"):
+        return SKIPPED
+    snap_no_worse_gate(_dclip(TRACER_HOLDOUT), _dclip(TRACER_HOLDOUT, {"road_snap": 0}), "holdout f100/f200")
+
+
+def check_clean_holdout_snap_no_worse_than_off() -> None:
+    if not _need_clip("clean_holdout_snap_no_worse_than_off"):
+        return SKIPPED
+    snap_no_worse_gate(_dclip(CLEAN_HOLDOUT), _dclip(CLEAN_HOLDOUT, {"road_snap": 0}), "clean holdout f70")
+
+
+def check_clip015_footprint() -> None:
+    if not _need_clip("clip015_footprint"):
+        return SKIPPED
+    footprint_gate(_dclip(GATE_FRAMES), "f40/f160")
+
+
+def check_holdout_footprint() -> None:
+    if not _need_clip("holdout_footprint"):
+        return SKIPPED
+    footprint_gate(_dclip(TRACER_HOLDOUT), "holdout f100/f200")
+
+
+def check_clean_holdout_footprint() -> None:
+    if not _need_clip("clean_holdout_footprint"):
+        return SKIPPED
+    footprint_gate(_dclip(CLEAN_HOLDOUT), "clean holdout f70")
+
+
+def check_clip015_rear_holes_poseB() -> None:
+    """Rear holes on pose B at frame 110 (Michael's still). Same 2% / 5% gates."""
+    if not _need_clip("clip015_rear_holes_poseB"):
+        return SKIPPED
+    m = clip_poseB_holes()
+    print(f"pose B frame {POSE_B_FRAME} nearest:", m["used"], "holes:", m["holes"], flush=True)
+    hole_gate(m["holes"], f"pose B f{POSE_B_FRAME}")
+
+
+def check_road_labelled_object_top_stays_put() -> None:
+    """A wall / car / curb top labelled road stays put: snap must not move it outward, and it keeps height and depth."""
+    p = pv()
+    bad = []
+    for cid, kind, x0, y0 in (("pillarR", "car", 2.5, 0.0), ("pillarR", "curb", 3.5, -3.0),
+                              ("wide", "car", 0.0, 8.0), ("main", "car", 0.0, 10.0), ("pillarL", "pole", -3.0, 1.0)):
+        cam = p.cam.get(cid)
+        if cam is None:
+            continue
+        if cid in ("wide", "main"):
+            # a face ahead, x = lateral, y = range: reuse object_scene-like geometry along y
+            g = geom(cam)
+            rays = g["rays"]
+            w, h_ = (1.8, 1.5) if kind == "car" else (0.15, 2.5)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = np.where(rays[..., 1] > 1e-9, (y0 - cam.pos[1]) / rays[..., 1], np.inf)
+                X = cam.pos[0] + t * rays[..., 0]
+                Z = cam.pos[2] + t * rays[..., 2]
+            face = np.isfinite(t) & (np.abs(X) <= w / 2) & (Z >= 0) & (Z <= h_) & (t < g["hit"])
+            gt = np.where(face, t, np.where(g["down"], g["hit"], np.inf))
+        else:
+            gt, fine0, face, g = side_object_scene(cam, kind, x0, y0)
+        if not face.any():
+            continue
+        zf = heights(cam, np.where(np.isfinite(gt), gt, 0.0))
+        zmax = float(zf[face].max())
+        top = face & (zf >= zmax - 0.15)   # the top 0.15 m of the object, labelled road
+        if not top.any():
+            continue
+        fine = np.where(top, ROAD_ID, np.where(face, OBJ_ID, np.where(~g["down"], sf_sky(), ROAD_ID)))
+        raw = np.where(np.isfinite(gt), gt, 1e4)
+        _, d, v, _ = p.run(cid, raw, fine)
+        ys, xs = np.nonzero(top)
+        if ys.size == 0:
+            continue
+        # snap must not pull these pixels onto the ground or farther along the ray
+        moved = (np.abs(d[top] - raw[top]) > 0.05) & v[top]
+        z_r = heights(cam, d)
+        lost = zf[top] - z_r[top]
+        outward = (d[top] > raw[top] + 0.05) & np.isfinite(d[top])
+        if outward.any() or (lost[v[top]] > OBJ_TOL_M).any() if v[top].any() else False:
+            bad.append(f"{cid} {kind} top: {int(outward.sum())} px moved outward, "
+                       f"max height lost {float(lost[v[top]].max()) if v[top].any() else 0:.3f} m, "
+                       f"GT z up to {zmax:.2f} m")
+    assert not bad, "; ".join(bad)
 
 
 # ------------------------------------------------------------------ hypothesis props
@@ -863,6 +1329,20 @@ CHECKS = [
     check_synthetic_edge_overshoot,
     check_synthetic_rear_holes,
     check_side_objects_keep_height_pins,
+    check_road_labelled_object_top_stays_put,
+    check_clip015_snap_misplace,
+    check_holdout_snap_misplace,
+    check_clean_holdout_snap_misplace,
+    check_clip015_edge_position,
+    check_holdout_edge_position,
+    check_clean_holdout_edge_position,
+    check_clip015_snap_no_worse_than_off,
+    check_holdout_snap_no_worse_than_off,
+    check_clean_holdout_snap_no_worse_than_off,
+    check_clip015_footprint,
+    check_holdout_footprint,
+    check_clean_holdout_footprint,
+    check_clip015_rear_holes_poseB,
     check_clip015_width,
     check_holdout_width,
     check_clip015_edge_overshoot,
@@ -881,6 +1361,7 @@ KNOWN_FAILING: dict[str, str] = {
     "check_synthetic_edge_overshoot": "L: road 0.35 m (pillars) / 0.71 m (repeats) past the GT edge at 0-5 m (12x16 label bleed)",
     "check_side_objects_keep_height_pins": "N: pillarR parked car x2.5 lost 1.07 m on 88 px; pole x3 lost 1.07 m on 351/391 px; curbs lost 0.11 m",
     "prop_side_objects_keep_height": "N: pillarL pole at x=-2.0, y0=0.0: lost 0.592 m",
+    "check_road_labelled_object_top_stays_put": "N: pillarR car top 218 px moved outward (GT z 1.50 m); curb top 1487 px, height lost 0.15 m; main car top also snapped outward",
 }
 
 _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}

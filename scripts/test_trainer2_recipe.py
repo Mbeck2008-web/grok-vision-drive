@@ -648,7 +648,8 @@ def check_deploy_real_export() -> None:
                         for prm in net.parameters():
                             prm.add_(torch.randn_like(prm) * 1e-3)
                 path = export_scene_onnx(Path(raw) / f"{preset}{int(perturb)}.onnx", net, cams=("main",))
-                out = rec.check_export_fits_deploy(net, path, preset=preset)
+                ref = SceneNet(cams=("main",), **scene_net_kwargs(preset))
+                out = rec.check_export_fits_deploy(net, path, preset=preset, reference=ref)
                 assert out["ok"] and out["params"] == rec.onnx_initializer_count(path), out
         # training-only aux heads are not in the export and not in the student count
         aux = SceneNet(cams=("main",), aux_sensors=True, **scene_net_kwargs("small"))
@@ -657,22 +658,36 @@ def check_deploy_real_export() -> None:
             for prm in aux.parameters():
                 prm.add_(torch.randn_like(prm) * 1e-3)
         aux_path = export_scene_onnx(Path(raw) / "aux.onnx", aux, cams=("main",))
-        out = rec.check_export_fits_deploy(aux, aux_path, preset="small")
+        aux_ref = SceneNet(cams=("main",), aux_sensors=True, **scene_net_kwargs("small"))
+        out = rec.check_export_fits_deploy(aux, aux_path, preset="small", reference=aux_ref)
         assert out["params"] == rec.onnx_initializer_count(aux_path) < sum(p.numel() for p in aux.parameters()), out
         small = SceneNet(cams=("main",), **scene_net_kwargs("small"))
         tiny_path = Path(raw) / "tiny0.onnx"
         try:
-            rec.check_export_fits_deploy(small, tiny_path, preset="small")
+            rec.check_export_fits_deploy(small, tiny_path, preset="small", reference=small)
         except rec.RecipeRefused as exc:
             assert "param count" in str(exc)
         else:
             raise AssertionError("a small net against a tiny export must fail")
         try:
-            rec.check_export_fits_deploy(small, tiny_path, preset="medium")
+            rec.check_export_fits_deploy(small, tiny_path, preset="medium", reference=small)
         except rec.RecipeRefused:
             pass
         else:
             raise AssertionError("medium must fail the deploy check")
+        # Bound to the preset: a medium net (its own export, its own count) labelled "small" or "tiny" is refused
+        # against a reference built from that preset's kwargs; the same net with its true preset label is a
+        # different refusal (not a deploy size), so the label cannot rescue it either way.
+        big = SceneNet(cams=("main",), **scene_net_kwargs("medium"))
+        big_path = export_scene_onnx(Path(raw) / "medium.onnx", big, cams=("main",))
+        for label in ("small", "tiny"):
+            try:
+                rec.check_export_fits_deploy(big, big_path, preset=label,
+                                             reference=SceneNet(cams=("main",), **scene_net_kwargs(label)))
+            except rec.RecipeRefused as exc:
+                assert "is not a" in str(exc) and label in str(exc), exc
+            else:
+                raise AssertionError(f"a medium net labelled {label} passed the deploy check")
         import onnx
         from onnx import TensorProto, helper
 
@@ -1088,6 +1103,114 @@ def check_run_recipe_end_to_end() -> None:
     print("_run_trainer2_recipe end to end: stage 1 trains then refuses (unmeasured), stage 2 inits from it, recipe-owned exit on real rms, exports, deploy OK, last ckpt chained; old ckpt untouched OK")
 
 
+def _ckpt_of(net, path, **meta):
+    from python.train.epoch_ckpt import write_epoch_ckpt
+
+    base = {"epoch": 3, "step": 7, "cams": ["main"], "scale": 1.0, "backbone": "scratch", "cam_age": False,
+            "ctl": False, "heads": [], "preset": "small"}
+    base.update(meta)
+    write_epoch_ckpt(path, {k: v.detach().cpu().numpy() for k, v in net.state_dict().items()}, base, min_free_bytes=0)
+    return path
+
+
+def check_camera_only_deploy_export() -> None:
+    """The deploy graph of a stage-7-shaped checkpoint (ctl + aux + road_edge + stop_line) is exported ctl-free.
+
+    ``--export`` refuses a ctl net, and stage 7 trains ctl, so the recipe exports the last checkpoint with the ctl
+    head dropped and no ctl-cond input (camera-only runtime), create-only, and checks it against the preset.
+    """
+    torch = _torch()
+    if torch is None:
+        skip_check("check_camera_only_deploy_export", "torch not installed")
+        return
+    try:
+        import onnx  # noqa: F401
+    except ImportError:
+        skip_check("check_camera_only_deploy_export", "onnx not installed (CI installs it)")
+        return
+    from onnx import numpy_helper
+
+    from python.train.epoch_ckpt import load_epoch_ckpt
+    from python.train.model_size import scene_net_kwargs
+    from python.train.scene_net import SceneNet
+
+    rec = _recipe()
+    heads = ["lanes", "objects", "signs", "lane_gt", "road_edge", "stop_line", "ctl"]
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        net = SceneNet(cams=("main",), ctl=True, aux_sensors=True, road_edge=True, stop_line=True, **scene_net_kwargs("small"))
+        with torch.no_grad():
+            for prm in net.parameters():
+                prm.add_(torch.randn_like(prm) * 1e-2)
+        assert hasattr(net, "ctl_head")
+        ck = _ckpt_of(net, base / "s7.ckpt_ep3_step7.npz", ctl=True, heads=heads)
+        out = base / "deploy.onnx"
+        info = rec.export_camera_only_deploy(ck, out, preset="small")
+        assert info["ok"] is True and info["onnx"] == str(out) and out.is_file(), info
+        model = onnx.load(str(out))
+        names = {i.name for i in model.graph.initializer}
+        assert not any("ctl_head" in n for n in names), [n for n in names if "ctl" in n]
+        assert not any("cond" in i.name.lower() for i in model.graph.input), [i.name for i in model.graph.input]
+        assert not any("ctl" in o.name.lower() for o in model.graph.output), [o.name for o in model.graph.output]
+        props = {p.key: p.value for p in model.metadata_props}
+        assert "ctl" not in props.get("gvd_heads", "ctl-absent").split(","), props
+        assert props.get("gvd_ckpt_file") == ck.name and props.get("gvd_ckpt_epoch") == "3", props
+        # every other tensor is the checkpoint's own (the last checkpoint, not a re-init)
+        w = load_epoch_ckpt(ck)["weights"]
+        inits = {i.name.removeprefix("net."): numpy_helper.to_array(i) for i in model.graph.initializer}
+        shared = [k for k in w if k in inits and inits[k].shape == np.shape(w[k])]
+        assert len(shared) >= 10 and all(np.array_equal(inits[k], np.asarray(w[k])) for k in shared)
+        # create-only: an existing file is refused first and is left byte-for-byte alone
+        before = out.read_bytes()
+        try:
+            rec.export_camera_only_deploy(ck, out, preset="small")
+        except rec.RecipeRefused as exc:
+            assert "create-only" in str(exc), exc
+        else:
+            raise AssertionError("an existing --export file must be refused, not overwritten")
+        assert out.read_bytes() == before
+        # a failing deploy check leaves no file and no .partial
+        out2 = base / "deploy2.onnx"
+        saved = rec.check_export_fits_deploy
+
+        def boom(*a, **k):
+            raise rec.RecipeRefused("count differs")
+
+        rec.check_export_fits_deploy = boom
+        try:
+            rec.export_camera_only_deploy(ck, out2, preset="small")
+        except rec.RecipeRefused:
+            pass
+        else:
+            raise AssertionError("a failed deploy check must refuse")
+        finally:
+            rec.check_export_fits_deploy = saved
+        assert not out2.exists() and not list(base.glob("deploy2*")), list(base.iterdir())
+        # camera-only: a ctl-cond / route-cond checkpoint is not exported
+        cond = SceneNet(cams=("main",), ctl=True, cond_dim=4, **scene_net_kwargs("small"))
+        cck = _ckpt_of(cond, base / "cond.ckpt_ep3_step7.npz", ctl=True, ctl_cond_dim=4, heads=heads)
+        try:
+            rec.export_camera_only_deploy(cck, base / "cond.onnx", preset="small")
+        except rec.RecipeRefused as exc:
+            assert "camera-only" in str(exc), exc
+        else:
+            raise AssertionError("--ctl-cond must never reach the deploy export")
+        assert not (base / "cond.onnx").exists()
+        # bound to the preset: a medium checkpoint labelled small, and a small one asked for as tiny, are refused
+        med = SceneNet(cams=("main",), **scene_net_kwargs("medium"))
+        for label, preset_asked, case_net in (("small", "small", med), ("medium", "small", med), ("small", "tiny", net)):
+            c = _ckpt_of(case_net, base / f"{label}_{preset_asked}.ckpt_ep3_step7.npz", preset=label,
+                         ctl=bool(case_net is net), heads=heads if case_net is net else [])
+            try:
+                rec.export_camera_only_deploy(c, base / f"{label}_{preset_asked}.onnx", preset=preset_asked)
+            except rec.RecipeRefused:
+                pass
+            else:
+                raise AssertionError(f"{label}-labelled {('medium' if case_net is med else 'small')} net passed as {preset_asked}")
+            assert not (base / f"{label}_{preset_asked}.onnx").exists()
+    print("camera-only deploy export: ctl dropped from a stage-7 ckpt, last-ckpt weights, create-only, preset-bound, ctl-cond refused, failed check leaves no file OK")
+
+
 def check_main_recipe_without_manifest_exits_2() -> None:
     torch = _torch()
     if torch is None:
@@ -1155,6 +1278,7 @@ def main() -> int:
         check_stage_result_from_stats_is_real,
         check_deploy_real_export,
         check_retention_real_paths,
+        check_camera_only_deploy_export,
         check_more_pins,
         check_balanced_loss_keeps_extras,
         check_recipe_stages_train_on_fixture,

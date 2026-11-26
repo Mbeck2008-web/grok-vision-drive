@@ -162,6 +162,7 @@ class CurriculumResult:
     metrics: dict[str, float]
     last_ckpt: str | None
     logs: list[str] = field(default_factory=list)
+    deploy: dict[str, Any] | None = None  # filled by the CLI runner after the camera-only export
 
 
 def validate_live_export_recipe(
@@ -402,8 +403,21 @@ def live_vram_fits(vram: float) -> bool:
     return float(vram) <= LIVE_INFER_VRAM_GB
 
 
-def student_export_fits_deploy(*, preset: str, student_param_count: int, exported_param_count: int) -> None:
-    """The exported student's param count matches the architecture, and the preset fits a 4 GB live budget."""
+def student_export_fits_deploy(
+    *,
+    preset: str,
+    student_param_count: int,
+    exported_param_count: int,
+    reference_param_count: int | None = None,
+    student_arch_count: int | None = None,
+) -> None:
+    """The exported student's param count matches the architecture, and the preset fits a 4 GB live budget.
+
+    ``reference_param_count`` is the deployed parameter count of a net built from the
+    *preset's* own constructor kwargs (same cams and flags); ``student_arch_count`` is the
+    student's, counted the same way. A net of another size labelled with this preset
+    differs from the reference and is refused (the spec's ``architecture_parameter_count``).
+    """
     from python.train.model_size import PRESETS
 
     name = str(preset or "")
@@ -425,6 +439,12 @@ def student_export_fits_deploy(*, preset: str, student_param_count: int, exporte
             f"exported ONNX param count {int(exported_param_count)} != student "
             f"param count {int(student_param_count)} (both counted by export_param_counts)"
         )
+    if reference_param_count is not None:
+        if student_arch_count is None or int(student_arch_count) != int(reference_param_count):
+            raise RecipeRefused(
+                f"student has {student_arch_count} deployed parameters but preset {name!r} "
+                f"builds {int(reference_param_count)}: the net is not a {name!r} net"
+            )
 
 
 def deployed_parameters(net: Any) -> list[Any]:
@@ -508,11 +528,101 @@ def export_param_counts(net: Any, path: Path | str) -> tuple[int, int]:
     return deduplicated_parameter_count(deployed_parameters(net)), onnx_initializer_count(path)
 
 
-def check_export_fits_deploy(net: Any, path: Path | str, *, preset: str) -> dict[str, Any]:
-    """Deploy check on a real export: preset fits 4 GB, ONNX initializers match the student net."""
+def check_export_fits_deploy(net: Any, path: Path | str, *, preset: str, reference: Any) -> dict[str, Any]:
+    """Deploy check on a real export, bound to the preset.
+
+    ``reference`` is a net built from ``scene_net_kwargs(preset)`` (same cams and flags),
+    never from the student's own checkpoint: the student must have the preset's deployed
+    parameter count, and its ONNX initializers must add up to the student's parameters.
+    """
     student, exported = export_param_counts(net, path)
-    student_export_fits_deploy(preset=preset, student_param_count=student, exported_param_count=exported)
-    return {"ok": True, "preset": str(preset), "params": int(student), "onnx": str(path)}
+    arch = sum(int(p.numel()) for p in deployed_parameters(net))
+    ref = sum(int(p.numel()) for p in deployed_parameters(reference))
+    student_export_fits_deploy(
+        preset=preset, student_param_count=student, exported_param_count=exported,
+        reference_param_count=ref, student_arch_count=arch,
+    )
+    return {"ok": True, "preset": str(preset), "params": int(student), "arch_params": int(arch),
+            "onnx": str(path)}
+
+
+def camera_only_deploy_net(ckpt: Path | str, *, preset: str) -> tuple[Any, Any, dict[str, Any]]:
+    """``(net, reference, meta)`` for the camera-only deploy graph of one recipe checkpoint.
+
+    The last stage trains ``ctl`` (stage 7) and ``--export`` refuses a ctl net. The
+    deployed student is camera-only: this builds the checkpoint's net without the ctl
+    head (and with no ctl-cond input), loads every other tensor, and refuses a
+    checkpoint that carries ``--ctl-cond`` / route-cond inputs or whose preset label
+    is not ``preset``. ``reference`` is the same net built from the *preset's* kwargs.
+    """
+    from python.train.epoch_ckpt import build_net, load_epoch_ckpt, load_into_net
+    from python.train.model_size import refuse_preset_mismatch
+
+    from python.train.model_size import PresetMismatch
+
+    loaded = load_epoch_ckpt(ckpt)
+    meta, weights = dict(loaded["meta"]), dict(loaded["weights"])
+    try:
+        refuse_preset_mismatch(preset, meta)
+    except PresetMismatch as exc:
+        raise RecipeRefused(str(exc)) from exc
+    if int(meta.get("ctl_cond_dim") or 0) or meta.get("route_cond") or any(k.startswith("route_proj.") for k in weights):
+        raise RecipeRefused("the deploy export is camera-only: a ctl-cond / route-cond checkpoint is not exported")
+    meta_free = dict(meta, ctl=False, ctl_cond_dim=0, route_cond=False)
+    try:
+        net = build_net(meta_free, weights)
+    except PresetMismatch as exc:
+        raise RecipeRefused(str(exc)) from exc
+    keep = net.state_dict()
+    dropped = [k for k in weights if k not in keep]
+    if any(not k.startswith("ctl_head.") for k in dropped):
+        raise RecipeRefused(f"the camera-only net does not have tensors {[k for k in dropped if not k.startswith('ctl_head.')][:3]}")
+    free = {k: v for k, v in weights.items() if k in keep}
+    try:
+        load_into_net(net, free)
+    except (RuntimeError, KeyError, ValueError) as exc:
+        raise RecipeRefused(f"the checkpoint's tensors are not a {preset!r} net: {str(exc)[:200]}") from exc
+    reference = build_net(dict(meta_free, preset=str(preset)), free)
+    return net.cpu().eval(), reference.cpu().eval(), meta
+
+
+def export_camera_only_deploy(ckpt: Path | str, out: Path | str, *, preset: str) -> dict[str, Any]:
+    """Export the camera-only (ctl-free) ONNX of the last recipe checkpoint and run the deploy check on it.
+
+    ``out`` is create-only (``export_scene_onnx`` overwrites an existing non-ctl file, so
+    this refuses first). The graph is written to a private ``.partial`` file, checked, then
+    linked into place; a failed check leaves no ``out``.
+    """
+    import os
+
+    from python.data.binary_io import link_or_copy_new
+    from python.train.cam_strip import GT_LABELER_META, GT_ORIGIN_META, stamp_onnx_metadata
+    from python.train.epoch_ckpt import sha256_file, unlink_own_partial
+    from python.train.scene_net import export_scene_onnx
+
+    ckpt, out = Path(ckpt), Path(out)
+    if out.exists():
+        raise RecipeRefused(f"--export {out.name} already exists; the recipe export is create-only")
+    net, reference, meta = camera_only_deploy_net(ckpt, preset=preset)
+    heads = tuple(h for h in (meta.get("heads") or ()) if h != "ctl") or None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    partial = out.with_name(f"{out.name}.partial-{os.getpid()}.onnx")
+    try:
+        gt_frame = {key: str(meta.get(key) or "unknown") for key in (GT_ORIGIN_META, GT_LABELER_META)}
+        export_scene_onnx(partial, net, heads=heads, gt_frame=gt_frame)
+        deploy = check_export_fits_deploy(net, partial, preset=preset, reference=reference)
+        stamp_onnx_metadata(str(partial), {
+            "gvd_ckpt_file": ckpt.name, "gvd_ckpt_sha256": sha256_file(ckpt),
+            "gvd_ckpt_epoch": str(int(meta["epoch"])), "gvd_ckpt_step": str(int(meta["step"])),
+            "gvd_ckpt_run": str(meta.get("run") or ""), "gvd_scale": str(float(meta.get("scale") or 1.0)),
+        })
+        link_or_copy_new(partial, out)
+    finally:
+        if partial.exists():
+            unlink_own_partial(partial, owned_partials=(partial,))
+    deploy["onnx"] = str(out)
+    deploy["ckpt"] = str(ckpt)
+    return deploy
 
 
 def may_unlink_checkpoint(path: Path | str, *, owned_partials: Iterable[Path | str] | None = None) -> bool:

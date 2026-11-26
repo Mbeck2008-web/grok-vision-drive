@@ -4166,11 +4166,6 @@ def train_directory(
                 _train_passes()
         if not paused_exit and not dry_run and not sanity and export_path is not None:
             export_scene_onnx(export_path, net, heads=train_heads, gt_frame=gt_frame)
-            if holder.get("recipe") == "trainer2":
-                from python.train.trainer2_recipe import check_export_fits_deploy
-
-                holder["deploy"] = check_export_fits_deploy(net, export_path, preset=str(model_preset))
-                print(f"[GVD] recipe trainer2: deploy check {holder['deploy']}", flush=True)
         if not paused_exit and not dry_run and not sanity:
             clear_checkpoint(root, pause_dir=pause_dir)
     except Exception:
@@ -4205,7 +4200,6 @@ def train_directory(
         "holdout_evals": list(holder.get("holdout_evals") or []),
         "epochs_run": int(holder.get("epochs_run") or 0),
         "epoch_ckpts": list(holder.get("epoch_ckpts") or []),
-        "deploy": holder.get("deploy"),
     }
 
 
@@ -4419,7 +4413,7 @@ def _recipe_stage_kwargs(args: argparse.Namespace, stage_id: str, ctx: Mapping[s
         epochs=min(int(args.epochs), STAGE_MAX_EPOCHS) if int(args.epochs) else STAGE_MAX_EPOCHS,
         lr=args.lr,
         capability=args.capability,
-        export_path=ctx.get("stage_export"),
+        export_path=None,  # the recipe exports once, after the curriculum (export_camera_only_deploy)
         resume=False,  # a stage never resumes another stage's pause file
         sanity=False,
         dry_run=False,
@@ -4525,6 +4519,7 @@ def _run_trainer2_recipe(
         MetricNotMeasured,
         RecipeRefused,
         StageResult,
+        export_camera_only_deploy,
         legacy_split_rows,
         parse_stage_filter,
         plan_curriculum,
@@ -4546,6 +4541,11 @@ def _run_trainer2_recipe(
     if "0" in live and bool(getattr(args, "no_ssl_pretrain", False)):
         raise RecipeRefused("stage 0 is SSL; drop --no-ssl-pretrain or pass --stage to skip 0")
     ssl_on = "0" in live
+    if export_path is not None:
+        if Path(export_path).exists():
+            raise RecipeRefused(f"--export {Path(export_path).name} already exists; the recipe export is create-only")
+        if not any(sid != "0" for sid in live):
+            raise RecipeRefused("--export needs a supervised stage to run (stage 0 is SSL only; it writes no checkpoint)")
     train_rows, hold_rows = legacy_split_rows(
         strip_roots, holdout_root, holdout_blocks=resolve_holdout_blocks(args.holdout_blocks)
     )
@@ -4561,7 +4561,6 @@ def _run_trainer2_recipe(
         "frame_cache": frame_cache, "aux_cache": aux_cache, "pause_dir": pause_dir, "start_now": start_now,
         "open_panel": open_panel, "init_stem": str(getattr(args, "init_stem", "") or "") or None, "ssl_meta": None,
     }
-    last_live = live[-1] if live else None
 
     def _call_train(stage, prev_ckpt):
         if stage_train_kwargs(stage.id)["kind"] == "ssl":
@@ -4572,19 +4571,9 @@ def _run_trainer2_recipe(
             if on:
                 ctx["init_stem"], ctx["ssl_meta"] = _default_ssl_stage(args, strip_roots, holdout_root, cam_names, net_kw)
             return stage_result_from_stats("0", {"ssl": ctx["ssl_meta"]})
-        # Only the last live stage exports; ctl is never exported (ctl refuses --export).
-        ctx["stage_export"] = None
-        if export_path is not None and stage.id == last_live:
-            if "ctl" in stage_train_kwargs(stage.id)["heads"]:
-                raise RecipeRefused(f"stage {stage.id} trains ctl; ctl refuses --export (scripts/export_epoch_onnx.py)")
-            if Path(export_path).exists():
-                raise RecipeRefused(f"--export {Path(export_path).name} already exists; the recipe export is create-only")
-            ctx["stage_export"] = export_path
         ctx["init_ckpt"] = prev_ckpt
         stats = train_directory(holdout_root, **_recipe_stage_kwargs(args, stage.id, ctx))
         ctx["last_stats"] = stats
-        if ctx["stage_export"] is not None and not (stats.get("deploy") or {}).get("ok"):
-            raise RecipeRefused("the recipe export ran but the deploy check did not pass")
         return stage_result_from_stats(stage.id, stats)
 
     result = run_curriculum(
@@ -4595,6 +4584,13 @@ def _run_trainer2_recipe(
         f"[GVD] recipe trainer2: trained={result.trained} skipped={result.skipped} ckpt={result.last_ckpt}",
         flush=True,
     )
+    if export_path is not None:
+        # One camera-only (ctl-free) export of the last stage's checkpoint, then the preset-bound deploy check.
+        deploy = export_camera_only_deploy(result.last_ckpt, export_path, preset=preset_name)
+        if deploy.get("ok") is not True:
+            raise RecipeRefused(f"the recipe export ran but the deploy check did not pass: {deploy!r}")
+        print(f"[GVD] recipe trainer2: deploy check {deploy}", flush=True)
+        result.deploy = deploy
     return result
 
 

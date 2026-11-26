@@ -458,6 +458,7 @@ def check_prediction_at_copies_keep_far() -> None:
             full = {**{k: v[b] for k, v in zero_batch.items()}, **targets[b]}  # this row's zero scene targets + its depth targets
             got = float(scene_loss(one, full, heads=("lane_gt",), aux_depth_weight=1.0)["aux_depth"].detach())
             depth_part, far_part = depth_hires_loss(one.aux_depth, one.aux_depth_far, targets[b])
+            depth_part, far_part = depth_part.detach(), far_part.detach()
             assert float(far_part) > 1e-3, "the fixture must give a non-trivial far term"
             want = float((depth_part + far_part).detach())
             assert abs(got - want) < 1e-5, f"{copy_name} row {b}: aux_depth term {got:.6f} != depth+far {want:.6f}"

@@ -725,9 +725,12 @@ def compose(chase: CameraPose, pts: np.ndarray, cols: np.ndarray, foot: np.ndarr
     sky_m = ~painted & up
     far_m_ = ~painted & ~up & (rng > far_m)
     prior = ~painted & ~up & (rng <= prior_max_m)
-    unknown = ~painted & ~sky_m & ~far_m_ & ~prior
+    # ground between the prior's reach and far_m with no point: was "unknown" (black band under the horizon, read as
+    # "no sky"). Render-only backdrop: the prior's ground colour fading into the horizon haze; never a 3-D point.
+    band = ~painted & ~up & (rng > prior_max_m) & (rng <= far_m)
+    unknown = ~painted & ~sky_m & ~far_m_ & ~prior & ~band
     haze = None
-    if sky_rgb is not None and (sky_m.any() or far_m_.any()):
+    if sky_rgb is not None and (sky_m.any() or far_m_.any() or band.any()):
         s = np.asarray(sky_rgb, np.float64)
         haze = 0.6 * s + 0.4 * np.array([225.0, 225.0, 225.0])
         # horizon row per column: where the ray elevation crosses 0
@@ -744,8 +747,14 @@ def compose(chase: CameraPose, pts: np.ndarray, cols: np.ndarray, foot: np.ndarr
         g = sky_gradient(chase.height, chase.width, cols_h, s, haze)
         rgb[sky_m] = g[sky_m]
         rgb[far_m_] = np.clip(np.round(haze), 0, 255).astype(np.uint8)
+        if band.any():
+            base = np.asarray(ground_rgb, np.float64) * 0.7 if ground_rgb is not None else haze
+            k = np.clip((rng - prior_max_m) / max(far_m - prior_max_m, 1e-6), 0.0, 1.0)[..., None]
+            gb = (1.0 - k) * base[None, None, :] + k * haze[None, None, :]
+            rgb[band] = np.clip(np.round(gb[band]), 0, 255).astype(np.uint8)
+            far_m_ = far_m_ | band
     else:
-        unknown |= sky_m | far_m_
+        unknown |= sky_m | far_m_ | band
         sky_m = np.zeros_like(sky_m)
         far_m_ = np.zeros_like(far_m_)
     if ground_rgb is not None and prior.any():

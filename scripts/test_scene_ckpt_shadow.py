@@ -80,7 +80,7 @@ def check_loader_round_trip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = _write_ckpt(Path(tmp), net)
         runtime = SceneCkptRuntime(path)
-        out = runtime.observe(frame, 0.1)
+        out = runtime.observe({"main": frame}, 0.1)
     got = np.asarray(out.lane_gt, dtype=np.float32).reshape(-1)
     assert got.shape == teacher.shape, (got.shape, teacher.shape)
     if not np.allclose(got, teacher, atol=1e-5, rtol=1e-5):
@@ -112,7 +112,7 @@ def check_aux_ckpt_without_meta_flag() -> None:
         path = _write_ckpt(Path(tmp), net, meta_extra={"aux_sensors": None})
         runtime = SceneCkptRuntime(path)
         assert runtime.aux_sensors is True
-        out = runtime.observe(frame, 0.05)
+        out = runtime.observe({"main": frame}, 0.05)
     got = np.asarray(out.lane_gt, dtype=np.float32).reshape(-1)
     assert np.allclose(got, teacher, atol=1e-5, rtol=1e-5), float(np.max(np.abs(got - teacher)))
     print("aux ckpt without meta.aux_sensors: inferred and matched teacher OK")
@@ -132,17 +132,17 @@ def check_main_cam_shape() -> None:
         runtime = SceneCkptRuntime(_write_ckpt(Path(tmp), net))
         empty = runtime.observe(None, 0.1)
         assert empty.lane_gt is None and empty.lane_x is None
-        ok = runtime.observe(_fixture_main(), 0.1)
+        ok = runtime.observe({"main": _fixture_main()}, 0.1)
         assert ok.canvas_shape == (192, 256, 3), ok.canvas_shape
         assert np.asarray(ok.lane_gt).reshape(-1).size >= 14
         try:
-            runtime.observe(np.zeros((480, 640), dtype=np.uint8), 0.1)
+            runtime.observe({"main": np.zeros((480, 640), dtype=np.uint8)}, 0.1)
         except SceneCkptInputError as exc:
             assert "channel" in str(exc).lower() or "shape" in str(exc).lower(), exc
         else:
             raise AssertionError("grayscale main frame was accepted")
         try:
-            runtime.observe(np.zeros((480, 640, 4), dtype=np.uint8), 0.1)
+            runtime.observe({"main": np.zeros((480, 640, 4), dtype=np.uint8)}, 0.1)
         except SceneCkptInputError as exc:
             assert "channel" in str(exc).lower() or "shape" in str(exc).lower(), exc
         else:

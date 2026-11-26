@@ -585,12 +585,12 @@ def check_overlay_caption_drawn_through_draw() -> None:
 def check_same_tick_observe_documented() -> None:
     """Pred is computed on this tick's main frame (no cached / aged pred).
 
-    Code pointer: python/run_vision.py observe(main, tick_dt) then
-    apply_scene_ckpt_lane in the same loop body. No pred-age/frame-id gate
-    is required while observe always uses the current frame.
+    Code pointer: python/run_vision.py observe(ckpt_frames, tick_dt) (this tick's live
+    8-camera frame dict) then apply_scene_ckpt_lane in the same loop body. No
+    pred-age/frame-id gate is required while observe always uses the current frame.
     """
     src = (ROOT / "python" / "run_vision.py").read_text()
-    assert "ckpt_pred = scene_ckpt.observe(main, tick_dt, route=route_vec)" in src
+    assert "ckpt_pred = scene_ckpt.observe(ckpt_frames, tick_dt, route=route_vec)" in src
     assert "apply_scene_ckpt_lane(pout, ckpt_pred, drive=True)" in src
     # No last-pred reuse cache in the runtime.
     rt = (ROOT / "python" / "train" / "scene_ckpt_runtime.py").read_text()

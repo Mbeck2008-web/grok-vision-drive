@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Refuse a multi-camera scene-ckpt: this shadow path only has the main frame.
+"""A multi-camera scene-ckpt loads: --scene-ckpt takes the live 8-camera frame dict.
 
-_main_canvas composes {"main": frame} then extract_cams for whatever cams the
-checkpoint lists. Missing sectors stay black. Engage is already off; drawing
-a lane from black side cameras is still the wrong image.
+Before Trainer 2.0 PR2b (#188) the shadow path only had the main frame, so any
+checkpoint listing more than ``main`` was refused at load (side sectors would
+have been black). ``_main_canvas`` now composes the whole live dict, so those
+checkpoints load; scripts/test_scene_ckpt_8cam.py pins what they are fed.
 
     py -3 scripts/test_scene_ckpt_multicam.py
 """
@@ -18,11 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-def check_multicam_refused_at_load() -> None:
+def check_multicam_loads() -> None:
     import torch
 
     from python.train.epoch_ckpt import epoch_ckpt_path, write_epoch_ckpt
-    from python.train.scene_ckpt_runtime import SceneCkptInputError, SceneCkptRuntime
+    from python.train.scene_ckpt_runtime import SceneCkptRuntime
     from python.train.scene_net import SceneNet
 
     torch.manual_seed(0)
@@ -42,14 +43,10 @@ def check_multicam_refused_at_load() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = epoch_ckpt_path(Path(tmp), Path(tmp) / "scene_lanes", "20261107T011144Z", 0, 1)
         write_epoch_ckpt(path, weights, meta, min_free_bytes=0)
-        try:
-            SceneCkptRuntime(path)
-        except SceneCkptInputError as exc:
-            msg = str(exc).lower()
-            assert "main" in msg and ("black" in msg or "camera" in msg or "cams" in msg), exc
-            print(f"multi-cam ckpt refused at load: {exc}")
-        else:
-            raise AssertionError("eight/multi-camera checkpoint loaded; side cameras would be black")
+        rt = SceneCkptRuntime(path)
+        assert tuple(rt.cams) == ("main", "wide"), rt.cams
+        assert rt.canvas_h == 192 and rt.canvas_w > 256, (rt.canvas_h, rt.canvas_w)
+        print(f"multi-cam ckpt loads: cams={list(rt.cams)} canvas {rt.canvas_h}x{rt.canvas_w}")
 
 
 def check_main_only_still_loads() -> None:
@@ -82,7 +79,7 @@ def check_main_only_still_loads() -> None:
 
 
 def main() -> None:
-    check_multicam_refused_at_load()
+    check_multicam_loads()
     check_main_only_still_loads()
     print("test_scene_ckpt_multicam: OK")
 

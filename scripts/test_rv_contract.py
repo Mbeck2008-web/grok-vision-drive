@@ -100,6 +100,31 @@ def check_flag_off_is_placeholder() -> None:
         assert np.array_equal(main_out, ref), f"main view placeholder altered for {st}"
         assert _sha256(main_out) == _sha256(ref)
 
+    # Flag OFF path in run_vision must not import python.viz.rv_contract into sys.modules.
+    lazy_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "from python.run_vision import build_parser, start_reality_view; "
+                "assert 'python.viz.rv_contract' not in sys.modules, 'imported on run_vision import'; "
+                "args = build_parser().parse_args([]); "
+                "assert start_reality_view(args) is None; "
+                "assert 'python.viz.rv_contract' not in sys.modules, 'rv_contract imported when flag OFF (default)'; "
+                "assert start_reality_view(args, cameras={'viz': {'reality_view_enabled': 'true'}}) is None; "
+                "assert 'python.viz.rv_contract' not in sys.modules, 'rv_contract imported on truthy string'; "
+                "print('LAZY_OK')"
+            ),
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert lazy_probe.returncode == 0, f"lazy import check failed: {lazy_probe.stdout} {lazy_probe.stderr}"
+    assert "LAZY_OK" in lazy_probe.stdout
+
 
 def _ast_imported_modules(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -197,6 +222,148 @@ def check_live_path_is_separate_process() -> None:
         client.close()
     assert client.is_alive() is False
 
+    # 6. Intermediate parent SIGKILL must not orphan the --serve stub (PDEATHSIG on Linux, ppid poll fallback).
+    import signal
+    import time
+
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _wait_pid_exit(pid: int, timeout_s: float = 4.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not _pid_alive(pid):
+                return True
+            time.sleep(0.05)
+        return not _pid_alive(pid)
+
+    # Case A: intermediate parent launches stub via RvClient, then gets SIGKILLed.
+    parent_a = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import time; "
+                "from python.viz.rv_contract import RvClient; "
+                "c = RvClient(); "
+                "pid = c.launch(); "
+                "print(pid, flush=True); "
+                "time.sleep(60)"
+            ),
+        ],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stub_pid_a: int | None = None
+    try:
+        assert parent_a.stdout is not None
+        line_a = parent_a.stdout.readline().strip()
+        assert line_a.isdigit(), f"unexpected parent_a output: {line_a!r}"
+        stub_pid_a = int(line_a)
+        assert _pid_alive(stub_pid_a), f"stub_pid_a {stub_pid_a} not alive"
+        parent_a.kill()
+        parent_a.wait(timeout=5)
+        assert _wait_pid_exit(stub_pid_a, timeout_s=4.0), f"stub_pid_a {stub_pid_a} orphaned after parent SIGKILL"
+    finally:
+        if parent_a.poll() is None:
+            parent_a.kill()
+            parent_a.wait(timeout=5)
+        if stub_pid_a is not None and _pid_alive(stub_pid_a):
+            try:
+                os.kill(stub_pid_a, signal.SIGKILL)
+            except OSError:
+                pass
+
+    # Case B: intermediate parent spawns --serve with stdin kept open by grandparent pipe (so EOF cannot trigger).
+    r_fd, w_fd = os.pipe()
+    os.set_inheritable(r_fd, True)
+    parent_b = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time; "
+                "from python.viz.rv_contract import RV_RENDERER_MODULE, pdeathsig_preexec; "
+                f"p = subprocess.Popen([sys.executable, '-m', RV_RENDERER_MODULE, '--serve'], stdin={r_fd}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=pdeathsig_preexec()); "
+                "print(p.pid, flush=True); "
+                "time.sleep(60)"
+            ),
+        ],
+        cwd=str(ROOT),
+        pass_fds=(r_fd,),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    os.close(r_fd)
+    stub_pid_b: int | None = None
+    try:
+        assert parent_b.stdout is not None
+        line_b = parent_b.stdout.readline().strip()
+        assert line_b.isdigit(), f"unexpected parent_b output: {line_b!r} stderr={parent_b.stderr.read() if parent_b.stderr else ''}"
+        stub_pid_b = int(line_b)
+        assert _pid_alive(stub_pid_b), f"stub_pid_b {stub_pid_b} not alive"
+        parent_b.kill()
+        parent_b.wait(timeout=5)
+        assert _wait_pid_exit(stub_pid_b, timeout_s=4.0), (
+            f"stub_pid_b {stub_pid_b} orphaned after parent SIGKILL with open stdin"
+        )
+    finally:
+        try:
+            os.close(w_fd)
+        except OSError:
+            pass
+        if parent_b.poll() is None:
+            parent_b.kill()
+            parent_b.wait(timeout=5)
+        if stub_pid_b is not None and _pid_alive(stub_pid_b):
+            try:
+                os.kill(stub_pid_b, signal.SIGKILL)
+            except OSError:
+                pass
+
+    # Case C (Linux): verify prctl PR_SET_PDEATHSIG(SIGTERM) is armed by both pdeathsig_preexec and stub._install_pdeathsig.
+    if sys.platform.startswith("linux"):
+        pdeath_probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import ctypes, signal, subprocess, sys; "
+                    "from python.viz.rv_contract import pdeathsig_preexec; "
+                    "fn = pdeathsig_preexec(); "
+                    "assert fn is not None; "
+                    "p = subprocess.run([sys.executable, '-c', "
+                    "'import ctypes; libc=ctypes.CDLL(None); pr=libc.prctl; "
+                    "pr.argtypes=[ctypes.c_int,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong]; "
+                    "s=ctypes.c_int(0); assert pr(2, ctypes.addressof(s), 0,0,0)==0; print(s.value)'], "
+                    "preexec_fn=fn, capture_output=True, text=True, check=True); "
+                    "assert int(p.stdout.strip()) == signal.SIGTERM, p.stdout; "
+                    "from python.viz.rv_renderer_stub import _install_pdeathsig; "
+                    "assert _install_pdeathsig() == signal.SIGTERM; "
+                    "libc = ctypes.CDLL(None); pr = libc.prctl; "
+                    "pr.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]; "
+                    "s = ctypes.c_int(0); assert pr(2, ctypes.addressof(s), 0, 0, 0) == 0; "
+                    "assert s.value == signal.SIGTERM, s.value; "
+                    "print('PDEATHSIG_OK')"
+                ),
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert pdeath_probe.returncode == 0, f"pdeathsig probe failed: {pdeath_probe.stdout} {pdeath_probe.stderr}"
+        assert "PDEATHSIG_OK" in pdeath_probe.stdout
+
 
 def check_rv_input_schema() -> None:
     """Versioned RV input schema validates shapes/cameras and rejects sim GT / wrong version."""
@@ -264,33 +431,113 @@ def check_rv_input_schema() -> None:
         "long side > 640",
     )
 
-    # Non-finite pose fails loudly.
-    bad_pose = pose.copy()
-    bad_pose[0, 3] = float("nan")
-    _expect_fail(
-        RvInputSpec(
-            schema_version=RV_SCHEMA_VERSION,
-            seq=1,
-            timestamp_s=1.0,
-            ego_pose_4x4=bad_pose,
-            camera_frames=good.camera_frames,
-        ),
-        "non-finite pose",
-    )
+    # Non-finite ego_pose_4x4, K (intrinsics_3x3), and T_cam_ego (extrinsics_4x4) fail loudly.
+    for bad_val in (float("nan"), float("inf"), float("-inf")):
+        bad_pose = pose.copy()
+        bad_pose[0, 3] = bad_val
+        _expect_fail(
+            RvInputSpec(
+                schema_version=RV_SCHEMA_VERSION,
+                seq=1,
+                timestamp_s=1.0,
+                ego_pose_4x4=bad_pose,
+                camera_frames=good.camera_frames,
+            ),
+            f"non-finite ego_pose_4x4 ({bad_val})",
+        )
 
-    # Sim GT / aux_depth keys rejected on live input contract.
-    for gt_key in ("depth_gt", "gt_depth", "sim_depth", "aux_depth", "path_world", "debug_gt"):
+        bad_k = k.copy()
+        bad_k[0, 2] = bad_val
         _expect_fail(
             RvInputSpec(
                 schema_version=RV_SCHEMA_VERSION,
                 seq=1,
                 timestamp_s=1.0,
                 ego_pose_4x4=pose,
-                camera_frames=good.camera_frames,
-                predicted_depth={gt_key: np.ones((360, 640), dtype=np.float32)},
+                camera_frames={
+                    "main": RvCameraInput(cam_id="main", rgb=frame, intrinsics_3x3=bad_k, extrinsics_4x4=t_cam)
+                },
             ),
-            f"forbidden depth key {gt_key}",
+            f"non-finite intrinsics_3x3 K ({bad_val})",
         )
+
+        bad_t = t_cam.copy()
+        bad_t[1, 3] = bad_val
+        _expect_fail(
+            RvInputSpec(
+                schema_version=RV_SCHEMA_VERSION,
+                seq=1,
+                timestamp_s=1.0,
+                ego_pose_4x4=pose,
+                camera_frames={
+                    "main": RvCameraInput(cam_id="main", rgb=frame, intrinsics_3x3=k, extrinsics_4x4=bad_t)
+                },
+            ),
+            f"non-finite extrinsics_4x4 T_cam_ego ({bad_val})",
+        )
+
+    # Sim GT / aux_depth keys rejected on live input contract by the forbidden-key check
+    # (pinned with a matching camera_frames entry so 'no matching camera frame' cannot mask it).
+    forbidden_keys = (
+        "depth_gt",
+        "gt_depth",
+        "sim_depth",
+        "aux_depth",
+        "sem_gt",
+        "gt_sem",
+        "path_world",
+        "debug_gt",
+        "labels",
+        "custom_gt",
+        "gt_custom",
+        "extra_sim_depth",
+    )
+    for gt_key in forbidden_keys:
+        matching_cam = RvCameraInput(cam_id="main", rgb=frame, intrinsics_3x3=k, extrinsics_4x4=t_cam)
+        depth_val = np.ones((360, 640), dtype=np.float32)
+
+        # (a) Valid matching camera_frames entry + matching predicted_depth -> only forbidden-key check can reject.
+        for spec_case, desc in (
+            (
+                RvInputSpec(
+                    schema_version=RV_SCHEMA_VERSION,
+                    seq=1,
+                    timestamp_s=1.0,
+                    ego_pose_4x4=pose,
+                    camera_frames={"main": good.camera_frames["main"], gt_key: matching_cam},
+                    predicted_depth={gt_key: depth_val},
+                ),
+                f"matching frame + predicted_depth forbidden key {gt_key}",
+            ),
+            (
+                RvInputSpec(
+                    schema_version=RV_SCHEMA_VERSION,
+                    seq=1,
+                    timestamp_s=1.0,
+                    ego_pose_4x4=pose,
+                    camera_frames=good.camera_frames,
+                    predicted_depth={gt_key: depth_val},
+                ),
+                f"predicted_depth forbidden key {gt_key}",
+            ),
+            (
+                RvInputSpec(
+                    schema_version=RV_SCHEMA_VERSION,
+                    seq=1,
+                    timestamp_s=1.0,
+                    ego_pose_4x4=pose,
+                    camera_frames={gt_key: matching_cam},
+                    predicted_depth=None,
+                ),
+                f"camera_frames forbidden key {gt_key}",
+            ),
+        ):
+            try:
+                validate_rv_input(spec_case)
+            except RvSchemaError as exc:
+                assert "forbidden" in str(exc).lower(), f"{desc}: expected forbidden error, got {exc!r}"
+            else:
+                raise AssertionError(f"expected RvSchemaError for {desc}")
 
 
 def check_rv_output_schema() -> None:
@@ -356,6 +603,37 @@ def check_rv_output_schema() -> None:
         RvOutputSpec(schema_version=99, seq=5, timestamp_s=2.0, pose_4x4=pose, rgb=rgb, depth=depth),
         "wrong version",
     )
+    # Non-finite output pose fails loudly.
+    for bad_val in (float("nan"), float("inf"), float("-inf")):
+        bad_out_pose = pose.copy()
+        bad_out_pose[2, 3] = bad_val
+        _expect_fail(
+            RvOutputSpec(schema_version=RV_SCHEMA_VERSION, seq=5, timestamp_s=2.0, pose_4x4=bad_out_pose, rgb=rgb, depth=depth),
+            f"non-finite output pose ({bad_val})",
+        )
+    # Max legal output (640x640) validates, and oversize output (>640) is rejected.
+    validate_rv_output(
+        RvOutputSpec(
+            schema_version=RV_SCHEMA_VERSION,
+            seq=5,
+            timestamp_s=2.0,
+            pose_4x4=pose,
+            rgb=np.zeros((640, 640, 3), dtype=np.uint8),
+            depth=np.zeros((640, 640), dtype=np.float32),
+        )
+    )
+    for bad_hw in ((641, 640), (640, 641)):
+        _expect_fail(
+            RvOutputSpec(
+                schema_version=RV_SCHEMA_VERSION,
+                seq=5,
+                timestamp_s=2.0,
+                pose_4x4=pose,
+                rgb=np.zeros((bad_hw[0], bad_hw[1], 3), dtype=np.uint8),
+                depth=np.zeros(bad_hw, dtype=np.float32),
+            ),
+            f"oversize output {bad_hw}",
+        )
 
 
 def check_shm_slot_roundtrip_and_copy_only() -> None:
@@ -408,18 +686,33 @@ def check_shm_slot_roundtrip_and_copy_only() -> None:
     assert np.array_equal(unpacked.depth, depth)
     assert np.allclose(unpacked.pose_4x4, pose)
 
-    # Wrong version in header bytes must fail loudly.
+    # Wrong version in header bytes must fail loudly (both RvShmHeader.unpack directly and unpack_output_slot).
     bad_ver = bytearray(raw)
     struct.pack_into("<I", bad_ver, 8, RV_SCHEMA_VERSION + 1)
+    try:
+        RvShmHeader.unpack(bytes(bad_ver))
+        raise AssertionError("RvShmHeader.unpack must fail loudly on wrong schema_version")
+    except RvSchemaError:
+        pass
     try:
         unpack_output_slot(bytes(bad_ver))
         raise AssertionError("wrong SHM schema_version must fail loudly")
     except RvSchemaError:
         pass
 
-    # Wrong magic must fail loudly.
+    # Wrong magic and short header must fail loudly in RvShmHeader.unpack directly.
     bad_magic = bytearray(raw)
     bad_magic[0:8] = b"BADMAGIC"
+    try:
+        RvShmHeader.unpack(bytes(bad_magic))
+        raise AssertionError("RvShmHeader.unpack must fail loudly on wrong magic")
+    except RvSchemaError:
+        pass
+    try:
+        RvShmHeader.unpack(raw[: SLOT_HEADER_SIZE - 1])
+        raise AssertionError("RvShmHeader.unpack must fail loudly on short buffer")
+    except RvSchemaError:
+        pass
     try:
         unpack_output_slot(bytes(bad_magic))
         raise AssertionError("wrong SHM magic must fail loudly")
@@ -484,6 +777,96 @@ def check_shm_slot_roundtrip_and_copy_only() -> None:
     assert ring.write_slot(raw, seq=3) is False
     assert ring.dropped == 1
     ring.set_consumer_busy(False)
+
+    # Real contended-lock backpressure: another thread holds ring._lock -> write_slot drops without blocking.
+    import threading
+
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def _hold_lock(lock: threading.Lock) -> None:
+        lock.acquire()
+        try:
+            acquired.set()
+            release.wait(timeout=5.0)
+        finally:
+            lock.release()
+
+    holder = threading.Thread(target=_hold_lock, args=(ring._lock,), daemon=True)
+    holder.start()
+    assert acquired.wait(timeout=2.0), "lock holder did not acquire lock"
+    write_result: dict[str, object] = {}
+
+    def _try_write() -> None:
+        write_result["ok"] = ring.write_slot(raw, seq=4)
+
+    writer = threading.Thread(target=_try_write, daemon=True)
+    before_drops = ring.dropped
+    writer.start()
+    writer.join(timeout=1.0)
+    timed_out = writer.is_alive()
+    release.set()
+    holder.join(timeout=2.0)
+    writer.join(timeout=2.0)
+    assert not timed_out, "DoubleBufferSlotLayout.write_slot blocked on contended lock instead of dropping"
+    assert write_result.get("ok") is False
+    assert ring.dropped == before_drops + 1
+
+    # Default RvClient slot is sized from the schema (max legal 640x640 RGB+depth+header = 2,867,328 B).
+    from python.viz.rv_contract import RV_MAX_LONG_SIDE, RvClient
+
+    expected_max_slot = SLOT_HEADER_SIZE + RV_MAX_LONG_SIDE * RV_MAX_LONG_SIDE * (3 + 4)
+    default_client = RvClient()
+    assert default_client._ring.slot_bytes >= expected_max_slot, (
+        f"default RvClient slot_bytes={default_client._ring.slot_bytes} < max legal frame {expected_max_slot}"
+    )
+
+    # 360x640 legal frame (1,612,928 B) and max legal 640x640 frame (2,867,328 B) pack and fit.
+    for h_out, w_out, expected_bytes, seq_no in (
+        (360, 640, 1_612_928, 10),
+        (RV_MAX_LONG_SIDE, RV_MAX_LONG_SIDE, expected_max_slot, 11),
+    ):
+        rgb_leg = np.zeros((h_out, w_out, 3), dtype=np.uint8)
+        rgb_leg[0, 0, :] = [11, 22, 33]
+        depth_leg = np.full((h_out, w_out), 7.5, dtype=np.float32)
+        packed = pack_output_slot(
+            RvOutputSpec(
+                schema_version=RV_SCHEMA_VERSION,
+                seq=seq_no,
+                timestamp_s=3.0,
+                pose_4x4=pose,
+                rgb=rgb_leg,
+                depth=depth_leg,
+            )
+        )
+        assert len(packed) == expected_bytes, f"{(h_out, w_out)} packed {len(packed)} != {expected_bytes}"
+        assert default_client._ring.write_slot(packed, seq=seq_no) is True
+        latest_leg = default_client._ring.read_latest()
+        assert latest_leg is not None
+        _, roundtrip = unpack_output_slot(latest_leg)
+        assert roundtrip.rgb.shape == (h_out, w_out, 3) and roundtrip.depth.shape == (h_out, w_out)
+        assert int(roundtrip.rgb[0, 0, 0]) == 11
+
+    # Oversize frame (>640) is rejected by pack_output_slot, and oversize raw slot fails loudly in write_slot.
+    try:
+        pack_output_slot(
+            RvOutputSpec(
+                schema_version=RV_SCHEMA_VERSION,
+                seq=12,
+                timestamp_s=3.0,
+                pose_4x4=pose,
+                rgb=np.zeros((641, 640, 3), dtype=np.uint8),
+                depth=np.zeros((641, 640), dtype=np.float32),
+            )
+        )
+        raise AssertionError("oversize 641x640 output must fail loudly")
+    except RvSchemaError:
+        pass
+    try:
+        default_client._ring.write_slot(b"\x00" * (default_client._ring.slot_bytes + 1), seq=13)
+        raise AssertionError("oversize raw slot payload must fail loudly")
+    except RvSchemaError:
+        pass
 
 
 def main() -> None:

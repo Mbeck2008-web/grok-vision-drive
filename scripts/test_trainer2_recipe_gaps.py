@@ -162,10 +162,37 @@ def check_stages_change_weights_at_real_lr() -> None:
     print("stages 1 / 2 / 7 move exactly the heads they train at lr 1e-5 OK")
 
 
+def check_aux_eval_only_on_recipe_runs() -> None:
+    """AuxEval (depth AbsRel / sem mIoU on every holdout pass) is a recipe-run feature: the same aux-head run without
+    ``--recipe trainer2`` records exactly the holdout keys it did on main, no extra keys and no extra CPU work.
+    """
+    if not _ready("check_aux_eval_only_on_recipe_runs"):
+        return
+    torch = base_tests._torch()
+    from python.train import train_scene
+
+    keys = ("depth_absrel", "sem_miou", "depth_cells", "sem_cells")
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        strips = base_tests._fixture(base)
+        stats_off, _, _ = _train_stage(torch, train_scene, strips, base, "1", lr=1e-5, recipe="")
+        stats_on, _, _ = _train_stage(torch, train_scene, strips, base, "1", lr=1e-5, recipe="trainer2")
+    off, on = stats_off["holdout_evals"], stats_on["holdout_evals"]
+    assert off and on, (off, on)
+    for entry in off:
+        assert "lane_rms" in entry and "holdout_loss" in entry, entry  # the pass did run and score
+        assert not any(k in entry for k in keys), f"a non-recipe run must not record AuxEval keys: {entry}"
+    for entry in on:
+        assert all(k in entry for k in keys) and entry["depth_cells"] > 0, entry
+    assert set(on[0]) - set(off[0]) == set(keys), (sorted(on[0]), sorted(off[0]))
+    print("AuxEval keys are recorded on recipe runs only; a non-recipe aux-head run keeps main's holdout record OK")
+
+
 CHECKS = (
     check_aux_eval_gt_only_class,
     check_aux_eval_inf_gt_depth,
     check_stages_change_weights_at_real_lr,
+    check_aux_eval_only_on_recipe_runs,
 )
 
 

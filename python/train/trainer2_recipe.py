@@ -564,14 +564,16 @@ def check_export_fits_deploy(net: Any, path: Path | str, *, preset: str, referen
             "onnx": str(path)}
 
 
-def camera_only_deploy_net(ckpt: Path | str, *, preset: str) -> tuple[Any, Any, dict[str, Any]]:
-    """``(net, reference, meta)`` for the camera-only deploy graph of one recipe checkpoint.
+def camera_only_deploy_net(ckpt: Path | str, *, preset: str) -> tuple[Any, dict[str, Any]]:
+    """``(net, meta)`` for the camera-only deploy graph of one recipe checkpoint.
 
     The last stage trains ``ctl`` (stage 7) and ``--export`` refuses a ctl net. The
     deployed student is camera-only: this builds the checkpoint's net without the ctl
     head (and with no ctl-cond input), loads every other tensor, and refuses a
     checkpoint that carries ``--ctl-cond`` / route-cond inputs or whose preset label
-    is not ``preset``. ``reference`` is the same net built from the *preset's* kwargs.
+    is not ``preset``. The preset binding is enforced here, before anything is exported: ``refuse_preset_mismatch``
+    on the label, then a strict ``load_into_net`` into a net built from the preset's kwargs (a tensor of another size,
+    e.g. an XL net labelled small, is refused).
     """
     from python.train.epoch_ckpt import build_net, load_epoch_ckpt, load_into_net
     from python.train.model_size import refuse_preset_mismatch
@@ -600,8 +602,7 @@ def camera_only_deploy_net(ckpt: Path | str, *, preset: str) -> tuple[Any, Any, 
         load_into_net(net, free)
     except (RuntimeError, KeyError, ValueError) as exc:
         raise RecipeRefused(f"the checkpoint's tensors are not a {preset!r} net: {str(exc)[:200]}") from exc
-    reference = build_net(dict(meta_free, preset=str(preset)), free)
-    return net.cpu().eval(), reference.cpu().eval(), meta
+    return net.cpu().eval(), meta
 
 
 def export_camera_only_deploy(ckpt: Path | str, out: Path | str, *, preset: str) -> dict[str, Any]:
@@ -621,20 +622,24 @@ def export_camera_only_deploy(ckpt: Path | str, out: Path | str, *, preset: str)
     ckpt, out = Path(ckpt), Path(out)
     if out.exists():
         raise RecipeRefused(f"--export {out.name} already exists; the recipe export is create-only")
-    net, reference, meta = camera_only_deploy_net(ckpt, preset=preset)
+    net, meta = camera_only_deploy_net(ckpt, preset=preset)
     heads = tuple(h for h in (meta.get("heads") or ()) if h != "ctl") or None
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(f"{out.name}.partial-{os.getpid()}.onnx")
     try:
         gt_frame = {key: str(meta.get(key) or "unknown") for key in (GT_ORIGIN_META, GT_LABELER_META)}
         export_scene_onnx(partial, net, heads=heads, gt_frame=gt_frame)
-        deploy = check_export_fits_deploy(net, partial, preset=preset, reference=reference)
+        # the net is the reference: it was built from the preset's kwargs and strictly loaded in camera_only_deploy_net
+        deploy = check_export_fits_deploy(net, partial, preset=preset, reference=net)
         stamp_onnx_metadata(str(partial), {
             "gvd_ckpt_file": ckpt.name, "gvd_ckpt_sha256": sha256_file(ckpt),
             "gvd_ckpt_epoch": str(int(meta["epoch"])), "gvd_ckpt_step": str(int(meta["step"])),
             "gvd_ckpt_run": str(meta.get("run") or ""), "gvd_scale": str(float(meta.get("scale") or 1.0)),
         })
-        link_or_copy_new(partial, out)
+        try:
+            link_or_copy_new(partial, out)
+        except FileExistsError as exc:  # another process created ``out`` after the exists() check: never replaced
+            raise RecipeRefused(f"--export {out.name} appeared during the export; the recipe export is create-only") from exc
     finally:
         if partial.exists():
             unlink_own_partial(partial, owned_partials=(partial,))

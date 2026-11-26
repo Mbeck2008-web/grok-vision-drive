@@ -264,6 +264,43 @@ def check_export_records_ckpt_sha256() -> None:
     print("exported ONNX carries the checkpoint's real sha256 / file / epoch / step / run / scale OK")
 
 
+def check_export_race_is_create_only() -> None:
+    """``--export`` is create-only even when the file appears AFTER the up-front exists() check (another process wins
+    the race while the graph is being written and checked): refused cleanly, the other file untouched, no partial left.
+    """
+    if not _ready("check_export_race_is_create_only", onnx=True):
+        return
+    torch = base_tests._torch()
+    rec = base_tests._recipe()
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        ck = _stage7_ckpt(torch, base)
+        out = base / "deploy.onnx"
+        theirs = b"another process's model, written during our export"
+        real = rec.check_export_fits_deploy
+
+        def racing_check(*a, **k):
+            result = real(*a, **k)
+            out.write_bytes(theirs)  # lands between the exists() check and the final link
+            return result
+
+        rec.check_export_fits_deploy = racing_check
+        try:
+            rec.export_camera_only_deploy(ck, out, preset="small")
+        except rec.RecipeRefused as exc:
+            assert "create-only" in str(exc), exc
+        else:
+            raise AssertionError("a file that appeared mid-export must be refused, not replaced")
+        finally:
+            rec.check_export_fits_deploy = real
+        assert out.read_bytes() == theirs, "the racing writer's file was replaced"
+        assert not [p for p in base.iterdir() if ".partial" in p.name], sorted(p.name for p in base.iterdir())
+        # without the race the same call exports normally (the refusal above was the race, not a broken export)
+        out2 = base / "deploy_ok.onnx"
+        assert rec.export_camera_only_deploy(ck, out2, preset="small")["ok"] is True and out2.is_file()
+    print("export race: a file that appears mid-export is refused as create-only, never replaced, no .partial left OK")
+
+
 CHECKS = (
     check_aux_eval_gt_only_class,
     check_aux_eval_inf_gt_depth,
@@ -271,6 +308,7 @@ CHECKS = (
     check_aux_eval_only_on_recipe_runs,
     check_manifest_records_real_git_sha,
     check_export_records_ckpt_sha256,
+    check_export_race_is_create_only,
 )
 
 

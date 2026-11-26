@@ -148,6 +148,17 @@ MUTANTS: list[Mutant] = [
         [(STUB, "    if err == _ERROR_INVALID_PARAMETER:\n        return None\n", "")],
     ),
     Mutant(
+        # r3 windows CI: daemon stdin thread inside BufferedReader -> 1 s shutdown stall + abort.
+        "stdin_thread_buffered_read",
+        [
+            (
+                STUB,
+                "                    fd = sys.stdin.fileno()\n                    while not eof_evt.is_set():\n                        if not os.read(fd, 64):\n                            break",
+                "                    while not eof_evt.is_set():\n                        if not sys.stdin.buffer.read(1):\n                            break",
+            )
+        ],
+    ),
+    Mutant(
         "remove_pidfd_path",
         [(STUB, "    if hasattr(os, \"pidfd_open\"):\n        return _open_pidfd_watch(ppid)\n", "")],
     ),

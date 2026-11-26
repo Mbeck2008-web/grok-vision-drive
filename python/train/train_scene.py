@@ -647,6 +647,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where --exp-ssl-pretrain writes stem weights (npz). Required with that flag.",
     )
     parser.add_argument(
+        "--no-ssl-pretrain",
+        action="store_true",
+        help=(
+            "Turn off the default SSL stem pretraining (A/B baselines only). SSL is ON for "
+            "every training run (docs/specs/trainer_2.md): train frames only, EMA target, "
+            "collapse guard; the stem is cached under the GVD cache and reused."
+        ),
+    )
+    parser.add_argument(
+        "--ssl-epochs",
+        type=int,
+        default=1,
+        help="Epochs of the default SSL stem pretraining (default 1).",
+    )
+    parser.add_argument(
+        "--ssl-max-rows",
+        type=int,
+        default=4000,
+        help="Evenly spaced train frames for the default SSL stage (default 4000; 0 = all).",
+    )
+    parser.add_argument(
         "--exp-active-subset",
         action="store_true",
         help=(
@@ -3937,6 +3958,66 @@ def heads_for_run(text: str | None, roots: Any = None) -> tuple[str, ...]:
     return resolve_train_heads(text, curb_palette_for_training(roots))
 
 
+def _default_ssl_stage(args: Any, strip_roots: Any, holdout_root: Path, cam_names: Any, net_kw: dict) -> str:
+    """Default-on SSL (docs/specs/trainer_2.md): train-frame stem, cached by content key. Returns its path."""
+    from python.data.data_root import cache_dir
+    from python.data.raw_frames import refuse_lossy
+    from python.train.exp_ssl import default_ssl_stem, ssl_rows_from_split
+    from python.train.scene_net import SceneNet
+    from python.train.strip_sources import load_multi_source_rows
+
+    for one in strip_roots:
+        refuse_lossy(one)
+    state_rows, source_meta = load_multi_source_rows(strip_roots, holdout_source=holdout_root)
+    train_rows = ssl_rows_from_split(
+        state_rows,
+        source_meta,
+        holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+    )
+    net = SceneNet(cams=cam_names, scale=float(args.scale), **net_kw).train()
+
+    def _ssl_image(row):
+        loaded = _frame_row(
+            Path(row["source_root"]) if row.get("source_root") else holdout_root,
+            row,
+            cams=tuple(cam_names),
+            scale=float(args.scale),
+        )
+        if loaded is None:
+            return None
+        frame, _meta = loaded
+        return frame
+
+    path, info = default_ssl_stem(
+        net,
+        train_rows,
+        image_fn=_ssl_image,
+        out_dir=Path(cache_dir()) / "ssl",
+        lr=float(args.lr),
+        seed=int(args.seed),
+        epochs=max(1, int(args.ssl_epochs)),
+        max_rows=int(args.ssl_max_rows),
+        key_extra={
+            "roots": [str(r) for r in strip_roots],
+            "holdout_root": str(holdout_root),
+            "holdout_blocks": resolve_holdout_blocks(args.holdout_blocks),
+            "cams": list(cam_names),
+            "scale": float(args.scale),
+            "net_kw": dict(net_kw),
+        },
+    )
+    if info.get("reused"):
+        print(f"[GVD] ssl-pretrain: reused {path} (key {info['key']}, rows={info['rows']})", flush=True)
+    else:
+        print(
+            f"[GVD] ssl-pretrain: wrote {path} rows={info['rows']} n={int(info.get('n', 0))} "
+            f"loss={float(info.get('last_loss', 0.0)):.6f} probe_std {float(info.get('probe_std_start', float('nan'))):.4f}"
+            f"->{float(info.get('probe_std_end', float('nan'))):.4f} ema={info.get('ema')}",
+            flush=True,
+        )
+    return str(path)
+
+
 def main(argv: list[str] | None = None) -> None:
     from python.data.data_root import DataDriveError, check_data_path, ensure_cache_dirs, scene_lanes_dir
 
@@ -4100,6 +4181,7 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[GVD] scene train: pause-dir refused: {exc}", flush=True)
                 sys.exit(2)
             pause_dir = Path(args.pause_dir).resolve()
+        saved = None
         if not args.no_resume and not args.build_cache:
             # Before any write: a pause file from another --exact-epochs setting is refused.
             try:
@@ -4248,6 +4330,21 @@ def main(argv: list[str] | None = None) -> None:
         if not open_panel:
             print("[GVD] scene train: no panel", flush=True)
         drop_wrong_way, require_road_dump, max_road_clip, road_dump = frame_quality_from_args(args)
+        init_stem_arg = str(getattr(args, "init_stem", "") or "") or None
+        from python.train.exp_ssl import SslError as _SslError, ssl_plan
+
+        try:
+            ssl_on, ssl_why = ssl_plan(args, resuming=saved is not None)
+        except ValueError as exc:
+            print(f"[GVD] scene train: ssl-pretrain: {exc}", flush=True)
+            sys.exit(2)
+        print(f"[GVD] ssl-pretrain: {ssl_why}", flush=True)
+        if ssl_on:
+            try:
+                init_stem_arg = _default_ssl_stage(args, strip_roots, holdout_root, cam_names, net_kw)
+            except (_SslError, LossyFramesError) as exc:
+                print(f"[GVD] scene train: ssl-pretrain: {exc}; pass --no-ssl-pretrain to train without SSL", flush=True)
+                sys.exit(2)
         try:
             stats = train_directory(
                 holdout_root,
@@ -4304,7 +4401,7 @@ def main(argv: list[str] | None = None) -> None:
                 exp_active_hard_frac=float(getattr(args, "exp_active_hard_frac", 0.3)),
                 exp_active_random_floor=float(getattr(args, "exp_active_random_floor", 0.1)),
                 grad_ckpt=bool(args.grad_ckpt),
-                init_stem=str(getattr(args, "init_stem", "") or "") or None,
+                init_stem=init_stem_arg,
                 pause_dir=pause_dir,
                 exact_epochs=args.exact_epochs,
                 val_worst=int(args.val_worst),

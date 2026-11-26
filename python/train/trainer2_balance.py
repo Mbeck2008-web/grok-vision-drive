@@ -23,6 +23,7 @@ Training-only module. Nothing on a live path imports it.
 from __future__ import annotations
 
 import math
+import sys
 from typing import Any, Iterable, Mapping
 
 ALPHA = 1.5
@@ -84,12 +85,18 @@ def project_weights(weights: Mapping[str, float], total: float, lo: float = W_MI
         return {}
     if not (n * lo - 1e-12 <= float(total) <= n * hi + 1e-12):
         raise ValueError(f"sum {total} unreachable for {n} weights in [{lo}, {hi}]")
-    raw = [max(float(weights[k]), 1e-12) for k in names]
+    # An overflowed step (lr * grad_norm = inf) is clamped to the largest finite float: it still
+    # ranks above every other weight, and ``hi / max(raw)`` below stays > 0.
+    raw = [min(max(float(weights[k]), 1e-12), sys.float_info.max) for k in names]
 
     def mass(c: float) -> float:
         return sum(min(hi, max(lo, c * w)) for w in raw)
 
-    a, b = 0.0, 1.0
+    # Start the bracket at the scale of the largest weight: with a fixed [0, 1] and 200
+    # halvings, ``c`` cannot resolve below ~6e-61, so a raw weight > ~1e61 (a huge grad
+    # norm) clamped everything to ``hi`` and broke ``sum == total``. Ordinary weights
+    # (max <= hi) still start at 1.0, so their bisection path is unchanged.
+    a, b = 0.0, min(1.0, hi / max(raw))
     while mass(b) < total:
         b *= 2.0
         if b > 1e30:
@@ -129,6 +136,11 @@ class GradNorm:
             raise ValueError(f"term(s) both balanced and fixed: {overlap}")
         self.alpha = float(alpha)
         self.lr = float(lr)
+        # A NaN/inf lr or alpha, or a negative alpha, breaks the renormalization (NaN/inf
+        # lr) or crashes ``update`` (0.0 ** negative); refuse them up front.
+        for what, val in (("alpha", self.alpha), ("lr", self.lr)):
+            if not math.isfinite(val) or val < 0.0:
+                raise ValueError(f"GradNorm {what} must be finite and >= 0, got {val!r}")
         self.initial: dict[str, float] = {}
 
     def weight_of(self, name: str) -> float:
@@ -169,7 +181,11 @@ class GradNorm:
         new = {}
         for n in names:
             r = ratio[n] / r_bar if r_bar > 0 else 1.0
-            target = g_bar * (r ** self.alpha)
+            try:
+                r_pow = r ** self.alpha
+            except OverflowError:  # r > 1 and a huge alpha: the target is astronomically large
+                r_pow = math.inf
+            target = g_bar * r_pow
             diff = big_g[n] - target
             grad = (1.0 if diff > 0 else -1.0 if diff < 0 else 0.0) * g[n]
             new[n] = self.weights[n] - self.lr * grad
@@ -183,6 +199,9 @@ def per_task_grad_norms(losses: Mapping[str, Any], shared: Any) -> dict[str, flo
 
     out: dict[str, float] = {}
     for name, loss in losses.items():
+        if not getattr(loss, "requires_grad", True):
+            out[str(name)] = 0.0  # constant loss (no graph): d/d shared is 0, not an error
+            continue
         (grad,) = torch.autograd.grad(loss, shared, retain_graph=True, allow_unused=True)
         out[str(name)] = 0.0 if grad is None else float(grad.detach().norm())
     return out

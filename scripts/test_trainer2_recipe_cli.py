@@ -241,7 +241,7 @@ def check_cli_default_plan_trains_through_2b() -> None:
         exits = {m[0]: (int(m[1]), json.loads(m[2])) for m in re.findall(
             r"recipe trainer2: stage (\w+) \([^)]*\) exited after (\d+) epoch\(s\), ckpt=\S+ metrics=(\{.*\})", text)}
         assert sorted(exits) == ["0", "1", "2", "2b", "7"], (sorted(exits), text[-2500:])
-        assert "trained=['0', '1', '2', '2b', '7'] skipped=[]" in text, text[-1500:]
+        assert "trained=['0', '1', '2', '2b', '7'] skipped=['3', '4', '5', '6']" in text, text[-1500:]
         s2b, s7 = exits["2b"][1], exits["7"][1]
         for name, m in (("2b", s2b), ("7", s7)):
             assert set(m) == {"lane_rms", "lane_r", "depth_absrel", "sem_miou", *rec.STOP_METRICS}, (name, m)
@@ -266,6 +266,7 @@ def check_cli_stage_errors_exit_2_without_traceback() -> None:
     from python.data.raw_frames import LossyFramesError
     from python.train import train_scene
     from python.train.exp_ssl import SslError
+    from python.train.stop_pred import StopNotMeasured
     from python.train.trainer2_split import SplitError
 
     with tempfile.TemporaryDirectory() as raw:
@@ -273,7 +274,7 @@ def check_cli_stage_errors_exit_2_without_traceback() -> None:
         strips = base_tests._fixture(base)
         saved = train_scene._run_trainer2_recipe
         try:
-            for exc in (SslError("ssl boom"), LossyFramesError("lossy boom"), SplitError("split boom")):
+            for exc in (SslError("ssl boom"), LossyFramesError("lossy boom"), SplitError("split boom"), StopNotMeasured("stop boom")):
                 def boom(*a, _e=exc, **k):
                     raise _e
 
@@ -282,7 +283,7 @@ def check_cli_stage_errors_exit_2_without_traceback() -> None:
                 assert code == 2 and "Traceback" not in text and str(exc) in text, (type(exc).__name__, code, text[-600:])
         finally:
             train_scene._run_trainer2_recipe = saved
-    print("CLI: SslError / LossyFramesError / SplitError inside the recipe path exit 2 with the message, no traceback OK")
+    print("CLI: SslError / LossyFramesError / SplitError / StopNotMeasured inside the recipe path exit 2 with the message, no traceback OK")
 
 
 def main() -> int:

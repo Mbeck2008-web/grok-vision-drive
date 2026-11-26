@@ -170,6 +170,48 @@ def check_pin_constant_loss_has_zero_grad_norm() -> None:
     assert shared.grad is None
 
 
+def check_pin_residual_spread_makes_sum_exact() -> None:
+    """project_weights promises sum == total exactly (its residual-spread step). Without that step,
+    or with a wrong share, these inputs land 4e-16..1e-14 off. Exact float equality is the contract."""
+    for w in (
+        {"h0": 1.426, "h1": 0.621, "h2": 8.964},
+        {"h0": 0.21, "h1": 0.111, "h2": 7.979, "h3": 1.139, "h4": 0.196},
+        {"h0": 4.094, "h1": 4.332, "h2": 3.018},
+        # bisection must keep b on the mass >= total side (``<`` not ``<=``): else 4.4e-16 short
+        {"h0": 0.35, "h1": 20.0, "h2": 3.518},
+        {"h0": 20.0, "h1": 10.0, "h2": 0.1, "h3": 9.907},
+        # weights clamped at lo are not free: spreading onto them gets re-clamped and the sum drifts 4.4e-16
+        {"h0": 78.971, "h1": 0.016, "h2": 0.332},
+        {"h0": 0.603, "h1": 86.363, "h2": 0.1},
+    ):
+        total = float(len(w))
+        out = project_weights(w, total)
+        assert sum(out.values()) == total, (w, sum(out.values()) - total)
+
+
+def check_per_task_grad_norms_keeps_shared_graph() -> None:
+    """Heads share a trunk that saves tensors (tanh). The per-head grads must not free that graph:
+    the next head and the later combined backward both still need it (retain_graph=True)."""
+    try:
+        import torch
+    except ImportError:
+        skip_check("per_task_grad_norms_keeps_shared_graph", "torch not installed")
+        return
+    from python.train.trainer2_balance import per_task_grad_norms
+
+    shared = torch.nn.Parameter(torch.tensor([0.5, -1.0, 2.0]))
+    h = torch.tanh(shared * 1.5)
+    losses = {"a": h.sum(), "b": (h * h).sum(), "c": (h ** 3).sum()}
+    out = per_task_grad_norms(losses, shared)
+    d = 1.5 * (1.0 - h.detach() ** 2)  # d h / d shared
+    want = {"a": d, "b": 2.0 * h.detach() * d, "c": 3.0 * h.detach() ** 2 * d}
+    for k, g in want.items():
+        assert abs(out[k] - float(g.norm())) < 1e-6, (k, out[k], float(g.norm()))
+    assert shared.grad is None
+    sum(losses.values()).backward()  # the training step's backward still has its graph
+    assert shared.grad is not None and torch.isfinite(shared.grad).all()
+
+
 def check_documented_edges() -> None:
     """Edge behavior pinned (not changed by this PR)."""
     # lone / empty active set
@@ -686,6 +728,89 @@ def _build_props():
             want = floor + (peak - floor) * (1.0 + math.cos(math.pi * frac)) / 2.0
         assert math.isclose(sch.lr_at(step), want, rel_tol=1e-12, abs_tol=1e-300), (sch.state_dict(), step, sch.lr_at(step), want)
 
+
+    from python.train.lr_schedule import scene_param_groups, stage_lr_mults
+
+    head_names = st.lists(st.sampled_from(["a_head", "b_head", "c_head", "d_head", "e_head"]), unique=True, max_size=5)
+
+    @cfg
+    @given(st.booleans(), head_names, head_names)
+    def prop_stage_lr_mults_spec_numbers(ssl_done, trained, entering):
+        both = sorted(set(trained) & set(entering))
+        if both:
+            try:
+                stage_lr_mults(ssl_done=ssl_done, trained_heads=trained, entering_heads=entering)
+            except ValueError as e:
+                assert str(both) in str(e), (e, both)
+            else:
+                raise AssertionError(f"overlap {both} accepted")
+            return
+        m = stage_lr_mults(ssl_done=ssl_done, trained_heads=iter(trained), entering_heads=iter(entering))
+        want = {"stem": 0.1 if ssl_done else 1.0, "trunk": 1.0}
+        want.update({k: 0.3 for k in trained})
+        want.update({k: 1.0 for k in entering})
+        assert m == want, (m, want)
+        assert stage_lr_mults(ssl_done=ssl_done) == {"stem": 0.1 if ssl_done else 1.0, "trunk": 1.0}
+
+    class _P:
+        def __init__(self, name, trainable):
+            self.name, self.requires_grad = name, trainable
+
+        def __repr__(self):
+            return f"_P({self.name!r})"
+
+    class _Net:
+        def __init__(self, children, params):
+            self._children, self._params = children, params
+
+        def named_children(self):
+            return [(c, object()) for c in self._children]
+
+        def named_parameters(self):
+            return [(p.name, p) for p in self._params]
+
+    child_pool = ["stem", "gru", "neck", "a_head", "b_head", "c_head", "stem_head", "headx"]
+
+    @cfg
+    @given(
+        st.lists(st.sampled_from(child_pool), unique=True, min_size=1, max_size=8).flatmap(lambda ch: st.tuples(
+            st.permutations(ch),
+            st.lists(st.tuples(st.sampled_from(ch), st.sampled_from(["w", "b", "x.y", "0.w"]), st.booleans()), max_size=14, unique_by=lambda t: (t[0], t[1])),
+            st.dictionaries(st.sampled_from([c for c in ch if c.endswith("_head")] + ["stem", "trunk"]), st.floats(0.0, 10.0), max_size=4),
+        )),
+        st.floats(1e-6, 1.0),
+    )
+    def prop_scene_param_groups_partition_and_rates(spec, lr):
+        children, plist, mults = spec
+        params = [_P(f"{c}.{leaf}", tr) for c, leaf, tr in plist]
+        net = _Net(list(children), params)
+        groups = scene_param_groups(net, lr, mults)
+        heads = [c for c in children if c.endswith("_head")]
+        def owner(pname):
+            top = pname.split(".", 1)[0]
+            return "stem" if top == "stem" else top if top in heads else "trunk"
+        # every trainable param in exactly one group, the right one; frozen ones in none
+        seen = [id(p) for g in groups for p in g["params"]]
+        assert len(seen) == len(set(seen))
+        assert set(seen) == {id(p) for p in params if p.requires_grad}
+        for g in groups:
+            assert g["params"], g
+            for p in g["params"]:
+                assert owner(p.name) == g["name"], (p, g["name"])
+            assert g["params"] == [p for p in params if p.requires_grad and owner(p.name) == g["name"]]  # param order kept
+            want_mult = float(mults.get(g["name"], 1.0))
+            assert g["lr_mult"] == want_mult and g["lr"] == lr * want_mult, g
+            assert set(g) == {"params", "lr", "lr_mult", "name"}
+        order = [n for n in ["stem", "trunk"] + heads if any(p.requires_grad and owner(p.name) == n for p in params)]
+        assert [g["name"] for g in groups] == order
+        bad = dict(mults, ghost_head=1.0)
+        try:
+            scene_param_groups(net, lr, bad)
+        except ValueError as e:
+            assert "ghost_head" in str(e)
+        else:
+            raise AssertionError("unknown group accepted")
+
     return [
         prop_gradnorm_update_matches_independent_reference,
         prop_project_weights_matches_exact_water_filling,
@@ -703,6 +828,8 @@ def _build_props():
         prop_lr_state_dict_round_trip,
         prop_lr_constructor_validates,
         prop_apply_lr_writes_rate_times_mult,
+        prop_stage_lr_mults_spec_numbers,
+        prop_scene_param_groups_partition_and_rates,
     ]
 
 
@@ -748,6 +875,8 @@ def main() -> None:
     check_pin_peak_overflow_in_warmup()
     check_pin_cosine_start_not_above_peak()
     check_pin_constant_loss_has_zero_grad_norm()
+    check_pin_residual_spread_makes_sum_exact()
+    check_per_task_grad_norms_keeps_shared_graph()
     _run_hypothesis_props_or_skip()
     print("test_gradnorm_props: OK")
 
@@ -779,6 +908,8 @@ def test_pins() -> None:
     check_pin_peak_overflow_in_warmup()
     check_pin_cosine_start_not_above_peak()
     check_pin_constant_loss_has_zero_grad_norm()
+    check_pin_residual_spread_makes_sum_exact()
+    check_per_task_grad_norms_keeps_shared_graph()
 
 
 def test_hypothesis_props() -> None:

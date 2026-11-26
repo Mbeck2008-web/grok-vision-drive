@@ -1700,7 +1700,8 @@ def _fake_env(base):
              "2": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3},
              "2b": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3, "missed_stop": 1.0,
                     "missed_light": 1.0, "false_brake": 1.0},
-             "7": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3}}
+             "7": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3, "missed_stop": 1.0,
+                   "missed_light": 1.0, "false_brake": 1.0}}  # stage 7 re-measures the stop metrics a 2b baseline holds
 
     def fake_train(root, **kw):
         sid = kw["recipe_stage"]

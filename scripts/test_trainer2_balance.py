@@ -332,7 +332,18 @@ def check_gradnorm_update_returns_a_copy() -> None:
     out["a"] = 99.0
     out.clear()
     assert gn.weights == saved and 99.0 not in gn.weights.values()
-    print("gradnorm: update returns a copy on the lone-head and multi-head branches; mutating it leaves balancer state OK")
+
+    # Y4f: three heads, only a,b active — the return is a copy of all weights, including inactive c.
+    gn = _gn(["a", "b", "c"], lr=0.1)
+    gn.weights["c"] = 1.7
+    out = gn.update({"a": 1.0, "b": 1.0}, {"a": 4.0, "b": 1.0}, active=["a", "b"])
+    assert out is not gn.weights
+    assert out == dict(gn.weights), out
+    assert out["c"] == 1.7 and gn.weights["c"] == 1.7 and set(out) == {"a", "b", "c"}
+    assert math.isclose(out["a"] + out["b"], 2.0, abs_tol=1e-9)
+    out["c"] = 99.0
+    assert gn.weights["c"] == 1.7
+    print("gradnorm: update returns a copy of all weights (inactive heads kept); mutating it leaves balancer state OK")
 
 
 def main() -> int:

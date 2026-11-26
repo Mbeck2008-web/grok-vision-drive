@@ -84,9 +84,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="N",
         help=(
             "How many clips in this batch are long highway/arterial runs "
-            f"(default {DEFAULT_LONG_CLIPS}: off, same as today). "
+            f"(default {DEFAULT_LONG_CLIPS}: off, same as today; the supervisor "
+            "must pass this flag). About 5-10 is the usual ask; that is a "
+            "recommendation, not a cap (N cannot exceed --clips). "
             "They are spread through the batch by --seed, use a highway spawn "
-            "at highway target speed (20-30 m/s), and are tagged long_highway."
+            "on a map that has highway roads, at highway target speed "
+            "(20-30 m/s), and are tagged long_highway."
         ),
     )
     parser.add_argument(

@@ -58,6 +58,15 @@ def hough_segments(lines: Any) -> list[tuple[int, int, int, int]]:
 # past that path. The join rule is unchanged.
 _MAIN_FAR_M = 35.0
 STITCH_LANE_FAR_M = 70.0
+# The wide camera feeds the lane fit only in the near field. Its pixel is ~3x
+# main's angle (labels_v4: 2 cm ground precision to 5.5 m on wide vs 17.3 m on
+# main), and on a 96 px sector one row past ~8.4 m jumps to 10.7, 15.1, 26.9 m.
+# Main and narrow own the far road. Wide owns the 22-37.5 deg side gap between
+# main (+-22.2) and the pillars (+-37.5 and out), 2-9 m ahead, where the near
+# lane edge and curb sit (the stop-sign frames that need it use 2.2-8.4 m ahead,
+# up to 4.5 m to the side). Lateral stays the 5 m cap every posed lane point has.
+WIDE_NEAR_MAX_Y_M = 9.0
+WIDE_NEAR_MAX_X_M = 5.0
 
 
 def estimate_lanes(
@@ -796,8 +805,13 @@ def _estimate_span_lanes(
     bgr: np.ndarray,
     far_m: float,
     x_spans: tuple[tuple[int, int], ...],
+    gate_wide: bool = True,
 ) -> LaneResult:
     """Fit wide, main, and narrow separately, then stack the polylines.
+
+    Wide points past ``WIDE_NEAR_MAX_Y_M`` ahead or ``WIDE_NEAR_MAX_X_M`` to
+    the side are dropped (``gate_wide``); a wide piece left with < 2 points is
+    dropped whole.
 
     One Hough on the whole band treats three cameras as one image. The left
     edge of each camera falls outside the shared trapezoid, and a line that
@@ -816,6 +830,13 @@ def _estimate_span_lanes(
             continue
         cam_id = names[index] if index < len(names) else None
         for poly in _fit_sector(crop, far_m, cam_id=cam_id):
+            if gate_wide and cam_id == "wide":
+                poly = [
+                    p for p in poly
+                    if float(p["y"]) <= WIDE_NEAR_MAX_Y_M and abs(float(p["x"])) <= WIDE_NEAR_MAX_X_M
+                ]
+                if len(poly) < 2:
+                    continue
             # Do not copy a far pixel's x down to y=8. That row is a different
             # distance, and the copy pinned lane_x on the wrong side of the car.
             for point in poly:

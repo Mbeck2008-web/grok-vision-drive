@@ -35,11 +35,12 @@ import math
 import random
 import time
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from python.collect.auto_mode import hour_to_beamng_tod
-from python.collect.spawn_mix import HIGHWAY, SPEED
+from python.collect.spawn_mix import HIGHWAY, SPEED, classify_roads, load_nav_roads, spawn_roads_path
 from python.sensors.tech import TECH_GFX
 
 EDGE_CASES: tuple[str, ...] = (
@@ -149,12 +150,46 @@ def long_clip_indices(clips: int, long_clips: int, seed: int) -> tuple[int, ...]
     return tuple(picked)
 
 
-def apply_long_highway(plan: ClipPlan, *, min_s: float, max_s: float) -> ClipPlan:
-    """Turn one planned clip into a long highway/arterial run at highway speed."""
+@lru_cache(maxsize=32)
+def map_has_highway_pool(map_name: str) -> bool:
+    """True when the map's road dump has at least one highway-classified road.
+
+    Uses ``spawn_roads_path`` (a live dump under roads_dir() wins, otherwise
+    the bundled fixture). A missing or unreadable dump is not a highway map.
+    """
+    try:
+        path = spawn_roads_path(str(map_name))
+        if path is None or not path.is_file():
+            return False
+        pools = classify_roads(load_nav_roads(path))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return bool(pools.get(HIGHWAY))
+
+
+def highway_maps(maps: Iterable[str]) -> tuple[str, ...]:
+    """Session maps that have a highway spawn pool, in pool order."""
+    return tuple(m for m in maps if str(m) and map_has_highway_pool(str(m)))
+
+
+def apply_long_highway(
+    plan: ClipPlan, *, min_s: float, max_s: float, maps: Iterable[str] | None = None
+) -> ClipPlan:
+    """Turn one planned clip into a long highway/arterial run at highway speed.
+
+    The clip is placed on a map from ``maps`` (or the planned map) that has a
+    highway road pool. If none of those maps has a highway pool, the plan is
+    left unchanged and is not tagged ``long_highway``.
+    """
     if float(min_s) <= 0.0 or float(max_s) < float(min_s):
         raise ValueError(f"long clip length range {min_s}-{max_s} s is empty")
+    pool = tuple(str(m) for m in (maps if maps is not None else (plan.map,)) if str(m))
+    hwy = highway_maps(pool)
+    if not hwy:
+        return plan
     rng = random.Random(f"gvd-long-clip:{int(plan.seed)}:{int(plan.index)}")
     duration = round(rng.uniform(float(min_s), float(max_s)), 3)
+    map_name = plan.map if plan.map in hwy else rng.choice(hwy)
     tags = list(plan.tags)
     if LONG_HIGHWAY_TAG not in tags:
         tags.append(LONG_HIGHWAY_TAG)
@@ -163,6 +198,7 @@ def apply_long_highway(plan: ClipPlan, *, min_s: float, max_s: float) -> ClipPla
         notes.append(LONG_HIGHWAY_TAG)
     return replace(
         plan,
+        map=map_name,
         duration_s=duration,
         spawn_kind=HIGHWAY,
         long_highway=True,
@@ -626,7 +662,7 @@ def run_clips(
             break
         plan = plan_clip(index, seed, maps, max_traffic, min_s=min_s, max_s=max_s, edge_cases=cases)
         if index in long_at:
-            plan = apply_long_highway(plan, min_s=long_min_s, max_s=long_max_s)
+            plan = apply_long_highway(plan, min_s=long_min_s, max_s=long_max_s, maps=maps)
         clip = new_clip_dir(session, plan)
         argv = clip_argv(plan, clip, chase=chase, extra=extra)
         log(f"clip {index + 1}/{clips} {clip.name}: {plan.edge_case} map={plan.map} traffic={plan.traffic} "

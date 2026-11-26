@@ -441,6 +441,122 @@ def check_run_clips_with_fake_collector() -> None:
     print("run_clips: 3 clips, 3 new folders, tags + session manifest")
 
 
+def check_run_clips_stop_file_pauses_between_clips() -> None:
+    """A stop file ends the batch between clips: the running clip finishes and is tagged, none starts after."""
+    from python.collect.clip_mode import STOP_FILE_REASON, run_clips
+    from scripts.gvd_test_env import collect_root
+
+    with collect_root() as root:
+        stop = root / "STOP"
+        calls = []
+
+        def runner(argv: list[str]) -> int:
+            out = Path(argv[argv.index("--out") + 1])
+            calls.append(out)
+            _fake_recording(out, rows=50)
+            if len(calls) == 2:
+                stop.write_text("pause\n", encoding="utf-8")  # owner asks to pause mid-clip 2
+            return 0
+
+        session = run_clips(root, clips=5, seed=5, maps=MAPS, max_traffic=4, runner=runner,
+                            min_s=4.0, max_s=5.0, stop_file=stop)
+        dirs = sorted(p for p in session.iterdir() if p.is_dir())
+        assert len(calls) == 2 and len(dirs) == 2, (calls, dirs)
+        for d in dirs:
+            assert (d / "clip_tags.json").is_file(), d
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["stop_reason"] == STOP_FILE_REASON == "stop_file", manifest
+        assert len(manifest["results"]) == 2
+        assert stop.is_file()  # never deleted by the recorder
+
+    with collect_root() as root:
+        stop = root / "STOP"
+        stop.write_text("", encoding="utf-8")
+        called = []
+        session = run_clips(root, clips=3, seed=5, maps=MAPS, max_traffic=4,
+                            runner=lambda argv: called.append(argv) or 0, min_s=4.0, max_s=5.0, stop_file=stop)
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert not called and manifest["stop_reason"] == "stop_file" and manifest["results"] == []
+        assert not [p for p in session.iterdir() if p.is_dir()]
+
+    from scripts.collect_clips import parse_args
+
+    a = parse_args(["--out", "X:/rec"])
+    assert Path(a.stop_file) == Path("X:/rec") / "STOP", a.stop_file
+    assert parse_args(["--out", "X:/rec", "--stop-file", ""]).stop_file is None
+
+    # Custom --stop-file PATH is kept and used: a flag at that path pauses
+    # the run, while a default <out>/STOP is ignored when a custom path is set.
+    with collect_root() as root:
+        custom = root / "pause.flag"
+        default = root / "STOP"
+        default.write_text("ignored\n", encoding="utf-8")
+        args = parse_args(["--out", str(root), "--clips", "3", "--stop-file", str(custom)])
+        assert Path(args.stop_file) == custom, args.stop_file
+        calls = []
+
+        def runner_custom(argv: list[str]) -> int:
+            out = Path(argv[argv.index("--out") + 1])
+            calls.append(out)
+            _fake_recording(out, rows=50)
+            if len(calls) == 1:
+                custom.write_text("pause\n", encoding="utf-8")
+            return 0
+
+        session = run_clips(
+            root, clips=3, seed=5, maps=MAPS, max_traffic=4, runner=runner_custom,
+            min_s=4.0, max_s=5.0, stop_file=args.stop_file,
+        )
+        dirs = sorted(p for p in session.iterdir() if p.is_dir())
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert len(calls) == 1 and len(dirs) == 1, (calls, dirs)
+        assert (dirs[0] / "clip_tags.json").is_file()
+        assert manifest["stop_reason"] == STOP_FILE_REASON == "stop_file", manifest
+        assert len(manifest["results"]) == 1
+        assert default.is_file() and custom.is_file()
+
+    print("run_clips: a stop file pauses the batch between clips (running clip finishes and is tagged)")
+
+
+def check_collect_clips_main_returns_0_on_stop_file() -> None:
+    """collect_clips.main() returns 0 on a stop-file pause, not watchdog exit 2."""
+    import importlib.util
+
+    from python.collect.clip_mode import STOP_FILE_REASON
+    from scripts.gvd_test_env import collect_root
+
+    spec = importlib.util.spec_from_file_location("collect_clips_main_stop", ROOT / "scripts" / "collect_clips.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)  # type: ignore[union-attr]
+
+    with collect_root() as root:
+        stop = root / "STOP"
+        stop.write_text("pause\n", encoding="utf-8")
+        orig_run = cli.run_clips
+        try:
+            def run_with_fake_collector(out, **kwargs):
+                def runner(argv: list[str]) -> int:
+                    path = Path(argv[argv.index("--out") + 1])
+                    _fake_recording(path, rows=50)
+                    return 0
+                kwargs["runner"] = runner
+                return orig_run(out, **kwargs)
+
+            cli.run_clips = run_with_fake_collector
+            rc = cli.main(["--out", str(root), "--clips", "3"])
+            assert rc == 0, rc
+        finally:
+            cli.run_clips = orig_run
+        sessions = sorted(p for p in root.iterdir() if p.is_dir() and (p / "session.json").is_file())
+        assert len(sessions) == 1, sessions
+        manifest = json.loads((sessions[0] / "session.json").read_text(encoding="utf-8"))
+        assert manifest["stop_reason"] == STOP_FILE_REASON == "stop_file", manifest
+        assert manifest["results"] == []
+        assert not [p for p in sessions[0].iterdir() if p.is_dir()]
+        assert stop.is_file()
+    print("collect_clips.main: returns 0 on a stop-file pause")
+
+
 def check_cli() -> None:
     """scripts/collect_clips.py: 30-60 s bounds, one collector subprocess per clip."""
     import importlib.util
@@ -627,6 +743,8 @@ def main() -> None:
     check_session_never_overwrites()
     check_tags_never_overwritten()
     check_run_clips_with_fake_collector()
+    check_run_clips_stop_file_pauses_between_clips()
+    check_collect_clips_main_returns_0_on_stop_file()
     check_cli()
     check_default_clip_maps_have_a_dump()
     check_cut_in_bend_speed_floor()

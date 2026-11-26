@@ -190,6 +190,77 @@ def check_wide_points_match_live_gate() -> None:
     print(f"wide parity: {n_frames} fixture strips, {n_points} wide points == gate_wide=True, {n_differ} differ from gate_wide=False OK")
 
 
+def _poly(*points: tuple[float, float]) -> list[dict[str, float]]:
+    return [{"x": float(x), "y": float(y)} for x, y in points]
+
+
+def check_wide_points_between_fixture_max_and_gate() -> None:
+    """Synthetic wide points the fixtures never reach: y in (8.5, 9.0], |x| in (4.5, 5.0], and the edges.
+
+    The 85 fixture strips top out at y 8.42 m and |x| 4.91 m, so a trainer-side rule
+    stricter than the live gate (say ``y <= 8.5``) or looser (ungated) is invisible there.
+    ``_fit_sector`` is replaced by a fixed fit; the gate under test is the real
+    ``lanes._estimate_span_lanes`` reached through ``lanes_from_view``.
+    """
+    from python.perception import lanes
+    from python.train import trainer2_wide
+
+    y_gate, x_gate = lanes.WIDE_NEAR_MAX_Y_M, lanes.WIDE_NEAR_MAX_X_M
+    assert (y_gate, x_gate) == (9.0, 5.0), (y_gate, x_gate)  # the ranges below are written for these live values
+    inside = {
+        "y in (8.5, 9.0]": _poly((1.0, 8.6), (1.2, 8.8), (1.4, 8.95)),
+        "y at the gate": _poly((1.0, 8.0), (1.2, y_gate)),
+        "|x| in (4.5, 5.0], right": _poly((4.6, 6.0), (4.8, 7.0), (4.99, 8.0)),
+        "|x| in (4.5, 5.0], left": _poly((-4.6, 6.0), (-4.8, 7.0), (-4.99, 8.0)),
+        "|x| at the gate": _poly((x_gate, 6.0), (-x_gate, 7.0)),
+        "both in the band": _poly((4.7, 8.7), (-4.9, 8.9)),
+    }
+    outside = {
+        "y past the gate": _poly((1.0, 9.0001), (1.2, 9.5)),
+        "|x| past the gate": _poly((5.0001, 6.0), (-5.5, 7.0)),
+    }
+    mixed = _poly((1.0, 8.0), (1.2, 8.9), (1.4, 9.2))  # tail past the gate is cut, head kept
+    main_poly = _poly((0.5, 20.0), (0.6, 30.0))
+    narrow_poly = _poly((0.5, 40.0), (0.6, 50.0))
+
+    def fake_fit(_crop, _far_m, cam_id=None):
+        if cam_id == "wide":
+            return [[dict(pt) for pt in poly] for poly in (*inside.values(), *outside.values(), mixed)]
+        if cam_id == "main":
+            return [[dict(pt) for pt in main_poly]]
+        return [[dict(pt) for pt in narrow_poly]]
+
+    strip = None
+    for path in sorted((ROOT / "tests" / "fixtures").rglob("*.jpg")):
+        img = cv2.imread(str(path))
+        if img is not None and img.shape[:2] == (96, 1336) and "esbr" not in path.name:
+            strip = img.copy()
+            strip[:28, :420] = (30, 30, 32)
+            break
+    assert strip is not None, "no 96x1336 fixture strip found"
+    real_fit = lanes._fit_sector
+    lanes._fit_sector = fake_fit
+    try:
+        got = trainer2_wide.wide_lane_points(strip)
+        live = [
+            [pt for pt in poly if pt.get("src") == "wide"]
+            for poly in lanes.lanes_from_view(None, strip).lanes_bev
+        ]
+    finally:
+        lanes._fit_sector = real_fit
+    live = [poly for poly in live if poly]
+    xy = lambda polys: [[(pt["x"], pt["y"]) for pt in poly] for poly in polys]  # noqa: E731
+    assert xy(got) == xy(live), "trainer wide points differ from the live gate on synthetic points"
+    expected = [xy([poly])[0] for poly in inside.values()] + [xy([_poly((1.0, 8.0), (1.2, 8.9))])[0]]
+    assert xy(got) == expected, (xy(got), expected)
+    assert all(pt["y"] <= y_gate and abs(pt["x"]) <= x_gate for poly in got for pt in poly)
+    assert any(8.5 < pt["y"] <= y_gate for poly in got for pt in poly)
+    assert any(4.5 < abs(pt["x"]) <= x_gate for poly in got for pt in poly)
+    assert all(pt.get("src") == "wide" for poly in got for pt in poly)
+    print(f"synthetic wide points: {len(got)} polylines kept with y in (8.5, 9.0] and |x| in (4.5, 5.0], "
+          f"{len(outside)} past-gate polylines dropped, mixed polyline cut at the gate, main/narrow excluded OK")
+
+
 def check_safety_path_static() -> None:
     seen = reachable(SAFETY_MODULES)
     bad = [chain(seen, m) for m in seen if m == "python.train" or m.startswith("python.train.")]
@@ -220,6 +291,7 @@ def main() -> int:
         check_gate_checker_catches_mutants,
         check_no_trainer2_gate_redefinition,
         check_wide_points_match_live_gate,
+        check_wide_points_between_fixture_max_and_gate,
         check_safety_path_static,
         check_safety_path_runtime,
     )

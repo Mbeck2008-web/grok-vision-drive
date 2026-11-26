@@ -83,6 +83,13 @@ def check_stage_2b_trains_end_to_end() -> None:
         no_stops = fx.build(base / "nostops", fx.N_ROWS, [], with_signs=True)
         _s, err, out = _train_2b(torch, train_scene, rec, no_stops, base, "nostops")
         assert isinstance(err, StopNotMeasured), (err, out[-800:])  # never brakes: no braking rows to fit, no events
+        # one kind of event is not enough, whichever it is (the in-training preflight, same words as the runner's)
+        ints = fx.intersections(fx.N_ROWS)
+        for label, picked, want in (("sign_only", ints[:2], "1 stop-sign/line and 0 red/yellow-light"),
+                                    ("light_only", [ints[0], ("traffic_light", ints[1][1], "red")], "0 stop-sign/line and 1 red/yellow-light")):
+            one = fx.build(base / label, fx.N_ROWS, picked)
+            _s, err, out = _train_2b(torch, train_scene, rec, one, base, label)
+            assert isinstance(err, StopNotMeasured) and want in str(err), (label, err, out[-800:])
         # the real thing
         strips = fx.build(base / "stops", fx.N_ROWS, fx.intersections(fx.N_ROWS))
         stats, err, out = _train_2b(torch, train_scene, rec, strips, base, "ok")

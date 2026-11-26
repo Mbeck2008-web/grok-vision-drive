@@ -264,6 +264,7 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 | `py -3 scripts\bot_engage.py on\|off` | none | Offline smoke only |
 | `py -3 scripts\validate_scene_lanes.py` | `--strips` (required), `--out`, `--montage` (4) | Offline smoke only |
 | `py -3 scripts\eval_scene_lanes.py` | `--strips` (required), `--checkpoint`, `--check-targets`, `--out`, `--worst` (8) | Unproven |
+| `py -3 scripts\migrate_ckpt_classes.py OLD.npz [NEW.npz]` | `--min-free-gb` (8; low-disk floor, same as the trainer's; 0 disables the floor; non-finite or negative values are an error). Output is create-only: any existing path is refused (exit 2), there is no overwrite flag. Opt-in: maps a 96-output (pre-v2, six classes) epoch checkpoint onto the 80-output head, dropping the removed people class; main's refusal stays the default. See `docs/CKPT_MIGRATE_CLASSES.md` | Offline smoke only |
 | `py -3 scripts\relabel_painted.py <root>` | `--zip MAP=PATH`, `--out` (`gt_painted.jsonl`) | Offline smoke only |
 | `py -3 scripts\live_lane_test.py` | `--seconds` (30), `--min-in-lane` (80), `--host`, `--port` | Unproven |
 | `py -3 scripts\gt_report.py <log>` | `--png` | Offline smoke only |

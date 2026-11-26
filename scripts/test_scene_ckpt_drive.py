@@ -324,7 +324,7 @@ def check_drive_without_ckpt_refused() -> None:
     print("--scene-ckpt-drive without --scene-ckpt refused at startup OK")
 
 
-def check_multicam_ckpt_refuses_drive() -> None:
+def check_multicam_ckpt_loads_drive_stops() -> None:
     """A cams!=('main',) ckpt must raise at load; drive must not steer on it."""
     import tempfile
 
@@ -332,7 +332,6 @@ def check_multicam_ckpt_refuses_drive() -> None:
 
     from python.train.epoch_ckpt import epoch_ckpt_path, write_epoch_ckpt
     from python.train.scene_ckpt_runtime import (
-        SceneCkptInputError,
         SceneCkptRuntime,
         apply_scene_ckpt_lane,
     )
@@ -355,21 +354,23 @@ def check_multicam_ckpt_refuses_drive() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = epoch_ckpt_path(Path(tmp), Path(tmp) / "scene_lanes", "20261109T000000Z", 0, 1)
         write_epoch_ckpt(path, weights, meta, min_free_bytes=0)
-        try:
-            SceneCkptRuntime(path)
-        except SceneCkptInputError as exc:
-            msg = str(exc).lower()
-            assert "main" in msg and ("black" in msg or "camera" in msg or "cams" in msg), exc
-        else:
-            raise AssertionError("multi-cam ckpt loaded; drive would steer on black sectors")
-    # Even a forged multi-cam pred must not be treated as a usable drive lane
-    # if decision somehow ran; the load refuse above is the gate of record.
+        rt = SceneCkptRuntime(path)
+        # PR2b: the live 8-camera frame dict feeds every sector, so a multi-cam ckpt loads.
+        assert tuple(rt.cams) == ("wide", "main"), rt.cams
+        frames = {
+            "main": np.full((480, 640, 3), 90, dtype=np.uint8),
+            "wide": np.full((360, 640, 3), 120, dtype=np.uint8),
+        }
+        pred = rt.observe(frames, 0.1)
+        assert pred.lane_gt is not None and pred.canvas_shape[0] == 192
+    # Drive semantics are unchanged by the 8-cam input: with no prediction
+    # (nothing observed) drive still stops and leaves the path empty.
     pout = _pout()
     # No runtime means no observe → None pred → stop under drive.
     decision = apply_scene_ckpt_lane(pout, None, drive=True)
     assert decision == "stop"
     assert pout.path_ego == []
-    print("multi-cam ckpt refuses load; drive does not steer OK")
+    print("multi-cam ckpt loads and sees the live dict; drive without a pred still stops OK")
 
 
 def check_nonfinite_lane_x_stops() -> None:
@@ -605,7 +606,7 @@ def main() -> None:
     check_empty_modular_plan_gets_drive_cap()
     check_low_conf_and_aeb_override()
     check_drive_without_ckpt_refused()
-    check_multicam_ckpt_refuses_drive()
+    check_multicam_ckpt_loads_drive_stops()
     check_nonfinite_lane_x_stops()
     check_steer_sign_locked_to_lane_x()
     check_modular_low_conf_and_stale_no_ckpt_steer()

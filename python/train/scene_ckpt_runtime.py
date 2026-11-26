@@ -9,6 +9,7 @@ so BeamNG keeps the GPU.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -542,12 +543,6 @@ class SceneCkptRuntime:
             if param.device.type != "cpu":
                 raise SceneCkptInputError("scene-ckpt shadow must stay on CPU")
         self.cams = tuple(getattr(self.net, "cams", ()) or ())
-        names = self.cams or ("main",)
-        if names != ("main",):
-            raise SceneCkptInputError(
-                f"{self.path.name}: this shadow runtime only has the main camera; "
-                f"refusing cams={list(names)} (missing sectors would be black)"
-            )
         self.canvas_h = int(getattr(self.net, "canvas_h", 192))
         self.canvas_w = int(getattr(self.net, "canvas_w", 256))
         self.aux_sensors = bool(getattr(self.net, "aux_sensors", False))
@@ -557,11 +552,16 @@ class SceneCkptRuntime:
     def wants_route(self) -> bool:
         return bool(getattr(self.net, "route_cond", False))
 
-    def observe(self, frame: Any, dt_s: float | None, route: Any = None) -> SceneCkptPred:
-        arr = _require_main(frame)
-        if arr is None:
+    def observe(self, frames: Any, dt_s: float | None, route: Any = None) -> SceneCkptPred:
+        """One tick. ``frames`` is the live camera frame dict (``CameraFrameBundle.frames``).
+
+        The strip is ``compose_strip`` of that whole dict, the same call the live lane path
+        makes, so every camera in the dict (wide included) lands in its sector.
+        """
+        pics = _require_frames(frames)
+        if pics is None:
             return SceneCkptPred.empty()
-        canvas = _main_canvas(arr, self.cams, self.canvas_h, self.canvas_w, float(getattr(self.net, "scale", 1.0) or 1.0))
+        canvas = _main_canvas(pics, self.cams, self.canvas_h, self.canvas_w, float(getattr(self.net, "scale", 1.0) or 1.0))
         import torch
 
         with torch.inference_mode():
@@ -589,30 +589,53 @@ class SceneCkptRuntime:
         )
 
 
-def _require_main(frame: Any) -> np.ndarray | None:
-    if frame is None:
+def _require_frames(frames: Any) -> Mapping[str, Any] | None:
+    """The live frame dict, checked. None (nothing grabbed, or no main picture) gives no prediction.
+
+    A bare main image is the old main-only input and is refused, not composed on its own.
+    """
+    if frames is None:
         return None
-    arr = np.asarray(frame)
-    if arr.ndim != 3 or int(arr.shape[-1]) != 3:
+    if not isinstance(frames, Mapping):
         raise SceneCkptInputError(
-            f"main camera must be HxWx3 (live long side ~640), got shape {tuple(arr.shape)} "
-            "(channel/shape check)"
+            f"scene-ckpt takes the live camera frame dict (cam name -> HxWx3 image), got {type(frames).__name__}; "
+            "a bare main frame is the old main-only input"
         )
-    return arr
+    from python.data.strip_writer import STRIP_ORDER
+
+    for cam in (*STRIP_ORDER, "cam_main"):
+        img = frames.get(cam)
+        if img is None:
+            continue
+        arr = np.asarray(img)
+        if arr.size == 0:
+            continue
+        if arr.ndim != 3 or int(arr.shape[-1]) != 3:
+            raise SceneCkptInputError(
+                f"{cam} camera must be HxWx3 (live long side ~640), got shape {tuple(arr.shape)} "
+                "(channel/shape check)"
+            )
+    main = frames.get("main")
+    if main is None:
+        main = frames.get("cam_main")
+    if main is None or np.asarray(main).size == 0:
+        return None
+    return frames
 
 
 def _main_canvas(
-    frame: np.ndarray,
+    frames: Mapping[str, Any],
     cams: tuple[str, ...],
     canvas_h: int,
     canvas_w: int,
     scale: float,
 ) -> np.ndarray:
+    """The model canvas from the live 8-camera frame dict: ``compose_strip(frames)``, cut to ``cams``."""
     from python.data.strip_writer import compose_strip
     from python.train.cam_strip import extract_cams, scale_canvas
 
     names = cams or ("main",)
-    strip = compose_strip({"main": frame})
+    strip = compose_strip(frames)
     packed = extract_cams(strip, names)
     if float(scale) < 0.999:
         packed = scale_canvas(packed, scale, names)

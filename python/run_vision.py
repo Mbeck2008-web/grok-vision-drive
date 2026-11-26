@@ -1646,7 +1646,8 @@ def main(clock=None) -> None:
                         route_vec = runtime_route_vec(
                             st.get("nav") if isinstance(st.get("nav"), dict) else {}, route_intent_result
                         )
-                    ckpt_pred = scene_ckpt.observe(main, tick_dt, route=route_vec)
+                    ckpt_frames = getattr(bundle, "frames", None)
+                    ckpt_pred = scene_ckpt.observe(ckpt_frames, tick_dt, route=route_vec)
                 except SceneCkptInputError as exc:
                     print(f"[GVD] scene-ckpt input: {exc}", flush=True)
                     ckpt_pred = None

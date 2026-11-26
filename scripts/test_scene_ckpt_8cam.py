@@ -194,14 +194,14 @@ def check_multicam_loads_and_observes() -> None:
     frames = _fixture_frames()
     with tempfile.TemporaryDirectory() as tmp:
         rt2, _ = _runtime(Path(tmp), ("main", "wide"), seed=4)
-        assert tuple(rt2.cams) == ("main", "wide"), rt2.cams
+        assert tuple(rt2.cams) == ("wide", "main"), rt2.cams
         pred, canvas, tensor = _observe_capture(rt2, frames)
         assert tensor.shape[-2] == 192 and tensor.shape[-1] == canvas.shape[1], (tensor.shape, canvas.shape)
         # sectors repacked in strip order: wide then main, both from the live dict
         wide_w = next(s for s in SECTORS if s.cam_id == "wide").x1 - next(s for s in SECTORS if s.cam_id == "wide").x0
         assert int(canvas[:, :wide_w].max()) > 0 and int(canvas[:, -256:].max()) > 0, "a sector of the 2-cam canvas is black"
         assert pred.lane_gt is not None and pred.canvas_shape == tuple(canvas.shape)
-    print(f"2-cam (main,wide) ckpt loads and sees both cams from the live dict (canvas {tuple(canvas.shape)}) OK")
+    print(f"2-cam (wide,main) ckpt loads and sees both cams from the live dict (canvas {tuple(canvas.shape)}) OK")
 
 
 def check_main_only_input_is_gone() -> None:

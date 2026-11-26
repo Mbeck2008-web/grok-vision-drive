@@ -44,7 +44,7 @@ def check_multicam_loads() -> None:
         path = epoch_ckpt_path(Path(tmp), Path(tmp) / "scene_lanes", "20261107T011144Z", 0, 1)
         write_epoch_ckpt(path, weights, meta, min_free_bytes=0)
         rt = SceneCkptRuntime(path)
-        assert tuple(rt.cams) == ("main", "wide"), rt.cams
+        assert tuple(rt.cams) == ("wide", "main"), rt.cams
         assert rt.canvas_h == 192 and rt.canvas_w > 256, (rt.canvas_h, rt.canvas_w)
         print(f"multi-cam ckpt loads: cams={list(rt.cams)} canvas {rt.canvas_h}x{rt.canvas_w}")
 

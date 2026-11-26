@@ -60,7 +60,8 @@ _MAIN_FAR_M = 35.0
 STITCH_LANE_FAR_M = 70.0
 # The wide camera feeds the lane fit only in the near field. Its pixel is ~3x
 # main's angle (labels_v4: 2 cm ground precision to 5.5 m on wide vs 17.3 m on
-# main), and on a 96 px sector one row past ~8.4 m jumps to 10.7, 15.1, 26.9 m.
+# main), and on a 96 px sector one row past ~8.4 m jumps to 9.415, 10.7,
+# 12.522, 15.1, 19.283, 26.9 m.
 # Main and narrow own the far road. Wide owns the 22-37.5 deg side gap between
 # main (+-22.2) and the pillars (+-37.5 and out), 2-9 m ahead, where the near
 # lane edge and curb sit (the stop-sign frames that need it use 2.2-8.4 m ahead,

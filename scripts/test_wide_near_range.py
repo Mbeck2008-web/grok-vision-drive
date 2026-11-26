@@ -52,7 +52,20 @@ def check_wide_points_near_range_only() -> None:
 
     limit = float(lanes.WIDE_NEAR_MAX_Y_M)
     assert 5.0 <= limit <= 10.0, limit
+    # 96 px wide sector rows, pinned as fixed distances (not WIDE_NEAR_MAX_Y_M):
+    # row 49 is 8.4165 m and must be KEPT; row 48 is 9.4152 m and must be DROPPED.
+    # Mutating the gate to 8.0 drops the kept row; mutating it to 10.0 keeps the
+    # dropped row. Both must fail this check.
+    KEEP_WIDE_ROW_Y_M = 8.4165
+    DROP_WIDE_ROW_Y_M = 9.4152
+    ROW_TOL_M = 0.001
+    pose = lanes.camera_pose("wide")
+    keep_hit = lanes.project_pose_pixel(pose, 84.0, 49.0, width=168, height=96)
+    drop_hit = lanes.project_pose_pixel(pose, 84.0, 48.0, width=168, height=96)
+    assert keep_hit is not None and abs(float(keep_hit["y"]) - KEEP_WIDE_ROW_Y_M) < ROW_TOL_M, keep_hit
+    assert drop_hit is not None and abs(float(drop_hit["y"]) - DROP_WIDE_ROW_Y_M) < ROW_TOL_M, drop_hit
     seen_far_before = 0
+    gated_keep = gated_drop = ungated_keep = ungated_drop = 0
     for p in sorted((ROOT / "tests" / "fixtures").rglob("*.jpg")):
         img = cv2.imread(str(p))
         if img is None or img.shape[:2] != (96, 1336) or "esbr" in p.name:
@@ -62,16 +75,39 @@ def check_wide_points_near_range_only() -> None:
         for poly in lanes.lanes_from_view(None, img).lanes_bev:
             for pt in poly:
                 if pt.get("src") == "wide":
-                    assert float(pt["y"]) <= limit, (p.name, pt)
+                    y = float(pt["y"])
+                    assert y <= limit, (p.name, pt)
                     assert abs(float(pt["x"])) <= lanes.WIDE_NEAR_MAX_X_M, (p.name, pt)
+                    if abs(y - KEEP_WIDE_ROW_Y_M) <= ROW_TOL_M:
+                        gated_keep += 1
+                    if abs(y - DROP_WIDE_ROW_Y_M) <= ROW_TOL_M:
+                        gated_drop += 1
         # ungated fit on the same strip: far wide points do exist (the gate is doing work)
         for poly in lanes._estimate_span_lanes(
             np.ascontiguousarray(img[:, 336:840]), lanes.STITCH_LANE_FAR_M,
             ((0, 160), (168, 328), (336, 496)), gate_wide=False,
         ).lanes_bev:
-            seen_far_before += sum(1 for pt in poly if pt.get("src") == "wide" and float(pt["y"]) > limit)
+            for pt in poly:
+                if pt.get("src") != "wide":
+                    continue
+                y = float(pt["y"])
+                if y > limit:
+                    seen_far_before += 1
+                if abs(y - KEEP_WIDE_ROW_Y_M) <= ROW_TOL_M:
+                    ungated_keep += 1
+                if abs(y - DROP_WIDE_ROW_Y_M) <= ROW_TOL_M:
+                    ungated_drop += 1
     assert seen_far_before > 0, "fixture set has no far wide points; the gate is untested"
-    print(f"wide gate: 0 wide points past {limit} m (ungated fit had {seen_far_before})")
+    assert ungated_keep > 0 and ungated_drop > 0, (
+        f"fixtures must include the {KEEP_WIDE_ROW_Y_M} m and {DROP_WIDE_ROW_Y_M} m wide rows "
+        f"(ungated keep={ungated_keep}, drop={ungated_drop})"
+    )
+    assert gated_keep > 0, f"{KEEP_WIDE_ROW_Y_M} m wide row must be KEPT (gated count {gated_keep})"
+    assert gated_drop == 0, f"{DROP_WIDE_ROW_Y_M} m wide row must be DROPPED (gated count {gated_drop})"
+    print(
+        f"wide gate: 0 wide points past {limit} m (ungated fit had {seen_far_before}); "
+        f"kept {KEEP_WIDE_ROW_Y_M} m x{gated_keep}, dropped {DROP_WIDE_ROW_Y_M} m"
+    )
 
 
 def _render_projected_road(cam_id: str, curve: float = 0.0, w: int = 256, h: int = 192) -> np.ndarray:
@@ -323,6 +359,15 @@ def check_sweep_zero_missed_vs_main() -> None:
                 new.append((f, k))
     print(f"sweep 255: main brakes {mb}, branch brakes {bb}, missed {len(missed)}, new {len(new)} {new}")
     assert not missed, f"MISSED BRAKES vs main: {missed}"
+    assert new == [], f"NEW BRAKES vs main: {new}"
+    record_diffs = []
+    for f in sorted(base):
+        for k in base[f]:
+            ba, bs, bl = base[f][k]
+            ga, gs, gl = got[f][k]
+            if (ba, bs, bl) != (ga, gs, gl):
+                record_diffs.append((f, k, (ba, bs, bl), (ga, gs, gl)))
+    assert record_diffs == [], f"full-record diffs (aeb, stop_reason, lane_source): {record_diffs}"
 
 
 def check_harness_vs_main() -> None:

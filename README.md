@@ -292,7 +292,7 @@ The settled game view. Soft Esc parked.
 
 ![wide](docs/cams/wide.jpg)
 
-The wide camera's lane points feed the planner only in the near field: at most `WIDE_NEAR_MAX_Y_M` = 9 m ahead and 5 m to the side (`python/perception/lanes.py`). Main and narrow own the far road. Wide covers the 22–37.5° side gap between main and the pillars, where the near lane edge and curb sit. Past ~8.4 m one 96 px row of wide jumps 2–11 m, so far wide points are dropped. The camera, its mount, and the recorder are unchanged.
+The wide camera's lane points feed the planner only in the near field: at most `WIDE_NEAR_MAX_Y_M` = 9 m ahead and 5 m to the side (`python/perception/lanes.py`). Main and narrow own the far road. Wide covers the 22–37.5° side gap between main and the pillars, where the near lane edge and curb sit. Past ~8.4 m one 96 px row of wide jumps to 9.415, 10.7, 12.522, 15.1, 19.283, 26.9 m, so far wide points are dropped. The camera, its mount, and the recorder are unchanged.
 
 ### main
 

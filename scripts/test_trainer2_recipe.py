@@ -1313,6 +1313,13 @@ def check_aux_eval_numbers() -> None:
         pass
     else:
         raise AssertionError("shape mismatch must raise, not broadcast")
+    try:  # a size-1 pred would broadcast silently against 2 cells: the explicit shape check refuses it
+        acc.update_depth(np.array([5.0]), np.array([1.0, 2.0]), np.array([1.0, 1.0]))
+    except ValueError as exc:
+        assert "shapes differ" in str(exc), exc
+    else:
+        raise AssertionError("a broadcastable shape mismatch must raise")
+    assert acc.rel_n == 4
     sem = AuxEval()
     logits = np.zeros((3, 1, 4))  # (C, H, W): argmax per cell
     for col, cls in enumerate((1, 1, 2, 0)):
@@ -1459,6 +1466,12 @@ def check_ssl_epoch_losses_and_stop() -> None:
                                              seed=0, epochs=3, max_rows=0)
         assert info3["reused"] and info3["losses"] is None  # no history: unknown, never invented
         assert not list(base.glob("*.partial*")), list(base.iterdir())
+        # default_ssl_stem hands its stop_fn to the run: a plateau rule ends the stem at 2 of 10 epochs
+        sub = base / "stopped"
+        sub.mkdir()
+        _ps, infos = exp_ssl.default_ssl_stem(SceneNet(cams=("main",), scale=1.0), rows, image_fn=image_fn, out_dir=sub, lr=1e-3,
+                                              seed=0, epochs=10, max_rows=0, stop_fn=lambda losses: len(losses) >= 2)
+        assert not infos["reused"] and len(infos["losses"]) == 2, infos
     print("SSL: per-epoch pretext losses, stop_fn ends the run, history saved create-only and returned on reuse (None if absent) OK")
 
 

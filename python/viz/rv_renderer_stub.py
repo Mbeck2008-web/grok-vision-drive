@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import json
 import os
 import select
@@ -25,7 +26,9 @@ import time
 _PR_SET_PDEATHSIG = 1
 _SYNCHRONIZE = 0x00100000
 _WAIT_OBJECT_0 = 0
+_ERROR_INVALID_PARAMETER = 87  # OpenProcess on a pid that no longer exists
 _POLL_MS = 200
+_WATCH_MODE_LABEL = {"winhandle": "handle", "pidfd": "pidfd", "ppid": "ppid"}
 
 # Test-only hook. Never read from env or config. Production --serve leaves this False.
 # Set as a private module attribute from a test process after import, before main().
@@ -66,23 +69,60 @@ def _win_kernel32() -> ctypes.WinDLL:
     return k
 
 
+def _win_open_process(ppid: int) -> tuple[object | None, int]:
+    """OpenProcess(SYNCHRONIZE) on ppid. Returns (handle, 0) or (None, GetLastError())."""
+    handle = _win_kernel32().OpenProcess(_SYNCHRONIZE, 0, int(ppid))
+    if handle:
+        return handle, 0
+    return None, int(ctypes.get_last_error())
+
+
+def _open_win_watch(ppid: int) -> tuple[str, object] | None:
+    """Only ERROR_INVALID_PARAMETER means the pid is gone; other errors (e.g. access
+    denied) fall back to the ppid poll rather than exiting under a live parent."""
+    handle, err = _win_open_process(ppid)
+    if handle:
+        return ("winhandle", handle)
+    if err == _ERROR_INVALID_PARAMETER:
+        return None
+    return ("ppid", int(ppid))
+
+
+def _open_pidfd_watch(ppid: int) -> tuple[str, object] | None:
+    """Only ESRCH means the pid is gone; ENOSYS/EMFILE/ENFILE/EPERM/other errors fall
+    back to the ppid poll rather than exiting under a live parent."""
+    try:
+        return ("pidfd", os.pidfd_open(int(ppid), 0))
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return None
+        return ("ppid", int(ppid))
+
+
 def _open_parent_watch(ppid: int) -> tuple[str, object] | None:
     """Open a process-object watch on the parent.
 
-    Returns None if the parent is already gone (caller must exit immediately).
-    Windows: OpenProcess(SYNCHRONIZE). Linux: pidfd_open. Else a getppid fallback.
+    Returns None only if the parent is known to be gone (caller must exit immediately).
+    Windows: OpenProcess(SYNCHRONIZE). Linux: pidfd_open. Else (or if the native
+    watch cannot be opened for a live parent) a getppid poll.
     """
     if sys.platform == "win32":
-        handle = _win_kernel32().OpenProcess(_SYNCHRONIZE, 0, int(ppid))
-        if not handle:
-            return None
-        return ("winhandle", handle)
+        return _open_win_watch(ppid)
     if hasattr(os, "pidfd_open"):
-        try:
-            return ("pidfd", os.pidfd_open(int(ppid), 0))
-        except OSError:
-            return None
+        return _open_pidfd_watch(ppid)
     return ("ppid", int(ppid))
+
+
+def _emit(line: str) -> None:
+    """Best-effort status line on stdout (RvClient sends stdout to DEVNULL)."""
+    try:
+        out = sys.stdout
+        if out is None:
+            return
+        out.write(line + "\n")
+        out.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 def _parent_has_exited(watch: tuple[str, object], timeout_s: float = 0.0) -> bool:
@@ -154,11 +194,13 @@ def main(argv: list[str] | None = None) -> int:
     watch = _open_parent_watch(expected_ppid)
     if watch is None or _parent_has_exited(watch):
         _close_parent_watch(watch)
+        _emit("RV_STUB_EXIT reason=parent_gone_at_start")
         return 0
 
     _install_pdeathsig()
     if _parent_has_exited(watch):
         _close_parent_watch(watch)
+        _emit("RV_STUB_EXIT reason=parent_gone_at_start")
         return 0
 
     stop = False
@@ -170,6 +212,9 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _on_sig)
     signal.signal(signal.SIGINT, _on_sig)
 
+    # Armed handshake: printed only after the parent watch is open and re-checked.
+    _emit(f"RV_WATCH_ARMED mode={_WATCH_MODE_LABEL.get(watch[0], watch[0])} parent_pid={expected_ppid}")
+    reason = "signal"
     try:
         stdin_fd: int | None = None
         if sys.platform != "win32":
@@ -178,7 +223,9 @@ def main(argv: list[str] | None = None) -> int:
             except (AttributeError, OSError, ValueError):
                 stdin_fd = None
 
-        if sys.platform == "win32":
+        if stdin_fd is None:
+            # Windows (and POSIX without a usable stdin fd): stdin EOF on a thread,
+            # parent watch polled every _POLL_MS.
             eof_evt = threading.Event()
 
             def _watch_stdin() -> None:
@@ -187,30 +234,43 @@ def main(argv: list[str] | None = None) -> int:
                         chunk = sys.stdin.buffer.read(1)
                         if not chunk:
                             break
-                except (OSError, ValueError):
+                except (OSError, ValueError, AttributeError):
                     pass
                 finally:
                     eof_evt.set()
 
             t = threading.Thread(target=_watch_stdin, daemon=True)
             t.start()
-            while not stop and not eof_evt.is_set():
-                if _parent_has_exited(watch, timeout_s=_POLL_MS / 1000.0):
+            while not stop:
+                if eof_evt.is_set():
+                    reason = "stdin_eof"
                     break
-        elif stdin_fd is not None:
+                if watch[0] == "winhandle":
+                    if _parent_has_exited(watch, timeout_s=_POLL_MS / 1000.0):
+                        reason = "parent_exit"
+                        break
+                else:
+                    if _parent_has_exited(watch):
+                        reason = "parent_exit"
+                        break
+                    eof_evt.wait(timeout=_POLL_MS / 1000.0)
+        else:
             wait_fds: list[object] = [stdin_fd]
             if watch[0] == "pidfd":
                 wait_fds.append(watch[1])
             while not stop:
                 if _parent_has_exited(watch):
+                    reason = "parent_exit"
                     break
                 try:
                     ready, _, _ = select.select(wait_fds, [], [], _POLL_MS / 1000.0)
                 except InterruptedError:
                     continue
                 except (OSError, ValueError):
+                    reason = "error"
                     break
                 if _parent_has_exited(watch):
+                    reason = "parent_exit"
                     break
                 if stdin_fd in ready:
                     try:
@@ -218,32 +278,15 @@ def main(argv: list[str] | None = None) -> int:
                     except InterruptedError:
                         continue
                     except OSError:
+                        reason = "error"
                         break
                     if not chunk:
+                        reason = "stdin_eof"
                         break
-        else:
-            eof_evt = threading.Event()
-
-            def _watch_stdin() -> None:
-                try:
-                    while not eof_evt.is_set():
-                        chunk = sys.stdin.buffer.read(1)
-                        if not chunk:
-                            break
-                except (OSError, ValueError):
-                    pass
-                finally:
-                    eof_evt.set()
-
-            t = threading.Thread(target=_watch_stdin, daemon=True)
-            t.start()
-            while not stop and not eof_evt.is_set():
-                if _parent_has_exited(watch):
-                    break
-                eof_evt.wait(timeout=_POLL_MS / 1000.0)
     finally:
         _close_parent_watch(watch)
 
+    _emit(f"RV_STUB_EXIT reason={reason}")
     return 0
 
 

@@ -93,18 +93,22 @@ def cam_frame(cam, idx):
     clamp_frac = 0.0
     snapped = np.zeros((ph, pw), bool)
     if a.road_snap and a.depth_src != "gt":
-        depth, snapped = S.road_snap(CAM_POSE[cam], depth, road & ~sky, max_hit_m=a.road_snap_max_m or S.ROAD_SNAP_MAX_M)
+        ego = np.zeros((ph, pw), bool)   # ego hood px are never drawn (valid=False below): not snapped either
+        if cam in EGO_MASK:
+            r0, c0, c1 = EGO_MASK[cam]; ego[int(r0 * ph):, int(c0 * pw):int(c1 * pw)] = True
+        depth, snapped = S.snap_road_for_cam(cam, CAM_POSE[cam], depth, road & ~sky, max_hit_m=a.road_snap_max_m or S.ROAD_SNAP_MAX_M, exclude=ego)
     SNAP_STATS.setdefault(cam, []).append(float(np.mean(snapped)))
+    # depth edges (S.edge_cut_far_side): edge pixels, snapped ones too, go to the far side (5x5 local max) ... but never under
+    # the road: where the far side is past the pixel's own ground hit (a thin pole or the road in front of a face would be
+    # pushed under the road, Breaker: -1.02 m at 29.9 m), the pixel keeps its own depth
+    cp_ = CAM_POSE[cam]; rz = S._pixel_rays(cp_)[..., 2]; dn = rz < -1e-6
+    ghit = np.where(dn, float(cp_.pos[2]) / np.where(dn, -rz, 1.0), np.inf) * (a.clamp_margin if a.ground_clamp else 1.0)
+    depth = S.edge_cut_far_side(depth, sky, ghit)
+    # and clamp after the cut, so nothing the cut touched can end up below the road
     if a.ground_clamp and a.depth_src != "gt":
         depth, cl = S.ground_clamp(CAM_POSE[cam], depth, margin=a.clamp_margin)
         clamp_frac = float(np.mean(cl & ~sky))
     CLAMP_STATS.setdefault(cam, []).append(clamp_frac)
-    # depth edges: re-place edge pixels on the far side (local max), so no sheet joins fg and bg
-    inv = 1.0 / np.maximum(depth, 1e-3)
-    gy, gx = np.gradient(inv)
-    cut = np.hypot(gx, gy) > 0.12 * inv
-    far_side = cv2.dilate(depth.astype(np.float32), np.ones((5, 5), np.uint8))
-    depth = np.where(cut & ~sky & ~snapped, far_side, depth)
     if a.max_depth == "cap":
         cap = S.depth_cap_m(c["far_m"])
         depth, farm = S.far_to_cap(depth, sky, cap)
@@ -119,14 +123,7 @@ def cam_frame(cam, idx):
     return rgb, depth, valid, sky
 
 def footprint(cam, depth):
-    d = np.where(np.isfinite(depth), depth, 0.0); h, w = d.shape
-    ys, xs = np.mgrid[0:h, 0:w]
-    g = np.stack([((xs + 0.5 - cam.cx) / cam.fx) * d, -((ys + 0.5 - cam.cy) / cam.fy) * d, d], -1)
-    sp = np.zeros((h, w))
-    sp[:, :-1] = np.maximum(sp[:, :-1], np.linalg.norm(np.diff(g, axis=1), axis=-1))
-    sp[:-1] = np.maximum(sp[:-1], np.linalg.norm(np.diff(g, axis=0), axis=-1))
-    base = d / cam.fy
-    return np.clip(sp, base, 6.0 * base)
+    return S.point_footprint(cam, depth)   # on-plane points reach the next ground row (rear/side holes)
 
 def gt_pose(row, ref):
     d = row["ego"]["dir"]; hw = math.atan2(d[1], d[0]); p = np.array(row["ego"]["pos"][:2])
@@ -173,6 +170,8 @@ for n_row, row in enumerate(rows):
         evidence.append(S.CamEvidence(cp, depth, valid, sky))
         if sky.any() and cam in ("main", "wide", "narrow"):
             sky_cols.append(rgb[sky])
+        elif cam == "main" and sky_rgb is None:   # no sky seen yet (tunnel): backdrop from main's top rows, render-only
+            sky_cols.append(rgb[: max(1, rgb.shape[0] // 10)].reshape(-1, 3))
         ys, xs = np.nonzero(valid)
         pts = S.unproject(cp, depth, ys, xs); cols = rgb[ys, xs]; foot = footprint(cp, depth)[ys, xs]
         hw, y0, y1, z0, z1 = EGO_BOX
@@ -213,7 +212,7 @@ for n_row, row in enumerate(rows):
     chase = S.chase_camera(CHASE_POS, CHASE_PITCH, CHASE_FOV, a.width, a.height, yaw_off)
     pts = np.concatenate(parts_p) if parts_p else np.zeros((0, 3)); cols = np.concatenate(parts_c) if parts_c else np.zeros((0, 3), np.uint8); foot = np.concatenate(parts_f) if parts_f else np.zeros(0)
     r = S.compose(chase, pts, cols, foot, sky_rgb=(sky_rgb if a.sky else None), ground_rgb=(ground_rgb if a.prior else None),
-                  splat_scale=1.0, max_radius_px=max(2, a.width // 120), fill=bool(a.fill))
+                  splat_scale=1.0, max_radius_px=S.splat_max_radius_px(a.width), fill=bool(a.fill))
     c2 = time.process_time()
     stats["fuse_cpu_ms"].append((c1 - c0) * 1e3); stats["render_cpu_ms"].append((c2 - c1) * 1e3)
     stats["black"].append(S.black_fraction(r.rgb))

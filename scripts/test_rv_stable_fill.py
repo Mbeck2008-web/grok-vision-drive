@@ -18,9 +18,22 @@ S7 ground clamp: a camera cannot see below the road. Depth farther than the down
    ground-plane hit (wide cam 88.7 deg vFOV, pitch -8, 1.24 m up) is capped there (x margin);
    true road, nearer surfaces (hood, walls) and rays at/above the horizon are untouched.
 S9 road is flat: net-labelled road pixels (>= 4 px inside the label, downward ray hitting within
-   25 m) are placed exactly on the ground plane, whatever the coarse net depth says, so the near road
+   25 m, not > 0.30 m above the plane by the net's own depth, S11) are placed exactly on the ground plane, so the near road
    cannot bend down/up and two cameras' road meets; road label edges, road beyond 25 m, non-road and
    upward rays are left alone.
+S11 snap rejection (runtime, no GT): a road-labelled px whose net depth puts it > 0.30 m above the road
+   plane is not snapped (wall labelled road stays put; pole/car under a 12x16 road label keeps height).
+S12 road snap runs only on ROAD_SNAP_CAMS (all but wide and narrow; wide switchable, S14).
+S7b ground_clamp caps +inf on a downward ray at the ground hit; NaN stays NaN.
+S3b CamDepthFilter does not push on/above-road input below the road plane.
+S15 a road px the snap rejects renders at its raw depth (not deleted by snap / clamp / cap).
+S14 snap: ego-hood px are excluded; wide snaps to a 15 m ground hit only.
+S16 the depth-edge cut has no snapped exemption (shared edge_cut_far_side).
+S19 the black band under the horizon is a 2-D render-only backdrop when a sky colour exists.
+S21 no module under python/ imports tools.rv_*, rv_stable_fill, or tools.rv_stable_fill (import isolation: AEB/planner cannot see the preview).
+S17 splat radius cap (W//60) covers the 0.25 m ground grid near the chase camera (behind-car strip).
+S13 ground splats reach the next camera row: on-plane points' footprint grows to the ground row spacing past
+   the old 6*(d/fy) cap (rear/repeater holes); off-plane points keep the cap.
 S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
    (narrow 250, main/wide 250, 100 m cams 99.5); non-sky pixels beyond the cap or +inf are
    drawn AT the cap (kept, not dropped); sky stays sky; nearer depth is untouched.
@@ -269,8 +282,18 @@ def check_road_snap() -> None:
     assert sf.ROAD_SNAP_MAX_M == 25.0
     R = 20.0  # this small fixture's horizon is only ~60 m out, so test the range gate at 20 m
     out, m = sf.road_snap(cam, raw, road, max_hit_m=R)
-    core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= R)
+    # S9 spec change (38c9827, ruled by GVD: snap rejection > 0.30 m above the plane), flagged for Michael's sign-off:
+    #   OLD: core = erode(road) & (dz < 0) & (hit <= R);            assert m == core   (every in-range road px snaps)
+    #   NEW: core = erode(road) & (dz < 0) & (hit <= R) & ~above;   assert m == core   (px > 0.30 m above the plane do not)
+    # Why OLD no longer holds: this fixture's raw depth bends *above* the road farther out, and at runtime that floating-road
+    # band is indistinguishable from a wall/pole/car under a coarse 12x16 road label (S11). The ruling is to leave such px at
+    # raw depth. NEW is LOOSER in one way: the fixture no longer guarantees that a road that bends up gets flattened there
+    # (the 'too-near band' px below). It is compensated by (1) asserting the band exists, (2) the exact-plane assert on all
+    # snapped px, (3) S11 (rejected stays put) and S15 (rejected still renders at raw depth).
+    above = (cam.pos[2] + raw * dz) > sf.ROAD_SNAP_MAX_ABOVE_M   # net already puts it > 0.30 m up: not road (S11)
+    core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= R) & ~above
     assert m.tolist() == core.tolist() and core.sum() > 1000
+    assert (sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (hit <= R) & above).any(), "fixture must have a too-near band"
     z = cam.pos[2] + out * dz
     assert np.max(np.abs(z[m])) < 1e-9, "snapped road must lie on the ground plane"
     zr = cam.pos[2] + raw * dz
@@ -313,6 +336,381 @@ def check_ownership() -> None:
         return sf.compose(chase, pts, col, np.full(len(pts), 3.0), sky_rgb=None, ground_rgb=None, fill=False).rgb
     red = lambda im: int(((im[..., 0] > 200) & (im[..., 1] < 50)).sum())
     assert red(draw(False)) > S and red(draw(True)) == 0
+
+
+def _flat_scene(cid, pos, pitch, fov, w=160, h=90):
+    cam = camera_from_angles(cid, pos, 0.0, pitch, fov, w, h, near_m=0.05, far_m=300.0)
+    ys, xs = np.mgrid[0:h, 0:w]
+    dz = sf._pixel_rays(cam)[..., 2]
+    down = dz < -1e-6
+    hit = np.where(down, cam.pos[2] / np.where(down, -dz, 1.0), np.inf)
+    return cam, ys, xs, dz, down, hit
+
+
+def check_snap_rejects_above_road() -> None:
+    """S11 (Skeptic/GVD): runtime-only snap rejection, no GT. A road-labelled px whose net depth puts it
+    more than ROAD_SNAP_MAX_ABOVE_M (0.30 m) above the road plane (net depth much shorter than its
+    ground-ray hit) is not snapped: a wall labelled road stays put, a pole/car labelled road at the
+    12x16 class grid keeps its height through road_snap + ground_clamp; true road still snaps."""
+    assert sf.ROAD_SNAP_MAX_ABOVE_M == 0.30
+    # wall labelled road: a vertical face 6 m ahead filling the lower image, the whole frame labelled road
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    wall = np.full(hit.shape, 6.0)
+    z = cam.pos[2] + wall * dz
+    face = down & (z > 0.31)
+    assert face.sum() > 500
+    out, m = sf.road_snap(cam, wall, np.ones(hit.shape, bool))
+    assert not m[face].any() and np.array_equal(out[face], wall[face]), "wall labelled road was snapped"
+    road_part = down & (z < 0.0)             # wall depth lies past the ground there: true under-road dip, snap it
+    assert m[road_part & sf._erode(np.ones(hit.shape, bool), sf.ROAD_SNAP_ERODE_PX) & (hit <= sf.ROAD_SNAP_MAX_M)].all()
+    # pole / car on exact road, road label at the 12x16 class grid (majority per cell)
+    for cid, pos, pitch, fov in (("wide", (0.0, 1.2, 1.24), -8.0, 88.7), ("main", (0.0, 1.2, 1.26), -6.0, 34.0)):
+        cam, ys, xs, dz, down, hit = _flat_scene(cid, pos, pitch, fov)
+        H, W = hit.shape
+        D = 8.0
+        zobj = cam.pos[2] + D * dz
+        obj = (xs >= 70) & (xs < 82) & down & (hit > D) & (zobj < 1.5)
+        assert obj.sum() > 30, (cid, obj.sum())
+        depth = np.where(obj, D, np.where(down, hit, 80.0))
+        cell = np.zeros((12, 16)); cnt = np.zeros((12, 16))
+        cy, cx = ys * 12 // H, xs * 16 // W
+        np.add.at(cell, (cy, cx), (~obj).astype(float)); np.add.at(cnt, (cy, cx), 1.0)
+        road = (cell / cnt > 0.5)[cy, cx] & down
+        assert road[obj].any(), "fixture: the coarse label must cover part of the object"
+        out, m = sf.road_snap(cam, depth, road)
+        out, cl = sf.ground_clamp(cam, out, margin=1.0)
+        hi = obj & (zobj > sf.ROAD_SNAP_MAX_ABOVE_M)
+        zo = cam.pos[2] + out * dz
+        assert np.max(np.abs(zo[hi] - zobj[hi])) < 1e-9, f"{cid}: object px above 0.30 m lost height"
+        assert m[road & ~obj & sf._erode(road, sf.ROAD_SNAP_ERODE_PX)].any(), "true road must still snap"
+
+
+def _with_snap_cams(cams, fn):
+    """Run fn with sf.ROAD_SNAP_CAMS temporarily set (the switch is a module constant)."""
+    old = sf.ROAD_SNAP_CAMS
+    sf.ROAD_SNAP_CAMS = tuple(cams)
+    try:
+        return fn()
+    finally:
+        sf.ROAD_SNAP_CAMS = old
+
+
+def check_snap_cams() -> None:
+    """S12: road snap runs only on ROAD_SNAP_CAMS: main, pillars, repeaters, rear. Wide is OFF by default (Michael
+    2026-11-26) and narrow stays off; every cam is switchable (module constant)."""
+    assert tuple(sf.ROAD_SNAP_CAMS) == ("main", "pillarL", "pillarR", "repeatL", "repeatR", "rear"), sf.ROAD_SNAP_CAMS
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    raw = np.where(down, hit * 1.5, 80.0)
+    road = down.copy()
+    for cid in sf.ROAD_SNAP_CAMS:
+        o, m = sf.snap_road_for_cam(cid, cam, raw, road)
+        assert m.any() and np.array_equal(o[m], hit[m]), cid
+    for cid in ("wide", "narrow"):
+        o, m = sf.snap_road_for_cam(cid, cam, raw, road)
+        assert not m.any() and np.array_equal(o, raw), cid
+    o, m = _with_snap_cams(("wide",), lambda: sf.snap_road_for_cam("wide", cam, raw, road))
+    assert m.any(), "wide must be switchable on"
+    o, m = _with_snap_cams(("wide",), lambda: sf.snap_road_for_cam("rear", cam, raw, road))
+    assert not m.any(), "switching a cam off must work"
+
+
+def check_clamp_inf() -> None:
+    """S7b: +inf on a downward ray is under the road too: ground_clamp caps it at the ground hit
+    (Breaker: far_to_cap otherwise drew it at the cap, z=-274 m). Up rays keep +inf (far_to_cap's job)."""
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    d = np.full(hit.shape, np.inf)
+    out, m = sf.ground_clamp(cam, d, margin=1.0)
+    assert m[down].all() and np.allclose(out[down], hit[down])
+    assert np.isposinf(out[~down]).all() and not m[~down].any()
+    nan = np.full(hit.shape, np.nan)
+    out, m = sf.ground_clamp(cam, nan, margin=1.0)
+    assert np.isnan(out).all() and not m.any(), "NaN stays invalid"
+
+
+def check_rejected_road_px_render_raw() -> None:
+    """S15 (Breaker/Skeptic): a road px the snap rejects (net depth puts it > 0.30 m above the plane: a floating
+    road band) is 'not snapped, drawn at raw depth', not deleted: through road_snap -> ground_clamp -> far_to_cap it
+    keeps its exact raw depth and stays a valid, finite, drawn px (traced on f40: 0% of rejected wide px are lost to
+    snap/clamp/cap; the only drops are the ownership yield and the ego mask, same as snap off)."""
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    h = float(cam.pos[2])
+    raw = np.where(down, np.maximum((h - 0.5) / np.where(down, -dz, 1.0), 0.31), 80.0)   # 0.5 m above the plane
+    road = np.ones(hit.shape, bool)
+    z_pred = h + raw * dz
+    out, m = sf.road_snap(cam, raw, road)
+    rej = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & down & (hit <= sf.ROAD_SNAP_MAX_M) & (z_pred > sf.ROAD_SNAP_MAX_ABOVE_M)
+    assert rej.sum() > 500, "fixture must have a floating road band"
+    assert not m[rej].any() and np.array_equal(out[rej], raw[rej]), "rejected px must keep raw depth"
+    out2, cl = sf.ground_clamp(cam, out, margin=1.0)
+    assert not cl[rej].any() and np.array_equal(out2[rej], raw[rej]), "ground_clamp must not touch a px above the plane"
+    cap = sf.depth_cap_m(300.0)
+    out3, far = sf.far_to_cap(out2, np.zeros(hit.shape, bool), cap)
+    valid = np.isfinite(out3) & (out3 > 0.3) & (out3 <= cap)
+    assert valid[rej].all() and not far[rej].any() and np.array_equal(out3[rej], raw[rej]), "rejected px must render"
+
+
+def check_filter_keeps_ground() -> None:
+    """S3b (Breaker F): CamDepthFilter never puts a pixel below the road plane that its input had on or
+    above it (the floor-lookup blend of a neighbouring ray's carried point dipped snapped road 5 cm)."""
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (-0.03, 1.2, 1.24), -8.0, 88.7, 320, 180)
+    depth = np.where(down, hit, 300.0)
+    valid = down & (hit < 60.0)
+    F = sf.CamDepthFilter()
+    for k in range(3):
+        d, _ = F.update(cam, depth, valid, (0.0, 1.0 * k, 0.0), 0.1 * k)
+    z = cam.pos[2] + d * dz
+    assert np.min(z[valid]) >= -1e-6, float(np.min(z[valid]))
+
+
+def check_ground_footprint() -> None:
+    """S13 (rear/side holes): a splat on the ground must cover the gap to the next camera row. Past ~6 h
+    (rear h 0.78 m, repeaters 0.90 m) ground row spacing beats the old 6*(d/fy) footprint cap, so the
+    chase view saw stripes of holes behind/beside the car. point_footprint lets on-plane points grow to
+    their ground row spacing; points off the plane (walls, cars) keep the 6*(d/fy) cap."""
+    cam = camera_from_angles("rear", (0.0, -2.25, 0.78), 180.0, -10.0, 80.0, 320, 180, near_m=0.05, far_m=100.0)
+    rays = sf._pixel_rays(cam); dz = rays[..., 2]; down = dz < -1e-6
+    hit = np.where(down, cam.pos[2] / np.where(down, -dz, 1.0), np.inf)
+    G = np.asarray(cam.pos) + np.where(down, hit, 0.0)[..., None] * rays
+    row_sp = np.full(hit.shape, np.inf); row_sp[:-1] = np.linalg.norm(G[1:] - G[:-1], axis=-1)
+    m = down[:-1] & down[1:]; m = np.vstack([m, np.zeros((1, m.shape[1]), bool)])
+    ground = np.where(down, hit, 80.0)
+    foot = sf.point_footprint(cam, ground)
+    base = ground / cam.fy
+    far = m & (hit > 6.0 * cam.pos[2]) & (hit < 60.0)
+    assert far.sum() > 200 and (row_sp[far] > 6.0 * base[far]).mean() > 0.5, "fixture: the old cap must bite"
+    assert np.all(foot[far] >= row_sp[far] * (1 - 1e-9)), "ground splat must reach the next row"
+    near = m & (hit < 3.0 * cam.pos[2])
+    assert np.all(foot[near] <= np.maximum(6.0 * base[near], row_sp[near]) + 1e-9)
+    # a wall 10 m behind: off the plane, keeps the 6*(d/fy) cap
+    wall = np.full(hit.shape, 10.0)
+    fw = sf.point_footprint(cam, wall)
+    zw = cam.pos[2] + wall * dz
+    off = zw > 0.30
+    assert off.sum() > 1000 and np.all(fw[off] <= 6.0 * wall[off] / cam.fy + 1e-9)
+
+
+def check_snap_range_and_exclude() -> None:
+    """S14: (a) px in ``exclude`` (ego hood, never drawn) are not snapped, so a hood that the plane would
+    flatten is not counted as snapped road (gate (b): wide 0-15 m was 12.5% hood px, 0.76% without them);
+    (b) wide snaps only to a 15 m ground hit (at 15-25 m, 0.30 m of height is ~5 m of depth: f160 had 20 of 22
+    snapped px with GT z > 0.30 there); rear keeps 25 m."""
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7, w=640, h=360)
+    raw = np.where(down, hit * 1.5, 80.0)
+    road = down.copy()
+    ex = np.zeros(hit.shape, bool); ex[240:, 120:520] = True
+    _, m0 = sf.road_snap(cam, raw, road)
+    out, m1 = sf.road_snap(cam, raw, road, exclude=ex)
+    assert (m0 & ex).sum() > 200, "fixture: exclude region must contain snappable px"
+    assert not (m1 & ex).any() and np.array_equal(m1, m0 & ~ex) and np.array_equal(out[ex], raw[ex])
+    assert np.array_equal(out[m1], hit[m1])
+    _, mw = _with_snap_cams(("wide",), lambda: sf.snap_road_for_cam("wide", cam, raw, road))
+    assert sf.ROAD_SNAP_RANGE_M["wide"] == 15.0
+    assert mw.any() and hit[mw].max() <= 15.0 + 1e-9, "wide must not snap a ground hit beyond 15 m"
+    assert (m0 & (hit > 15.0) & (hit <= sf.ROAD_SNAP_MAX_M)).any(), "fixture: there is road at 15-25 m"
+    cam_r = camera_from_angles("rear", (0.0, -2.25, 0.78), 180.0, -10.0, 80.0, 640, 360, near_m=0.05, far_m=100.0)
+    dzr = sf._pixel_rays(cam_r)[..., 2]; dr = dzr < -1e-6
+    hr = np.where(dr, cam_r.pos[2] / np.where(dr, -dzr, 1.0), np.inf)
+    _, mr = sf.snap_road_for_cam("rear", cam_r, np.where(dr, hr * 1.5, 80.0), dr.copy())
+    assert (mr & (hr > 15.0)).any() and hr[mr].max() <= sf.ROAD_SNAP_MAX_M + 1e-9, "rear keeps the 25 m range"
+
+
+def check_edge_cut_includes_snapped() -> None:
+    """S16 (Skeptic): the depth-edge cut has no snapped exemption. A px snapped onto the plane (depth = ground hit)
+    that sits next to a farther surface is moved to the 5x5 far side like any other px; the cut still never
+    pushes a px under its own ground hit."""
+    import inspect
+    assert "snapped" not in inspect.signature(sf.edge_cut_far_side).parameters
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    ghit = np.where(down, hit * 2.0, np.inf)                        # allowance past the plane hit for the far side (a step the cut may take)
+    snap = np.where(down, hit, 80.0)                                # snapped road: exactly on the plane
+    d = snap.copy()
+    step = down & (xs >= 80) & (hit < 12.0)
+    d[step] = snap[step] * 1.5                                      # a farther surface on the right (step > 12% inv per px = depth edge)
+    sky = np.zeros(hit.shape, bool)
+    out = sf.edge_cut_far_side(d, sky, ghit)
+    left = down & (xs == 79) & (hit < 12.0)                      # snapped px next to the edge (the only column with a big gradient)
+    moved = left & (np.abs(out - d) > 1e-6)
+    assert left.sum() > 15 and moved.sum() > 0.8 * left.sum(), (int(moved.sum()), int(left.sum()))
+    assert np.all(out[moved] > d[moved]) and np.all(out[down] <= ghit[down] * (1 + 1e-6)), "cut must not go under the road"
+    out2 = sf.edge_cut_far_side(d, sky, np.where(down, hit, np.inf))  # margin 1.0: past the ground hit -> never cut
+    assert np.array_equal(out2[down & (xs < 80)], d[down & (xs < 80)])
+
+
+def check_splat_radius_covers_ground_grid() -> None:
+    """S17 (Skeptic, behind-car strip): the ground grid keeps one point per 0.25 m cell; at ~3 m from the pose A chase
+    camera that is ~39 px apart, so a splat radius capped at 8 px (W//120 at 960) leaves a third of the road cells just
+    behind the car without a splat. The cap (splat_max_radius_px) must cover that lattice; the preview uses it."""
+    ch = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 960, 540, 0.0)
+    g = np.arange(-12, 12, 0.25) + 0.125; gy = np.arange(-8, 30, 0.25) + 0.125
+    X, Y = np.meshgrid(g, gy)
+    P = np.c_[X.ravel(), Y.ravel(), np.zeros(X.size)]
+    cx, cy = np.meshgrid(np.arange(-4.4, 4.4, 0.25) + 0.125, np.arange(-0.9, 0.0, 0.25) + 0.125)
+    C = np.c_[cx.ravel(), cy.ravel(), np.zeros(cx.size)]
+    u, v, z = sf.project(ch, C)
+    vis = np.isfinite(z) & (z > ch.near_m) & (u >= 0) & (u < 960) & (v >= 0) & (v < 540)
+    assert vis.sum() > 100
+    ui, vi = np.floor(u[vis]).astype(int), np.floor(v[vis]).astype(int)
+
+    def hole(r):
+        _, _, obs = sf.splat(ch, P, np.full((len(P), 3), 128, np.uint8), np.full(len(P), 0.3), splat_scale=1.0, max_radius_px=r)
+        k = np.ones((3, 3), bool)
+        pad = np.pad(obs, 1)
+        dil = np.zeros_like(obs)
+        for dy in range(3):
+            for dx in range(3):
+                dil |= pad[dy:dy + obs.shape[0], dx:dx + obs.shape[1]]
+        return float((~dil[vi, ui]).mean())
+    assert hole(8) > 0.2, "fixture: the old 8 px cap must leave the strip open"
+    r = sf.splat_max_radius_px(960)
+    assert r > 8 and hole(r) <= 0.02, (r, hole(r))
+    assert sf.splat_max_radius_px(1) == 2
+    tool = (ROOT / "tools" / "rv_stable_preview.py").read_text(encoding="utf-8")
+    assert "max_radius_px=S.splat_max_radius_px(a.width)" in tool and "// 120" not in tool, "preview must use the helper"
+    assert "S.edge_cut_far_side(" in tool and "~snapped" not in tool, "preview must use the shared edge cut without exemption"
+
+
+def _sha(*arrs) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for a_ in arrs:
+        a_ = np.ascontiguousarray(a_)
+        h.update(str(a_.dtype).encode() + str(a_.shape).encode() + a_.tobytes())
+    return h.hexdigest()
+
+
+def _sky_pipeline(sky_rgb):
+    """Everything the preview computes for one frame sequence, with ``sky_rgb`` the ONLY thing that differs: the
+    ground-grid occupancy, every CamDepthFilter output, the point set handed to compose, the observed/filled masks
+    and the render's depth buffer. Returns a dict of sha256. Safety is this byte-identity plus S21 import isolation
+    (AEB lives under python/control, planning, perception, runtime and must not import the preview)."""
+    cam = camera_from_angles("main", (0.0, 1.2, 1.3), 0.0, -4.0, 60.0, 96, 64, near_m=0.05, far_m=300.0)
+    ch = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 160, 90, 0.0)
+    dz = sf._pixel_rays(cam)[..., 2]; down = dz < -1e-6
+    hit = np.where(down, cam.pos[2] / np.where(down, -dz, 1.0), np.inf)
+    depth = np.where(down, hit, 250.0)
+    sky = ~down                                            # a sky band: the thing the backdrop stands in for
+    valid = down & (hit < 60.0)
+    F = sf.CamDepthFilter(); G = sf.GroundGrid()
+    out = {"filter": [], "grid": [], "points": [], "depth_buffer": [], "occupancy": []}
+    for k in range(4):
+        pose = (0.0, 0.5 * k, 0.0)
+        d, _ = F.update(cam, depth, valid, pose, 0.1 * k)
+        ys, xs = np.nonzero(valid)
+        pts = sf.unproject(cam, d, ys, xs); cols = np.full((len(ys), 3), 120, np.uint8); foot = np.full(len(ys), 0.3)
+        gp = sf.transform_points(pts, (0.0, 0.0, 0.0), pose)
+        G.add(gp[gp[:, 2] < 0.3], cols[gp[:, 2] < 0.3], np.ones(int((gp[:, 2] < 0.3).sum())), 0.1 * k)
+        lp, lc = G.live(0.1 * k, pose[:2])
+        r = sf.compose(ch, np.vstack([pts, lp]), np.vstack([cols, lc]), np.concatenate([foot, np.full(len(lp), 0.3)]),
+                       sky_rgb=sky_rgb, ground_rgb=(110, 105, 100))
+        out["filter"].append(_sha(d)); out["grid"].append(_sha(lp, lc))
+        out["points"].append(_sha(pts, cols, foot)); out["depth_buffer"].append(_sha(r.depth))
+        out["occupancy"].append(_sha(r.masks["observed"], r.masks["filled"]))
+    return out
+
+
+def check_backdrop_render_only() -> None:
+    """S19 (Michael 2026-11-26 "the sky is not visible only the road"): chase px below the horizon with no point and a
+    ground range in (PRIOR_MAX_M, FAR_M] were "unknown" (black). With a sky colour they are a 2-D backdrop (ground colour
+    fading to haze) counted as far; without one they stay unknown. Safety is import isolation (S21) plus byte-identical
+    hashes: with sky on vs off the sha256 of the ground-grid occupancy, every CamDepthFilter output, the point set handed
+    to compose, the observed/filled masks and the render's depth buffer are identical. The sky colour touches ONLY
+    compose's colour image (in the preview, sky_rgb is read only by compose). AEB lives in python/control/actuate.py,
+    override.py, planning/speed.py, perception/cipv.py and runtime/frame_gate.py; those modules are covered by S21 and
+    do not import the preview. The point-set hash is one of the hashed buffers, not a stand-in for planner/AEB."""
+    on = _sky_pipeline((150, 180, 220)); off = _sky_pipeline(None)
+    for key in ("filter", "grid", "points", "depth_buffer", "occupancy"):
+        assert on[key] == off[key], f"{key}: sha256 differs with sky on vs off"
+    ch = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 160, 90, 0.0)
+    pts = np.array([[0.0, 5.0, 0.0], [1.0, 6.0, 0.0]]); cols = np.full((2, 3), 120, np.uint8); foot = np.full(2, 0.3)
+    r1 = sf.compose(ch, pts, cols, foot, sky_rgb=(150, 180, 220), ground_rgb=(110, 105, 100))
+    r0 = sf.compose(ch, pts, cols, foot, sky_rgb=None, ground_rgb=(110, 105, 100))
+    rays = sf._pixel_rays(ch); dz = rays[..., 2]; up = dz >= -1e-9
+    t = np.where(up, np.inf, -ch.pos[2] / np.where(up, -1.0, dz))
+    rng = np.where(up, np.inf, np.hypot(ch.pos[0] + t * rays[..., 0], ch.pos[1] + t * rays[..., 1]))
+    band = ~up & (rng > sf.PRIOR_MAX_M) & (rng <= sf.FAR_M) & ~r1.masks["observed"] & ~r1.masks["filled"]
+    assert band.sum() > 20, "fixture: the band exists"
+    assert not r1.masks["unknown"][band].any() and r1.masks["far"][band].all()
+    assert not sf.black_mask(r1.rgb)[band].any()
+    assert r0.masks["unknown"][band].all(), "no sky colour: still unknown"
+    assert _sha(r1.depth, r1.masks["observed"], r1.masks["filled"]) == _sha(r0.depth, r0.masks["observed"], r0.masks["filled"])
+    tool = (ROOT / "tools" / "rv_stable_preview.py").read_text(encoding="utf-8")
+    uses = [ln for ln in tool.splitlines() if "sky_rgb" in ln and not ln.lstrip().startswith("#")]
+    assert all(("sky_rgb = " in ln) or ("S.compose(" in ln) or ("sky_rgb is None" in ln) or ("sky_rgb=" in ln) for ln in uses), uses
+    assert not any("filters[" in ln or "grid." in ln or "evidence" in ln for ln in uses), "sky colour must not reach filter/grid/evidence"
+
+
+
+def _banned_module(name: str) -> bool:
+    """True if ``name`` is tools.rv_*, rv_stable_fill, or tools.rv_stable_fill (any dotted prefix)."""
+    if not name:
+        return False
+    parts = name.split(".")
+    if "rv_stable_fill" in parts:
+        return True
+    return name == "tools.rv_" or name.startswith("tools.rv_")
+
+
+def _import_module_arg(node: ast.AST) -> str | None:
+    """Literal module name passed to importlib.import_module(...) or __import__(...)."""
+    if not isinstance(node, ast.Call):
+        return None
+    fn = node.func
+    hook = (isinstance(fn, ast.Name) and fn.id in {"__import__", "import_module"}) or (
+        isinstance(fn, ast.Attribute) and fn.attr in {"__import__", "import_module"})
+    if not hook:
+        return None
+    arg = None
+    if node.args:
+        arg = node.args[0]
+    for kw in node.keywords:
+        if kw.arg in (None, "name"):
+            arg = kw.value
+            if kw.arg == "name":
+                break
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    return None
+
+
+def check_python_import_isolation() -> None:
+    """S21: no .py under python/ imports tools.rv_*, rv_stable_fill, or tools.rv_stable_fill, in any form
+    (import, from-import, importlib.import_module, __import__ with a literal). AEB lives in
+    python/control/actuate.py, override.py, planning/speed.py, perception/cipv.py and runtime/frame_gate.py;
+    those files are in the scan. Combined with S19's on/off hashes, this is the safety argument for the
+    render-only sky backdrop (not a claim that the compose point-set hash stands in for planner/AEB)."""
+    root = ROOT / "python"
+    hits: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        src = path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(src, filename=str(path))
+        except SyntaxError as e:
+            raise AssertionError(f"S21: cannot parse {path.relative_to(ROOT)}: {e}") from e
+        rel = str(path.relative_to(ROOT))
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names.extend(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if _banned_module(base):
+                    names.append(base)
+                for a in node.names:
+                    # from tools import rv_foo  /  from python.viz import rv_stable_fill
+                    if a.name != "*":
+                        names.append(f"{base}.{a.name}" if base else a.name)
+            else:
+                arg = _import_module_arg(node)
+                if arg is not None:
+                    names.append(arg)
+            for n in names:
+                if _banned_module(n):
+                    hits.append(f"{rel}:{node.lineno} {n}")
+    assert not hits, "S21 import isolation failed (python/ imported tools.rv_*, rv_stable_fill, or tools.rv_stable_fill): " + "; ".join(hits)
+
+
+def test_python_import_isolation() -> None:
+    check_python_import_isolation()
 
 
 def check_flag_and_deps() -> None:
@@ -364,6 +762,26 @@ def test_road_snap() -> None:
     check_ownership()
 
 
+def test_snap_rejects_above_road() -> None:
+    check_snap_rejects_above_road()
+
+
+def test_snap_cams() -> None:
+    check_snap_cams()
+
+
+def test_clamp_inf() -> None:
+    check_clamp_inf()
+
+
+def test_filter_keeps_ground() -> None:
+    check_filter_keeps_ground()
+
+
+def test_ground_footprint() -> None:
+    check_ground_footprint()
+
+
 def test_flag_and_deps() -> None:
     check_flag_and_deps()
 
@@ -371,7 +789,11 @@ def test_flag_and_deps() -> None:
 if __name__ == "__main__":
     for fn in (check_metrics, check_damped_view_less_jitter, check_damped_follows_turn,
                check_depth_filter_flicker_and_reset, check_compose_explains_every_pixel,
-               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership, check_flag_and_deps):
+               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership,
+               check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_rejected_road_px_render_raw,
+               check_filter_keeps_ground, check_ground_footprint, check_snap_range_and_exclude,
+               check_edge_cut_includes_snapped, check_splat_radius_covers_ground_grid, check_backdrop_render_only,
+               check_python_import_isolation, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

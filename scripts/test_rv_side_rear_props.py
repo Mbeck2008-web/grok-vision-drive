@@ -1618,6 +1618,35 @@ def check_edge_cut_pin_counts() -> None:
     assert not bad, "; ".join(bad)
 
 
+def check_narrow_wide_road_px_unchanged_by_snap() -> None:
+    """check_clip015_footprint is computed over SNAPPED px only, so a cam that does not snap drops out of it (narrow and
+    wide have no entry on a5978d5 and pass by omission). Make that explicit: narrow and wide are not in ROAD_SNAP_CAMS and
+    their rendered depth and validity are identical with --road-snap 1 and 0 (0 px changed, snap mask empty), on the
+    flat synthetic ground and on the left-road / right-2.5x scene."""
+    p = pv()
+    snap_cams = set(resolve_road_snap_cams())
+    leak = snap_cams & {"narrow", "wide"}
+    assert not leak, f"{sorted(leak)} must not be in ROAD_SNAP_CAMS (got {sorted(snap_cams)})"
+    changed, masks = {}, {}
+    saved = p.a.road_snap
+    try:
+        for cid in ("narrow", "wide"):
+            n_changed = n_mask = 0
+            for name, raw, lab in cut_clamp_order_scenes(cid):
+                p.a.road_snap = 1
+                _, d_on, v_on, _ = p.run(cid, raw, lab)
+                m_on = p.last_snap
+                p.a.road_snap = 0
+                _, d_off, v_off, _ = p.run(cid, raw, lab)
+                n_changed += int(((~np.isclose(d_on, d_off, equal_nan=True)) | (v_on != v_off)).sum())
+                n_mask += 0 if m_on is None else int(np.asarray(m_on).sum())
+            changed[cid], masks[cid] = n_changed, n_mask
+    finally:
+        p.a.road_snap = saved
+    print(f"  narrow/wide px changed by road snap on vs off: {changed}; snapped px: {masks}", flush=True)
+    assert not any(changed.values()) and not any(masks.values()), f"narrow/wide road px changed by snap: {changed}, snapped {masks}"
+
+
 def pose_a_chase():
     n = pv().ns
     d = pv().defaults
@@ -3934,6 +3963,7 @@ CHECKS = [
     check_cut_then_clamp_order_and_nothing_under_road,
     check_edge_cut_never_touches_sky,
     check_edge_cut_pin_counts,
+    check_narrow_wide_road_px_unchanged_by_snap,
     check_road_labelled_object_top_stays_put,
     check_behind_car_strip_holes,
     check_clip015_render_edge_and_holes,

@@ -2078,6 +2078,24 @@ def _optimizer_group(
     return loss_value, n_loss, end_state, end_state
 
 
+def _measure_aux(acc: Any, pred: Any, target: Mapping[str, Any]) -> None:
+    """Pool one scored tick's depth AbsRel / sem mIoU sums. A head the net lacks, or a ``depth_hires`` grid, adds nothing."""
+    depth = getattr(pred, "aux_depth", None)
+    if depth is not None and getattr(pred, "aux_depth_far", None) is None and "aux_depth" in target:
+        acc.update_depth(
+            depth.detach().float().cpu().numpy(),
+            target["aux_depth"].detach().float().cpu().numpy(),
+            target["aux_depth_valid"].detach().float().cpu().numpy(),
+        )
+    logits = getattr(pred, "aux_sem_logits", None)
+    if logits is not None and "aux_sem" in target:
+        acc.update_sem(
+            logits.detach().float().cpu().numpy(),
+            np.rint(target["aux_sem"].detach().float().cpu().numpy()).astype(np.int64),
+            target["aux_sem_valid"].detach().float().cpu().numpy(),
+        )
+
+
 def _eval_sequence(
     net: Any,
     root: Path,
@@ -2107,6 +2125,7 @@ def _eval_sequence(
     road_edge_weight: float = 1.0,
     frames: list[Any] | None = None,
     aux_cache: Any = None,
+    aux_eval: Any = None,
 ) -> tuple[float | None, int]:
     """Holdout forward. No optimizer step and no gradient through these frames.
 
@@ -2119,6 +2138,8 @@ def _eval_sequence(
     (``(row, vector)`` per scored frame) follow the primary stream.
     ``ctl_out`` gets ``(row, ctl (3, K))`` per frame of a ctl net, primary stream.
     ``worst`` (a ``val_worst.WorstFrames``) sees each loss row's total, primary stream.
+    ``aux_eval`` (an ``aux_eval.AuxEval``, recipe runs) pools depth AbsRel and sem mIoU over the
+    scored rows, primary stream: it loads the aux targets even at weight 0 and never adds a loss.
     """
     import torch
 
@@ -2189,10 +2210,16 @@ def _eval_sequence(
                             pairs_long.append(pair)
                 if not loss_mask(row):
                     continue
+                measure = 1.0 if aux_eval is not None else 0.0
+                target = _as_target(
+                    _row_labels(row, root, heads, aux_depth_w or measure, aux_sem_w or measure, aux_cache), device
+                )
                 step = scene_loss(
-                    one, _as_target(_row_labels(row, root, heads, aux_depth_w, aux_sem_w, aux_cache), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
+                    one, target, heads, conf_weight=conf_weight, ctl_weight=ctl_weight, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
                     ctl_loss=ctl_loss,
                 )
+                if aux_eval is not None:
+                    _measure_aux(aux_eval, one, target)
                 value = step["total"]
                 total = value if total is None else total + value
                 n_loss += 1
@@ -2689,6 +2716,7 @@ def train_directory(
     gpu_name: str = "",
     recipe: str | None = None,
     recipe_stage: str | None = None,
+    aux_measure: bool = False,
     accum_requested: int = 0,
     init_ckpt: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -2709,7 +2737,12 @@ def train_directory(
     use_road_edge = bool(train_heads) and "road_edge" in train_heads
     use_stop_line = bool(train_heads) and "stop_line" in train_heads
     use_depth_hires = bool(train_heads) and "depth_hires" in train_heads
-    use_aux_sensors = bool(aux_depth) or bool(aux_sem)
+    use_aux_sensors = bool(aux_depth) or bool(aux_sem) or bool(aux_measure)
+    aux_ev = None
+    if use_aux_sensors and str(recipe or "") == "trainer2":
+        from python.train.aux_eval import AuxEval
+
+        aux_ev = AuxEval()  # recipe runs score depth AbsRel / sem mIoU on every holdout pass
     aux_depth_w = float(aux_depth_weight) if aux_depth else 0.0
     aux_sem_w = float(aux_sem_weight) if aux_sem else 0.0
     if use_aux_sensors and backbone not in ("", "scratch"):
@@ -3523,6 +3556,8 @@ def train_directory(
             val_pairs_long: list[tuple[float, float]] = []
             val_rows: list[Mapping[str, Any]] = []
             val_parts: dict[str, float] = {"lane_reg": 0.0, "conf_bce": 0.0, "n": 0}
+            if aux_ev is not None:
+                aux_ev.reset()
             val_ctl: list[Any] = []
             # No status dir (status_root=None), nowhere to write: no heap either.
             worst = WorstFrames(int(val_worst)) if int(val_worst) > 0 and debug_dir is not None else None
@@ -3589,6 +3624,7 @@ def train_directory(
                         ctl_out=val_ctl if use_ctl else None,
                         worst=worst,
                         aux_cache=aux_cache,
+                        aux_eval=aux_ev,
                     )
                     if held_loss is not None and held_count:
                         hold_sum += float(held_loss) * int(held_count)
@@ -3951,6 +3987,7 @@ def train_directory(
                     "lane_rms": None if scored.get("rms") is None else float(scored["rms"]),
                     "lane_r": None if scored.get("r") is None else float(scored["r"]),
                     "holdout_loss": float(mean),
+                    **({} if aux_ev is None else {"depth_absrel": aux_ev.absrel(), "sem_miou": aux_ev.miou()}),
                 }
             )
             holder["epochs_run"] = int(epoch) + 1
@@ -3973,11 +4010,14 @@ def train_directory(
                 # The recipe owns the stage exit (spec C PR 6): <= EXIT_GAIN over EXIT_PATIENCE_EVALS
                 # evals of the stage metric, or STAGE_MAX_EPOCHS. The last weights are the stage's
                 # checkpoint (no best-weight restore), so export == last epoch checkpoint.
-                from python.train.trainer2_recipe import stage_exited
+                from python.train.trainer2_recipe import eval_series, stage_exited_all
 
-                rms_evals = [float("nan") if e.get("lane_rms") is None else float(e["lane_rms"])
-                             for e in holder.get("holdout_evals") or []]
-                if stage_exited(str(holder["recipe_stage"]), rms_evals, epochs=int(epoch) + 1):
+                # A missing value is NaN (never 0.0); every primary metric of the stage must plateau.
+                if stage_exited_all(
+                    str(holder["recipe_stage"]),
+                    eval_series(str(holder["recipe_stage"]), holder.get("holdout_evals") or []),
+                    epochs=int(epoch) + 1,
+                ):
                     print(f"[GVD] recipe stage {holder['recipe_stage']}: stage exit at epoch={int(epoch)} step={done}",
                           flush=True)
                     break
@@ -4309,7 +4349,8 @@ def _release_ssl_cuda(device: Any) -> None:
 
 
 def _default_ssl_stage(
-    args: Any, strip_roots: Any, holdout_root: Path, cam_names: Any, net_kw: dict
+    args: Any, strip_roots: Any, holdout_root: Path, cam_names: Any, net_kw: dict,
+    *, recipe_stop: bool = False, rows_check: Any = None,
 ) -> tuple[str | None, dict[str, Any]]:
     """Default-on SSL (docs/specs/trainer_2.md): train-frame stem, cached by content key.
 
@@ -4326,6 +4367,8 @@ def _default_ssl_stage(
     from python.train.scene_net import SceneNet
 
     train_rows, _ssl_image = _ssl_train_rows_and_reader(args, strip_roots, holdout_root, cam_names)
+    if rows_check is not None:
+        rows_check(train_rows)  # the recipe: every SSL row must be a row of the run's split manifest
     meta: dict[str, Any] = {"on": True, "why": "on (default)", "key": None, "rows": 0, "reused": None, "empty_split": False}
     if not train_rows:
         # Nothing to pretrain on. train_directory decides whether that is fatal.
@@ -4339,6 +4382,17 @@ def _default_ssl_stage(
     try:
         net = SceneNet(cams=cam_names, scale=float(args.scale), **net_kw).to(device).train()
         print(f"[GVD] ssl-pretrain: {len(train_rows)} train rows, device={device.type}", flush=True)
+        ssl_epochs, stop_fn, stop_rule = max(1, int(args.ssl_epochs)), None, {}
+        if recipe_stop:
+            from python.train.trainer2_recipe import (
+                EXIT_GAIN, EXIT_PATIENCE_EVALS, STAGE_MAX_EPOCHS, stage_exited,
+            )
+
+            # Stage 0 exits on a pretext-loss plateau (<= EXIT_GAIN over EXIT_PATIENCE_EVALS epochs) or the
+            # epoch cap; --ssl-epochs does not apply under the recipe.
+            ssl_epochs = STAGE_MAX_EPOCHS
+            stop_fn = lambda losses: stage_exited("0", list(losses), epochs=len(losses))  # noqa: E731
+            stop_rule = {"recipe_exit": [EXIT_GAIN, EXIT_PATIENCE_EVALS, STAGE_MAX_EPOCHS]}
         path, info = default_ssl_stem(
             net,
             train_rows,
@@ -4346,9 +4400,11 @@ def _default_ssl_stage(
             out_dir=Path(cache_dir()) / "ssl",
             lr=float(args.lr),
             seed=int(args.seed),
-            epochs=max(1, int(args.ssl_epochs)),
+            epochs=ssl_epochs,
             max_rows=int(args.ssl_max_rows),
+            stop_fn=stop_fn,
             key_extra={
+                **stop_rule,
                 "roots": [str(r) for r in strip_roots],
                 "holdout_root": str(holdout_root),
                 "holdout_blocks": resolve_holdout_blocks(args.holdout_blocks),
@@ -4374,6 +4430,8 @@ def _default_ssl_stage(
             flush=True,
         )
     meta.update(key=str(info["key"]), rows=int(info["rows"]), reused=bool(info.get("reused")))
+    if recipe_stop:
+        meta["losses"] = None if info.get("losses") is None else [float(v) for v in info["losses"]]
     return str(path), meta
 
 
@@ -4466,6 +4524,9 @@ def _recipe_stage_kwargs(args: argparse.Namespace, stage_id: str, ctx: Mapping[s
         val_worst_png=bool(args.val_worst_png),
         aux_depth=bool(kw.get("aux_depth")),
         aux_sem=bool(kw.get("aux_sem")),
+        # Later stages keep the aux heads (weight 0, no gradient) so they re-measure depth AbsRel / sem mIoU
+        # for the non-regression chain.
+        aux_measure=True,
         aux_depth_weight=float(getattr(args, "aux_depth_weight", 0.1)),
         aux_sem_weight=float(getattr(args, "aux_sem_weight", 0.1)),
         road_edge_weight=float(getattr(args, "road_edge_weight", 1.0)),
@@ -4505,12 +4566,15 @@ def _run_trainer2_recipe(
 ) -> Any:
     """Curriculum loop for ``--recipe trainer2``. Recipe-off ``main`` is unchanged.
 
-    Before any stage: deploy-size preset, ``--ckpt-dir`` with a pre-registered run +
-    split manifest that matches this run and the trainer's own train / holdout rows.
-    Every existing checkpoint under ``--ckpt-dir`` is hashed and re-checked after each
-    stage. Stage exits are claimed only on measured holdout metrics
-    (``stage_result_from_stats``); a stage whose exit metric is not measured offline
-    stops the run with ``MetricNotMeasured`` (exit 2), after training it.
+    Before any stage, and before anything is written: a deploy-size preset, a plan with no stage that
+    cannot exit (2b, ``require_measurable_stages``), SSL on when stage 0 runs, and a create-only
+    ``--export``. Then ``--ckpt-dir`` gets the split + run manifests pre-registered (create-only; an
+    existing run manifest is only checked) and every train / holdout / SSL row must be in them.
+    Every existing checkpoint under ``--ckpt-dir`` is hashed and re-checked after each stage. Stage exits
+    are claimed only on measured metrics (``stage_result_from_stats``: SSL pretext-loss plateau, depth
+    AbsRel / sem mIoU, 8 m lane rms); a stage whose metric is missing stops the run with
+    ``MetricNotMeasured`` (exit 2). With ``--export``, once the curriculum has finished, the last stage's
+    checkpoint is exported camera-only (no ctl head, no ctl-cond) and deploy-checked against the preset.
     """
     from python.train.model_size import PRESETS
     from python.train.trainer2_recipe import (
@@ -4519,10 +4583,13 @@ def _run_trainer2_recipe(
         MetricNotMeasured,
         RecipeRefused,
         StageResult,
+        check_ssl_rows_in_manifest,
+        ensure_recipe_manifest,
         export_camera_only_deploy,
         legacy_split_rows,
         parse_stage_filter,
         plan_curriculum,
+        require_measurable_stages,
         require_recipe_manifest,
         run_curriculum,
         stage_result_from_stats,
@@ -4538,8 +4605,18 @@ def _run_trainer2_recipe(
     wanted = parse_stage_filter(getattr(args, "stage", "") or "")
     plan = plan_curriculum(stages=wanted)
     live = [s.id for s in plan if s.action == "run"]
+    require_measurable_stages(live)  # a stage that cannot exit stops the run before anything trains
     if "0" in live and bool(getattr(args, "no_ssl_pretrain", False)):
         raise RecipeRefused("stage 0 is SSL; drop --no-ssl-pretrain or pass --stage to skip 0")
+    if "0" in live:
+        from python.train.exp_ssl import ssl_plan
+
+        try:
+            stage0_on, stage0_why = ssl_plan(args, resuming=False)
+        except ValueError as exc:
+            raise RecipeRefused(str(exc)) from exc
+        if not stage0_on:
+            raise RecipeRefused(f"stage 0 is SSL but SSL is {stage0_why}; pass --stage to skip 0")
     ssl_on = "0" in live
     if export_path is not None:
         if Path(export_path).exists():
@@ -4549,6 +4626,11 @@ def _run_trainer2_recipe(
     train_rows, hold_rows = legacy_split_rows(
         strip_roots, holdout_root, holdout_blocks=resolve_holdout_blocks(args.holdout_blocks)
     )
+    wrote = ensure_recipe_manifest(
+        getattr(args, "ckpt_dir", None), strip_roots=strip_roots, holdout_root=holdout_root,
+        holdout_blocks=resolve_holdout_blocks(args.holdout_blocks), seed=int(args.seed), ssl_pretrain=ssl_on,
+    )
+    print(f"[GVD] recipe trainer2: run manifest {'pre-registered now' if wrote else 'found in --ckpt-dir'}", flush=True)
     run = require_recipe_manifest(
         getattr(args, "ckpt_dir", None), seed=int(args.seed), ssl_pretrain=ssl_on,
         train_rows=train_rows, holdout_rows=hold_rows,
@@ -4569,7 +4651,10 @@ def _run_trainer2_recipe(
             on, why = ssl_plan(args, resuming=False)
             print(f"[GVD] recipe trainer2: stage 0 SSL ({why})", flush=True)
             if on:
-                ctx["init_stem"], ctx["ssl_meta"] = _default_ssl_stage(args, strip_roots, holdout_root, cam_names, net_kw)
+                ctx["init_stem"], ctx["ssl_meta"] = _default_ssl_stage(
+                    args, strip_roots, holdout_root, cam_names, net_kw, recipe_stop=True,
+                    rows_check=lambda rows: check_ssl_rows_in_manifest(rows, run, holdout_root=holdout_root),
+                )
             return stage_result_from_stats("0", {"ssl": ctx["ssl_meta"]})
         ctx["init_ckpt"] = prev_ckpt
         stats = train_directory(holdout_root, **_recipe_stage_kwargs(args, stage.id, ctx))
@@ -4893,6 +4978,7 @@ def main(argv: list[str] | None = None) -> None:
             print("[GVD] scene train: no panel", flush=True)
         drop_wrong_way, require_road_dump, max_road_clip, road_dump = frame_quality_from_args(args)
         if str(getattr(args, "recipe", "") or "") == "trainer2":
+            from python.train.exp_ssl import SslError as _RecipeSslError
             from python.train.trainer2_recipe import CheckpointRejected, RecipeRefused
             from python.train.trainer2_split import SplitError
 
@@ -4913,7 +4999,8 @@ def main(argv: list[str] | None = None) -> None:
                     start_now=start_now,
                     open_panel=open_panel,
                 )
-            except (RecipeRefused, CheckpointRejected, SplitError) as exc:
+            except (RecipeRefused, CheckpointRejected, SplitError, _RecipeSslError, LossyFramesError, ExactEpochsMismatch,
+                    TrainFitError, MaskFileError, CtlDataError) as exc:
                 print(f"[GVD] scene train: {exc}", flush=True)
                 sys.exit(2)
             return

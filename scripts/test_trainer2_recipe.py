@@ -596,27 +596,128 @@ def check_runner_baseline_chain_joint_and_exit() -> None:
     print("runner: --stage needs baseline+ckpt, ckpt chain, earlier baseline, joint 2% cap, last stage must exit, unmeasured stops OK")
 
 
+def _stats(evals, ckpts=("a.ckpt", "b.ckpt")):
+    return {"holdout_evals": list(evals), "epochs_run": len(evals), "epoch_ckpts": list(ckpts)}
+
+
 def check_stage_result_from_stats_is_real() -> None:
     rec = _recipe()
-    for sid in ("0", "1", "2b"):
+    nan = float("nan")
+    # stage 0: the SSL run's per-epoch pretext losses, never a placeholder
+    losses = [0.9, 0.8, 0.79, 0.79, 0.79]
+    res0 = rec.stage_result_from_stats("0", {"ssl": {"on": True, "losses": losses}})
+    assert res0.metrics == {"ssl_pretext": 0.79} and res0.evals == losses and res0.epochs == 5 and res0.ckpt is None, res0
+    assert res0.evals_by == {"ssl_pretext": losses}
+    for bad in ({}, {"ssl": None}, {"ssl": {"on": False, "why": "off"}}, {"ssl": {"losses": []}}, {"ssl": {"losses": None}},
+                {"ssl": {"losses": [0.5, nan]}}, {"ssl": {"losses": [0.5, float("inf")]}}):
         try:
-            rec.stage_result_from_stats(sid, {"holdout_evals": [{"lane_rms": 1.0}] * 4})
-        except rec.MetricNotMeasured as exc:
-            assert "not measured offline" in str(exc)
-        else:
-            raise AssertionError(f"stage {sid} has no offline exit metric; must not pass")
-    for bad in ({}, {"holdout_evals": []}, {"holdout_evals": [{"lane_rms": None}]},
-                {"holdout_evals": [{"lane_rms": 1.0}, {"lane_rms": float("nan")}]}):
-        try:
-            rec.stage_result_from_stats("2", bad)
+            rec.stage_result_from_stats("0", bad)
         except rec.MetricNotMeasured:
             pass
         else:
-            raise AssertionError(f"{bad} must not yield a stage result")
-    res = rec.stage_result_from_stats("2", {"holdout_evals": [{"lane_rms": 1.2, "lane_r": 0.5}, {"lane_rms": 1.1, "lane_r": 0.6}],
-                                            "epochs_run": 2, "epoch_ckpts": ["a.ckpt", "b.ckpt"]})
-    assert res.evals == [1.2, 1.1] and res.metrics == {"lane_rms": 1.1, "lane_r": 0.6} and res.ckpt == "b.ckpt" and res.epochs == 2, res
-    print("stage results come from real holdout evals; stages 0/1/2b refuse (not measured offline in PR 6) OK")
+            raise AssertionError(f"{bad} must not yield a stage-0 result")
+    # stage 1: depth AbsRel and sem mIoU on every eval; its (untrained) lane score is not carried
+    ev1 = [{"depth_absrel": 0.9, "sem_miou": 0.2, "lane_rms": 3.0, "lane_r": 0.1},
+           {"depth_absrel": 0.8, "sem_miou": 0.3, "lane_rms": 3.0, "lane_r": 0.1}]
+    res1 = rec.stage_result_from_stats("1", _stats(ev1))
+    assert res1.metrics == {"depth_absrel": 0.8, "sem_miou": 0.3}, res1.metrics
+    assert res1.evals_by == {"depth_absrel": [0.9, 0.8], "sem_miou": [0.2, 0.3]} and res1.evals == [0.9, 0.8], res1
+    assert res1.ckpt == "b.ckpt" and res1.epochs == 2
+    for bad in ([], [{"depth_absrel": 0.9, "sem_miou": None}], [{"depth_absrel": nan, "sem_miou": 0.3}],
+                [{"depth_absrel": 0.9, "sem_miou": 0.3}, {"depth_absrel": 0.9}], [{"lane_rms": 1.0}] * 4):
+        try:
+            rec.stage_result_from_stats("1", _stats(bad))
+        except rec.MetricNotMeasured as exc:
+            assert "not claiming exit" in str(exc), exc
+        else:
+            raise AssertionError(f"{bad} must not yield a stage-1 result")
+    # stage 2b: refused with the precise reason, never a made-up number
+    try:
+        rec.stage_result_from_stats("2b", _stats([{"lane_rms": 1.0}] * 4))
+    except rec.MetricNotMeasured as exc:
+        assert "PR 6b" in str(exc) and "stop ids" in str(exc) and "pred_v" in str(exc), exc
+    else:
+        raise AssertionError("stage 2b has no offline exit metric; must not pass")
+    # stages 2 and 7: the 8 m lane score, plus the re-measured aux metrics when the net kept its aux heads
+    for sid in ("2", "7"):
+        for bad in ({}, {"holdout_evals": []}, {"holdout_evals": [{"lane_rms": None}]},
+                    {"holdout_evals": [{"lane_rms": 1.0}, {"lane_rms": nan}]}):
+            try:
+                rec.stage_result_from_stats(sid, bad)
+            except rec.MetricNotMeasured:
+                pass
+            else:
+                raise AssertionError(f"stage {sid}: {bad} must not yield a stage result")
+        res = rec.stage_result_from_stats(sid, _stats([{"lane_rms": 1.2, "lane_r": 0.5}, {"lane_rms": 1.1, "lane_r": 0.6,
+                                                                                          "depth_absrel": 0.7, "sem_miou": 0.4}]))
+        assert res.evals == [1.2, 1.1] and res.ckpt == "b.ckpt" and res.epochs == 2, res
+        assert res.metrics == {"lane_rms": 1.1, "lane_r": 0.6, "depth_absrel": 0.7, "sem_miou": 0.4}, res.metrics
+        only = rec.stage_result_from_stats(sid, _stats([{"lane_rms": 1.1, "lane_r": None}]))
+        assert only.metrics == {"lane_rms": 1.1}, only.metrics
+    # stage 3-6 have no metric here
+    for sid in ("3", "5", "6"):
+        try:
+            rec.stage_result_from_stats(sid, _stats([{"lane_rms": 1.0}] * 4))
+        except rec.MetricNotMeasured:
+            pass
+        else:
+            raise AssertionError(f"stage {sid} must not yield a result")
+    # the chain, built only from real stage results: 0 -> 1 -> 2 -> 7 with the 5% / 2% gates
+    on = dict.fromkeys(rec.STAGE_ORDER, True)
+    flat = lambda **m: [dict(m)] * 4  # noqa: E731
+    stats = {"1": flat(depth_absrel=0.80, sem_miou=0.30), "2": flat(lane_rms=1.0, depth_absrel=0.82, sem_miou=0.30),
+             "7": flat(lane_rms=1.0, depth_absrel=0.82, sem_miou=0.30)}
+
+    def chain(edit=None, stages=("0", "1", "2", "7")):
+        table = {k: [dict(e) for e in v] for k, v in stats.items()}
+        if edit:
+            edit(table)
+
+        def fn(stage, prev):
+            if stage.id == "0":
+                return rec.stage_result_from_stats("0", {"ssl": {"losses": [0.5] * 20}})
+            return rec.stage_result_from_stats(stage.id, _stats(table[stage.id], ckpts=(f"s{stage.id}.ckpt",)))
+        return rec.run_curriculum(fn, stages=stages, heads_exist=on, data_exist=on)
+
+    out = chain(stages=("0", "1", "2", "7"))
+    assert out.trained == ["0", "1", "2", "7"] and out.last_ckpt == "s7.ckpt", out
+    assert out.metrics == {"depth_absrel": 0.82, "sem_miou": 0.30, "lane_rms": 1.0}, out.metrics  # no ssl_pretext baseline
+    # stage 7 goes through stage_result_from_stats and its own 2% cap (stage 2 may be 5% worse, stage 7 may not)
+    chain(lambda t: t["2"].__setitem__(slice(None), flat(lane_rms=1.0, depth_absrel=0.83, sem_miou=0.30)))  # +3.75% <= 5%
+    for field, bad in (("depth_absrel", 0.8 * 1.06), ("sem_miou", 0.30 * 0.94)):
+        try:
+            chain(lambda t: t["2"].__setitem__(slice(None), flat(lane_rms=1.0, **{"depth_absrel": 0.80, "sem_miou": 0.30, field: bad})))
+        except rec.CheckpointRejected as exc:
+            assert field in str(exc), exc
+        else:
+            raise AssertionError(f"stage 2 {field} 6% worse than stage 1 must be rejected")
+    def seven_worse(t):
+        t["2"][:] = flat(lane_rms=1.0, depth_absrel=0.80, sem_miou=0.30)
+        t["7"][:] = flat(lane_rms=1.03, depth_absrel=0.80, sem_miou=0.30)
+    try:
+        chain(seven_worse)
+    except rec.CheckpointRejected as exc:
+        assert "lane_rms" in str(exc) and "2.00%" in str(exc), exc
+    else:
+        raise AssertionError("stage 7 lane_rms 3% worse must be rejected by the 2% joint cap")
+    # a later stage that did not re-measure an earlier metric is rejected, not skipped
+    try:
+        chain(lambda t: t["2"].__setitem__(slice(None), flat(lane_rms=1.0)))
+    except rec.CheckpointRejected as exc:
+        assert "depth_absrel" in str(exc) and "not measured" in str(exc), exc
+    else:
+        raise AssertionError("stage 2 without depth_absrel must be rejected")
+    # stage 1 exits only when EVERY primary metric has plateaued
+    t1 = lambda tb: tb["1"].__setitem__(slice(None), [  # noqa: E731
+        {"depth_absrel": 0.8, "sem_miou": 0.30}, {"depth_absrel": 0.8, "sem_miou": 0.35},
+        {"depth_absrel": 0.8, "sem_miou": 0.40}, {"depth_absrel": 0.8, "sem_miou": 0.45}])
+    try:
+        chain(t1)
+    except rec.RecipeRefused as exc:
+        assert "did not exit" in str(exc), exc
+    else:
+        raise AssertionError("sem mIoU still improving: stage 1 must not exit")
+    print("stage results come from real measurements (0 SSL loss, 1 AbsRel/mIoU, 2/7 lane + re-measured aux); 2b refused with its reason; chain gates 5% / 2% / re-measure OK")
 
 
 def check_deploy_real_export() -> None:
@@ -859,9 +960,25 @@ def check_balanced_loss_keeps_extras() -> None:
 
 
 def _fixture(base):
+    """48x64 recording, 70 ticks: lane_gt rows, ``main_depth`` (u16 cm) and ``main_sem`` (u8 ids) train-only planes."""
+    import cv2
     import test_trainer2_depth_hires as T
 
-    return T._hires_recording(base, 70)
+    strips = T._hires_recording(base, 70)
+    sem_dir = strips / "raw" / "main_sem"
+    sem_dir.mkdir(parents=True)
+    for index in range(70):
+        ids = np.ones((48, 64), np.uint8)
+        ids[:, 32:] = 2 + (index % 2)
+        ids[:10] = 3
+        ids[-3:, :6] = 0  # unknown: masked out of the loss and the mIoU
+        ok, buf = cv2.imencode(".png", ids)
+        assert ok
+        (sem_dir / f"{index:06d}.png").write_bytes(buf.tobytes())
+    (strips / "sem_classes.json").write_text(
+        json.dumps({"kind": "gvd_sem_classes", "train_only": True, "classes": {"0": "unknown", "1": "road", "2": "car", "3": "sky"}}),
+        encoding="utf-8")
+    return strips
 
 
 def _grad_spy(torch, train_scene, names):
@@ -999,108 +1116,33 @@ def check_recipe_manifest_required() -> None:
         else:
             raise AssertionError("a holdout row outside the manifest must refuse")
         import json as _json
-        runm = ck / "run_manifest.json"
-        body = _json.loads(runm.read_text())
-        body["config"]["exit_gain"] = 0.5
+
         from python.train.trainer2_split import manifest_sha256
-        body["config_sha256"] = "x"
-        body["sha256"] = manifest_sha256(body)
-        runm.write_text(_json.dumps(body))
-        try:
-            rec.require_recipe_manifest(ck, seed=0, ssl_pretrain=False, train_rows=train, holdout_rows=hold)
-        except rec.RecipeRefused as exc:
-            assert "exit_gain" in str(exc)
-        else:
-            raise AssertionError("a manifest pinning other exit values must refuse")
+        # every pinned value is checked: a manifest that pins any other value for any of them is refused
+        pinned = ("recipe", "exit_gain", "exit_patience_evals", "stage_max_epochs", "non_regression_frac",
+                  "joint_head_regression_frac", "reality_view_built_and_integrated", "stage_order")
+        assert tuple(rec.PINNED_CONFIG_KEYS) == pinned, rec.PINNED_CONFIG_KEYS
+        for key in pinned:
+            ck2 = base / f"ck_{key}"
+            ck2.mkdir()
+            _prereg(rec, ck2, strips)
+            runm = ck2 / "run_manifest.json"
+            body = _json.loads(runm.read_text())
+            old_value = body["config"][key]
+            body["config"][key] = (not old_value) if isinstance(old_value, bool) else (
+                list(reversed(old_value)) if isinstance(old_value, list) else (
+                    old_value + "x" if isinstance(old_value, str) else old_value + 0.5))
+            assert body["config"][key] != old_value
+            body["config_sha256"] = "x"
+            body["sha256"] = manifest_sha256(body)
+            runm.write_text(_json.dumps(body))
+            try:
+                rec.require_recipe_manifest(ck2, seed=0, ssl_pretrain=False, train_rows=train, holdout_rows=hold)
+            except rec.RecipeRefused as exc:
+                assert key in str(exc), (key, exc)
+            else:
+                raise AssertionError(f"a manifest pinning another {key} must refuse")
     print("recipe manifest: needs --ckpt-dir, a pre-registered run, matching pins/seed/SSL, train and holdout rows in the manifest OK")
-
-
-def check_run_recipe_end_to_end() -> None:
-    """Real ``_run_trainer2_recipe`` on the fixture: manifest, stage 1 -> ckpt -> stage 2 init, export, deploy, gates."""
-    torch = _torch()
-    if torch is None:
-        skip_check("check_run_recipe_end_to_end", "torch not installed")
-        return
-    try:
-        import cv2  # noqa: F401
-        import onnx  # noqa: F401
-    except ImportError:
-        skip_check("check_run_recipe_end_to_end", "cv2 / onnx not installed (CI installs both)")
-        return
-    import contextlib
-    import io
-
-    from python.train import train_scene
-
-    rec = _recipe()
-    with tempfile.TemporaryDirectory() as raw:
-        base = Path(raw)
-        strips = _fixture(base)
-        ck = base / "ck"
-        ck.mkdir()
-        keep = ck / "pre-existing.ckpt"
-        keep.write_bytes(b"older run")
-        _prereg(rec, ck, strips)
-        argv = ["--recipe", "trainer2", "--no-augment", "--cams", "main", "--epochs", "1", "--ckpt-dir", str(ck),
-                "--min-valid", "0", "--workers", "0", "--no-panel"]
-
-        def run(stage, **kw):
-            args = _parser().parse_args(argv + ["--stage", stage])
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                try:
-                    res = train_scene._run_trainer2_recipe(
-                        args, strip_roots=(strips,), holdout_root=strips, cam_names=("main",), net_kw={},
-                        preset_name="small", train_precision="auto", plan_precision=None, frame_cache=None,
-                        aux_cache=None, pause_dir=None, start_now=True, open_panel=False, **kw)
-                    err = None
-                except (rec.RecipeRefused, rec.CheckpointRejected) as exc:
-                    res, err = None, exc
-            return res, err, out.getvalue()
-
-        # stage 1 trains, then refuses to claim an exit it cannot measure
-        from python.train.epoch_ckpt import write_epoch_ckpt
-        from python.train.model_size import scene_net_kwargs
-        from python.train.scene_net import SceneNet
-
-        seed_net = SceneNet(cams=("main",), **scene_net_kwargs("small"))
-        seed = base / "stage0_seed.ckpt"  # stands in for a stage-0 checkpoint (outside --ckpt-dir)
-        write_epoch_ckpt(seed, {k: v.detach().numpy() for k, v in seed_net.state_dict().items()}, {"epoch": 0, "step": 0},
-                         min_free_bytes=0)
-        res, err, text = run("1", export_path=None, start_ckpt=str(seed), earlier_metrics={"ssl_pretext": 1.0})
-        assert isinstance(err, rec.MetricNotMeasured) and "depth AbsRel" in str(err), (err, text[-1500:])
-        s1 = sorted(ck.rglob("*.ckpt_ep*.npz"))
-        s1 = [p for p in s1 if p.name != keep.name]
-        assert s1, "stage 1 wrote no epoch checkpoint\n" + text[-3000:]
-        # stage 2 from stage 1's checkpoint: loads it, exports, deploy-checks the real ONNX, scores real rms
-        export = base / "student.onnx"
-        res, err, text = run("2", export_path=export, start_ckpt=str(s1[-1]), earlier_metrics={"lane_rms": 1e9})
-        assert "init from previous stage" in text, text[-2000:]
-        assert "deploy check {'ok': True, 'preset': 'small', 'params': " in text, (err, text[-800:])
-        assert export.is_file()
-        # the recipe owns the stage exit: <= 1% gain over 3 evals or the 20-epoch cap, scored on real holdout rms
-        n_evals = text.count("[GVD] val step=")
-        assert 1 <= n_evals <= rec.STAGE_MAX_EPOCHS, n_evals
-        assert "holdout stopped" not in text  # the legacy 2% plateau stop is off under the recipe
-        assert "recipe stage 2: stage exit" in text, text[-1500:]
-        assert err is None, (err, text[-1500:])
-        s2 = sorted(ck.rglob("*.ckpt_ep*.npz"), key=lambda q: q.stat().st_mtime)
-        assert str(res.last_ckpt) == str(s2[-1]) and res.trained == ["2"], (res, s2[-1])
-        # the export is the last epoch checkpoint's weights (no best-weight restore under the recipe)
-        from onnx import numpy_helper
-
-        from python.train.epoch_ckpt import load_epoch_ckpt
-        inits = {i.name.removeprefix("net."): numpy_helper.to_array(i) for i in onnx.load(str(export)).graph.initializer}
-        last_w = load_epoch_ckpt(s2[-1])["weights"]
-        shared = [k for k in last_w if k in inits and inits[k].shape == np.shape(last_w[k])]
-        assert len(shared) >= 10, len(shared)
-        diff = [k for k in shared if not np.array_equal(inits[k], np.asarray(last_w[k]))]
-        assert not diff, diff[:5]
-        # a mid-curriculum start without a baseline is refused
-        res, err, text = run("2", export_path=None)
-        assert err is not None and "mid-curriculum" in str(err), err
-        assert keep.read_bytes() == b"older run"
-    print("_run_trainer2_recipe end to end: stage 1 trains then refuses (unmeasured), stage 2 inits from it, recipe-owned exit on real rms, exports, deploy OK, last ckpt chained; old ckpt untouched OK")
 
 
 def _ckpt_of(net, path, **meta):
@@ -1211,49 +1253,429 @@ def check_camera_only_deploy_export() -> None:
     print("camera-only deploy export: ctl dropped from a stage-7 ckpt, last-ckpt weights, create-only, preset-bound, ctl-cond refused, failed check leaves no file OK")
 
 
-def check_main_recipe_without_manifest_exits_2() -> None:
+def check_aux_eval_numbers() -> None:
+    """depth AbsRel / sem mIoU sums: hand-computed values, masks, ignored cells (numpy only)."""
+    from python.train.aux_eval import AuxEval
+
+    acc = AuxEval()
+    assert acc.absrel() is None and acc.miou() is None  # nothing scored is None, never 0.0
+    gt = np.array([[2.0, 4.0], [0.0, 10.0]])
+    pred = np.array([[3.0, 2.0], [5.0, 10.0]])
+    valid = np.array([[1.0, 1.0], [1.0, 0.0]])
+    acc.update_depth(pred, gt, valid)  # cells: |3-2|/2 = .5, |2-4|/4 = .5; gt 0 and masked cells are ignored
+    assert abs(acc.absrel() - 0.5) < 1e-12 and acc.rel_n == 2
+    acc.update_depth(np.array([[1.0, 1.0]]), np.array([[1.0, 2.0]]), np.array([[1.0, 1.0]]))  # + 0 and .5 -> 4 cells, sum 1.5
+    assert abs(acc.absrel() - 0.375) < 1e-12 and acc.rel_n == 4
+    acc.update_depth(np.array([[9.0]]), np.array([[1.0]]), np.array([[0.0]]))  # masked: unchanged
+    assert acc.rel_n == 4
+    try:
+        acc.update_depth(np.zeros((2, 2)), np.zeros((2, 3)), np.zeros((2, 2)))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("shape mismatch must raise, not broadcast")
+    sem = AuxEval()
+    logits = np.zeros((3, 1, 4))  # (C, H, W): argmax per cell
+    for col, cls in enumerate((1, 1, 2, 0)):
+        logits[cls, 0, col] = 5.0
+    gt_ids = np.array([[1, 2, 2, 1]])
+    sem.update_sem(logits, gt_ids, np.array([[1.0, 1.0, 1.0, 0.0]]))  # last cell masked
+    # class 1: pred {0,1} gt {0} -> inter 1 union 2; class 2: pred {2} gt {1,2} -> inter 1 union 2
+    assert abs(sem.miou() - 0.5) < 1e-12, sem.miou()
+    sem.update_sem(logits[None], gt_ids, np.array([[1.0, 1.0, 1.0, 1.0]]))  # NCHW input; last cell class 0 vs gt 1
+    assert sem.sem_n == 7 and 0.0 < sem.miou() < 1.0
+    sem.reset()
+    assert sem.miou() is None and sem.absrel() is None
+    print("aux eval: AbsRel / mIoU hand values, masks, shape mismatch raises, empty is None OK")
+
+
+def check_eval_series_and_exit_all() -> None:
+    rec = _recipe()
+    nan = float("nan")
+    # a missing value is NaN (never 0.0): an aux-only stage with no lane score never plateaus at 0.0
+    assert all(v != v for v in rec.eval_series("2", [{"lane_rms": None}] * 5)["lane_rms"])
+    assert all(v != v for v in rec.eval_series("2", [{}] * 5)["lane_rms"])
+    assert rec.eval_series("1", [{"depth_absrel": 0.5}])["sem_miou"][0] != 0.0
+    series = rec.eval_series("1", [{"depth_absrel": 0.7, "sem_miou": 0.2, "lane_rms": 9.0}])
+    assert series == {"depth_absrel": [0.7], "sem_miou": [0.2]}, series
+    assert rec.eval_series("2b", [{"lane_rms": 1.0}]) == {k: [nan] for k in rec.STAGE_PRIMARY_METRICS["2b"]} or all(
+        v != v for vs in rec.eval_series("2b", [{"lane_rms": 1.0}]).values() for v in vs)
+    flat = [0.5, 0.5, 0.5, 0.5]
+    assert rec.stage_exited_all("2", {"lane_rms": [nan] * 5}, epochs=5) is False
+    assert rec.stage_exited_all("2", {"lane_rms": [0.0] * 5}, epochs=5) is True  # a real flat 0.0 is a plateau; NaN is not
+    assert rec.stage_exited_all("2", {"lane_rms": [nan] * 5}, epochs=rec.STAGE_MAX_EPOCHS) is True  # the cap always exits
+    assert rec.stage_exited_all("1", {"depth_absrel": flat, "sem_miou": flat}, epochs=4) is True
+    assert rec.stage_exited_all("1", {"depth_absrel": flat, "sem_miou": [0.3, 0.35, 0.4, 0.45]}, epochs=4) is False
+    assert rec.stage_exited_all("1", {"depth_absrel": flat}, epochs=4) is False  # a metric never evaluated has not plateaued
+    assert rec.stage_exited_all("0", {"ssl_pretext": flat}, epochs=4) is True
+    print("eval series: missing is NaN not 0.0; stage exit needs every primary metric flat (or the cap) OK")
+
+
+def check_stage7_lr_multipliers_pinned() -> None:
+    rec = _recipe()
+    heads = {"aux_depth_head", "aux_sem_head", "lane_head", "lane_valid_head", "lane_gt_head", "road_edge_head", "sign_head",
+             "sign_class_head", "sign_state_head", "ctl_head", "stop_line_head"}
+    want = {"stem": 0.1, "trunk": 1.0, **dict.fromkeys(heads, 0.3)}
+    assert rec.stage_lr_mults_for("7") == want, rec.stage_lr_mults_for("7")  # joint: every head trains at x0.3, none enters at x1
+    assert all(v == 0.3 for k, v in rec.stage_lr_mults_for("2b").items() if k in {"aux_depth_head", "lane_gt_head"})
+    assert rec.stage_lr_mults_for("2b")["ctl_head"] == 1.0 and rec.stage_lr_mults_for("1")["aux_depth_head"] == 1.0
+    print("stage 7 LR multipliers pinned (stem 0.1, trunk 1.0, every head 0.3); 2b / 1 entering heads at 1.0 OK")
+
+
+def check_stop_path_keeps_old_checkpoints() -> None:
+    """The run that ends on an unmeasurable stage (MetricNotMeasured) still re-checks the old checkpoints."""
+    rec = _recipe()
+    on = dict.fromkeys(rec.STAGE_ORDER, True)
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        old = root / "run.ckpt_ep1_step1.npz"
+        old.write_bytes(b"older run")
+
+        def stop_and_delete(stage, prev):
+            if stage.id == "0":
+                return _res(rec, {"ssl_pretext": 1.0}, evals=(1.0,) * 4)
+            old.unlink()  # a stage that removes an old checkpoint, then stops unmeasured
+            raise rec.MetricNotMeasured("not measured")
+
+        try:
+            rec.run_curriculum(stop_and_delete, stages=("0", "1"), heads_exist=on, data_exist=on, ckpt_root=root)
+        except rec.MetricNotMeasured:
+            raise AssertionError("the removed checkpoint must be reported, not hidden behind the stop")
+        except rec.RecipeRefused as exc:
+            assert "run.ckpt_ep1_step1.npz" in str(exc), exc
+        old.write_bytes(b"older run")
+        try:
+            rec.run_curriculum(lambda s, p: (_ for _ in ()).throw(rec.MetricNotMeasured("x")) if s.id == "1" else
+                               _res(rec, {"ssl_pretext": 1.0}, evals=(1.0,) * 4), stages=("0", "1"), heads_exist=on,
+                               data_exist=on, ckpt_root=root)
+        except rec.MetricNotMeasured:
+            pass
+        else:
+            raise AssertionError("an untouched tree must still propagate the stop")
+    print("stop path: an old checkpoint removed by the stopping stage is reported; an untouched tree propagates the stop OK")
+
+
+def check_ssl_epoch_losses_and_stop() -> None:
     torch = _torch()
     if torch is None:
-        skip_check("check_main_recipe_without_manifest_exits_2", "torch not installed")
+        skip_check("check_ssl_epoch_losses_and_stop", "torch not installed")
         return
-    try:
-        import cv2  # noqa: F401
-    except ImportError:
-        skip_check("check_main_recipe_without_manifest_exits_2", "cv2 not installed")
-        return
-    import contextlib
-    import io
-    import os
+    from python.train import exp_ssl
+    from python.train.scene_net import SceneNet
 
-    import python.data.data_root as data_root
-    from python.train import train_scene
-
+    rows = [{"i": i, "kind": "train", "source": "s"} for i in range(6)]
+    rng = np.random.RandomState(0)
+    images = {i: (rng.rand(48, 64, 3) * 255).astype(np.uint8) for i in range(6)}
+    image_fn = lambda r: images[int(r["i"])]  # noqa: E731
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
-        strips = _fixture(base)
-        ck = base / "ck"
-        ck.mkdir()
-        saved = (data_root.free_bytes, os.environ.get("GVD_DATA_DIR"))
-        data_root.free_bytes = lambda _p: 500 * 1024 ** 3
-        os.environ["GVD_DATA_DIR"] = str(base)
-        out = io.StringIO()
-        code = None
+        net = SceneNet(cams=("main",), scale=1.0)
+        stats = exp_ssl.run_ssl_pretrain(net, rows, image_fn=image_fn, out_path=base / "a.npz", lr=1e-3, seed=0, epochs=3)
+        assert len(stats["epoch_losses"]) == 3 and all(np.isfinite(stats["epoch_losses"])), stats["epoch_losses"]
+        assert stats["last_loss"] > 0 and stats["n"] == 18.0
+        seen = []
+        stop = lambda losses: (seen.append(list(losses)), len(losses) >= 2)[1]  # noqa: E731
+        stats2 = exp_ssl.run_ssl_pretrain(SceneNet(cams=("main",), scale=1.0), rows, image_fn=image_fn, out_path=base / "b.npz",
+                                          lr=1e-3, seed=0, epochs=10, stop_fn=stop)
+        assert len(stats2["epoch_losses"]) == 2 and seen == [stats2["epoch_losses"][:1], stats2["epoch_losses"]], (seen, stats2)
+        # the loss history is saved create-only beside the stem and a reused stem reports it
+        net3 = SceneNet(cams=("main",), scale=1.0)
+        path, info = exp_ssl.default_ssl_stem(net3, rows, image_fn=image_fn, out_dir=base, lr=1e-3, seed=0, epochs=3, max_rows=0)
+        side = path.with_suffix("").with_name(path.stem + ".losses.json")
+        assert not info["reused"] and info["losses"] == info["epoch_losses"] and side.is_file(), (info, list(base.iterdir()))
+        before = side.read_text()
+        path2, info2 = exp_ssl.default_ssl_stem(SceneNet(cams=("main",), scale=1.0), rows, image_fn=image_fn, out_dir=base, lr=1e-3,
+                                                seed=0, epochs=3, max_rows=0)
+        assert path2 == path and info2["reused"] and info2["losses"] == info["losses"] and side.read_text() == before
+        side.unlink()
+        _p, info3 = exp_ssl.default_ssl_stem(SceneNet(cams=("main",), scale=1.0), rows, image_fn=image_fn, out_dir=base, lr=1e-3,
+                                             seed=0, epochs=3, max_rows=0)
+        assert info3["reused"] and info3["losses"] is None  # no history: unknown, never invented
+        assert not list(base.glob("*.partial*")), list(base.iterdir())
+    print("SSL: per-epoch pretext losses, stop_fn ends the run, history saved create-only and returned on reuse (None if absent) OK")
+
+
+def _fake_env(base):
+    """Real ``_run_trainer2_recipe`` with the two compute stages replaced by recorders; manifest, curriculum, export and
+    deploy check are the real code."""
+    from python.train import train_scene
+    from python.train.model_size import scene_net_kwargs
+    from python.train.scene_net import SceneNet
+
+    rec = _recipe()
+    strips = _fixture(base)
+    calls: list = []
+    env = SimpleNamespace(base=base, strips=strips, calls=calls, rec=rec, ssl_kw=[], on_train=None, raise_in=None, n=0)
+
+    def fake_ssl(args, roots, holdout_root, cams, net_kw, **kw):
+        calls.append(("ssl",))
+        env.ssl_kw.append(kw)
+        return None, {"on": True, "why": "on (default)", "key": "k", "rows": 4, "reused": False, "losses": [0.5] * 20}
+
+    table = {"1": {"depth_absrel": 0.8, "sem_miou": 0.3},
+             "2": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3},
+             "7": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3}}
+
+    def fake_train(root, **kw):
+        sid = kw["recipe_stage"]
+        calls.append(("train", sid, kw["export_path"], kw["aux_measure"], tuple(kw["heads"])))
+        if env.on_train is not None:
+            env.on_train(sid)
+        if env.raise_in == sid:
+            raise rec.MetricNotMeasured(f"stage {sid} unmeasured")
+        env.n += 1
+        net = SceneNet(cams=("main",), ctl="ctl" in kw["heads"], aux_sensors=True, **scene_net_kwargs("small"))
+        path = Path(kw["ckpt_dir"]) / f"scene_x.run20260101T00000{env.n}Z.ckpt_ep{env.n}_step{env.n}.npz"
+        _ckpt_of(net, path, epoch=env.n, step=env.n, ctl="ctl" in kw["heads"], heads=list(kw["heads"]), preset="small")
+        return {"holdout_evals": [dict(table[sid])] * 4, "epoch_ckpts": [str(path)], "epochs_run": 4}
+
+    def run(*, stage="0,1,2,7", export=None, preset="small", extra=(), ck_name="ck"):
+        ck = base / ck_name
+        ck.mkdir(exist_ok=True)
+        argv = ["--recipe", "trainer2", "--no-augment", "--cams", "main", "--ckpt-dir", str(ck), "--min-valid", "0",
+                "--workers", "0", "--no-panel", "--stage", stage, *extra]
+        args = _parser().parse_args(argv)
+        saved = (train_scene.train_directory, train_scene._default_ssl_stage, rec._repo_git_sha)
+        train_scene.train_directory, train_scene._default_ssl_stage, rec._repo_git_sha = fake_train, fake_ssl, lambda: "0" * 40
         try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                train_scene.main(["--strips", str(strips), "--recipe", "trainer2", "--no-augment", "--cams", "main",
-                                  "--no-panel", "--no-resume", "--ckpt-dir", str(ck)])
-        except SystemExit as exc:
-            code = exc.code
+            res = train_scene._run_trainer2_recipe(
+                args, strip_roots=(strips,), holdout_root=strips, cam_names=("main",), net_kw=scene_net_kwargs(preset),
+                preset_name=preset, train_precision="auto", plan_precision=None, frame_cache=None, aux_cache=None,
+                export_path=export, pause_dir=None, start_now=True, open_panel=False)
+            return res, None, ck
+        except Exception as exc:  # noqa: BLE001
+            return None, exc, ck
         finally:
-            data_root.free_bytes = saved[0]
-            if saved[1] is None:
-                os.environ.pop("GVD_DATA_DIR", None)
+            train_scene.train_directory, train_scene._default_ssl_stage, rec._repo_git_sha = saved
+
+    env.run = run
+    return env
+
+
+def _torch_cv2_onnx(name):
+    if _torch() is None:
+        skip_check(name, "torch not installed")
+        return False
+    try:
+        import cv2  # noqa: F401
+        import onnx  # noqa: F401
+    except ImportError:
+        skip_check(name, "cv2 / onnx not installed (CI installs both)")
+        return False
+    return True
+
+
+def check_runner_refuses_before_training() -> None:
+    """Every refusal the runner owns happens before any stage trains and before any manifest is written."""
+    if not _torch_cv2_onnx("check_runner_refuses_before_training"):
+        return
+    rec = _recipe()
+    with tempfile.TemporaryDirectory() as raw:
+        env = _fake_env(Path(raw))
+        existing = env.base / "existing.onnx"
+        existing.write_bytes(b"a model that must survive")
+        cases = (
+            ("existing export", dict(export=existing), rec.RecipeRefused, "create-only"),
+            ("export, SSL-only plan", dict(stage="0", export=env.base / "new.onnx"), rec.RecipeRefused, "supervised stage"),
+            ("medium preset", dict(preset="medium"), rec.RecipeRefused, "GB"),
+            ("xl preset", dict(preset="xl"), rec.RecipeRefused, "GB"),
+            ("--no-ssl-pretrain with stage 0", dict(extra=("--no-ssl-pretrain",)), rec.RecipeRefused, "--no-ssl-pretrain"),
+            ("--init-stem with stage 0", dict(extra=("--init-stem", str(env.base / "x.npz"))), rec.RecipeRefused, "--init-stem"),
+            ("default plan (stage 2b)", dict(stage=""), rec.MetricNotMeasured, "PR 6b"),
+        )
+        for k, (label, kw, kind, word) in enumerate(cases):
+            res, err, ck = env.run(ck_name=f"ck{k}", **kw)
+            assert res is None and isinstance(err, kind) and word in str(err), (label, err)
+            assert env.calls == [], (label, env.calls)
+            assert not (ck / "run_manifest.json").exists() and not (ck / "split_manifest.json").exists(), label
+        assert existing.read_bytes() == b"a model that must survive"
+        # 2b says exactly what is missing
+        _r, err, _c = env.run(stage="", ck_name="ck_2b")
+        for word in ("stop ids", "stops", "pred_v", "Nothing was trained", "--stage"):
+            assert word in str(err), (word, err)
+        # dropping 2b from --stage is the supported way to run the rest
+        res, err, ck = env.run(stage="0,1,2,7", ck_name="ck_ok")
+        assert err is None and res.trained == ["0", "1", "2", "7"], err
+    print("runner: existing export / SSL-only export / medium+xl preset / --no-ssl-pretrain / --init-stem / stage 2b refuse before anything trains or is written OK")
+
+
+def check_runner_exports_once_after_the_last_stage() -> None:
+    if not _torch_cv2_onnx("check_runner_exports_once_after_the_last_stage"):
+        return
+    import onnx
+
+    rec = _recipe()
+    with tempfile.TemporaryDirectory() as raw:
+        env = _fake_env(Path(raw))
+        export = env.base / "student.onnx"
+        env.on_train = lambda sid: (_ for _ in ()).throw(AssertionError(f"export exists before stage {sid}")) if export.exists() else None
+        res, err, ck = env.run(export=export)
+        assert err is None, err
+        assert res.trained == ["0", "1", "2", "7"] and export.is_file(), (res.trained, err)
+        trains = [c for c in env.calls if c[0] == "train"]
+        # no stage exports on its own (train_directory never gets an export path) and every stage keeps the aux heads
+        assert [c[1] for c in trains] == ["1", "2", "7"] and all(c[2] is None and c[3] is True for c in trains), trains
+        assert "ctl" in trains[-1][4], trains[-1]
+        assert env.ssl_kw and env.ssl_kw[0].get("recipe_stop") is True and callable(env.ssl_kw[0].get("rows_check")), env.ssl_kw
+        assert sorted(p.name for p in env.base.glob("student*")) == ["student.onnx"], list(env.base.iterdir())
+        props = {p.key: p.value for p in onnx.load(str(export)).metadata_props}
+        last = sorted(ck.glob("*.ckpt_ep*.npz"))[-1]
+        assert props["gvd_ckpt_file"] == last.name == Path(res.last_ckpt).name, (props.get("gvd_ckpt_file"), last.name)
+        assert res.deploy and res.deploy["ok"] is True and res.deploy["preset"] == "small", res.deploy
+        assert not any("ctl_head" in i.name for i in onnx.load(str(export)).graph.initializer)
+        assert set(res.metrics) == {"lane_rms", "lane_r", "depth_absrel", "sem_miou"}, res.metrics  # no ssl_pretext baseline
+        # a stop before the last stage exports nothing
+        env2 = _fake_env(Path(raw) / "b") if (Path(raw) / "b").mkdir() is None else None
+        env2.raise_in = "2"
+        e2 = env2.base / "student2.onnx"
+        r2, err2, _ = env2.run(export=e2)
+        assert isinstance(err2, rec.MetricNotMeasured) and not e2.exists(), (err2, e2.exists())
+        # the runner does not take the export's word for it: a result without ok=True is refused
+        env3 = _fake_env(Path(raw) / "c") if (Path(raw) / "c").mkdir() is None else None
+        saved = rec.export_camera_only_deploy
+        rec.export_camera_only_deploy = lambda *a, **k: {"ok": False, "preset": "small"}
+        try:
+            r3, err3, _ = env3.run(export=env3.base / "student3.onnx")
+        finally:
+            rec.export_camera_only_deploy = saved
+        assert isinstance(err3, rec.RecipeRefused) and "did not pass" in str(err3), err3
+        rec.export_camera_only_deploy = lambda *a, **k: {"preset": "small"}  # no "ok" key at all
+        env4 = _fake_env(Path(raw) / "d") if (Path(raw) / "d").mkdir() is None else None
+        try:
+            r4, err4, _ = env4.run(export=env4.base / "student4.onnx")
+        finally:
+            rec.export_camera_only_deploy = saved
+        assert isinstance(err4, rec.RecipeRefused) and "did not pass" in str(err4), err4
+    print("runner: one camera-only export after the last stage from the last checkpoint (ctl dropped); a stop exports nothing; ok=True required OK")
+
+
+def check_runner_ssl_rows_must_be_manifest_train_rows() -> None:
+    if not _torch_cv2_onnx("check_runner_ssl_rows_must_be_manifest_train_rows"):
+        return
+    from python.train.trainer2_split import SplitError
+
+    rec = _recipe()
+    with tempfile.TemporaryDirectory() as raw:
+        env = _fake_env(Path(raw))
+        res, err, ck = env.run(stage="0", ck_name="ck_a")
+        assert err is None, err
+        check = env.ssl_kw[0]["rows_check"]
+        train, hold = rec.legacy_split_rows((env.strips,), env.strips, holdout_blocks=1)
+        assert train and hold
+        check(train[:5])  # train rows pass
+        for bad, label in ((hold[:1], "holdout row"), ([dict(train[0], i=987654)], "row the manifest does not list"),
+                           (train[:3] + hold[:1], "train rows with one holdout row")):
+            try:
+                check(bad)
+            except SplitError as exc:
+                assert "ssl" in str(exc), exc
             else:
-                os.environ["GVD_DATA_DIR"] = saved[1]
-        text = out.getvalue()
-        assert code == 2, (code, text[-1500:])
-        assert "Traceback" not in text and "run manifest" in text, text[-1500:]
-    print("main --recipe trainer2 without a pre-registered manifest: clean exit 2 OK")
+                raise AssertionError(f"SSL {label} must be refused")
+        # untagged rows (single-root, no ``source``) are tagged with the recording root like the split's own rows
+        run = rec.require_preregistered_for_test(ck) if hasattr(rec, "require_preregistered_for_test") else None
+        from python.train.trainer2_split import require_preregistered
+
+        run = require_preregistered(ck)
+        bare = [{k: v for k, v in r.items() if k != "source"} for r in train[:3]]
+        assert rec.check_ssl_rows_in_manifest(bare, run, holdout_root=env.strips) == 3
+        assert rec.check_ssl_rows_in_manifest([], run, holdout_root=env.strips) == 0
+        # the real stage-0 path refuses before the stem is trained when the SSL rows include a holdout row
+        from python.train import exp_ssl, train_scene
+
+        trained = []
+        saved = (train_scene._ssl_train_rows_and_reader, exp_ssl.default_ssl_stem, rec._repo_git_sha)
+        train_scene._ssl_train_rows_and_reader = lambda *a, **k: (train[:3] + hold[:1], lambda r: None)
+        exp_ssl.default_ssl_stem = lambda *a, **k: trained.append(1)
+        rec._repo_git_sha = lambda: "0" * 40
+        try:
+            from python.train.model_size import scene_net_kwargs
+
+            args = _parser().parse_args(["--recipe", "trainer2", "--no-augment", "--cams", "main", "--ckpt-dir", str(ck),
+                                         "--min-valid", "0", "--workers", "0", "--no-panel", "--stage", "0"])
+            try:
+                train_scene._run_trainer2_recipe(
+                    args, strip_roots=(env.strips,), holdout_root=env.strips, cam_names=("main",), net_kw={}, preset_name="small",
+                    train_precision="auto", plan_precision=None, frame_cache=None, aux_cache=None, export_path=None,
+                    pause_dir=None, start_now=True, open_panel=False)
+            except SplitError as exc:
+                assert "ssl" in str(exc), exc
+            else:
+                raise AssertionError("a holdout row among the SSL rows must stop stage 0")
+        finally:
+            train_scene._ssl_train_rows_and_reader, exp_ssl.default_ssl_stem, rec._repo_git_sha = saved
+        assert trained == [], "the stem must not be trained on rows the manifest does not allow"
+    print("SSL rows: subset of the manifest's train rows (holdout / unlisted rows refused before the stem trains) OK")
+
+
+def check_runner_preregisters_the_manifest() -> None:
+    """The real path writes the split + run manifests before any stage (create-only), then checks them."""
+    if not _torch_cv2_onnx("check_runner_preregisters_the_manifest"):
+        return
+    import json as _json
+
+    from python.train.trainer2_split import SplitError, require_preregistered
+
+    rec = _recipe()
+    with tempfile.TemporaryDirectory() as raw:
+        env = _fake_env(Path(raw))
+        seen = {}
+        env.on_train = lambda sid: seen.setdefault("run_before_first_stage", (env.base / "ck" / "run_manifest.json").is_file())
+        res, err, ck = env.run(stage="0,1,2,7")
+        assert err is None and seen.get("run_before_first_stage") is True, (err, seen)
+        run = require_preregistered(ck)
+        assert run["seed"] == 0 and run["ssl_pretrain"] is True and run["git_sha"] == "0" * 40, run
+        assert run["config"]["recipe"] == "trainer2" and run["decision_tier"] == "iteration", run
+        assert (ck / "split_manifest.json").is_file() and Path(run["split_path"]) == (ck / "split_manifest.json").resolve()
+        assert (env.base / "prereg_registry").is_dir() and len(list((env.base / "prereg_registry").glob("*.json"))) == 1
+        # a second run in the same folder finds it; the file is not rewritten
+        before = (ck / "run_manifest.json").read_bytes()
+        res, err, _ = env.run(stage="0,1,2,7")
+        assert err is None and (ck / "run_manifest.json").read_bytes() == before
+        # another seed in the same folder is a re-roll: refused, nothing rewritten
+        res, err, _ = env.run(stage="0,1,2,7", extra=("--seed", "1"))
+        assert isinstance(err, rec.RecipeRefused) and "seed" in str(err), err
+        assert (ck / "run_manifest.json").read_bytes() == before
+        # SSL off in the plan (--stage 1,2,7 is refused mid-curriculum, so use the helper directly) is recorded as such
+        ck2 = env.base / "ck2"
+        assert rec.ensure_recipe_manifest(ck2, strip_roots=(env.strips,), holdout_root=env.strips, holdout_blocks=1, seed=3,
+                                          ssl_pretrain=False, git_sha="1" * 40) is True
+        run2 = require_preregistered(ck2)
+        assert run2["ssl_pretrain"] is False and run2["seed"] == 3 and run2["git_sha"] == "1" * 40
+        assert rec.ensure_recipe_manifest(ck2, strip_roots=(env.strips,), holdout_root=env.strips, holdout_blocks=1, seed=3,
+                                          ssl_pretrain=False, git_sha="1" * 40) is False
+        # a sibling folder with another seed for the same arm: the shared registry refuses the re-roll
+        try:
+            rec.ensure_recipe_manifest(env.base / "ck3", strip_roots=(env.strips,), holdout_root=env.strips, holdout_blocks=1,
+                                       seed=4, ssl_pretrain=False, git_sha="1" * 40)
+        except SplitError as exc:
+            assert "re-roll" in str(exc), exc
+        else:
+            raise AssertionError("a second seed for the same arm must be refused")
+        # a different split already in --ckpt-dir is refused, not overwritten
+        ck4 = env.base / "ck4"
+        ck4.mkdir()
+        (ck4 / "split_manifest.json").write_text(_json.dumps({"format": "x"}))
+        try:
+            rec.ensure_recipe_manifest(ck4, strip_roots=(env.strips,), holdout_root=env.strips, holdout_blocks=1, seed=0,
+                                       ssl_pretrain=True, git_sha="1" * 40)
+        except Exception as exc:  # noqa: BLE001
+            assert isinstance(exc, (SplitError, rec.RecipeRefused, ValueError, KeyError)), exc
+        else:
+            raise AssertionError("a foreign split_manifest.json must be refused")
+        assert _json.loads((ck4 / "split_manifest.json").read_text()) == {"format": "x"}
+        try:
+            rec.ensure_recipe_manifest(None, strip_roots=(env.strips,), holdout_root=env.strips, holdout_blocks=1, seed=0,
+                                       ssl_pretrain=True)
+        except rec.RecipeRefused as exc:
+            assert "--ckpt-dir" in str(exc)
+        else:
+            raise AssertionError("no --ckpt-dir must refuse")
+        # the git commit comes from the checkout, hex only
+        sha = rec._repo_git_sha()
+        assert len(sha) >= 7 and all(c in "0123456789abcdef" for c in sha), sha
+    print("manifest: split + run manifests pre-registered by the real path before stage 1 (create-only, re-roll and foreign split refused) OK")
+
+
 
 def main() -> int:
     checks = (
@@ -1283,8 +1705,15 @@ def main() -> int:
         check_balanced_loss_keeps_extras,
         check_recipe_stages_train_on_fixture,
         check_recipe_manifest_required,
-        check_run_recipe_end_to_end,
-        check_main_recipe_without_manifest_exits_2,
+        check_aux_eval_numbers,
+        check_eval_series_and_exit_all,
+        check_stage7_lr_multipliers_pinned,
+        check_stop_path_keeps_old_checkpoints,
+        check_ssl_epoch_losses_and_stop,
+        check_runner_refuses_before_training,
+        check_runner_exports_once_after_the_last_stage,
+        check_runner_ssl_rows_must_be_manifest_train_rows,
+        check_runner_preregisters_the_manifest,
     )
     failed = 0
     for check in checks:

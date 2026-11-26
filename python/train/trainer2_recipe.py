@@ -19,7 +19,9 @@ pinned in ``recipe_run_config`` / the run manifest. This PR does not decide them
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -153,6 +155,8 @@ class StageResult:
     metrics: dict[str, float]
     evals: list[float]
     epochs: int
+    # Every primary metric's per-eval series (stage 1 has two). Empty: ``evals`` stands for each primary metric.
+    evals_by: dict[str, list[float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -370,6 +374,20 @@ def stage_exited(stage_id: str, evals: list[float], *, epochs: int, metric: str 
         if metric_gain(prev, cur, metric=name) > EXIT_GAIN:
             return False
     return True
+
+
+def stage_exited_all(stage_id: str, evals_by: Mapping[str, list[float]], *, epochs: int) -> bool:
+    """The stage exits at the max-epoch cap, or when EVERY primary metric of the stage has plateaued.
+
+    A primary metric with no series (never evaluated) has not plateaued.
+    """
+    if int(epochs) >= STAGE_MAX_EPOCHS:
+        return True
+    names = STAGE_PRIMARY_METRICS.get(stage_id, ("lane_rms",))
+    return all(
+        name in evals_by and stage_exited(stage_id, list(evals_by[name]), epochs=int(epochs), metric=name)
+        for name in names
+    )
 
 
 def check_non_regression(
@@ -759,41 +777,103 @@ def recipe_run_config(**extra: Any) -> dict[str, Any]:
     return cfg
 
 
-def stage_result_from_stats(stage_id: str, stats: Mapping[str, Any]) -> StageResult:
-    """Real per-stage metrics from a ``train_directory`` stats dict, or ``MetricNotMeasured``.
+# Stage 0's pretext loss is a property of the SSL run: no later stage's net can score it again, so it is
+# a stage-0 exit metric only and is not carried into the non-regression baseline.
+NOT_REMEASURABLE_METRICS = ("ssl_pretext",)
 
-    Only lane stages (2 and 7) have an offline exit metric today: the 8 m holdout
-    ``rms`` / ``r`` that ``train_directory`` scores every eval (``holdout_evals``).
-    Stage 1 (depth AbsRel / sem mIoU) and 2b (missed / false brakes, PR 6b) are not
-    scored offline yet, and stage 0 records only the SSL last loss, not a plateau.
-    Those raise: the runner never reports an exit it did not measure.
+# Stages whose exit metric cannot be measured offline yet, and exactly why. A run that includes one is refused
+# before it trains anything (``require_measurable_stages``), not after hours of SSL and stage 1.
+UNMEASURABLE_STAGES: dict[str, str] = {
+    "2b": (
+        "stage 2b's exit metric (missed / false brakes on signs and lights) needs three inputs that exist nowhere "
+        "in the repo before PR 6b: per-event stop ids on the holdout rows (signs.jsonl entries carry no id and no "
+        "producer writes the `stops` rows that stop_events.score reads), the held-stop speed key, and a predicted "
+        "speed profile (pred_v) from the ctl brake output. Inventing them would be a fake metric"
+    ),
+}
+
+# holdout_evals keys the recipe scores each pass, by stage metric name (train_directory records them).
+_EVAL_KEY = {"lane_rms": "lane_rms", "lane_r": "lane_r", "depth_absrel": "depth_absrel", "sem_miou": "sem_miou"}
+
+
+def require_measurable_stages(stage_ids: Iterable[str]) -> None:
+    """Refuse a plan holding a stage whose exit metric cannot be measured, before any stage trains."""
+    for sid in stage_ids:
+        if sid in UNMEASURABLE_STAGES:
+            raise MetricNotMeasured(
+                f"stage {sid} is in this run but cannot exit: {UNMEASURABLE_STAGES[sid]}. "
+                "Nothing was trained; drop it with --stage (e.g. --stage 0,1,2,7) or wait for PR 6b"
+            )
+
+
+def eval_series(stage_id: str, holdout_evals: Iterable[Mapping[str, Any]]) -> dict[str, list[float]]:
+    """Per primary metric of ``stage_id``, its value at every holdout eval. A missing value is NaN, never 0.0."""
+    evals = list(holdout_evals)
+    out: dict[str, list[float]] = {}
+    for name in STAGE_PRIMARY_METRICS.get(stage_id, ("lane_rms",)):
+        key = _EVAL_KEY.get(name)
+        out[name] = [float("nan") if key is None or e.get(key) is None else float(e[key]) for e in evals]
+    return out
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def stage_result_from_stats(stage_id: str, stats: Mapping[str, Any]) -> StageResult:
+    """Real per-stage metrics from a stage's stats, or ``MetricNotMeasured``. Nothing is a placeholder.
+
+    * stage 0: ``stats["ssl"]["losses"]``, the SSL run's mean pretext loss per epoch (``exp_ssl`` records it).
+    * stages 1 / 2 / 7: ``stats["holdout_evals"]``, the holdout pass ``train_directory`` scores every eval:
+      depth AbsRel and sem mIoU (stage 1), the 8 m lane ``rms`` / ``r`` (stages 2 and 7). A later stage's net
+      keeps the earlier aux heads (at weight 0) so it re-measures AbsRel / mIoU for the non-regression gate.
+    * stage 2b: see ``UNMEASURABLE_STAGES``.
     """
-    if stage_id not in ("2", "7"):
-        what = {
-            "0": "SSL pretext-loss plateau (exp_ssl records only the last loss)",
-            "1": "holdout depth AbsRel / sem mIoU",
-            "2b": "holdout missed / false brakes (PR 6b)",
-        }.get(stage_id, "the stage exit metric")
-        raise MetricNotMeasured(
-            f"stage {stage_id} trained, but its exit metric ({what}) is not measured offline in PR 6; "
-            "not claiming exit and not advancing (real metrics land with PR 6b / PR 7)"
+    if stage_id in UNMEASURABLE_STAGES:
+        raise MetricNotMeasured(f"stage {stage_id} cannot exit: {UNMEASURABLE_STAGES[stage_id]}")
+    if stage_id == "0":
+        ssl = dict(stats.get("ssl") or {})
+        losses = ssl.get("losses")
+        if not isinstance(losses, (list, tuple)) or not losses:
+            raise MetricNotMeasured(
+                f"stage 0: no per-epoch pretext loss was recorded ({ssl.get('why') or 'the SSL stage did not run'}); "
+                "not claiming a plateau"
+            )
+        series = [_finite_or_none(v) for v in losses]
+        if any(v is None for v in series):
+            raise MetricNotMeasured(f"stage 0: a pretext loss is not finite ({list(losses)!r}); not claiming a plateau")
+        return StageResult(
+            ckpt=None, metrics={"ssl_pretext": float(series[-1])}, evals=[float(v) for v in series],
+            epochs=len(series), evals_by={"ssl_pretext": [float(v) for v in series]},
         )
+    if stage_id not in ("1", "2", "7"):
+        raise MetricNotMeasured(f"stage {stage_id}: no exit metric is defined for it in this PR; not claiming exit")
     evals_raw = list(stats.get("holdout_evals") or [])
-    rms = [e.get("lane_rms") for e in evals_raw]
-    if not rms or any(v is None or not math.isfinite(float(v)) for v in rms):
-        raise MetricNotMeasured(
-            f"stage {stage_id}: no finite 8 m holdout rms on every eval ({rms!r}); not claiming exit"
-        )
+    by = eval_series(stage_id, evals_raw)
+    for name, values in by.items():
+        if not values or any(not math.isfinite(v) for v in values):
+            raise MetricNotMeasured(
+                f"stage {stage_id}: no finite holdout {name} on every eval ({values!r}); not claiming exit"
+            )
     last = evals_raw[-1]
-    metrics = {"lane_rms": float(last["lane_rms"])}
-    if last.get("lane_r") is not None and math.isfinite(float(last["lane_r"])):
-        metrics["lane_r"] = float(last["lane_r"])
+    metrics: dict[str, float] = {}
+    # Stage 1 trains no lane head: its (untrained) lane score is not a metric it owns, so it is not a baseline.
+    for name in (("depth_absrel", "sem_miou") if stage_id == "1" else ("lane_rms", "lane_r", "depth_absrel", "sem_miou")):
+        value = _finite_or_none(last.get(_EVAL_KEY[name]))
+        if value is not None:
+            metrics[name] = value
     ckpts = list(stats.get("epoch_ckpts") or [])
+    primary = STAGE_PRIMARY_METRICS[stage_id]
     return StageResult(
         ckpt=str(ckpts[-1]) if ckpts else None,
         metrics=metrics,
-        evals=[float(v) for v in rms],
-        epochs=int(stats.get("epochs_run") or len(rms)),
+        evals=list(by[primary[0]]),
+        epochs=int(stats.get("epochs_run") or len(evals_raw)),
+        evals_by=by,
     )
 
 
@@ -839,7 +919,7 @@ def run_curriculum(
     before = snapshot_checkpoints(ckpt_root) if ckpt_root is not None else None
     trained: list[str] = []
     skipped: list[str] = []
-    kept = dict(earlier_metrics or {})
+    kept = {k: v for k, v in dict(earlier_metrics or {}).items() if k not in NOT_REMEASURABLE_METRICS}
     prev_exited = True
     prev_ckpt: str | None = start_ckpt
     for stage in plan:
@@ -879,15 +959,22 @@ def run_curriculum(
         except CheckpointRejected as exc:
             _log(f"[GVD] recipe trainer2: stage {stage.id} checkpoint rejected (non-regression): {exc}")
             raise
-        kept.update(result.metrics)
+        kept.update({k: v for k, v in result.metrics.items() if k not in NOT_REMEASURABLE_METRICS})
         prev_ckpt = result.ckpt
-        prev_exited = stage_exited(stage.id, list(result.evals), epochs=int(result.epochs))
+        prev_exited = stage_exited_all(
+            stage.id,
+            result.evals_by or {name: list(result.evals) for name in STAGE_PRIMARY_METRICS.get(stage.id, ("lane_rms",))},
+            epochs=int(result.epochs),
+        )
         if not prev_exited:
             raise RecipeRefused(
                 f"stage {stage.id} did not exit (need no gain > {EXIT_GAIN:.0%} over "
                 f"{EXIT_PATIENCE_EVALS} evals, or {STAGE_MAX_EPOCHS} epochs)"
             )
-        _log(f"[GVD] recipe trainer2: stage {stage.id} ({stage.name}) exited, ckpt={result.ckpt}")
+        _log(
+            f"[GVD] recipe trainer2: stage {stage.id} ({stage.name}) exited after {int(result.epochs)} epoch(s), "
+            f"ckpt={result.ckpt} metrics={json.dumps({k: round(float(v), 6) for k, v in result.metrics.items()}, sort_keys=True)}"
+        )
     return CurriculumResult(trained=trained, skipped=skipped, metrics=kept, last_ckpt=prev_ckpt, logs=notes)
 
 
@@ -946,6 +1033,60 @@ def preregister_recipe_run(out_dir: Path | str, *, split_path: Path | str, git_s
     return preregister(out_dir, split_path=split_path, git_sha=git_sha, config=recipe_run_config(),
                        seed=int(seed), ssl_pretrain=bool(ssl_pretrain), decision_tier=decision_tier,
                        registry=registry)
+
+
+def _repo_git_sha() -> str:
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    try:
+        out = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RecipeRefused(f"cannot read the git commit to pre-register the run: {exc}") from exc
+    sha = out.stdout.strip().lower()
+    if out.returncode != 0 or not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+        raise RecipeRefused("cannot read the git commit to pre-register the run (is this a git checkout?)")
+    return sha
+
+
+def ensure_recipe_manifest(ckpt_dir: Path | str | None, *, strip_roots: Iterable[Path | str], holdout_root: Path | str,
+                           holdout_blocks: int, seed: int, ssl_pretrain: bool, git_sha: str | None = None) -> bool:
+    """Pre-register the run on the real CLI path. True when it wrote the manifests, False when ``--ckpt-dir`` had one.
+
+    Writes ``split_manifest.json`` (the #187 split ``train_directory`` uses) and ``run_manifest.json``
+    (pinned recipe config, seed, SSL on/off, git commit) into ``--ckpt-dir`` BEFORE any stage trains,
+    create-only: an existing run manifest is never replaced here (``require_recipe_manifest`` then
+    checks it against this run), and a different existing split manifest is refused. The shared
+    run registry is ``<ckpt-dir parent>/prereg_registry``, so a second seed for the same arm in a
+    sibling folder is refused as a re-roll.
+    """
+    from python.train.trainer2_split import RUN_MANIFEST, write_split_manifest
+
+    if not ckpt_dir:
+        raise RecipeRefused("--recipe trainer2 needs --ckpt-dir holding the run_manifest.json it pre-registers")
+    out = Path(ckpt_dir)
+    if (out / RUN_MANIFEST).exists():
+        return False
+    split = build_recipe_split(strip_roots, holdout_root, holdout_blocks=int(holdout_blocks))
+    out.mkdir(parents=True, exist_ok=True)
+    split_path = write_split_manifest(out / "split_manifest.json", split)
+    preregister_recipe_run(out, split_path=split_path, git_sha=git_sha or _repo_git_sha(), seed=int(seed),
+                           ssl_pretrain=bool(ssl_pretrain), registry=out.parent / "prereg_registry")
+    return True
+
+
+def check_ssl_rows_in_manifest(ssl_rows: Iterable[Mapping[str, Any]], run: Mapping[str, Any], *, holdout_root: Path | str) -> int:
+    """Refuse an SSL row that is not a train row of the run's split manifest. Returns the number checked.
+
+    SSL rows (``ssl_rows_from_split``) exclude the holdout blocks; a row the manifest does not list
+    as train (holdout, the 4 s purge, a held-out map cell) must never feed the pretext.
+    """
+    from python.train.trainer2_split import _load, check_subset_of_train
+
+    rows = _tag_source(ssl_rows, str(Path(holdout_root).resolve()))
+    split = _load(Path(run["split_path"]), "split manifest")
+    check_subset_of_train(rows, split, what="ssl")
+    return len(rows)
 
 
 def require_recipe_manifest(ckpt_dir: Path | str | None, *, seed: int, ssl_pretrain: bool,

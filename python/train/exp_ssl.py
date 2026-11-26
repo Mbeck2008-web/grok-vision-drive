@@ -180,7 +180,8 @@ def run_ssl_pretrain(
     epochs: int = 1,
     ema: float = EMA_MOMENTUM,
     _after_step=None,
-) -> dict[str, float]:
+    stop_fn=None,
+) -> dict[str, Any]:
     """Masked-token pretext on the provided train rows only (no zero canvas).
 
     The target token comes from an EMA copy of the stem. The first
@@ -192,6 +193,9 @@ def run_ssl_pretrain(
     floor at init (e.g. constant test canvases), cannot be guarded: that is
     reported in the stats (``probe_std_start`` NaN or < floor), not hidden.
     ``_after_step`` is a test hook called with ``net`` after each step.
+    ``epoch_losses`` in the stats is the mean pretext loss of each epoch run; ``stop_fn``
+    (optional) gets that list after every epoch and ends the run when it returns True
+    (Trainer 2.0 stage 0 stops on a pretext-loss plateau; ``epochs`` is then the cap).
     """
     import torch
 
@@ -208,6 +212,7 @@ def run_ssl_pretrain(
     probe_now = float("nan")
     last = 0.0
     used = 0
+    epoch_losses: list[float] = []
 
     def guard() -> None:
         nonlocal probe_now
@@ -221,6 +226,7 @@ def run_ssl_pretrain(
             )
 
     for epoch in range(max(1, int(epochs))):
+        epoch_sum, epoch_n = 0.0, 0
         for row in collected:
             image = image_fn(row)
             if image is None:
@@ -241,11 +247,17 @@ def run_ssl_pretrain(
             if _after_step is not None:
                 _after_step(net)
             last = float(loss.detach().item())
+            epoch_sum += last
+            epoch_n += 1
             used += 1
             if used % GUARD_EVERY == 0:
                 guard()
         init_net = None
         guard()
+        if epoch_n > 0:
+            epoch_losses.append(epoch_sum / epoch_n)
+        if stop_fn is not None and epoch_losses and stop_fn(list(epoch_losses)):
+            break
     if used <= 0:
         raise SslError("no train-frame images loaded; refusing to pretrain on a zero canvas")
     if len(probe) >= PROBE_N:
@@ -253,6 +265,7 @@ def run_ssl_pretrain(
     save_stem_weights(out_path, net)
     return {
         "last_loss": last,
+        "epoch_losses": list(epoch_losses),
         "n": float(used),
         "rows": float(len(collected)),
         "ema": float(ema),
@@ -339,6 +352,7 @@ def default_ssl_stem(
     epochs: int = 1,
     max_rows: int = DEFAULT_MAX_ROWS,
     key_extra: Mapping[str, Any] | None = None,
+    stop_fn=None,
 ) -> tuple[Path, dict[str, Any]]:
     """Default-on SSL stem for a supervised run: ``(stem path, info)``.
 
@@ -347,6 +361,10 @@ def default_ssl_stem(
     ``ssl_stem_<key>.npz``, keyed by the row list, the settings, ``SSL_RECIPE``
     and a hash of the frame content (read once per picked row, per source); an
     existing file with that key is reused, never overwritten, and no stem is deleted.
+    The per-epoch pretext losses are saved create-only beside the stem (``.losses.json``) so a
+    reused stem still reports its loss history (``info["losses"]``; ``None`` when no file exists).
+    ``stop_fn`` is passed to ``run_ssl_pretrain``; put its rule in ``key_extra`` so a stem trained
+    under another rule is never reused.
     """
     import hashlib
     import json
@@ -377,18 +395,40 @@ def default_ssl_stem(
     folder.mkdir(parents=True, exist_ok=True)
     final = folder / f"ssl_stem_{key}.npz"
     info: dict[str, Any] = {"key": key, "rows": len(picked), "reused": False}
+    side = folder / f"ssl_stem_{key}.losses.json"
     if final.is_file():
         load_stem_into_net(net, final)
         info["reused"] = True
+        info["losses"] = None
+        if side.is_file():
+            try:
+                loaded = json.loads(side.read_text(encoding="utf-8"))
+                info["losses"] = [float(v) for v in loaded["epoch_losses"]]
+            except (OSError, ValueError, KeyError, TypeError):
+                info["losses"] = None
         return final, info
     tmp = folder / f"ssl_stem_{key}.partial.npz"
     try:
-        stats = run_ssl_pretrain(net, picked, image_fn=image_fn, out_path=tmp, lr=lr, seed=seed, epochs=epochs)
+        stats = run_ssl_pretrain(net, picked, image_fn=image_fn, out_path=tmp, lr=lr, seed=seed, epochs=epochs,
+                                 stop_fn=stop_fn)
         os.replace(tmp, final)
     finally:
         if tmp.exists():
             tmp.unlink()
     info.update(stats)
+    info["losses"] = list(stats.get("epoch_losses") or [])
+    side_tmp = folder / f"ssl_stem_{key}.losses.partial.json"
+    try:
+        side_tmp.write_text(json.dumps({"epoch_losses": info["losses"], "key": key}), encoding="utf-8")
+        from python.data.binary_io import link_or_copy_new
+
+        try:
+            link_or_copy_new(side_tmp, side)  # create-only: an existing history is never replaced
+        except FileExistsError:
+            pass
+    finally:
+        if side_tmp.exists():
+            side_tmp.unlink()
     return final, info
 
 

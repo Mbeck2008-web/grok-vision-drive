@@ -241,10 +241,49 @@ def check_recipe_off_is_bit_identical() -> None:
           f"({len(added)} newer flag(s) not pinned)")
 
 
+class _P:
+    def __init__(self, requires_grad: bool = True) -> None:
+        self.requires_grad = requires_grad
+
+
+class _FakeNet:
+    """Just enough of an nn.Module for scene_param_groups (no torch needed)."""
+
+    def __init__(self) -> None:
+        self.stem = object()
+        self.lane_head = object()
+        self.sign_head = object()
+        self._params = [("stem.fc.weight", _P()), ("gru.w", _P()), ("lane_head.w", _P()), ("sign_head.w", _P())]
+
+    def named_children(self):
+        return [("stem", self.stem), ("lane_head", self.lane_head), ("sign_head", self.sign_head)]
+
+    def named_parameters(self):
+        return list(self._params)
+
+
+def check_group_missing_from_mults_trains_at_one() -> None:
+    """A group the mults mapping does not name gets lr_mult 1.0 and lr = base (not 0.3, not 0.0). Torch-free."""
+    from python.train.lr_schedule import scene_param_groups
+
+    net = _FakeNet()
+    groups = {g["name"]: g for g in scene_param_groups(net, 2e-3, {"lane_head": 0.3})}
+    assert list(groups) == ["stem", "trunk", "lane_head", "sign_head"], list(groups)
+    assert groups["lane_head"]["lr_mult"] == 0.3 and math.isclose(groups["lane_head"]["lr"], 6e-4)
+    for name in ("stem", "trunk", "sign_head"):
+        assert groups[name]["lr_mult"] == 1.0 and groups[name]["lr"] == 2e-3, (name, groups[name]["lr_mult"], groups[name]["lr"])
+    empty = scene_param_groups(net, 2e-3, {})
+    assert [g["lr_mult"] for g in empty] == [1.0] * 4 and all(g["lr"] == 2e-3 for g in empty)
+    net._params[0][1].requires_grad = False  # frozen stem: the group is dropped, the others keep 1.0
+    assert [g["name"] for g in scene_param_groups(net, 2e-3, {})] == ["trunk", "lane_head", "sign_head"]
+    print("param groups (torch-free): a group missing from mults gets lr_mult 1.0 and the base lr, empty mults all 1.0 OK")
+
+
 def main() -> int:
     checks = (
         check_warmup_cosine_shape,
         check_param_groups_lr_mult,
+        check_group_missing_from_mults_trains_at_one,
         check_apply_lr_scales_each_group,
         check_state_dict_round_trip,
         check_resume_keeps_schedule,

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import gzip
 import io
 import json
 import math
@@ -41,7 +42,7 @@ def _iso_banned(path: Path, banned: tuple[str, ...]) -> None:
 
 
 def check_isolation() -> None:
-    banned = ("route_hindsight", "label_route_intent")
+    banned = ("route_hindsight", "label_route_intent", "road_graph")
     for rel in (
         "python/planning/path_predictor.py",
         "python/actuate.py",
@@ -91,6 +92,68 @@ def _rows_from_poses(poses: list[tuple[float, float, float]], *, dt: float = 0.1
             }
         )
     return rows
+
+
+def _rows_v2_from_poses(poses: list[tuple[float, float, float]], *, dt: float = 0.1) -> list[dict]:
+    """Collect-shaped v2 state.jsonl rows: ego.pos / capture.pos, no top-level pos."""
+    rows = []
+    for i, (x, y, heading) in enumerate(poses):
+        pos = [float(x), float(y), 0.0]
+        direction = [math.cos(heading), math.sin(heading), 0.0]
+        rows.append(
+            {
+                "t": round(i * dt, 4),
+                "ego": {"pos": pos, "dir": direction},
+                "capture": {"pos": list(pos), "dir": list(direction)},
+            }
+        )
+    return rows
+
+
+def _write_tiny_road_dump(path: Path) -> Path:
+    """Minimal <data>/roads/<map>.json.gz for the synth_a T at the origin.
+
+    Through-road W(-200,0)–X(200,0) plus stem S(0,-200)–T(0,0). The dump
+    walk must merge the stem end onto the through road to make a degree-3
+    node. Edge records use the BeamNG left/middle/right xyz shape; oneWay
+    is the string "0" used in real dumps.
+    """
+    def edges(points: list[tuple[float, float]], *, horizontal: bool) -> list[dict]:
+        half = 2.0
+        out = []
+        for x, y in points:
+            if horizontal:
+                left, right = [x, y - half, 0.0], [x, y + half, 0.0]
+            else:
+                left, right = [x - half, y, 0.0], [x + half, y, 0.0]
+            out.append({"left": left, "right": right, "middle": [x, y, 0.0]})
+        return out
+
+    def road(rid: str, points: list[tuple[float, float]], *, horizontal: bool) -> tuple[str, dict]:
+        return rid, {
+            "drivability": "1",
+            "oneWay": "0",
+            "edges": edges(points, horizontal=horizontal),
+        }
+
+    payload = {
+        "map": "synth_a",
+        "spawn": {"pos": [0.0, -200.0, 0.0], "source": "fixture"},
+        "note": "tiny route-backlabel T-junction",
+        "road_network": dict(
+            (
+                road("through", [(-200.0, 0.0), (0.0, 0.0), (200.0, 0.0)], horizontal=True),
+                road("stem", [(0.0, -200.0), (0.0, 0.0)], horizontal=False),
+            )
+        ),
+        "roads": {},
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    return path
+
 
 
 def _graph(level: str = "synth_a"):
@@ -245,6 +308,78 @@ def check_cli_sidecar() -> None:
     print("  CLI writes intent.jsonl and refuses gt.jsonl")
 
 
+
+def check_v2_ego_pos_parity() -> None:
+    """Nested ego.pos / capture.pos (no top-level pos) match flattened labels."""
+    from python.collect.route_hindsight import label_sequence
+
+    data = load_graph()
+    graph = _graph()
+    poses = track(data, "synth_a", ["S", "T", "X"], speed_mps=10.0, dt_s=0.1)
+    flat = label_sequence(graph, _rows_from_poses(poses))
+    nested = label_sequence(graph, _rows_v2_from_poses(poses))
+    assert len(nested) == len(flat) == len(poses)
+    assert all("pos" not in row for row in _rows_v2_from_poses(poses)[:3])
+    for got, want in zip(nested, flat):
+        assert got["cmd"] == want["cmd"], (got, want)
+        assert got.get("next_jct_m") == want.get("next_jct_m"), (got, want)
+        assert got.get("reason") == want.get("reason"), (got, want)
+    assert "right" in _approach_cmds(nested)
+    # Capture-only rows (no ego, no top-level pos) also match.
+    capture_only = []
+    for row in _rows_v2_from_poses(poses):
+        capture_only.append({"t": row["t"], "capture": row["capture"]})
+    captured = label_sequence(graph, capture_only)
+    assert [r["cmd"] for r in captured] == [r["cmd"] for r in flat]
+    print("  v2 ego.pos / capture.pos parity: same labels as flattened {pos,dir}")
+
+
+def check_cli_gzip_road_dump() -> None:
+    """CLI loads <data>/roads/<map>.json.gz and labels a v2 state.jsonl clip."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from label_route_intent import main as label_main
+    from python.collect.route_hindsight import label_sequence
+
+    from python.collect.road_graph import load_label_graph
+
+    data = load_graph()
+    poses = track(data, "synth_a", ["S", "T", "X"], speed_mps=10.0, dt_s=0.1)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        state = tmp_path / "clip" / "state.jsonl"
+        out = tmp_path / "clip" / "intent.jsonl"
+        dump = tmp_path / "roads" / "synth_a.json.gz"
+        _write_tiny_road_dump(dump)
+        dump_graph = load_label_graph(dump)
+        assert any(
+            abs(x) <= 1.0 and abs(y) <= 1.0
+            for name, (x, y) in dump_graph.nodes.items()
+            if name in dump_graph.junctions()
+        ), (dump_graph.nodes, dump_graph.junctions())
+        want = label_sequence(dump_graph, _rows_from_poses(poses))
+        state.parent.mkdir(parents=True, exist_ok=True)
+        with state.open("w", encoding="utf-8") as fh:
+            for row in _rows_v2_from_poses(poses):
+                assert "pos" not in row and "dir" not in row
+                fh.write(json.dumps(row) + "\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = label_main(["--state", str(state), "--graph", str(dump), "--out", str(out)])
+        hist = buf.getvalue()
+        assert rc == 0 and out.is_file(), (rc, hist)
+        lines = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert len(lines) == len(want)
+        assert [r["cmd"] for r in lines] == [r["cmd"] for r in want]
+        assert any(row["cmd"] == "right" for row in lines)
+        for key in ("follow=", "left=", "right=", "straight=", "mask=", "junction"):
+            assert key in hist, (key, hist)
+        gt = tmp_path / "gt.jsonl"
+        rc_bad = label_main(["--state", str(state), "--graph", str(dump), "--out", str(gt)])
+        assert rc_bad != 0
+        assert not gt.exists()
+    print("  CLI: v2 state.jsonl + roads/synth_a.json.gz matches flattened labels; still refuses gt.jsonl")
+
+
 def main() -> int:
     check_isolation()
     check_iso_catches_dotted_hindsight_imports()
@@ -254,6 +389,8 @@ def main() -> int:
     check_roundabout_masked()
     check_ambiguous_and_no_future()
     check_cli_sidecar()
+    check_v2_ego_pos_parity()
+    check_cli_gzip_road_dump()
     print("test_route_hindsight: ok")
     return 0
 

@@ -9,6 +9,7 @@ Tests:
 - check_preexec_ppid_race_exit
 - check_parent_watch_errno_discipline
 - check_orphan_cases
+- check_stub_stdin_thread_clean_exit
 - check_rv_input_schema
 - check_rv_output_schema
 - check_shm_slot_roundtrip_and_copy_only
@@ -649,6 +650,70 @@ def check_orphan_cases() -> None:
         )
 
 
+def check_stub_stdin_thread_clean_exit() -> None:
+    """The stdin-thread serve loop (always used on win32) must exit promptly with rc 0.
+
+    windows CI @ b4ed9a9: case W armed=handle reason=parent_exit but exited_in=1.062s.
+    Cause: the daemon stdin thread blocked in sys.stdin.buffer.read() holds the
+    BufferedReader lock, so interpreter shutdown waits 1 s in _enter_buffered_busy
+    and then aborts (Fatal Python error, rc != 0). The stub is our direct child here,
+    so its exit code is visible; on Linux the thread path is forced via a private
+    module attribute and confirmed by the armed line (stdin=thread).
+    """
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], close_fds=True)
+    src = (
+        "import python.viz.rv_renderer_stub as _s\n"
+        "_s._TEST_DISABLE_PDEATHSIG = True\n"
+        "_s._TEST_FORCE_STDIN_THREAD = True\n"
+        "raise SystemExit(_s.main(['--serve', '--parent-pid', '%d']))\n" % sleeper.pid
+    )
+    stub = subprocess.Popen(
+        [sys.executable, "-c", src],
+        cwd=str(ROOT),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        close_fds=True,
+    )
+    lq = _LineQueue(stub)
+    try:
+        armed_line = lq.wait_for(lambda ln: ln.startswith(_ARMED_PREFIX), 15.0, "stdin_thread RV_WATCH_ARMED")
+        armed = _kv(armed_line, "mode")
+        assert armed == _expected_native_watch_mode(), f"armed mode {armed!r} ({armed_line!r})"
+        assert _kv(armed_line, "stdin") == "thread", f"stdin thread path not taken: {armed_line!r}"
+        time.sleep(0.3)
+        assert stub.poll() is None, f"stub exited while watched pid alive; seen={lq.seen!r}"
+        t0 = time.monotonic()
+        sleeper.kill()
+        sleeper.wait(timeout=5)
+        try:
+            rc = stub.wait(timeout=4.0)
+        except subprocess.TimeoutExpired:
+            rc = None
+        elapsed = time.monotonic() - t0
+        reason = "-"
+        if rc is not None:
+            reason = _kv(lq.wait_for(lambda ln: ln.startswith(_EXIT_PREFIX), 3.0, "stdin_thread RV_STUB_EXIT"), "reason")
+        print(
+            f"orphan_check platform={sys.platform} mode=stdin_thread_direct armed={armed} reason={reason} "
+            f"rc={rc} exited_in={elapsed:.3f}s",
+            flush=True,
+        )
+        assert rc is not None, "stdin-thread stub did not exit within 4 s of watched pid death"
+        err = stub.stderr.read() if stub.stderr is not None else ""
+        assert rc == 0, f"stdin-thread stub exit rc={rc} (shutdown stall/abort?) stderr={err[:300]!r}"
+        assert reason == "parent_exit", f"exit reason {reason!r}"
+    finally:
+        try:
+            if stub.stdin is not None:
+                stub.stdin.close()
+        except OSError:
+            pass
+        _hard_kill_proc(stub)
+        _hard_kill_proc(sleeper)
+
+
 def check_parent_watch_errno_discipline() -> None:
     """Only 'pid is gone' errors mean exit; any other open failure falls back to polling.
 
@@ -1281,6 +1346,7 @@ def main() -> None:
     check_preexec_ppid_race_exit()
     check_parent_watch_errno_discipline()
     check_orphan_cases()
+    check_stub_stdin_thread_clean_exit()
     check_rv_input_schema()
     check_rv_output_schema()
     check_shm_slot_roundtrip_and_copy_only()

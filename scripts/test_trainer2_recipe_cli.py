@@ -191,8 +191,35 @@ def check_cli_default_plan_stops_before_training() -> None:
     print("CLI default plan: stops before SSL / manifest / any stage because stage 2b cannot exit OK")
 
 
+def check_cli_stage_errors_exit_2_without_traceback() -> None:
+    """An SSL / data error raised inside the recipe path is a clean exit 2 (it used to be a traceback)."""
+    if not _ready("check_cli_stage_errors_exit_2_without_traceback"):
+        return
+    from python.data.raw_frames import LossyFramesError
+    from python.train import train_scene
+    from python.train.exp_ssl import SslError
+    from python.train.trainer2_split import SplitError
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        strips = base_tests._fixture(base)
+        saved = train_scene._run_trainer2_recipe
+        try:
+            for exc in (SslError("ssl boom"), LossyFramesError("lossy boom"), SplitError("split boom")):
+                def boom(*a, _e=exc, **k):
+                    raise _e
+
+                train_scene._run_trainer2_recipe = boom
+                code, text = _main(_flags(strips, base / "ck", "0,1,2,7"), base)
+                assert code == 2 and "Traceback" not in text and str(exc) in text, (type(exc).__name__, code, text[-600:])
+        finally:
+            train_scene._run_trainer2_recipe = saved
+    print("CLI: SslError / LossyFramesError / SplitError inside the recipe path exit 2 with the message, no traceback OK")
+
+
 def main() -> int:
-    checks = (check_cli_default_plan_stops_before_training, check_cli_full_curriculum_stages_0_1_2_7)
+    checks = (check_cli_default_plan_stops_before_training, check_cli_stage_errors_exit_2_without_traceback,
+              check_cli_full_curriculum_stages_0_1_2_7)
     failed = 0
     for check in checks:
         try:

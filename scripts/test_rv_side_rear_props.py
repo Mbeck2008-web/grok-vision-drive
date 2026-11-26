@@ -76,6 +76,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -241,7 +242,7 @@ class Preview:
         exec(compile(ast.Module(body=body, type_ignores=[]), str(PREVIEW), "exec"), self.ns)
         self.cam = self.ns["CAM_POSE"]
         self.has_yield = "YIELD" in self.ns
-        self.snap_hook = {"mask": None}
+        self.snap_hook = {"mask": None, "pre": None, "calls": []}
 
         class _SHook:
             def __init__(self, real, hook):
@@ -251,10 +252,26 @@ class Preview:
             def __getattr__(self, name):
                 return getattr(object.__getattribute__(self, "_real"), name)
 
-            def road_snap(self, *a, **k):
-                out, m = object.__getattribute__(self, "_real").road_snap(*a, **k)
-                object.__getattribute__(self, "_hook")["mask"] = m
+            def _wrap(self, name, *a, **k):
+                hk = object.__getattribute__(self, "_hook")
+                cam = a[0] if a else k.get("cam")
+                dep = a[1] if len(a) > 1 else k.get("depth")
+                if not hk.get("_in"):
+                    hk["pre"] = None if dep is None else np.array(dep, np.float64, copy=True)
+                hk["calls"].append((name, getattr(cam, "name", None) or getattr(cam, "cam_id", None) or id(cam)))
+                hk["_in"] = hk.get("_in", 0) + 1
+                try:
+                    out, m = getattr(object.__getattribute__(self, "_real"), name)(*a, **k)
+                finally:
+                    hk["_in"] -= 1
+                hk["mask"] = m
                 return out, m
+
+            def road_snap(self, *a, **k):
+                return self._wrap("road_snap", *a, **k)
+
+            def snap_road_for_cam(self, *a, **k):   # per-cam snap entry point, if the runtime has one
+                return self._wrap("snap_road_for_cam", *a, **k)
 
         self.ns["S"] = _SHook(sf, self.snap_hook)
         self.last_snap = None
@@ -277,6 +294,7 @@ class Preview:
             self.P[f"{cid}/{idx}/0/x0"] = np.array([0, W0])
             self.P[f"{cid}/{idx}/0/s"] = np.asarray(sem)
         self.snap_hook["mask"] = None
+        self.snap_hook["pre"] = None
         with np.errstate(all="ignore"):
             out = self.ns["cam_frame"](cid, idx)
         self.last_snap = self.snap_hook.get("mask")
@@ -1955,6 +1973,1372 @@ def check_road_labelled_object_top_stays_put() -> None:
     assert not bad, "; ".join(bad)
 
 
+# ------------------------------------------------------------------ ripple (rings) + isolated streak (GVD 2026-11-26)
+# Michael picked WIDE SNAP OFF (1:08 PM). With wide snap off he sees (1) concentric rings on the road in the
+# pose-B chase and (2) a single line of 3-D points shooting off into the distance. Thresholds below were
+# set by rule on dev threshold frames RS_THRESH_FRAMES (never f40/f110/f160, never burned f60/f130, never
+# the sealed held-out pair #2), then verified on f40/f110/f160. See the commit message for the table.
+RS_THRESH_FRAMES = (10, 25, 50, 120, 140, 155)  # rule: clip015 multiples of 5 outside the seal guard band (frame AND every cam's pred idx), not 40/60/110/130/160, >=10 from them, no shared sparse pred idx; greedy >=15 apart from f10 (f170 dropped 13:51: inside the guard band)
+RS_VERIFY_FRAMES = (40, 110, 160)               # Michael's before/after still frames
+RS_BURNED = (60, 130)                           # one-time unseal on 2026-11-26: burned
+HELDOUT2_SEALED = (85, 185)                     # sealed held-out pair #2 (rv-side-evidence/heldout2_SEALED.md); never measured here
+HELDOUT2_SEALED_IDX = {"main": (85, 185), "narrow": (85, 185), "wide": (85, 185), "pillarL": (86, 184), "pillarR": (85, 184),
+                       "rear": (86, 183), "repeatL": (83, 184), "repeatR": (85, 187)}
+# SEAL GUARD BAND (Skeptic, binding 13:51): no dev measurement / threshold / fixture / tuning may use a frame or a
+# pred idx within +-20 of a sealed pred idx (83-87, 183-187) -> excluded 63-107 and 163-207 (kills f70/f80/f100/f200).
+# Verify frame f110: rear's nearest pred idx is 107 (in band) -> rear is not measured at f110.
+SEAL_GUARD_M = 20
+SEAL_GUARD_RANGES = ((83 - SEAL_GUARD_M, 87 + SEAL_GUARD_M), (183 - SEAL_GUARD_M, 187 + SEAL_GUARD_M))  # sealed pred idxs 83-87, 183-187 -> 63-107, 163-207
+
+
+def in_seal_guard(i) -> bool:
+    return i is not None and any(lo <= int(i) <= hi for lo, hi in SEAL_GUARD_RANGES)
+
+
+RS_CAMS = ("wide", "main", "narrow", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+RIP_BIN_M = 0.5            # range bin for the residual profile
+RIP_R_MAX = 30.0
+RIP_GT_Z = 1.0             # GT road = net road px whose GT point is within 1 m of z=0 (as the strip gate)
+RIP_MIN_PX = 10            # px per range bin for the bin to count
+RIP_MIN_BINS = 10          # bins per cam for the profile metrics to count (else n/a, printed)
+RIP_ZC_EPS = 0.01          # zero-crossing dead band (m): sign changes of the detrended residual beyond +-1 cm
+RIP_DETREND_BINS = 11      # local linear ground fit over 11 bins = 5.5 m centred on each bin
+RIP_DZ_BINS = ((0.0, 5.0), (5.0, 10.0), (10.0, 15.0), (15.0, 30.0))
+RIP_PTP_BIN = (5.0, 15.0)
+RIP_BAND = 0.25            # synthetic banding: every other 12x16 row 25% short (raised by 0.25 x cam height; far-side errors are clamped to the road)
+RIP_METRICS = ("std", "ptp_5_15", "pfrac", "zc") + tuple(f"dz_{lo:g}_{hi:g}" for lo, hi in RIP_DZ_BINS)
+STREAK_Y = (15.0, 20.0)
+STREAK_X = (0.5, 1.0)
+STREAK_K = 3
+STREAK_Z_M = 5.0           # ray run: > 5 m of range along one pixel column
+STREAK_RAY_X = 1.0         # ray-run points must be isolated (< STREAK_K neighbours within 1.0 m)
+FOOT_GAP_K = 1.05           # Tracer: row spacing > 1.05 x footprint = a visible gap (stripe)
+FOOT_GAP_MAX = 1.0 - FOOTPRINT_MIN_FRAC   # = 5%: the committed P gate (>= 95% of rows covered), not tuned here
+FOOT_GAP_BINS = ((0.0, 5.0), (5.0, 15.0), (15.0, 30.0))
+COLMONO_RISE_M = 100.0     # INFO only (Skeptic: circular vs the fix): drawn depth rising > 100 m up one column; Tracer's number, not derived
+GC_RATIO, GC_ABS = 1.5, 20.0   # GT-consistency: drawn depth >= 1.5 x GT AND > GT + 20 m where GT has the nearer surface (Skeptic's numbers, stated not derived)
+FR_MIN_M = 30.0            # false-removal: GT surface past 30 m
+FR_MARGIN = 0.02           # kept fraction >= head (worst threshold frame) - 2 pp
+HOLE_BANDS = ((0.0, 5.0), (5.0, 15.0), (15.0, 30.0))
+GC_LIMITS: dict = {"wide": 531, "main": 1584, "narrow": 3637, "pillarL": 701, "pillarR": 978, "repeatL": 732, "repeatR": 834, "rear": 716}  # min(ON, v2) + GT-path, worst threshold frame
+FR_LIMITS: dict = {"wide": 0.0397, "main": 0.5822, "narrow": 0.9175, "pillarL": 0.2314, "pillarR": None, "repeatL": 0.3118, "repeatR": 0.2822, "rear": 0.0287}  # head (snap OFF) pooled threshold frames - 2 pp; None: n < 200
+RINGA_LIMITS: dict = {"0-5": 0.0136, "5-15": 0.0443, "15-30": 0.0}  # min(ON, v2) + GT, worst threshold frame
+STREAK_START_MAX_M = 30.0  # a ray run must start inside the 0-30 m field (the line starts near the car and shoots off)
+SURF_REL, SURF_ABS = 0.10, 0.5   # on the GT surface: within 10% / 0.5 m of GT depth anywhere in the px's 3x3 GT neighbourhood
+# Limits (rule: no worse than the better of 783fedd snap ON and v2 10893ee, worst threshold frame of
+# each, plus the GT-depth floor of the same metric as margin; see RS_LIMIT_RULE). None = n/a for that cam.
+RIPPLE_LIMITS: dict = {   # {cam: {metric: limit}}; rule on RS_THRESH_FRAMES (rv-side-evidence/ripple/rule.log)
+    'wide': {'std': 0.164, 'ptp_5_15': 0.436, 'pfrac': 0.561, 'zc': 15, 'dz_0_5': 0.08, 'dz_5_10': 0.163, 'dz_10_15': 0.431, 'dz_15_30': 0.417},
+    'main': {'std': 0.107, 'ptp_5_15': 0.051, 'pfrac': 0.486, 'zc': 13, 'dz_0_5': 0.09, 'dz_5_10': 0.125, 'dz_10_15': 0.22, 'dz_15_30': 0.266},
+    'narrow': {'std': 0.076, 'ptp_5_15': 0.011, 'pfrac': 0.409, 'zc': 11, 'dz_0_5': None, 'dz_5_10': 0.143, 'dz_10_15': 0.265, 'dz_15_30': 0.299},
+    'pillarL': {'std': 0.194, 'ptp_5_15': 0.258, 'pfrac': 0.673, 'zc': 8, 'dz_0_5': 0.033, 'dz_5_10': 0.093, 'dz_10_15': 0.347, 'dz_15_30': 0.258},
+    'pillarR': {'std': 0.185, 'ptp_5_15': 0.722, 'pfrac': 1.1, 'zc': 4, 'dz_0_5': 0.046, 'dz_5_10': 0.524, 'dz_10_15': 0.2, 'dz_15_30': 1.717},
+    'repeatL': {'std': 0.118, 'ptp_5_15': 0.229, 'pfrac': 0.801, 'zc': 17, 'dz_0_5': 0.041, 'dz_5_10': 0.106, 'dz_10_15': 0.212, 'dz_15_30': 0.36},
+    'repeatR': {'std': 0.148, 'ptp_5_15': 0.26, 'pfrac': 0.531, 'zc': 21, 'dz_0_5': 0.037, 'dz_5_10': 0.118, 'dz_10_15': 0.212, 'dz_15_30': 0.424},
+    'rear': {'std': 0.222, 'ptp_5_15': 0.386, 'pfrac': 0.465, 'zc': 27, 'dz_0_5': 0.062, 'dz_5_10': 0.109, 'dz_10_15': 0.196, 'dz_15_30': 0.503},
+}
+WIDE_BOWL_LIMIT = 0.543    # rule: min(ON 0.523, v2 2.607) + GT 0.020 (worst threshold frame)
+PLANE_PULL_TOL: dict = {"0-5": 0.122, "5-10": 0.048, "10-15": 0.056, "15-30": 0.059}  # upsample tolerance, worst threshold frame, wide
+ISO_LIMITS: dict = {(15.0, 0.5): 14987, (15.0, 1.0): 5427, (20.0, 0.5): 14876, (20.0, 1.0): 5426}  # pooled all cams; min(ON, v2) worst threshold frame, no margin (GT path has MORE: 20672/8829/20631/8823)
+STREAK_RAY_LIMIT = 0       # rays above STREAK_Z_M per cam (GT floor stated in the commit)
+RS_LIMIT_RULE = ("limit = min(max_f ON, max_f v2) + max_f GT-path, per cam and metric, over RS_THRESH_FRAMES; "
+                 "ISO pooled: min(max_f ON, max_f v2), no margin; false-removal: head pooled - 2 pp; rays/colmono/footgap: INFO")
+
+
+def rs_frames_ok(frames, used: dict | None = None) -> None:
+    """Never measure burned or sealed frames (nor the sealed pair's sparse-cam pred indices)."""
+    bad = [f for f in frames if f in RS_BURNED or f in HELDOUT2_SEALED or in_seal_guard(f)]
+    for cid, idxs in (used or {}).items():
+        bad += [f"{cid}:{i}" for i in idxs if i in HELDOUT2_SEALED_IDX.get(cid, ()) or in_seal_guard(i)]
+    assert not bad, f"burned/sealed frames requested: {bad}"
+
+
+def rs_record(cam, d, v, gtd, road, cap: float = math.inf) -> dict:
+    """Per-cam record for the ripple/streak metrics; works for any pipeline (head, v2, GT path). cap = the
+    pipeline's own far cap (far px are drawn at the cap by design; the GT surface is capped the same way)."""
+    H, W = d.shape
+    ys, xs = np.mgrid[0:H, 0:W]
+    ys, xs = ys.ravel(), xs.ravel()
+    with np.errstate(all="ignore"):
+        q = sf.unproject(cam, np.where(np.isfinite(d), d, 0.0), ys, xs).reshape(H, W, 3)
+        qg = sf.unproject(cam, np.where(np.isfinite(gtd), gtd, 0.0), ys, xs).reshape(H, W, 3)
+    return {"d": np.asarray(d, np.float64), "v": np.asarray(v, bool) & np.isfinite(d) & (np.asarray(d) > 0),
+            "gtd": np.asarray(gtd, np.float64), "road": np.asarray(road, bool), "q": q, "qg": qg, "cap": float(cap),
+            "cam_z": float(np.asarray(cam.pos)[2])}
+
+
+def ripple_metrics(rec) -> dict:
+    """GT-road px drawn after cam_frame: dz = z_render - z_GT at the same px, range = hypot(x, y) of the GT point.
+    Profile = per 0.5 m range bin median dz over 0-30 m (bins with >= RIP_MIN_PX px). Detrend = local ground fit:
+    per bin, a least-squares line in range over the valid bins within +-2.5 m (RIP_DETREND_BINS), subtracted. std = std of the detrended profile; ptp_5_15 = its max-min in 5-15 m;
+    pfrac = share of non-DC power in the dominant FFT bin of the detrended profile (gaps linearly interpolated);
+    zc = sign changes of the detrended profile outside +-RIP_ZC_EPS; dz_lo_hi = median |dz| over px in that range."""
+    gtd, qg, q = rec["gtd"], rec["qg"], rec["q"]
+    m = rec["v"] & rec["road"] & np.isfinite(gtd) & (np.abs(qg[..., 2]) <= RIP_GT_Z)
+    R = np.hypot(qg[..., 0], qg[..., 1])[m]
+    dz = (q[..., 2] - qg[..., 2])[m]
+    out = {"n_px": int(m.sum())}
+    for lo, hi in RIP_DZ_BINS:
+        k = (R >= lo) & (R < hi)
+        out[f"dz_{lo:g}_{hi:g}"] = float(np.median(np.abs(dz[k]))) if k.sum() >= RIP_MIN_PX else None
+        out[f"n_{lo:g}_{hi:g}"] = int(k.sum())
+    nb = int(round(RIP_R_MAX / RIP_BIN_M))
+    b = np.floor(R / RIP_BIN_M).astype(np.int64)
+    ok = (b >= 0) & (b < nb)
+    cnt = np.bincount(b[ok], minlength=nb)
+    med = np.full(nb, np.nan)
+    order = np.argsort(b[ok], kind="stable")
+    bs, ds = b[ok][order], dz[ok][order]
+    starts = np.searchsorted(bs, np.arange(nb))
+    ends = np.searchsorted(bs, np.arange(nb), side="right")
+    for i in range(nb):
+        if cnt[i] >= RIP_MIN_PX:
+            med[i] = float(np.median(ds[starts[i]:ends[i]]))
+    good = np.isfinite(med)
+    out["n_bins"] = int(good.sum())
+    centres = (np.arange(nb) + 0.5) * RIP_BIN_M
+    out["profile"] = [None if not np.isfinite(x) else round(float(x), 4) for x in med]
+    if good.sum() < RIP_MIN_BINS:
+        out.update(std=None, ptp_5_15=None, pfrac=None, zc=None, resid=None)
+        return out
+    e = np.full(nb, np.nan)
+    h = RIP_DETREND_BINS // 2
+    for i in np.nonzero(good)[0]:     # local ground fit: linear in range over a 5 m window around the bin
+        lo, hi = max(0, i - h), min(nb, i + h + 1)
+        k = good[lo:hi]
+        if k.sum() >= 3:
+            cf = np.polyfit(centres[lo:hi][k], med[lo:hi][k], 1)
+            e[i] = med[i] - np.polyval(cf, centres[i])
+    good = np.isfinite(e)
+    if good.sum() < RIP_MIN_BINS:
+        out.update(std=None, ptp_5_15=None, pfrac=None, zc=None, resid=None)
+        return out
+    out["resid"] = [None if not np.isfinite(x) else round(float(x), 4) for x in e]
+    out["std"] = float(np.std(e[good]))
+    k = good & (centres >= RIP_PTP_BIN[0]) & (centres < RIP_PTP_BIN[1])
+    out["ptp_5_15"] = float(np.ptp(e[k])) if k.sum() >= 2 else None
+    i0, i1 = int(np.nonzero(good)[0][0]), int(np.nonzero(good)[0][-1])
+    xs_ = np.arange(i0, i1 + 1)
+    x = np.interp(xs_, np.nonzero(good)[0], e[good])
+    spec = np.abs(np.fft.rfft(x - x.mean())) ** 2
+    out["pfrac"] = float(spec[1:].max() / spec[1:].sum()) if spec[1:].sum() > 0 else 0.0
+    sgn = np.sign(np.where(np.abs(e[good]) > RIP_ZC_EPS, e[good], 0.0))
+    sgn = sgn[sgn != 0]
+    out["zc"] = int(np.count_nonzero(np.diff(sgn) != 0))
+    return out
+
+
+def _surface_ok(d, gtd, cap=math.inf):
+    """Rendered depth within SURF_REL/SURF_ABS of the GT depth anywhere in the px's 3x3 GT neighbourhood
+    (so the GT path's own nearest-resize half-pixel shift is not counted as off-surface); GT capped at the
+    pipeline's far cap, since far px are drawn at the cap by design."""
+    g = np.where(np.isfinite(gtd), np.minimum(gtd, cap), np.nan)
+    gmin = -cv2.dilate(np.where(np.isfinite(g), -g, -np.inf).astype(np.float32), np.ones((3, 3), np.uint8))
+    gmax = cv2.dilate(np.where(np.isfinite(g), g, -np.inf).astype(np.float32), np.ones((3, 3), np.uint8))
+    with np.errstate(invalid="ignore"):
+        return np.isfinite(gmax) & (d >= gmin * (1 - SURF_REL) - SURF_ABS) & (d <= gmax * (1 + SURF_REL) + SURF_ABS)
+
+
+def streak_metrics(recs: dict) -> dict:
+    """Rendered 3-D point set of one frame (every cam's drawn px after cam_frame, ego box cut; NO sky exemption):
+    iso[(Y, X)] = points past Y m (hypot x,y) with < STREAK_K neighbours within X m (per cam and total).
+    Ray runs, per cam: consecutive rows of one pixel column whose points are off the GT surface (_surface_ok
+    false) and isolated (< STREAK_K neighbours within STREAK_RAY_X), starting within STREAK_START_MAX_M and
+    spanning > STREAK_Z_M of range."""
+    from scipy.spatial import cKDTree
+    pts, own, pix = [], [], []
+    for cid, r in recs.items():
+        ys, xs = np.nonzero(r["v"])
+        q = r["q"][ys, xs]
+        k = ego_box_filter(q)
+        pts.append(q[k]); own += [cid] * int(k.sum()); pix.append(np.stack([ys[k], xs[k]], 1))
+    if not pts:
+        return {"n_pts": 0, "iso": {}, "rays": {}}
+    P = np.concatenate(pts); own = np.array(own); pix = np.concatenate(pix)
+    tree = cKDTree(P)
+    R = np.hypot(P[:, 0], P[:, 1])
+    out = {"n_pts": int(len(P)), "iso": {}, "rays": {}}
+    for Y in STREAK_Y:
+        far = R > Y
+        for X in STREAK_X:
+            c = tree.query_ball_point(P[far], X, return_length=True) - 1 if far.any() else np.zeros(0, int)
+            iso = c < STREAK_K
+            out["iso"][(Y, X)] = {"total": int(iso.sum()), "n_far": int(far.sum()),
+                                  "by_cam": {cid: int((own[far][iso] == cid).sum()) for cid in recs}}
+    nbr = tree.query_ball_point(P, STREAK_RAY_X, return_length=True) - 1
+    isolated = nbr < STREAK_K
+    for cid, r in recs.items():
+        sel = own == cid
+        H, W = r["d"].shape
+        bad = np.zeros((H, W), bool)
+        rng = np.full((H, W), np.nan)
+        yx = pix[sel]
+        rng[yx[:, 0], yx[:, 1]] = R[sel]
+        bad[yx[:, 0], yx[:, 1]] = isolated[sel]
+        bad &= ~_surface_ok(r["d"], r["gtd"], r.get("cap", math.inf))
+        runs = []
+        for c in np.nonzero(bad.any(0))[0]:
+            col = np.concatenate([[False], bad[:, c], [False]])
+            dif = np.diff(col.astype(np.int8))
+            for a0, a1 in zip(np.nonzero(dif == 1)[0], np.nonzero(dif == -1)[0]):
+                seg = rng[a0:a1, c]
+                span = float(np.nanmax(seg) - np.nanmin(seg))
+                if span > STREAK_Z_M and float(np.nanmin(seg)) <= STREAK_START_MAX_M:
+                    j = a0 + int(np.nanargmin(seg))
+                    runs.append({"span_m": round(span, 2), "col": int(c), "rows": [int(a0), int(a1 - 1)],
+                                 "start_row": int(j), "r_start_m": round(float(np.nanmin(seg)), 2),
+                                 "r_end_m": round(float(np.nanmax(seg)), 2)})
+        runs.sort(key=lambda z: -z["span_m"])
+        out["rays"][cid] = {"count": len(runs), "max_span_m": runs[0]["span_m"] if runs else 0.0, "top": runs[:5],
+                            "n_px": int(sel.sum())}
+    out["colmono"] = {}
+    for cid, r in recs.items():
+        cm = col_monotonic(r)
+        out["colmono"][cid] = {"count": len(cm), "top": cm[:5]}
+    return out
+
+
+def _raw_nn(p: Preview, P, cid, idx, c, pw, ph):
+    """The net's raw 12x16 depth (x fs), nearest-upsampled to processing res (no inverse-depth interpolation)."""
+    W0, H0 = c["resolution"]
+    fs = (p.ns["fy_full"](c) * 192.0 / H0) / p.ns["FY_REF"]
+    out = np.full((ph, pw), np.nan)
+    sx = pw / W0
+    k = 0
+    while f"{cid}/{idx}/{k}/d" in P.files:
+        x0, cw = P[f"{cid}/{idx}/{k}/x0"]
+        a0, a1 = int(round(x0 * sx)), int(round((x0 + cw) * sx))
+        out[:, a0:a1] = cv2.resize((P[f"{cid}/{idx}/{k}/d"] * fs).astype(np.float32), (a1 - a0, ph), interpolation=cv2.INTER_NEAREST)
+        k += 1
+    return out
+
+
+def footprint_gap(rec) -> dict:
+    """Source 1 (Tracer): drawn GT-ground px (|GT z| <= STATIC_MAX_HEIGHT_M) whose next row down is also drawn
+    GT ground; gap = 3-D spacing of the two rendered points > FOOT_GAP_K x footprint (preview footprint(),
+    capped at 6 d / fy). Per range bin and total."""
+    v, qg, q, f = rec["v"], rec["qg"], rec["q"], rec["foot"]
+    gnd = v & np.isfinite(rec["gtd"]) & (np.abs(qg[..., 2]) <= sf.STATIC_MAX_HEIGHT_M)
+    pair = gnd[:-1] & gnd[1:]
+    sp = np.linalg.norm(q[:-1] - q[1:], axis=-1)
+    gap = pair & (sp > FOOT_GAP_K * f[:-1])
+    Rg = np.hypot(qg[:-1, :, 0], qg[:-1, :, 1])
+    out = {"n": int(pair.sum()), "k": int(gap.sum()), "frac": float(gap.sum() / pair.sum()) if pair.sum() else None}
+    for lo, hi in FOOT_GAP_BINS:
+        m = pair & (Rg >= lo) & (Rg < hi)
+        out[f"{lo:g}-{hi:g}"] = (int((gap & m).sum()), int(m.sum()))
+    return out
+
+
+def coarse_row_bowl(rec) -> dict:
+    """Source 2 (Tracer): wide height bowl. Median dz (z_render - z_GT) of drawn GT-road px per 12x16 coarse
+    row; bowl = max - min over rows with >= RIP_MIN_PX px."""
+    m = rec["v"] & rec["road"] & np.isfinite(rec["gtd"]) & (np.abs(rec["qg"][..., 2]) <= RIP_GT_Z)
+    H = m.shape[0]
+    dz = rec["q"][..., 2] - rec["qg"][..., 2]
+    rows = {}
+    for r in range(12):
+        mm = m[r * H // 12:(r + 1) * H // 12]
+        if mm.sum() >= RIP_MIN_PX:
+            rows[r] = round(float(np.median(dz[r * H // 12:(r + 1) * H // 12][mm])), 3)
+    return {"rows": rows, "bowl": (max(rows.values()) - min(rows.values())) if len(rows) >= 2 else None,
+            "n": int(m.sum())}
+
+
+def plane_pull(rec) -> dict:
+    """Anti-plane-pull (wide, snap off): per range bin, median of z(final drawn depth) - z(raw upsampled net
+    depth, the cam_frame depth before any snap/clamp/cut) on drawn GT-road px, and the upsample tolerance
+    = median |z(raw upsampled) - z(raw 12x16 nearest)| on the same px."""
+    raw, nn = rec.get("raw"), rec.get("raw_nn")
+    if raw is None or nn is None:
+        return {}
+    m = rec["v"] & rec["road"] & np.isfinite(rec["gtd"]) & (np.abs(rec["qg"][..., 2]) <= RIP_GT_Z) & np.isfinite(raw) & np.isfinite(nn)
+    Rg = np.hypot(rec["qg"][..., 0], rec["qg"][..., 1])
+    rays_z = rec["q"][..., 2] - rec["cam_z"]
+    with np.errstate(all="ignore"):
+        per = rays_z / np.where(rec["d"] > 0, rec["d"], np.nan)      # z per unit planar depth along each px ray
+    out = {}
+    for lo, hi in RIP_DZ_BINS:
+        k = m & (Rg >= lo) & (Rg < hi)
+        if k.sum() < RIP_MIN_PX:
+            out[f"{lo:g}-{hi:g}"] = None
+            continue
+        z_f = rec["q"][..., 2][k]
+        z_r = rec["cam_z"] + per[k] * raw[k]
+        z_n = rec["cam_z"] + per[k] * nn[k]
+        out[f"{lo:g}-{hi:g}"] = {"pull": float(np.median(z_f - z_r)), "tol": float(np.median(np.abs(z_r - z_n))), "n": int(k.sum())}
+    return out
+
+
+def col_monotonic(rec, road_ok=False) -> list:
+    """Streak along one column (Tracer f160 narrow / f200 car smear): consecutive drawn, non-road (net), off-GT-
+    surface px in one column whose depth keeps rising going up the column (>= 80% of steps non-decreasing)
+    by more than COLMONO_RISE_M. Returns runs (col, rows, depth range, GT median)."""
+    d, v, g = rec["d"], rec["v"], rec["gtd"]
+    bad = v & ~_surface_ok(d, g, rec.get("cap", math.inf))
+    if not road_ok:
+        bad &= ~rec["road"]
+    runs = []
+    for c in np.nonzero(bad.any(0))[0]:
+        col = np.concatenate([[False], bad[:, c], [False]])
+        dif = np.diff(col.astype(np.int8))
+        for a0, a1 in zip(np.nonzero(dif == 1)[0], np.nonzero(dif == -1)[0]):
+            seg = d[a0:a1, c][::-1]           # bottom -> top
+            if seg.size < 3:
+                continue
+            rise = float(seg.max() - seg.min())
+            up = np.diff(seg)
+            if rise > COLMONO_RISE_M and np.mean(up >= 0) >= 0.8 and seg[-1] > seg[0]:
+                gs = g[a0:a1, c]
+                runs.append({"col": int(c), "rows": [int(a0), int(a1 - 1)], "d_min": round(float(seg.min()), 1),
+                             "d_max": round(float(seg.max()), 1), "gt_med": round(float(np.nanmedian(gs)), 1) if np.isfinite(gs).any() else None})
+    runs.sort(key=lambda z: -(z["d_max"] - z["d_min"]))
+    return runs
+
+
+def gt_consistency(rec) -> dict:
+    """Eval-only: drawn px whose depth exceeds GT (capped at the pipeline's far cap; the FARTHEST GT in the px's
+    3x3 neighbourhood, as _surface_ok, so the GT path's own half-pixel resample at silhouettes is not counted) by
+    >= GC_RATIO x and > GC_ABS m, i.e. GT has a nearer surface on that ray. No sky exemption (sky is never drawn on head)."""
+    g = np.where(np.isfinite(rec["gtd"]), np.minimum(rec["gtd"], rec.get("cap", math.inf)), -np.inf)
+    gmax = cv2.dilate(g.astype(np.float32), np.ones((3, 3), np.uint8)).astype(np.float64)   # farthest GT in the 3x3 (as _surface_ok)
+    with np.errstate(invalid="ignore"):
+        bad = rec["v"] & np.isfinite(rec["gtd"]) & (rec["d"] >= GC_RATIO * gmax) & (rec["d"] > gmax + GC_ABS)
+    ys, xs = np.nonzero(bad)
+    return {"count": int(bad.sum()), "n": int(rec["v"].sum()),
+            "cols": [int(xs.min()), int(xs.max())] if xs.size else None, "rows": [int(ys.min()), int(ys.max())] if ys.size else None}
+
+
+def false_removal(rec) -> dict:
+    """Px with a GT surface past FR_MIN_M (GT range) where the raw net depth (cam_frame's depth before
+    snap/clamp/cut) is within SURF_REL / SURF_ABS of GT: the share still drawn (valid)."""
+    raw = rec.get("raw")
+    if raw is None:
+        return {}
+    g = rec["gtd"]
+    Rg = np.hypot(rec["qg"][..., 0], rec["qg"][..., 1])
+    with np.errstate(invalid="ignore"):
+        good = np.isfinite(g) & (Rg > FR_MIN_M) & np.isfinite(raw) & (np.abs(raw - g) <= np.maximum(SURF_REL * g, SURF_ABS))
+    return {"n": int(good.sum()), "kept": int((good & rec["v"]).sum()),
+            "frac": float((good & rec["v"]).sum() / good.sum()) if good.sum() else None}
+
+
+def ring_a_holes(recs: dict, W: int = 960, H: int = 540) -> dict:
+    """Ring-A gate: pose-B render (current-frame drawn points, preview footprint, splat radius W//120, gap fill on)
+    vs GT ground (|GT z| <= STATIC_MAX_HEIGHT_M, GT range <= 30 m, splatted the same way): share of GT-ground
+    chase px left unpainted, per chase-ground range band; attributed per cam = among the GT-ground px of that cam."""
+    chase = sf.chase_camera(POSE_B_POS, POSE_B_PITCH, POSE_B_FOV, W, H, 0.0)
+    rad = max(2, W // 120)
+    def paint(pts, foot):
+        if not len(pts):
+            return np.zeros((H, W), bool)
+        r = sf.compose(chase, pts, np.full((len(pts), 3), 128, np.uint8), foot, sky_rgb=None, ground_rgb=None,
+                       max_radius_px=rad, fill=True)
+        return r.masks["observed"] | r.masks["filled"]
+    rp, rf, gm = [], [], {}
+    for cid, r in recs.items():
+        ys, xs = np.nonzero(r["v"])
+        q = r["q"][ys, xs]
+        k = ego_box_filter(q)
+        rp.append(q[k]); rf.append(r["foot"][ys, xs][k])
+        gq = r["qg"]
+        m = np.isfinite(r["gtd"]) & (np.abs(gq[..., 2]) <= sf.STATIC_MAX_HEIGHT_M) & (np.hypot(gq[..., 0], gq[..., 1]) <= 30.0)
+        ys, xs = np.nonzero(m)
+        qq = gq[ys, xs]
+        kk = ego_box_filter(qq)
+        fg = r.get("foot_gt")
+        gf = fg[ys, xs][kk] if fg is not None else np.full(int(kk.sum()), 0.3)
+        gm[cid] = paint(qq[kk], gf)
+    drawn = paint(np.concatenate(rp) if rp else np.zeros((0, 3)), np.concatenate(rf) if rf else np.zeros(0))
+    rays = sf._pixel_rays(chase)
+    dz = rays[..., 2]
+    down = dz < -1e-9
+    t = np.where(down, -chase.pos[2] / np.where(down, dz, -1.0), np.nan)
+    rng = np.hypot(chase.pos[0] + t * rays[..., 0], chase.pos[1] + t * rays[..., 1])
+    gall = np.zeros((H, W), bool)
+    for m in gm.values():
+        gall |= m
+    out = {}
+    for lo, hi in HOLE_BANDS:
+        b = gall & (rng >= lo) & (rng < hi)
+        hole = b & ~drawn
+        out[f"{lo:g}-{hi:g}"] = {"frac": float(hole.sum() / b.sum()) if b.sum() else None, "n": int(b.sum()), "k": int(hole.sum()),
+                                 "by_cam": {cid: [int((m & hole & (rng >= lo) & (rng < hi)).sum()), int((m & (rng >= lo) & (rng < hi)).sum())] for cid, m in gm.items()}}
+    return out
+
+
+def _wide_snap_off(p: Preview) -> None:
+    """Michael's pick: road snap on every cam except wide. Uses ROAD_SNAP_CAMS when the code has it
+    (module or preview), else wraps road_snap for the wide CameraPose only (other cams unchanged)."""
+    if "ROAD_SNAP_CAMS" in p.ns:
+        p.ns["ROAD_SNAP_CAMS"] = tuple(c for c in p.ns["ROAD_SNAP_CAMS"] if c != "wide")
+        return
+    hook = p.ns["S"]
+    real = object.__getattribute__(hook, "_real")
+    h = object.__getattribute__(hook, "_hook")
+    if hasattr(real, "ROAD_SNAP_CAMS"):
+        object.__setattr__(hook, "ROAD_SNAP_CAMS", tuple(c for c in real.ROAD_SNAP_CAMS if c != "wide"))
+        return
+    wide = p.cam["wide"]
+
+    def road_snap(*a, **k):
+        cam = a[0] if a else k["cam"]
+        depth = np.asarray(a[1] if len(a) > 1 else k["depth"], np.float64)
+        h["pre"] = depth.copy()
+        h["calls"].append(("road_snap", getattr(cam, "cam_id", id(cam))))
+        if cam is wide:
+            m = np.zeros(depth.shape, bool)
+            h["mask"] = m
+            return depth.copy(), m
+        out, m = real.road_snap(*a, **k)
+        h["mask"] = m
+        return out, m
+
+    object.__setattr__(hook, "road_snap", road_snap)
+
+
+def rs_collect(mode: str, frames, info_in_guard: bool = False) -> dict:
+    """{frame: {cid: rs_record}} through the runtime cam_frame. mode: 'on' (head as is), 'off' (wide snap off),
+    'gt' (GT depth through the same cam_frame path, eval only: the floor)."""
+    clip, preds, gt_root = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    P = np.load(preds)
+    ov = {"depth_src": "gt", "gt_depth_root": str(gt_root)} if mode == "gt" else None
+    p = Preview(ov, root=clip, P=P, cams=cams)
+    if mode == "off":
+        _wide_snap_off(p)
+    avail = {cid: pred_frames(P, cid) for cid in p.cam}
+    used = {cid: [i for i in (nearest_idx(avail.get(cid) or [], f) for f in frames) if not in_seal_guard(i)] for cid in p.cam}
+    if not info_in_guard:   # only the opt-in INFO f200 fixture may bypass the guard band (never sealed frames)
+        rs_frames_ok(frames, used)
+    else:
+        assert not set(frames) & set(HELDOUT2_SEALED) and not set(frames) & set(RS_BURNED), frames
+    out = {}
+    for f in frames:
+        out[f] = {}
+        for cid in RS_CAMS:
+            idx = nearest_idx(avail.get(cid) or [], f)
+            if idx is None:
+                continue
+            if in_seal_guard(idx) and not info_in_guard:   # seal guard band: e.g. rear idx 107 at f110 is never measured
+                print(f"  seal guard: f{f} {cid} pred idx {idx} in {SEAL_GUARD_RANGES} -> not measured", flush=True)
+                continue
+            fr = p.run(cid, None, None, idx=idx)
+            if fr is None:
+                continue
+            _, d, v, _ = fr
+            c = cams[cid]
+            pw, ph = p.ns["proc_res"](c)
+            gtd = _load_gt_depth(gt_root, cid, idx, c, pw, ph)
+            if gtd is None:
+                continue
+            pre = p.snap_hook.get("pre")
+            out[f][cid] = rs_record(p.cam[cid], d, v, gtd, _net_road(P, cid, idx, c["resolution"][0], pw, ph),
+                                    cap=sf.depth_cap_m(c["far_m"]))
+            out[f][cid].update(idx=idx, foot=p.ns["footprint"](p.cam[cid], np.where(np.isfinite(d), d, 0.0)),
+                               foot_gt=p.ns["footprint"](p.cam[cid], np.where(np.isfinite(gtd), gtd, 0.0)),
+                               raw=pre, raw_nn=_raw_nn(p, P, cid, idx, c, pw, ph) if mode != "gt" else None,
+                               snap=None if p.last_snap is None else np.array(p.last_snap, bool, copy=True), cam=p.cam[cid])
+    return out
+
+
+def _fmt(x, nd=3):
+    return "n/a" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
+
+
+def print_ripple(rows: dict, label: str) -> None:
+    for f, per in rows.items():
+        for cid, m in per.items():
+            print(f"  ripple {label} f{f} {cid}: n_px={m['n_px']} n_bins={m['n_bins']} std={_fmt(m['std'])} "
+                  f"ptp_5_15={_fmt(m['ptp_5_15'])} pfrac={_fmt(m['pfrac'])} zc={_fmt(m['zc'])} "
+                  + " ".join(f"|dz|{lo:g}-{hi:g}={_fmt(m[f'dz_{lo:g}_{hi:g}'])}(n={m[f'n_{lo:g}_{hi:g}']})"
+                             for lo, hi in RIP_DZ_BINS), flush=True)
+
+
+def print_streak(rows: dict, label: str) -> None:
+    for f, s in rows.items():
+        iso = " ".join(f"Y{Y:g}/X{X:g}={v['total']}/{v['n_far']}" for (Y, X), v in s["iso"].items())
+        print(f"  streak {label} f{f}: n_pts={s['n_pts']} isolated(k<{STREAK_K}) {iso}", flush=True)
+        for cid, r in s["rays"].items():
+            if r["count"]:
+                t = r["top"][0]
+                print(f"    rays {label} f{f} {cid}: {r['count']} runs > {STREAK_Z_M:g} m (n_px={r['n_px']}), max {r['max_span_m']} m: "
+                      f"col {t['col']} rows {t['rows'][0]}-{t['rows'][1]}, starts row {t['start_row']} at {t['r_start_m']} m -> {t['r_end_m']} m",
+                      flush=True)
+        for cid, r in s.get("colmono", {}).items():
+            if r["count"]:
+                t = r["top"][0]
+                print(f"    colmono {label} f{f} {cid}: {r['count']} runs; top col {t['col']} rows {t['rows'][0]}-{t['rows'][1]} "
+                      f"depth {t['d_min']}->{t['d_max']} m (GT median {t['gt_med']} m)", flush=True)
+
+
+def ripple_gate(rows: dict, label: str) -> list:
+    bad = []
+    for f, per in rows.items():
+        for cid, m in per.items():
+            for k, lim in (RIPPLE_LIMITS.get(cid) or {}).items():
+                if lim is None or m.get(k) is None:
+                    continue
+                if m[k] > lim:
+                    bad.append(f"{label} f{f} {cid} {k} {_fmt(m[k])} > {_fmt(lim)}"
+                               + (f" (n={m['n_' + k[3:]]})" if k.startswith("dz_") else f" (n_bins={m['n_bins']}, n_px={m['n_px']})"))
+    return bad
+
+
+def streak_gate(rows: dict, label: str, recs: dict | None = None) -> list:
+    """GATES (Skeptic): (a) isolated far points pooled over cams <= ISO_LIMITS (no sky exemption); (b) eval-only
+    GT-consistency count per cam <= GC_LIMITS. Ray runs and column-monotonic runs are printed as INFO."""
+    bad = []
+    for f, s_ in rows.items():
+        for (Y, X), v in s_["iso"].items():
+            lim = ISO_LIMITS.get((Y, X))
+            if lim is not None and v["total"] > lim:
+                bad.append(f"{label} f{f} isolated Y{Y:g}/X{X:g} {v['total']} > {lim} (n_far={v['n_far']}, by cam {v['by_cam']})")
+        for cid, r in ((recs or {}).get(f) or {}).items():
+            gc = gt_consistency(r)
+            print(f"    GT-consistency {label} f{f} {cid}: {gc['count']}/{gc['n']} drawn px >= {GC_RATIO}x GT and > GT+{GC_ABS:g} m "
+                  f"(cols {gc['cols']}, rows {gc['rows']}; limit {GC_LIMITS.get(cid)})", flush=True)
+            if GC_LIMITS.get(cid) is not None and gc["count"] > GC_LIMITS[cid]:
+                bad.append(f"{label} f{f} {cid} GT-consistency {gc['count']} > {GC_LIMITS[cid]} (cols {gc['cols']}, rows {gc['rows']})")
+    return bad
+
+
+_RS_CACHE: dict = {}
+
+
+def _rs(mode, frames):
+    key = (mode, tuple(frames))
+    if key not in _RS_CACHE:
+        _RS_CACHE[key] = rs_collect(mode, frames)
+    return _RS_CACHE[key]
+
+
+RIP_DZ_KEYS = ("dz_0_5", "dz_5_10", "dz_10_15", "dz_15_30")
+RIP_PERIOD_KEYS = ("std", "ptp_5_15", "pfrac", "zc")
+
+
+def _ripple_check(cams, keys, label) -> None:
+    data = _rs("off", RS_VERIFY_FRAMES)
+    rows = {f: {cid: ripple_metrics(r) for cid, r in per.items() if cid in cams} for f, per in data.items()}
+    print_ripple(rows, label)
+    bad = [b for b in ripple_gate(rows, label) if any(f" {k} " in b for k in keys)]
+    assert not bad, "; ".join(bad)
+
+
+def check_clip015_ripple_wide_dz() -> None:
+    """Ripple (rings) gate, wide snap OFF, verify frames: per-range median |dz| on GT-road drawn px (0-5/5-10/10-15/
+    15-30 m) <= RIPPLE_LIMITS['wide'] (the wide coarse-row ripple dz)."""
+    if not _need_clip("clip015_ripple_wide_dz"):
+        return SKIPPED
+    _ripple_check(("wide",), RIP_DZ_KEYS, "snapOFF-wide-dz")
+
+
+def check_clip015_ripple_wide_periodicity() -> None:
+    """Ripple (rings) gate, wide snap OFF, verify frames: detrended-profile std / ptp_5_15 / pfrac / zero crossings."""
+    if not _need_clip("clip015_ripple_wide_periodicity"):
+        return SKIPPED
+    _ripple_check(("wide",), RIP_PERIOD_KEYS, "snapOFF-wide-period")
+
+
+def check_clip015_ripple_other_cams() -> None:
+    """Ripple gate on the non-wide cams (unchanged by the wide snap toggle), same metrics and rule."""
+    if not _need_clip("clip015_ripple_other_cams"):
+        return SKIPPED
+    _ripple_check(tuple(c for c in RS_CAMS if c != "wide"), RIP_DZ_KEYS + RIP_PERIOD_KEYS, "snapOFF-others")
+
+
+def check_clip015_streak_wide_snap_off() -> None:
+    """Isolated-point / ray-streak gate on the verify frames with wide snap OFF (no sky exemption)."""
+    if not _need_clip("clip015_streak_wide_snap_off"):
+        return SKIPPED
+    data = _rs("off", RS_VERIFY_FRAMES)
+    rows = {f: streak_metrics(per) for f, per in data.items()}
+    print_streak(rows, "snapOFF")
+    bad = streak_gate(rows, "snapOFF", data)
+    assert not bad, "; ".join(bad[:12]) + (f" (+{len(bad) - 12} more)" if len(bad) > 12 else "")
+
+
+def check_snap_hook_hit() -> None:
+    """Harness self-test (Redesigner 2026-11-26): the snap hook must be hit by the runtime's real per-cam snap
+    path, or gate (b) passes vacuously. Dev f40, every cam: >= 1 hooked snap call per cam whose frame has net
+    road px; if the runtime has snap_road_for_cam it must be among the hooked calls."""
+    if not _need_clip("snap_hook_hit"):
+        return SKIPPED
+    clip, preds, _ = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    P = np.load(preds)
+    p = Preview(root=clip, P=P, cams=cams)
+    bad, seen = [], {}
+    for cid in p.cam:
+        idx = nearest_idx(pred_frames(P, cid), 40)
+        if idx is None:
+            continue
+        p.snap_hook["calls"] = []
+        fr = p.run(cid, None, None, idx=idx)
+        if fr is None:
+            continue
+        c = cams[cid]
+        pw, ph = p.ns["proc_res"](c)
+        has_road = bool(_net_road(P, cid, idx, c["resolution"][0], pw, ph).any())
+        calls = list(p.snap_hook["calls"])
+        seen[cid] = (len(calls), has_road, int(p.last_snap.sum()) if p.last_snap is not None else None)
+        if p.a.road_snap and has_road and not calls:
+            bad.append(f"{cid}: road px but 0 hooked snap calls")
+        if hasattr(sf, "snap_road_for_cam") and not any(n == "snap_road_for_cam" for n, _ in calls):
+            bad.append(f"{cid}: runtime has snap_road_for_cam but the hook never saw it")
+    print(f"  snap hook calls per cam f40 (calls, net road present, snapped px): {seen}", flush=True)
+    assert not bad, "; ".join(bad)
+
+
+def info_clip015_footprint_row_gaps() -> None:
+    """INFO (Skeptic: circular vs the fix). Ripple source 1 (Tracer): footprint striping. Fraction of drawn
+    GT-ground adjacent row pairs with 3-D spacing > 1.05 x footprint, per cam and frame (reference 5%, the
+    committed P gate). Snap-independent. The gate for ring A is check_clip015_ringA_poseB_holes."""
+    if not _need_clip("clip015_footprint_row_gaps"):
+        return SKIPPED
+    bad = []
+    for f, per in _rs("off", RS_VERIFY_FRAMES).items():
+        for cid, r in per.items():
+            fg = footprint_gap(r)
+            print(f"  footgap f{f} {cid}: {fg['k']}/{fg['n']} = {_fmt(fg['frac'], 4)} "
+                  + " ".join(f"{lo:g}-{hi:g}:{fg[f'{lo:g}-{hi:g}'][0]}/{fg[f'{lo:g}-{hi:g}'][1]}" for lo, hi in FOOT_GAP_BINS), flush=True)
+            if fg["frac"] is not None and fg["frac"] > FOOT_GAP_MAX:
+                bad.append(f"f{f} {cid} {fg['frac']:.2%} ({fg['k']}/{fg['n']})")
+    if bad:   # INFO (Skeptic: circular vs the fix that grows the splat to the next point); the ring-A gate is the drawn hole fraction
+        print(f"  INFO footgap over {FOOT_GAP_MAX:.0%}: " + "; ".join(bad), flush=True)
+
+
+def check_clip015_wide_coarse_row_bowl() -> None:
+    """Ripple source 2 (Tracer): wide height bowl, wide snap OFF. Per 12x16 coarse row median dz of drawn GT-road
+    px; bowl (max - min over rows) <= WIDE_BOWL_LIMIT (rule: no worse than the better of 783fedd snap ON and v2
+    on the threshold frames, + GT-path floor)."""
+    if not _need_clip("clip015_wide_coarse_row_bowl"):
+        return SKIPPED
+    bad = []
+    for f, per in _rs("off", RS_VERIFY_FRAMES).items():
+        if "wide" not in per:
+            continue
+        b = coarse_row_bowl(per["wide"])
+        print(f"  bowl f{f} wide: n={b['n']} rows(median dz)={b['rows']} bowl={_fmt(b['bowl'])} (limit {WIDE_BOWL_LIMIT})", flush=True)
+        if b["bowl"] is not None and WIDE_BOWL_LIMIT is not None and b["bowl"] > WIDE_BOWL_LIMIT:
+            bad.append(f"f{f} wide bowl {b['bowl']:.3f} > {WIDE_BOWL_LIMIT} rows {b['rows']}")
+    assert not bad, "; ".join(bad)
+
+
+def _plane_pull_check(bins) -> None:
+    bad = []
+    for f, per in _rs("off", RS_VERIFY_FRAMES).items():
+        if "wide" not in per:
+            continue
+        pp = plane_pull(per["wide"])
+        print(f"  plane-pull f{f} wide: " + " ".join(
+            f"{k}: pull {_fmt(v['pull'])} tol(this frame) {_fmt(v['tol'])} n={v['n']} limit {PLANE_PULL_TOL.get(k)}" if v else f"{k}: n/a"
+            for k, v in pp.items() if k in bins), flush=True)
+        for k, v in pp.items():
+            if k in bins and v and PLANE_PULL_TOL.get(k) is not None and abs(v["pull"]) > PLANE_PULL_TOL[k]:
+                bad.append(f"f{f} wide {k} |pull| {abs(v['pull']):.3f} > {PLANE_PULL_TOL[k]} (n={v['n']})")
+    assert not bad, "; ".join(bad)
+
+
+def check_wide_snap_off_no_plane_pull_0_5m() -> None:
+    """The 0-5 m bin of the anti-plane-pull guard (same definition and tolerance). Fails on head: ground_clamp
+    (clamp margin 1.0) lifts below-road net depth onto the road plane at 0-5 m."""
+    if not _need_clip("wide_snap_off_no_plane_pull_0_5m"):
+        return SKIPPED
+    _plane_pull_check(("0-5",))
+
+
+def check_wide_snap_off_no_plane_pull() -> None:
+    """GUARD (GVD ruling, must pass): with wide snap OFF, the final drawn wide depth on GT-road px matches the raw
+    net depth (cam_frame's upsampled depth before snap/clamp/cut): per range bin |median dz(final - raw)| <=
+    PLANE_PULL_TOL[bin] (upsample tolerance, measured on head: median |z(raw upsampled) - z(raw 12x16 nearest)|,
+    worst threshold frame). Catches any plane flatten / ground-grid pull on wide. Verify frames f40/f110/f160.
+    Bins 5-10/10-15/15-30 m here (pass on head); 0-5 m is check_wide_snap_off_no_plane_pull_0_5m (fails on head:
+    ground_clamp lifts below-road net depth to the plane)."""
+    if not _need_clip("wide_snap_off_no_plane_pull"):
+        return SKIPPED
+    _plane_pull_check(("5-10", "10-15", "15-30"))
+
+
+def check_clip015_ringA_poseB_holes() -> None:
+    """Ring-A GATE (Skeptic): pose-B drawn-image hole fraction of GT ground (0-30 m) per range band, wide snap OFF,
+    verify frames; <= RINGA_LIMITS (rule on threshold frames). Per-cam attribution printed."""
+    if not _need_clip("clip015_ringA_poseB_holes"):
+        return SKIPPED
+    bad = []
+    for f, per in _rs("off", RS_VERIFY_FRAMES).items():
+        h = ring_a_holes(per)
+        for band, v in h.items():
+            att = " ".join(f"{c}:{k}/{n}" for c, (k, n) in v["by_cam"].items() if n)
+            print(f"  ringA f{f} {band} m: {v['k']}/{v['n']} = {_fmt(v['frac'], 4)} (limit {RINGA_LIMITS.get(band)}) by cam {att}", flush=True)
+            if v["frac"] is not None and RINGA_LIMITS.get(band) is not None and v["frac"] > RINGA_LIMITS[band]:
+                bad.append(f"f{f} {band} m holes {v['frac']:.4f} > {RINGA_LIMITS[band]} ({v['k']}/{v['n']})")
+    assert not bad, "; ".join(bad)
+
+
+def check_clip015_false_removal() -> None:
+    """FALSE-REMOVAL guard (must pass on head): px with a GT surface past 30 m whose raw net depth is within
+    10% / 0.5 m of GT; the drawn share, pooled over the threshold frames, wide snap OFF, per cam >= FR_LIMITS
+    (head - 2 pp). Catches a fix that deletes real far hills / buildings / terrain."""
+    if not _need_clip("clip015_false_removal"):
+        return SKIPPED
+    bad = []
+    pooled = {}
+    for f, per in _rs("off", RS_THRESH_FRAMES).items():
+        for cid, r in per.items():
+            fr = false_removal(r)
+            k, n = pooled.get(cid, (0, 0))
+            pooled[cid] = (k + fr.get("kept", 0), n + fr.get("n", 0))
+    for cid, (k, n) in pooled.items():
+        lim = FR_LIMITS.get(cid)
+        print(f"  false-removal {cid}: kept {k}/{n} = {_fmt(k / n if n else None, 4)} (limit {lim})", flush=True)
+        if lim is not None and n and k / n < lim:
+            bad.append(f"{cid} kept {k / n:.4f} < {lim} ({k}/{n})")
+    assert not bad, "; ".join(bad)
+
+
+def check_runtime_never_reads_gt() -> None:
+    """GT is eval-only (Skeptic): no runtime module (python/**) mentions gt_eval_only / GT depth roots; in the
+    preview, the GT depth root is read only inside `if a.depth_src == "gt"` (eval mode) and the road / sky class
+    used by snap comes from the net's semantic preds (P[.../s]); the test's own GT masks never enter cam_frame."""
+    bad = []
+    for f in sorted((ROOT / "python").rglob("*.py")):
+        t = f.read_text(encoding="utf-8", errors="ignore")
+        for k in ("gt_eval_only", "gt_depth_root", "GVD_RV_CLIP015_GT"):
+            if k in t:
+                bad.append(f"{f.relative_to(ROOT)} mentions {k}")
+    tree = ast.parse(PREVIEW.read_text(encoding="utf-8"))
+    cf = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "cam_frame")
+    guarded = set()
+    for n in ast.walk(cf):
+        if isinstance(n, ast.If) and "depth_src" in ast.unparse(n.test) and '"gt"' in ast.unparse(n.test).replace("'", '"') and "==" in ast.unparse(n.test):
+            guarded |= {id(x) for x in ast.walk(n)}
+    for n in ast.walk(cf):
+        if isinstance(n, ast.Attribute) and n.attr == "gt_depth_root" and id(n) not in guarded:
+            bad.append(f"cam_frame reads a.gt_depth_root outside the depth_src == 'gt' branch (line {n.lineno})")
+    src = ast.unparse(cf)
+    if "road[:, a0:a1] |=" not in src or "isin(s, S.ROAD_CLASS_IDS)" not in src:
+        bad.append("cam_frame road class no longer visibly from the net's semantic preds (P[.../s])")
+    assert not bad, "; ".join(bad)
+
+
+SNAP_REJECT_Z = 0.30
+SNAP_REJECT_CAMS = ("main", "narrow", "pillarL", "pillarR", "repeatL", "repeatR", "rear")   # non-wide snap cams
+
+
+def _snap_fns():
+    """The runtime snap entry points present on this head (road_snap always; snap_road_for_cam if it exists)."""
+    fns = [("road_snap", lambda cam, cid, d, road: sf.road_snap(cam, d, road))]
+    if hasattr(sf, "snap_road_for_cam"):
+        fns.append(("snap_road_for_cam", lambda cam, cid, d, road: sf.snap_road_for_cam(cid, cam, d, road)))
+    return fns
+
+
+def snap_rejection_violations(snap_fn) -> list:
+    """Behavioural: a road-class px whose pred point sits 0.5 m above the ground must NOT be snapped to the plane;
+    a road px whose pred point is 0.05 m above ground must still be snapped (rejection is one-sided, not 'no snap')."""
+    p = Preview()
+    bad = []
+    for cid in SNAP_REJECT_CAMS:
+        if cid not in p.cam:
+            continue
+        cam = p.cam[cid]
+        rz = sf._pixel_rays(cam)[..., 2]
+        h = float(np.asarray(cam.pos)[2])
+        down = rz < -1e-6
+        hit = np.where(down, h / np.where(down, -rz, 1.0), np.inf)
+        cand = down & (hit < 12.0) & (hit > 2.0)
+        if not cand.any():
+            continue
+        ys, xs = np.nonzero(cand)
+        H, W = cand.shape
+        # left half: pred z = 0.5 m (raised: curb / car side labelled road); right half: pred z = 0.05 m
+        zpred = np.where(np.arange(W)[None, :] < W // 2, 0.5, 0.05) * np.ones((H, 1))
+        d = np.where(cand, (h - zpred) / np.where(down, -rz, 1.0), 50.0)
+        road = np.ones((H, W), bool)
+        out, mask = snap_fn(cam, cid, d.copy(), road)
+        raised = cand & (zpred > SNAP_REJECT_Z)
+        low = cand & (zpred < SNAP_REJECT_Z)
+        moved_raised = int((np.asarray(mask, bool) & raised).sum())
+        kept_low = int((np.asarray(mask, bool) & low).sum())
+        if moved_raised:
+            bad.append(f"{cid}: {moved_raised}/{int(raised.sum())} road px with pred z 0.5 m snapped to the plane")
+        if low.sum() > 50 and kept_low < 0.5 * int(low.sum()):
+            bad.append(f"{cid}: only {kept_low}/{int(low.sum())} road px with pred z 0.05 m snapped (rejection not one-sided)")
+    return bad
+
+
+def check_snap_rejects_raised_pred_z() -> None:
+    """Skeptic (13:59): the one-sided pred-z > 0.30 m rejection must be in the snap path for the non-wide snap cams
+    (road_snap / snap_road_for_cam). Behavioural (synthetic pred z 0.5 vs 0.05 m road px) + mutant: a snap that
+    ignores pred z must fail this check. Expected FAIL on dee9827 (road_snap has no such rejection; normal FAIL,
+    Fix item for Redesigner); must pass on the fix SHA."""
+    def mutant(cam, cid, d, road):   # rejection removed: snap decided on a ground-level depth, then applied to d
+        rz = sf._pixel_rays(cam)[..., 2]
+        h = float(np.asarray(cam.pos)[2])
+        flat = np.where(rz < -1e-6, h / np.where(rz < -1e-6, -rz, 1.0), 1e4)
+        _, m = sf.road_snap(cam, flat, road)
+        return np.where(m, flat, d), m
+    def reference(cam, cid, d, road):   # test-only positive control: road_snap + one-sided pred-z rejection
+        rz = sf._pixel_rays(cam)[..., 2]
+        z = float(np.asarray(cam.pos)[2]) + np.asarray(d, np.float64) * rz
+        out, m = sf.road_snap(cam, d, road)
+        m = m & ~(z > SNAP_REJECT_Z)
+        return np.where(m, out, d), m
+    mut = snap_rejection_violations(mutant)
+    assert mut, "mutant without the pred-z rejection was not caught"
+    ref = snap_rejection_violations(reference)
+    assert not ref, f"positive control (road_snap + rejection) flagged: {ref}"
+    bad = []
+    for name, fn in _snap_fns():
+        v = snap_rejection_violations(fn)
+        print(f"  snap rejection {name}: " + ("; ".join(v) if v else "raised road px kept, ground road px snapped"), flush=True)
+        bad += [f"{name} {x}" for x in v]
+    print(f"  mutant (no rejection) caught: {len(mut)} cams", flush=True)
+    assert not bad, "; ".join(bad)
+
+
+SNAPB_ATTR_CAMS = ("pillarR", "repeatR", "pillarL")
+
+
+def snap_b_attribution(r) -> dict:
+    """Gate (b) attribution for one cam/frame on the head render (snap ON for this cam), 0-15 m:
+    bad = snapped & drawn & GT z > SNAP_BAD_Z (gate (b) numerator); good = snapped & drawn & GT z <= SNAP_BAD_Z.
+    (i) bad/n; (ii) the same bad px with snap disabled = the raw (pre-snap) net depth: share whose raw pred z is
+    < SNAP_BAD_Z (the raised px is already drawn at road level without snap) and < 0.15; raw z p50; snap shift p50;
+    (iii) share of bad px whose pred px class is road (net seg says road where GT is raised).
+    INFO: good px that a raw-pred-z > 0.30 rejection would wrongly drop."""
+    snap, pre = r.get("snap"), r.get("raw")
+    if snap is None or pre is None:
+        return {"n": 0}
+    cam = r["cam"]
+    m = snap & r["v"] & np.isfinite(r["gtd"]) & np.isfinite(pre) & (pre > 0)
+    ys, xs = np.nonzero(m)
+    if not ys.size:
+        return {"n": 0}
+    qg = r["qg"][ys, xs]
+    keep = np.hypot(qg[:, 0], qg[:, 1]) < 15.0
+    ys, xs, qg = ys[keep], xs[keep], qg[keep]
+    zr = sf.unproject(cam, pre, ys, xs)[:, 2]
+    zf = r["q"][ys, xs, 2]
+    bad = qg[:, 2] > SNAP_BAD_Z
+    nb, n = int(bad.sum()), int(ys.size)
+    out = {"n": n, "bad": nb, "frac": nb / n if n else None}
+    if nb:
+        out.update(raw_lt030=float((zr[bad] < SNAP_BAD_Z).mean()), raw_lt015=float((zr[bad] < 0.15).mean()),
+                   raw_z_p50=float(np.median(zr[bad])), gt_z_p50=float(np.median(qg[bad, 2])),
+                   shift_p50=float(np.median(np.abs(zf[bad] - zr[bad]))),
+                   pred_road=float(r["road"][ys[bad], xs[bad]].mean()))
+    good = ~bad
+    out["good"] = int(good.sum())
+    out["good_rej030"] = float((zr[good] > SNAP_BAD_Z).mean()) if good.any() else None
+    return out
+
+
+def info_snap_b_attribution() -> None:
+    """INFO (Skeptic 13:52 / Tracer rv_snapb.txt): pillarR/repeatR gate (b) attribution on dev threshold frames
+    (guard band respected; not f40). Verdict printed: net seg+depth if most bad px are pred-road AND already at
+    road level (raw z < 0.30) before snap; snap if they are not."""
+    if not _need_clip("snap_b_attribution"):
+        return SKIPPED
+    tot = {}
+    for f, per in _rs("on", RS_THRESH_FRAMES).items():
+        for cid in SNAPB_ATTR_CAMS:
+            if cid not in per:
+                continue
+            a = snap_b_attribution(per[cid])
+            t = tot.setdefault(cid, {"n": 0, "bad": 0, "lt030": 0.0, "lt015": 0.0, "road": 0.0, "good": 0, "rej": 0.0})
+            t["n"] += a["n"]; t["bad"] += a.get("bad", 0); t["good"] += a.get("good", 0)
+            if a.get("bad"):
+                t["lt030"] += a["raw_lt030"] * a["bad"]; t["lt015"] += a["raw_lt015"] * a["bad"]; t["road"] += a["pred_road"] * a["bad"]
+            if a.get("good_rej030") is not None:
+                t["rej"] += a["good_rej030"] * a["good"]
+            print(f"  snap(b) attr f{f} {cid} idx {per[cid]['idx']}: (i) bad {a.get('bad', 0)}/{a['n']} = {_fmt(a.get('frac'), 4)}"
+                  + (f" | (ii) raw z<0.30 {a['raw_lt030']:.0%} raw z<0.15 {a['raw_lt015']:.0%} raw z p50 {a['raw_z_p50']:.2f} "
+                     f"GT z p50 {a['gt_z_p50']:.2f} snap shift p50 {a['shift_p50']:.3f} m | (iii) pred road {a['pred_road']:.0%}"
+                     if a.get("bad") else "")
+                  + (f" | residual after a pred-z>0.30 rejection (bad & raw z<=0.30): {int(round(a['raw_lt030'] * a['bad']))}" if a.get("bad") else "")
+                  + f" | INFO good px raw z>0.30 (wrongly rejected by a z>0.30 rule) {_fmt(a.get('good_rej030'), 3)} of {a.get('good', 0)}", flush=True)
+    for cid, t in tot.items():
+        if not t["bad"]:
+            print(f"  snap(b) attr pooled {cid}: 0 bad px of {t['n']}", flush=True)
+            continue
+        lt030, lt015, road = t["lt030"] / t["bad"], t["lt015"] / t["bad"], t["road"] / t["bad"]
+        verdict = ("net seg+depth (raised px already at road level before snap)" if lt030 >= 0.5 else
+                   f"snap moves them: pred class is road on {road:.0%} (snap only acts on pred road) but raw net depth keeps "
+                   f"{1 - lt030:.0%} of them >= {SNAP_BAD_Z} m before snap")
+        print(f"  snap(b) attr pooled {cid}: bad {t['bad']}/{t['n']} = {t['bad'] / t['n']:.2%}; raw z<0.30 {lt030:.0%}, "
+              f"raw z<0.15 {lt015:.0%}, pred road {road:.0%} -> {verdict}; good-px wrongly rejected by z>0.30 "
+              f"{(t['rej'] / t['good']) if t['good'] else float('nan'):.1%} of {t['good']}", flush=True)
+
+
+F200_FIXTURE = 200   # BURNED for thresholds (Tracer holdout); regression fixture only: narrow car smear rows 42-78, cols 61-213
+
+
+def info_streak_fixture_f200_narrow_car_smear() -> None:
+    """Regression fixture (fail-first only; f200 is burned and never sets a threshold): clip015 f200 narrow car
+    ~20 m away (GT) smeared 32-254 m along its rays, rows 42-78 / cols 61-213 (Tracer). The committed streak
+    gates (isolated pooled + GT-consistency), unchanged, are applied to f200; column-monotonic runs are INFO."""
+    if os.environ.get("RV_PROPS_F200_INFO", "") != "1":   # f200 is inside the seal guard band (163-207): INFO, opt-in only
+        skip_check("streak_fixture_f200_narrow_car_smear", "f200 in the seal guard band; INFO only, set RV_PROPS_F200_INFO=1")
+        return SKIPPED
+    if not _need_clip("streak_fixture_f200_narrow_car_smear"):
+        return SKIPPED
+    data = rs_collect("off", (F200_FIXTURE,), info_in_guard=True)
+    rows = {F200_FIXTURE: streak_metrics(data[F200_FIXTURE])}
+    print_streak(rows, "f200fixture")
+    r = data[F200_FIXTURE].get("narrow")
+    if r is not None:
+        g = np.where(np.isfinite(r["gtd"]), np.minimum(r["gtd"], r["cap"]), -np.inf)
+        gmax = cv2.dilate(g.astype(np.float32), np.ones((3, 3), np.uint8))
+        with np.errstate(invalid="ignore"):
+            bad_px = r["v"] & np.isfinite(r["gtd"]) & (r["d"] >= GC_RATIO * gmax) & (r["d"] > gmax + GC_ABS)
+        box = bad_px[42:79, 61:214]
+        print(f"  f200 narrow (idx {r['idx']}): GT-consistency px in the fixture box rows 42-78/cols 61-213: {int(box.sum())} "
+              f"(whole frame {int(bad_px.sum())})", flush=True)
+    bad = streak_gate(rows, "f200fixture", data)
+    print("  INFO f200 (not a gate, not out-of-sample evidence): " + ("; ".join(bad) if bad else "under the committed streak limits"), flush=True)
+
+
+VIS_BAND_FRAC = 0.10   # band = the 10% of image rows just below the horizon line
+
+
+def check_clip015_poseB_unknown_report() -> None:
+    """Visibility (Tracer): sky is never 3-D points (valid = ~sky); the backdrop is a 2-D gradient in compose.
+    REPORT ONLY: pose-B (960x540, fill/sky/prior on, current-frame points, wide snap OFF) share of 'unknown'
+    px in the top half and in the band just below the horizon, per verify frame."""
+    if not _need_clip("clip015_poseB_unknown_report"):
+        return SKIPPED
+    for f, per in _rs("off", RS_VERIFY_FRAMES).items():
+        pts, cols, foot = [], [], []
+        for cid, r in per.items():
+            ys, xs = np.nonzero(r["v"])
+            q = r["q"][ys, xs]
+            k = ego_box_filter(q)
+            pts.append(q[k]); cols.append(np.full((int(k.sum()), 3), 128, np.uint8)); foot.append(r["foot"][ys, xs][k])
+        chase = sf.chase_camera(POSE_B_POS, POSE_B_PITCH, POSE_B_FOV, 960, 540, 0.0)
+        out = sf.compose(chase, np.concatenate(pts), np.concatenate(cols), np.concatenate(foot), sky_rgb=(200, 220, 240),
+                         ground_rgb=(128, 128, 128), max_radius_px=8, fill=True)
+        unk = out.masks["unknown"]
+        up = sf._pixel_rays(chase)[..., 2] >= -1e-9
+        hz = np.argmax(~up, axis=0)
+        rows = np.arange(540)[:, None]
+        band = (rows >= hz[None, :]) & (rows < hz[None, :] + int(540 * VIS_BAND_FRAC))
+        print(f"  poseB unknown f{f}: top half {unk[:270].mean():.4f} (n={unk[:270].size}), below-horizon band "
+              f"{unk[band].mean():.4f} (n={int(band.sum())}), sky backdrop px {out.masks['sky'].mean():.4f}", flush=True)
+
+
+# ---- synthetic: the metrics detect what they claim (fail-first on synthetic)
+def _synthetic_wide_plane(banded: bool):
+    """Flat road plane on the wide cam, every ground px labelled road, wide snap OFF. Depth is fed as
+    the net outputs it: the plane sampled on the 12x16 grid (cell centres); cam_frame upsamples 1/d linearly,
+    which is exact for a plane. banded=True scales every other grid row by 1 - RIP_BAND (banded net
+    depth); banded=False feeds the exact plane samples."""
+    p = Preview()
+    _wide_snap_off(p)
+    cam = p.cam["wide"]
+    g = geom(cam)
+    exact = np.where(g["down"], g["hit"], 1e4)
+    fine = np.where(~g["down"], sf_sky(), ROAD_ID)
+    H, W = exact.shape
+    yi = ((np.arange(12) + 0.5) * H / 12).astype(int)
+    xi = ((np.arange(16) + 0.5) * W / 16).astype(int)
+    depth_in = exact[yi[:, None], xi[None, :]]
+    if banded:
+        depth_in = depth_in * np.where(np.arange(12) % 2 == 0, 1.0, 1.0 - RIP_BAND)[:, None]
+    _, d, v, _ = p.run("wide", depth_in, coarse(fine))
+    gtd = np.where(g["down"], g["hit"], np.nan)
+    return rs_record(cam, d, v, gtd, fine == ROAD_ID, cap=sf.depth_cap_m(CAM_SPECS["wide"]["far_m"]))
+
+
+def check_synthetic_ripple_signature() -> None:
+    """A: banded (12x16) depth of a perfectly flat plane through cam_frame must fail at least one wide ripple
+    limit; the exact plane must pass every wide ripple limit. (At the committed limits the banded plane is caught
+    by the per-range |dz| limits; std / ptp / zc / pfrac of the banded plane stay under the rule limits - printed.)"""
+    lim = RIPPLE_LIMITS.get("wide") or {}
+    clean = ripple_metrics(_synthetic_wide_plane(False))
+    band = ripple_metrics(_synthetic_wide_plane(True))
+    for tag, m in (("exact", clean), ("banded", band)):
+        print(f"  synthetic ripple {tag}: n_px={m['n_px']} n_bins={m['n_bins']} std={_fmt(m['std'])} ptp_5_15={_fmt(m['ptp_5_15'])} "
+              f"pfrac={_fmt(m['pfrac'])} zc={_fmt(m['zc'])} " + " ".join(f"|dz|{lo:g}-{hi:g}={_fmt(m[f'dz_{lo:g}_{hi:g}'])}" for lo, hi in RIP_DZ_BINS), flush=True)
+    over_clean = [k for k, l in lim.items() if l is not None and clean.get(k) is not None and clean[k] > l]
+    over_band = [(k, round(band[k], 3), l) for k, l in lim.items() if l is not None and band.get(k) is not None and band[k] > l]
+    print(f"  synthetic ripple: banded flagged by {over_band}; exact flagged by {over_clean}", flush=True)
+    assert not over_clean, f"exact flat plane flagged: {[(k, clean[k], lim[k]) for k in over_clean]}"
+    assert over_band, "banded plane not flagged by any wide ripple limit"
+
+
+def _synthetic_scene_recs(spike_col: int | None = None):
+    """Every cam sees exact flat ground through cam_frame (GT = the plane, labels exact). spike_col: one wide
+    pixel column gets bad depth (3x the plane) on the rows whose ground range is 8-40 m, injected into the
+    DRAWN depth after cam_frame: a 1-px column spike fed into cam_frame is clamped to the road (ground_clamp)
+    or removed by the depth-edge cut before it is drawn, so it never reaches the point set."""
+    p = Preview()
+    recs = {}
+    for cid in RS_CAMS:
+        cam = p.cam[cid]
+        g = geom(cam)
+        exact = np.where(g["down"], g["hit"], 1e4)
+        fine = np.where(~g["down"], sf_sky(), ROAD_ID)
+        gtd = np.where(g["down"], g["hit"], np.nan)
+        _, d, v, _ = p.run(cid, exact, fine)
+        if cid == "wide" and spike_col is not None:
+            rows = np.nonzero(v[:, spike_col] & g["down"][:, spike_col] & (g["R"][:, spike_col] > 8.0) & (g["R"][:, spike_col] < 40.0))[0]
+            d = d.copy()
+            d[rows, spike_col] = 3.0 * g["hit"][rows, spike_col]
+        recs[cid] = rs_record(cam, d, v, gtd, fine == ROAD_ID, cap=sf.depth_cap_m(CAM_SPECS[cid]["far_m"]))
+    return recs
+
+
+def check_synthetic_streak() -> None:
+    """B: a clean flat scene gives 0 ray runs; one bad wide column (drawn depth 3x the plane on the rows at
+    8-40 m ground range) is caught as a ray run in exactly that column, and nothing else is flagged."""
+    cr = _synthetic_scene_recs(None)
+    clean = streak_metrics(cr)
+    gcc = {c: gt_consistency(r) for c, r in cr.items()}
+    # INFO: on an exact plane the horizon row is cut to its far side and sent to the cap (far_to_cap), so 1-2
+    # full rows per cam read as cap vs GT ~35-115 m. Pre-existing pipeline behaviour, under GC_LIMITS.
+    print("  synthetic clean GT-consistency (horizon row -> cap): " + " ".join(
+        f"{c}:{g['count']} rows {g['rows']}" for c, g in gcc.items() if g["count"]), flush=True)
+    over = {c: g["count"] for c, g in gcc.items() if GC_LIMITS.get(c) is not None and g["count"] > GC_LIMITS[c]}
+    assert not over, f"clean flat scene over GC_LIMITS: {over}"
+    n_clean = {c: r["count"] for c, r in clean["rays"].items() if r["count"]}
+    iso = " ".join(f"Y{Y:g}/X{X:g}={v['total']}/{v['n_far']}" for (Y, X), v in clean["iso"].items())
+    print(f"  synthetic streak clean: n_pts={clean['n_pts']} rays={n_clean or 0}; isolated far pts (flat ground, report only) {iso}", flush=True)
+    assert not n_clean, f"clean flat scene has ray runs: {n_clean}"
+    W = pv().cam["wide"].width
+    col = W // 2 + W // 5
+    sr = _synthetic_scene_recs(col)
+    spk = streak_metrics(sr)
+    def _gc_px(r):
+        g = np.where(np.isfinite(r["gtd"]), np.minimum(r["gtd"], r["cap"]), -np.inf)
+        gm = cv2.dilate(g.astype(np.float32), np.ones((3, 3), np.uint8))
+        with np.errstate(invalid="ignore"):
+            return r["v"] & np.isfinite(r["gtd"]) & (r["d"] >= GC_RATIO * gm) & (r["d"] > gm + GC_ABS)
+    new = {c: _gc_px(sr[c]) & ~_gc_px(cr[c]) for c in sr}
+    ys, xs = np.nonzero(new["wide"])
+    print(f"  synthetic spike: GT-consistency px added vs clean: wide {xs.size} (cols {sorted(set(xs.tolist()))}, rows "
+          f"{[int(ys.min()), int(ys.max())] if xs.size else None}); others {sum(int(m.sum()) for c, m in new.items() if c != 'wide')}", flush=True)
+    assert xs.size >= 1 and set(xs.tolist()) == {col} and not any(m.any() for c, m in new.items() if c != "wide"), "spike not isolated by GT-consistency"
+    r = spk["rays"]["wide"]
+    others = {c: x["count"] for c, x in spk["rays"].items() if c != "wide" and x["count"]}
+    print(f"  synthetic streak spike col {col}: wide rays={r['count']} top={r['top'][:1]} others={others or 0}", flush=True)
+    assert r["count"] >= 1 and all(abs(t["col"] - col) <= 1 for t in r["top"]) and not others, \
+        f"bad column {col} not caught (or others flagged): {r} {others}"
+
+
+# ---- safety: the sky / any RV render option is render-only (Skeptic 2026-11-26)
+RV_SKY_FLAG = "RV_SKY_BACKDROP"   # expected name of a future sky-backdrop flag; parametrized here once it lands
+SAFETY_ROWS = 8                   # first clip015 rows (dev; far from burned/sealed frames)
+RENDER_VARIANTS = (
+    {}, {"sky": 0}, {"prior": 0}, {"fill": 0}, {"width": 960, "height": 540}, {"debug_color": "cam"},
+    {"debug_color": "height"}, {"chase": "rigid"}, {"omega": 3.0},
+)
+
+
+def _h(*arrs) -> str:
+    import hashlib
+    m = hashlib.sha256()
+    for a in arrs:
+        a = np.ascontiguousarray(np.asarray(a))
+        m.update(str(a.dtype).encode() + str(a.shape).encode())
+        m.update(a.tobytes())
+    return m.hexdigest()
+
+
+def _perception_trace(variant: dict, root=None, P=None, cams=None, rows=None) -> tuple[list, list]:
+    """Run the preview's per-row pipeline (cam_frame -> CamDepthFilter -> GroundGrid -> compose) with one
+    render variant; return the sha256 trace of everything that is not the picture (cam_frame outputs,
+    filter in/out, grid adds, grid.live, CamEvidence inputs) and any in-place mutation found by compose."""
+    over = {k: v for k, v in variant.items() if k != "__env"}
+    p = Preview(over, root=root, P=P, cams=cams)
+    a = p.a
+    ns = p.ns
+    filters = {c: sf.CamDepthFilter() for c in p.cam}
+    grid = sf.GroundGrid()
+    damp = sf.DampedHeading(omega=a.omega)
+    trace, mut = [], []
+    latest = {}
+    sky_rgb = ground_rgb = None
+    for n, row in enumerate(rows):
+        i, t, pose = row["i"], row["t"], row["pose"]
+        for cid in p.cam:
+            if root is None:
+                fr = p.run(cid, row["depth"][cid], row["sem"][cid], idx=i)
+            else:
+                if cid not in (row.get("cams") or {}) or not (root / "raw" / cid / "000" / f"{i:06d}.png").is_file():
+                    continue
+                fr = p.run(cid, None, None, idx=i)
+            if fr is None:
+                continue
+            rgb, depth, valid, sky = fr
+            trace.append(("cam_frame", i, cid, _h(rgb, depth, valid, sky)))
+            cp = p.cam[cid]
+            conf = np.clip(1.0 / (1.0 + depth / 20.0), 0.2, 1.0)
+            cin = np.where(valid, conf, 0.0)
+            trace.append(("filter_in", i, cid, _h(depth, valid, cin, np.array(pose), np.array([t]))))
+            if a.depth_filter:
+                depth, wgt = filters[cid].update(cp, depth, valid, pose, t, conf=cin)
+                trace.append(("filter_out", i, cid, _h(depth, wgt)))
+            trace.append(("evidence", i, cid, _h(depth, valid, sky)))
+            ys, xs = np.nonzero(valid)
+            pts = sf.unproject(cp, depth, ys, xs)
+            cols = rgb[ys, xs]
+            foot = ns["footprint"](cp, depth)[ys, xs]
+            keep = ego_box_filter(pts)
+            pts, cols, foot = pts[keep], cols[keep], foot[keep]
+            latest[cid] = (pts, cols, foot, pose)
+            if a.grid:
+                st_ = pts[:, 2] <= sf.STATIC_MAX_HEIGHT_M
+                w_in = sf.transform_points(pts[st_], pose, (0.0, 0.0, 0.0))
+                c_in = cols[st_].astype(np.float64)
+                k_in = 1.0 / (1.0 + np.hypot(pts[st_, 0], pts[st_, 1]) / 15.0)
+                trace.append(("grid_add", i, cid, _h(w_in, c_in, k_in)))
+                grid.add(w_in, c_in, k_in, t)
+            if sky.any():
+                sc = np.median(rgb[sky], axis=0)
+                sky_rgb = sc if sky_rgb is None else 0.8 * sky_rgb + 0.2 * sc
+        pp, pc, pf = [], [], []
+        for cid, (pts, cols, foot, ps) in latest.items():
+            pp.append(sf.transform_points(pts, ps, pose)); pc.append(cols); pf.append(foot)
+        if a.grid:
+            gp, gc = grid.live(t, pose[:2])
+            trace.append(("grid_live", i, "-", _h(gp, gc)))
+            if gp.shape[0]:
+                gl = sf.transform_points(gp, (0.0, 0.0, 0.0), pose)
+                pp.append(gl); pc.append(gc); pf.append(np.full(gl.shape[0], sf.GRID_CELL_M * 1.3))
+                near = np.hypot(gl[:, 0], gl[:, 1]) < 12.0
+                if near.sum() > 20:
+                    g_ = np.median(gc[near], axis=0)
+                    ground_rgb = g_ if ground_rgb is None else 0.8 * ground_rgb + 0.2 * g_
+        if not pp:
+            continue
+        pts = np.concatenate(pp); cols = np.concatenate(pc); foot = np.concatenate(pf)
+        yaw_off = (damp.step(pose[2], 0.05 if n else 0.0) - pose[2]) if a.chase == "damped" else 0.0
+        chase = sf.chase_camera(POSE_B_POS, POSE_B_PITCH, POSE_B_FOV, int(a.width), int(a.height), yaw_off)
+        held = [(c, _h(*v[:3])) for c, v in latest.items()]
+        before = _h(pts, cols, foot)
+        gstate = _h(*[np.array(v) for v in grid.cells.values()]) if grid.cells else ""
+        fstate = [_h(f.depth, f.w, f.valid) for f in filters.values() if f.depth is not None]
+        sf.compose(chase, pts, cols, foot, sky_rgb=(sky_rgb if a.sky else None),
+                   ground_rgb=(ground_rgb if a.prior else None), max_radius_px=max(2, int(a.width) // 120), fill=bool(a.fill))
+        if _h(pts, cols, foot) != before:
+            mut.append(f"row {i}: compose mutated pts/cols/foot")
+        if [(c, _h(*v[:3])) for c, v in latest.items()] != held:
+            mut.append(f"row {i}: compose mutated held per-cam points")
+        if (_h(*[np.array(v) for v in grid.cells.values()]) if grid.cells else "") != gstate:
+            mut.append(f"row {i}: compose mutated the ground grid")
+        if [_h(f.depth, f.w, f.valid) for f in filters.values() if f.depth is not None] != fstate:
+            mut.append(f"row {i}: compose mutated a CamDepthFilter state")
+    return trace, mut
+
+
+def _rv_consumers() -> list:
+    """Modules outside the RV render (python/viz, tools, scripts) that import an RV render module."""
+    bad = []
+    for sub in ("planning", "control", "perception", "runtime", "sensors"):
+        for f in sorted((ROOT / "python" / sub).rglob("*.py")) if (ROOT / "python" / sub).is_dir() else []:
+            s = f.read_text(encoding="utf-8", errors="ignore")
+            if any(k in s for k in ("rv_stable_fill", "rv_multicam", "reality_view_c", "rv_contract")):
+                bad.append(str(f.relative_to(ROOT)))
+    return bad
+
+
+RV_FORBIDDEN_DOC = "tools.rv_* or rv_stable_fill (any package path)"
+AEB_PLANNER_MODULES = ("python.control.actuate", "python.control.override", "python.planning.speed",
+                       "python.perception.cipv", "python.runtime.frame_gate")
+
+
+def _rv_forbidden(mod: str) -> bool:
+    parts = mod.split(".")
+    return (parts[0] == "tools" and len(parts) > 1 and parts[1].startswith("rv_")) or "rv_stable_fill" in parts
+
+
+def _module_imports(path: Path, modname: str) -> set:
+    """Absolute module names imported anywhere in the file (incl. function-level / try imports; relative resolved)."""
+    out = set()
+    pkg = modname.split(".")[:-1] if path.name != "__init__.py" else modname.split(".")
+    for n in ast.walk(ast.parse(path.read_text(encoding="utf-8", errors="ignore"))):
+        if isinstance(n, ast.Import):
+            out |= {a.name for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            base = n.module or ""
+            if n.level:
+                base = ".".join(pkg[: len(pkg) - (n.level - 1)] + ([base] if base else []))
+            out.add(base)
+            out |= {f"{base}.{a.name}" for a in n.names}
+        elif isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", "")) in ("import_module", "__import__") \
+                and n.args and isinstance(n.args[0], ast.Constant) and isinstance(n.args[0].value, str):
+            out.add(n.args[0].value)
+    return out
+
+
+def rv_import_violations(root: Path, pkg: str = "python") -> list:
+    """Static AST scan of root/pkg/**: modules that import a forbidden RV module directly or transitively (through
+    other modules under the same tree)."""
+    files = {}
+    for f in sorted((root / pkg).rglob("*.py")):
+        rel = f.relative_to(root).with_suffix("")
+        mod = ".".join(rel.parts[:-1] if rel.name == "__init__" else rel.parts)
+        files[mod] = f
+    graph = {m: _module_imports(f, m) for m, f in files.items()}
+    bad = []
+    for start in sorted(files):
+        if _rv_forbidden(start):
+            continue
+        seen, stack, path_of = {start}, [start], {start: [start]}
+        hit = None
+        while stack and hit is None:
+            m = stack.pop()
+            for t in sorted(graph.get(m, ())):
+                if _rv_forbidden(t):
+                    hit = path_of[m] + [t]
+                    break
+                for cand in (t, t.rsplit(".", 1)[0]):
+                    if cand in files and cand not in seen:
+                        seen.add(cand); path_of[cand] = path_of[m] + [cand]; stack.append(cand)
+        if hit:
+            bad.append(" -> ".join(hit))
+    return bad
+
+
+def rv_runtime_modules(mods, extra_path: Path | None = None) -> list:
+    """Fresh interpreter: import the AEB / planner modules; return any rv_* module that ended up in sys.modules."""
+    code = ("import sys, importlib\n"
+            + (f"sys.path.insert(0, {str(extra_path)!r})\n" if extra_path else "")
+            + f"for m in {list(mods)!r}: importlib.import_module(m)\n"
+            + "print('\\n'.join(sorted(k for k in sys.modules if any(p.startswith('rv_') for p in k.split('.')) or 'rv_stable_fill' in k)))")
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT)] + ([str(extra_path)] if extra_path else []))})
+    assert r.returncode == 0, f"import of {mods} failed: {r.stderr[-800:]}"
+    return [l for l in r.stdout.splitlines() if l.strip()]
+
+
+def check_import_isolation_rv() -> None:
+    """RENDER-ONLY SAFETY (sky-gateable; guard, must pass): nothing under python/ imports """ + "tools.rv_* or rv_stable_fill" + """,
+    directly or transitively (AST scan of python/**); importing the AEB / planner modules (actuate, override,
+    planning.speed, perception.cipv, runtime.frame_gate) in a fresh interpreter loads no rv_* module. Mutant self-test:
+    a temp tree whose module imports tools.rv_stable_preview (via a helper) must be flagged by the static scan, and a
+    temp module importing a stub rv_stable_fill must be flagged by the runtime check."""
+    bad = rv_import_violations(ROOT)
+    loaded = rv_runtime_modules(AEB_PLANNER_MODULES)
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        t = Path(td)
+        (t / "python" / "control").mkdir(parents=True)
+        (t / "python" / "__init__.py").write_text("")
+        (t / "python" / "control" / "__init__.py").write_text("")
+        (t / "python" / "control" / "helper.py").write_text("def f():\n    from tools import rv_stable_preview\n    return rv_stable_preview\n")
+        (t / "python" / "control" / "mut_aeb.py").write_text("from . import helper\n")
+        mut_static = rv_import_violations(t)
+        (t / "rv_stable_fill.py").write_text("X = 1\n")
+        (t / "mut_aeb_rt.py").write_text("import rv_stable_fill\n")
+        mut_rt = rv_runtime_modules(("mut_aeb_rt",), extra_path=t)
+    print(f"  import isolation: static violations {bad or 0}; rv_* loaded by {len(AEB_PLANNER_MODULES)} AEB/planner modules: "
+          f"{loaded or 0}; mutant static {mut_static}; mutant runtime {mut_rt}", flush=True)
+    assert any("python.control.mut_aeb -> python.control.helper -> tools" in m for m in mut_static), f"mutant (transitive) not caught: {mut_static}"
+    assert "rv_stable_fill" in mut_rt, f"runtime mutant not caught: {mut_rt}"
+    assert not bad, f"python/ imports {RV_FORBIDDEN_DOC}: {bad}"
+    assert not loaded, f"AEB/planner imports load RV modules: {loaded}"
+
+
+def check_threshold_frames_outside_seal_guard() -> None:
+    """Seal guard band (Skeptic 13:51): threshold frames (and every cam's nearest pred idx at them) never fall in
+    63-107 / 163-207; nor are they verify, burned or sealed frames. The f200 fixture is INFO and opt-in only."""
+    clip = clip_paths()
+    bad = [f for f in RS_THRESH_FRAMES if in_seal_guard(f) or f in RS_VERIFY_FRAMES or f in RS_BURNED or f in HELDOUT2_SEALED]
+    if clip is not None:
+        P = np.load(clip[1])
+        for cid in RS_CAMS:
+            av = pred_frames(P, cid)
+            bad += [f"f{f}:{cid}:{nearest_idx(av, f)}" for f in RS_THRESH_FRAMES if in_seal_guard(nearest_idx(av, f))]
+    assert SEAL_GUARD_RANGES == ((63, 107), (163, 207)), SEAL_GUARD_RANGES
+    assert not bad, f"threshold frames in the seal guard band / reserved: {bad}"
+
+
+def check_render_options_do_not_touch_perception() -> None:
+    """SAFETY (guard, must pass): sky backdrop on/off and every RV render option leave cam_frame outputs,
+    CamDepthFilter inputs/outputs, GroundGrid inputs/outputs and CamEvidence byte-identical (sha256), and
+    compose never mutates its inputs or the held per-cam points / grid / filter state in place. No planner /
+    control / perception / runtime module imports an RV render module (AEB/planner read nothing from RV).
+    On this head the sky toggle is --sky (2-D gradient backdrop in compose; sky px are never 3-D points).
+    Expected future flag: RV_SKY_BACKDROP (env or module attr); toggled here too once it exists."""
+    cons = _rv_consumers()
+    assert not cons, f"planner/AEB-side modules import RV render code: {cons}"
+    # planner / AEB inputs: plan_speed(ego_speed_mps, curvature, ttc_lead, aeb) (python/planning/speed.py) and the
+    # actuator's AEB brake (aeb flag / ttc, python/control/actuate.py) come from perception state in run_vision.
+    # RV is a separate child process (python/viz/rv_contract.RvClient): run_vision only launches and closes it.
+    # select_cipv consumes tracker tracks (detector output), which are not in the clip015 preds, so the AEB inputs
+    # cannot be driven from the clip offline: a fixed synthetic track / speed grid through select_cipv + plan_speed
+    # (+ AEB_BRAKE_TTC) is hashed before and after every RV variant; check_import_isolation_rv covers the imports.
+    rv_src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    rv_uses = sorted({n.attr for n in ast.walk(ast.parse(rv_src)) if isinstance(n, ast.Attribute)
+                      and isinstance(n.value, ast.Name) and n.value.id == "rv_client"})
+    assert set(rv_uses) <= {"close"}, f"run_vision reads from the RV client: {rv_uses}"
+    from python.planning.speed import plan_speed
+    def _aeb_inputs_hash():
+        outs = [plan_speed(ego_speed_mps=v, curvature=k, ttc_lead=t, aeb=a_) for v in (None, 0.0, 8.0, 25.0)
+                for k in (0.0, 0.02) for t in (None, 0.8, 3.0) for a_ in ("none", "warn", "brake")]
+        from python.perception.cipv import select_cipv
+        from python.control.actuate import AEB_BRAKE_TTC
+        tracks = [{"class": "vehicle", "x": x, "y": y, "speed_mps": sp} for x in (-1.5, 0.0, 0.9) for y in (3.0, 6.0, 25.0)
+                  for sp in (-8.0, -0.01, 2.0)] + [{"class": "pedestrian", "x": 0.0, "y": 5.0, "speed_mps": -3.0}]
+        cv = [select_cipv([t], ego_speed_mps=v) for t in tracks for v in (None, 0.0, 10.0)] + [select_cipv(tracks, ego_speed_mps=10.0)]
+        enc = lambda x: {None: -1.0, "off": 0.0, "warn": 1.0, "brake": 2.0}.get(x, -2.0)
+        return _h(np.array([[np.nan if o.target_v is None else o.target_v, np.nan if o.ttc_lead is None else o.ttc_lead,
+                             enc(o.aeb)] for o in outs]
+                           + [[np.nan if c.ttc_lead is None else c.ttc_lead, enc(c.aeb), -1.0 if c.track is None else c.track["y"]] for c in cv]
+                           + [[AEB_BRAKE_TTC, 0.0, 0.0]], np.float64))
+    aeb0 = _aeb_inputs_hash()
+    variants = list(RENDER_VARIANTS)
+    if hasattr(sf, RV_SKY_FLAG):
+        variants.append({"__module_flag": 0})
+    if clip_paths() is not None:
+        clip, preds, _ = clip_paths()
+        cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+        P = np.load(preds)
+        rows, odo = [], [0.0, 0.0, 0.0]
+        for n, l in enumerate((clip / "state.jsonl").read_text().splitlines()[:SAFETY_ROWS]):
+            r = json.loads(l)
+            odo = [odo[0], odo[1] + float(r["veh"]["wheelspeed"]) * 0.05 * (n > 0), odo[2] + 0.002 * n]
+            rows.append({"i": int(r["i"]), "t": float(r["t"]), "pose": tuple(odo), "cams": r.get("cams")})
+        kw = {"root": clip, "P": P, "cams": cams}
+        rs_frames_ok([r["i"] for r in rows])
+    else:
+        rows = []
+        for n in range(4):
+            dep, sem = {}, {}
+            for cid in CAM_SPECS:
+                g = geom(pv().cam[cid])
+                dep[cid] = np.where(g["down"], g["hit"] * (1.0 + 0.01 * n), 1e4)
+                sem[cid] = coarse(np.where(~g["down"], sf_sky(), ROAD_ID))
+            rows.append({"i": n, "t": 0.05 * n, "pose": (0.0, 0.5 * n, 0.01 * n), "depth": dep, "sem": sem})
+        kw = {}
+    base = None
+    bad = []
+    for var in variants:
+        saved = None
+        if "__module_flag" in var:
+            saved = getattr(sf, RV_SKY_FLAG)
+            setattr(sf, RV_SKY_FLAG, not saved)
+        try:
+            tr, mut = _perception_trace({k: v for k, v in var.items() if not k.startswith("__")}, rows=rows, **kw)
+        finally:
+            if saved is not None:
+                setattr(sf, RV_SKY_FLAG, saved)
+        bad += [f"{var}: {m}" for m in mut]
+        if base is None:
+            base = tr
+            continue
+        if tr != base:
+            diff = next((x for x, y in zip(tr, base) if x != y), None) if len(tr) == len(base) else f"len {len(tr)} vs {len(base)}"
+            bad.append(f"{var}: perception trace differs from base at {diff}")
+    assert _aeb_inputs_hash() == aeb0, "planner/AEB outputs changed after running RV render variants (global state leak)"
+    print(f"  safety: {len(variants)} render variants x {len(rows)} rows, {len(base or [])} hashed perception arrays/row-steps; "
+          f"sky flag on this head: --sky (module {RV_SKY_FLAG}: {'present' if hasattr(sf, RV_SKY_FLAG) else 'absent'})", flush=True)
+    assert not bad, "; ".join(bad[:6])
+
+
 # ------------------------------------------------------------------ hypothesis props
 def _build_props():
     if given is None:
@@ -2065,6 +3449,27 @@ CHECKS = [
     check_holdout_edge_overshoot,
     check_clip015_rear_holes,
     check_holdout_rear_holes,
+    check_render_options_do_not_touch_perception,
+    check_import_isolation_rv,
+    check_threshold_frames_outside_seal_guard,
+    check_synthetic_ripple_signature,
+    check_synthetic_streak,
+    check_clip015_ripple_wide_dz,
+    check_clip015_ripple_wide_periodicity,
+    check_clip015_ripple_other_cams,
+    check_clip015_streak_wide_snap_off,
+    check_snap_hook_hit,
+    info_clip015_footprint_row_gaps,
+    check_clip015_ringA_poseB_holes,
+    info_snap_b_attribution,
+    check_snap_rejects_raised_pred_z,
+    check_clip015_false_removal,
+    check_wide_snap_off_no_plane_pull_0_5m,
+    check_runtime_never_reads_gt,
+    check_clip015_wide_coarse_row_bowl,
+    check_wide_snap_off_no_plane_pull,
+    info_streak_fixture_f200_narrow_car_smear,
+    check_clip015_poseB_unknown_report,
 ]
 
 # name -> counterexample on 783fedd (real runs after thresholds commit 8b53e6b;
@@ -2079,7 +3484,8 @@ KNOWN_FAILING: dict[str, str] = {
     "check_snapped_pixels_not_exempt_from_edge_cut": "NEW vs a56f514: 456/456 snapped px at a depth edge were exempt from the cut (tools/rv_stable_preview.py: `cut & ~sky & ~snapped`, added at 4df1176). wide, left-half road 2.5x / right unsnapped 2.5x, clamp on.",
     "prop_side_objects_keep_height": "N: pillarL pole at x=-2.0, y0=0.0: lost 0.592 m",
     "check_road_labelled_object_top_stays_put": "N: pillarR car top 218 px moved outward (GT z 1.50 m); curb top 1487 px, height lost 0.15 m; main car top also snapped outward",
-    "check_clip015_snap_misplace": "f40/f160 DRAWN-only: pillarR 18.10% (7317/40432; f40 36.90%/f160 3.50%), repeatR 4.65% (1835/39434), wide 10.12% (3555/35133; was 15.00% all-snapped 7461/49726) at 0-15 m; wide 61.64% (188/305; all-snapped 59.35% 219/369) at 15-30 m (GT z>0.30)",
+    # pillarR/repeatR (b): michael 2026-11-26 13:50 CT, net seg+depth, Trainer 2.0 -- residual after a pred-z>0.30 rejection only
+    "check_clip015_snap_misplace": "f40/f160 DRAWN-only: pillarR 18.10% (7317/40432; f40 36.90%/f160 3.50%), repeatR 4.65% (1835/39434), wide 10.12% (3555/35133; was 15.00% all-snapped 7461/49726) at 0-15 m; wide 61.64% (188/305; all-snapped 59.35% 219/369) at 15-30 m (GT z>0.30) || pillarR/repeatR (b) attribution (Breaker, dev f50/f120 + Tracer swarm-2/logs/rv_snapb.txt f40, rv_snapb_more.txt f20/f50/f120/f150): residual after a one-sided pred-z>0.30 rejection = pred-road px with raw net z<=0.30 (net seg+depth): pillarR f50 2635/6274 (Tracer 2635), repeatR f50 779/1947 (Tracer 779), f120 0/3672 and 0/957 (Tracer 0) -> root cause of the residual 'net seg+depth (pred road on curb, raw z<=0.30), Trainer 2.0'; approval michael 2026-11-26 13:50 CT: \"Yeah, if this issue can be fixed with training on a large data set like the one that we're creating that's perfectly fine\". The rest of the (b) px (raw z>0.30) are snap-created: the rejection is ABSENT on dee9827 (check_snap_rejects_raised_pred_z FAILs, normal FAIL, Fix item Redesigner). Approval does not cover wide or other cams.",
     "check_holdout_snap_misplace": "f100/f200 DRAWN-only: wide 4.46% (1562/34986; was 15.00% all-snapped) and pillarR 4.44% at 0-15 m; wide 30.80% (182/591; was 37.67%), rear 6.25%, repeatL 5.29% at 15-30 m",
     "check_clean_holdout_snap_misplace": "f70 DRAWN-only: pillarR 55.49%, pillarL 41.55%, repeatR 24.60%, wide 11.39% (2067/18147; was 14.34% all-snapped), rear 5.16% at 0-15 m; wide 79.38% (77/97), rear 9.44% at 15-30 m",
     "check_clip015_edge_position": "f40/f160: wide 5-15 m median 1.334/p90 5.119 vs 10%/20% of |x_gt| 4.36 m; also narrow/main 5-15 p90 over the 20% gate",
@@ -2092,6 +3498,13 @@ KNOWN_FAILING: dict[str, str] = {
     "check_holdout_footprint": "f100/f200: narrow 46.9%, main 72.6%, wide 88.1%, pillarR 89.2%, repeatR 93.4%",
     "check_clean_holdout_footprint": "f70: pillarL 18.3%, narrow 49.5%, pillarR 58.8%, main 72.2%, wide 86.0%",
     "check_behind_car_strip_holes": "pose A f40 0.2000 of 160 cells (max v2 0.1456); pose A f160 0.2250 of 160 (max v2 0.0000). Pose B f110 0.0054 of 1491 PASSES (max v2 0.1058). This test: n=160/160; Historian 783fedd was 0.2215/0.2767 (n=158/159) — same definition, small n/frac difference.",
+    # ---- ripple / streak / sky (swarm-4 Breaker, wide snap OFF, thresholds by rule on f10/25/50/120/140/155) ----
+    # wide coarse-row dz: michael 2026-11-26 13:50 CT, net depth, Trainer 2.0
+    "check_clip015_ripple_wide_dz": "NEW (wide snap OFF; snap ON passes these bins at f40/f110/f160): wide |dz| f110 0-5 m 0.130 > 0.080, 5-10 m 0.327 > 0.163; f160 0-5 0.103, 5-10 0.277; f40 15-30 0.435 > 0.417. Root cause: net depth (12x16 coarse-row bands, wide f110 R6..R9 +0.43/+0.19/+0.22/+0.07 m; Tracer swarm-2/logs/rv_ring2.txt), fix in training (Trainer 2.0), not runtime. Approval michael 2026-11-26 13:50 CT: \"Yeah, if this issue can be fixed with training on a large data set like the one that we're creating that's perfectly fine\". Limits unchanged.",
+    "check_clip015_ripple_other_cams": "PRE-EXISTING (non-wide cams are not touched by the wide toggle; same with snap ON): f40 main std 0.110 > 0.107, ptp_5_15 0.150 > 0.051, |dz| 5-10 0.150 > 0.125, 10-15 0.345 > 0.220; f40 narrow std 0.100 > 0.076, ptp 0.191 > 0.011; plus pillar/repeat/rear bins (see props log). Not covered by the approval: Fix item.",
+    "check_clip015_streak_wide_snap_off": "PRE-EXISTING (snap ON f110 15778 / f160 16007, same): isolated far Y15/X0.5 f110 15762 > 14987, f160 16016 > 14987; Y15/X1 f160 6115 > 5427. GT path itself is 16003/22963 at f110/f160 (sparse far geometry). GT-consistency passes. Not covered by the approval: Fix item.",
+    "check_clip015_ringA_poseB_holes": "PRE-EXISTING, worse with snap OFF: pose-B f110 GT-ground 0-5 m hole frac 0.0290 (1738/59903) > 0.0136 (snap ON 0.0163, also over). Not covered by the approval: Fix item.",
+    "check_wide_snap_off_no_plane_pull_0_5m": "PRE-EXISTING (ground_clamp margin 1.0 lifts below-road net depth to the plane): f40 wide 0-5 m |pull| 0.240 > 0.122 (n=11279). 5-30 m guard passes.",
     "check_clip015_render_edge_and_holes": "render-frame edge: poseA f40 5-15 m median 0.303/p90 2.651 vs 10%/20% of |x_gt| 4.245 m; poseB f40 5-15 p90 1.381 vs 3.981 m; poseA f160 5-15 p90 2.044 vs 5.429 m; poseA f110 5-15 p90 2.394 vs 5.540 m; poseB f110 5-15 p90 1.282 vs 5.223 m; overshoot poseA-f40 0-5 m 2.792 m, poseB-f40 0-5 m 1.385 m. Render-frame holes PASS (all poses/frames <=2%/<=5%).",
 }
 

@@ -19,7 +19,8 @@ G6  HeadRamp.factor is 0 before entry, in [0, 1], non-decreasing, exactly 1.0 fr
 G7  per_task_grad_norms: a head with no path to the shared weight, a constant loss, or a zero
     gradient reports 0.0, never raises, and shared.grad is untouched (torch; skips visibly).
 L1  WarmupCosine.lr_at is finite and 0 <= lr <= peak for every step, incl. negative and
-    past-the-end steps, for any finite positive peak.
+    past-the-end steps, for any finite peak in [1e-300, F_MAX] (a subnormal peak is out of
+    domain: 0.5 * 5e-324 rounds to 0).
 L2  Non-decreasing through warmup (reaches peak at the last warmup step), non-increasing after.
 L3  After warmup lr >= floor_frac * peak; lr_at(total_steps) == floor exactly when there is a
     cosine phase; past the end it holds that value.
@@ -138,6 +139,12 @@ def check_pin_warmup_last_step_not_above_peak() -> None:
     assert w.warmup_steps == 118
     assert w.lr_at(117) == w.peak, w.lr_at(117)
     assert max(w.lr_at(s) for s in range(0, 130)) <= w.peak
+
+
+def check_pin_cosine_start_not_above_peak() -> None:
+    """floor + (peak - floor) * 1.0 was 1 ulp above peak (peak 7.66e15, floor_frac 0.10546875)."""
+    w = WarmupCosine(7662519389186461.0, 2, warmup_steps=1, floor_frac=0.10546875)
+    assert max(w.lr_at(s) for s in range(0, 6)) <= w.peak and w.lr_at(1) <= w.lr_at(0) == w.peak
 
 
 def check_pin_peak_overflow_in_warmup() -> None:
@@ -318,7 +325,12 @@ def _build_props():
             rec = grad_norm_record(s, {n: 0.0 for n in entry}, gn, ramp)
             assert json.loads(json.dumps(rec, allow_nan=False)) == rec
 
-    coef = st.one_of(st.sampled_from([0.0, -0.0, 1.0, -3.5, 1e-30, 1e30]), st.floats(-1e6, 1e6, allow_nan=False))
+    # |c| >= 1e-100: torch's float64 norm squares the entries, so c < ~1e-162 underflows to 0.0
+    # (a torch property, not a trainer2_balance one)
+    coef = st.one_of(
+        st.sampled_from([0.0, -0.0, 1.0, -3.5, 1e-30, 1e30]),
+        st.floats(-1e6, 1e6, allow_nan=False).filter(lambda c: c == 0.0 or abs(c) >= 1e-100),
+    )
 
     @cfg_torch
     @given(st.lists(coef, min_size=1, max_size=5), st.integers(1, 6))
@@ -351,8 +363,8 @@ def _build_props():
 
     # -------------------------------------------------------------- LR
     peaks = st.one_of(
-        st.sampled_from([5e-324, 1e-300, 1e-6, 3e-4, 1.0, 1e30, 8.98846567431158e307, F_MAX]),
-        st.floats(min_value=5e-324, max_value=F_MAX, allow_nan=False, allow_infinity=False),
+        st.sampled_from([1e-300, 1e-6, 3e-4, 1.0, 1e30, 8.98846567431158e307, F_MAX]),
+        st.floats(min_value=1e-300, max_value=F_MAX, allow_nan=False, allow_infinity=False),
         st.floats(min_value=1e-8, max_value=10.0),
     )
     totals = st.one_of(st.integers(1, 12), st.integers(1, 10**6), st.sampled_from([118, 499, 500, 501, 10**9]))
@@ -391,9 +403,9 @@ def _build_props():
     def prop_lr_phase_boundaries_and_tail(sch):
         peak, warm, total = sch.peak, sch.warmup_steps, sch.total_steps
         if warm > 0:
-            assert sch.lr_at(warm - 1) == peak  # warmup ends exactly at peak
+            assert sch.lr_at(warm - 1) == peak, sch.state_dict()  # warmup ends exactly at peak
         else:
-            assert sch.lr_at(0) == peak
+            assert sch.lr_at(0) == peak, (sch.lr_at(0), sch.state_dict())  # no warmup: starts at peak
         assert sch.lr_at(-7) == sch.lr_at(0)
         if total > warm:
             end = sch.floor_frac * peak
@@ -404,7 +416,7 @@ def _build_props():
         # whole-schedule scan for short stages: no NaN, bounded, unimodal
         if total <= 3000:
             vals = [sch.lr_at(s) for s in range(0, total + 3)]
-            assert all(math.isfinite(v) and 0.0 <= v <= peak for v in vals)
+            assert all(math.isfinite(v) and 0.0 <= v <= peak for v in vals), (sch.state_dict(), [v for v in vals if not 0.0 <= v <= peak][:3])
             top = vals.index(max(vals))
             assert all(a <= b for a, b in zip(vals[: top + 1], vals[1 : top + 1]))
             assert all(a >= b for a, b in zip(vals[top:], vals[top + 1 :]))
@@ -499,6 +511,7 @@ def main() -> None:
     check_pin_ctor_refuses_poison_hyperparams()
     check_pin_warmup_last_step_not_above_peak()
     check_pin_peak_overflow_in_warmup()
+    check_pin_cosine_start_not_above_peak()
     check_pin_constant_loss_has_zero_grad_norm()
     _run_hypothesis_props_or_skip()
     print("test_gradnorm_props: OK")
@@ -519,6 +532,7 @@ def test_pins() -> None:
     check_pin_ctor_refuses_poison_hyperparams()
     check_pin_warmup_last_step_not_above_peak()
     check_pin_peak_overflow_in_warmup()
+    check_pin_cosine_start_not_above_peak()
     check_pin_constant_loss_has_zero_grad_norm()
 
 

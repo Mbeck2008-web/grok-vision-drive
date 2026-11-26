@@ -1476,6 +1476,49 @@ def check_snapped_pixels_not_exempt_from_edge_cut() -> None:
     assert not bad, "; ".join(bad)
 
 
+UNDER_ROAD_TOL_M = 0.05   # no rendered point below the road plane by more than this (z < -0.05 m)
+
+
+def cut_clamp_order_scenes(cid):
+    """(name, raw net depth, coarse labels) fed to cam_frame for the order / under-road check: the flat synthetic
+    ground with the net's 12x16 labels, and a left-road / right-non-road scene at 2.5x depth (net depth under the road)."""
+    cam = pv().cam[cid]
+    depth, fine, net, gt_road, g = ground_scene(cam)
+    H, W = g["hit"].shape
+    xs = np.mgrid[0:H, 0:W][1]
+    half = np.where(g["down"], g["hit"] * np.where(xs < W // 2, 1.0, 2.5), 1e4)
+    return [("ground", depth, net), ("left road / right 2.5x deep", half, net)]
+
+
+def check_cut_then_clamp_order_and_nothing_under_road() -> None:
+    """38c9827: the depth-edge cut runs first and the ground clamp after it, on every snapping cam, and nothing is
+    rendered under the road. (1) call order cam_frame -> edge_cut_far_side then ground_clamp, with the clamp's input
+    exactly the cut's output (a clamp-then-cut order fails here); (2) valid rendered points with z < -0.05 m: 0 per cam
+    on the synthetic scenes (the count is printed). Swapping the order alone leaves the guarded cut under-road-free on
+    these scenes, so (1) is what pins the order."""
+    bad = []
+    counts = {}
+    for cid in sorted(resolve_road_snap_cams()):
+        cam = pv().cam[cid]
+        n_under = 0
+        for name, raw, lab in cut_clamp_order_scenes(cid):
+            fr, log = run_tapped(cid, raw, lab)
+            _, d, v, _ = fr
+            kinds = [e[0] for e in log]
+            if kinds != ["cut", "clamp"]:
+                bad.append(f"{cid} {name}: cam_frame stage order {kinds} (want ['cut', 'clamp'])")
+                continue
+            if not np.array_equal(log[1][1], log[0][4], equal_nan=True):
+                bad.append(f"{cid} {name}: ground_clamp input is not the edge cut's output")
+            under = v & np.isfinite(d) & (heights(cam, d) < -UNDER_ROAD_TOL_M)
+            n_under += int(under.sum())
+            if under.any():
+                bad.append(f"{cid} {name}: {int(under.sum())} rendered px below the road plane by > {UNDER_ROAD_TOL_M} m")
+        counts[cid] = n_under
+    print(f"  rendered px below the road plane (z < -{UNDER_ROAD_TOL_M} m), synthetic scenes, per snap cam: {counts}", flush=True)
+    assert not bad, "; ".join(bad)
+
+
 def pose_a_chase():
     n = pv().ns
     d = pv().defaults
@@ -3789,6 +3832,7 @@ CHECKS = [
     check_synthetic_rear_holes,
     check_side_objects_keep_height_pins,
     check_snapped_pixels_not_exempt_from_edge_cut,
+    check_cut_then_clamp_order_and_nothing_under_road,
     check_road_labelled_object_top_stays_put,
     check_behind_car_strip_holes,
     check_clip015_render_edge_and_holes,

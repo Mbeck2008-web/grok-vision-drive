@@ -434,6 +434,52 @@ def start_cpp_viz(args: argparse.Namespace, cameras: dict[str, Any] | None = Non
         return None
 
 
+def _reality_view_flag_on(args: argparse.Namespace, cameras: dict[str, Any] | None = None) -> bool:
+    """Resolve RV live-boundary flag (literal True only, no env bypass) without importing rv_contract."""
+    if getattr(args, "reality_view", False) is True:
+        return True
+    if cameras is None:
+        from python.viz.stage import _load_viz_files
+
+        cameras, _vram = _load_viz_files()
+    from collections.abc import Mapping
+
+    if not isinstance(cameras, Mapping):
+        return False
+    viz = cameras.get("viz")
+    return isinstance(viz, Mapping) and viz.get("reality_view_enabled") is True
+
+
+def start_reality_view(args: argparse.Namespace, cameras: dict[str, Any] | None = None) -> Any:
+    """``--reality-view`` / ``viz.reality_view_enabled``: separate RV child or None.
+
+    Default OFF (returns None; viz pane stays the bit-identical #242 placeholder).
+    When enabled, spawns only a separate child process (no in-process renderer)
+    and never blocks or stops the supervisor.
+    """
+    if not _reality_view_flag_on(args, cameras):
+        return None
+    try:
+        import atexit
+        from python.viz.rv_contract import RvClient, reality_view_enabled
+
+        if cameras is None:
+            from python.viz.stage import _load_viz_files
+
+            cameras, _vram = _load_viz_files()
+        if not reality_view_enabled(cameras, cli_reality_view=getattr(args, "reality_view", False) is True):
+            return None
+        client = RvClient()
+        atexit.register(client.close)
+        client.launch()
+        if client.note:
+            print(f"[GVD] {client.note}", flush=True)
+        return client
+    except Exception as exc:  # noqa: BLE001 - viz never stops the supervisor
+        print(f"[GVD] reality-view: off ({exc!r})", flush=True)
+        return None
+
+
 def resolve_main_view(args: argparse.Namespace) -> ViewChoice:
     """Main view from config/cameras.yaml viz.* and --view / --enable-classic-view."""
     from python.viz.stage import _load_viz_files
@@ -504,6 +550,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--viz-cpp-port", type=int, default=47800, help="UDP port for --viz-cpp (127.0.0.1 only)")
     ap.add_argument("--viz-cpp-exe", default="", help="gvd_viz path for --viz-cpp (default: cpp/viz/build)")
     ap.add_argument("--viz-cpp-no-launch", action="store_true", help="--viz-cpp: publish only, do not start gvd_viz")
+    ap.add_argument(
+        "--reality-view",
+        action="store_true",
+        help="Enable Reality View separate-process boundary (default OFF; viz.reality_view_enabled: true or --reality-view).",
+    )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--hz", type=float, default=15.0)
     ap.add_argument("--backend", default="auto", choices=["auto", "beamngpy", "window", "stub"])
@@ -1022,6 +1073,7 @@ def main(clock=None) -> None:
     fox = FoxgloveBridge(sensors_cfg)
 
     cpp_viz = start_cpp_viz(args)
+    rv_client = start_reality_view(args)
     win = "GVD VISION" if args.viz else None
     view_choice = resolve_main_view(args)
     if win is not None:
@@ -2463,6 +2515,8 @@ def main(clock=None) -> None:
             pass
         if cpp_viz is not None:
             cpp_viz.close()
+        if rv_client is not None:
+            rv_client.close()
         if win is not None:
             import cv2
 

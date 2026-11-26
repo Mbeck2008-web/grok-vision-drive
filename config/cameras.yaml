@@ -48,6 +48,7 @@ viz:
   main_view: reality      # reality (GVD 2.0 main view) | classic (old stage view, disabled below)
   classic_view_enabled: false  # true (or --enable-classic-view) to allow main_view/--view classic
   cpp_viz_enabled: false       # true (or --enable-viz-cpp) to allow --viz-cpp to open gvd_viz
+  reality_view_enabled: false  # true (literal) or --reality-view for separate-process RV (default OFF -> #242 placeholder)
 cameras:
   - id: narrow
     role: long_range_forward

@@ -529,9 +529,12 @@ def check_unreadable_input_is_refused_exit_2() -> None:
         from python.train.epoch_ckpt import FORMAT
 
         def _write_meta(path: Path, meta_obj) -> None:
+            _write_meta_arrays(path, meta_obj, w0=np.zeros(3, np.float32))
+
+        def _write_meta_arrays(path: Path, meta_obj, **arrays) -> None:
             import json
 
-            np.savez(path, meta=np.array(json.dumps(meta_obj)), w0=np.zeros(3, np.float32))
+            np.savez(path, meta=np.array(json.dumps(meta_obj)), **arrays)
 
         malformed = {
             "meta_list.npz": ["not", "an", "object"],
@@ -546,15 +549,44 @@ def check_unreadable_input_is_refused_exit_2() -> None:
             out = d / (bad.stem + ".out.npz")
             try:
                 mig.migrate_file(bad, out)
-            except mig.MigrationRefused:
-                pass
+            except mig.MigrationRefused as exc:
+                if name.startswith("names_"):
+                    assert "weight_names" in str(exc), (name, exc)
             else:
                 raise AssertionError(f"{name}: accepted")
             assert not out.exists() and not list(d.glob("*.partial*")), name
             r = _cli(str(bad), str(out), "--min-free-gb", "0")
             assert r.returncode == 2 and "REFUSED" in r.stderr and "Traceback" not in r.stderr, (name, r.returncode, r.stderr)
+            if name.startswith("names_"):
+                assert "weight_names" in r.stderr, (name, r.stderr)
             assert not out.exists(), name
-    print("garbage / truncated / empty / missing / directory / list-null-string meta / bad weight_names: REFUSED exit 2, no traceback, no output")
+        # JSON has no tuples, so a tuple-of-str weight_names cannot be written into an npz meta.
+        # Pin the validation at load_epoch_ckpt: after json.loads, swap the list for a tuple.
+        from python.train import epoch_ckpt
+        from python.train.epoch_ckpt import load_epoch_ckpt
+
+        # include w0 and w1 so a dropped check would load successfully rather than die later on a missing array
+        tuple_path = d / "names_tuple.npz"
+        _write_meta_arrays(tuple_path, {"format": FORMAT, "weight_names": ["a", "b"]}, w0=np.zeros(3, np.float32), w1=np.zeros(3, np.float32))
+        real_loads = epoch_ckpt.json.loads
+
+        def loads_as_tuple(text, *a, **k):
+            meta = real_loads(text, *a, **k)
+            if isinstance(meta, dict) and isinstance(meta.get("weight_names"), list):
+                meta["weight_names"] = tuple(meta["weight_names"])  # ('a', 'b')
+            return meta
+
+        epoch_ckpt.json.loads = loads_as_tuple
+        try:
+            try:
+                load_epoch_ckpt(tuple_path)
+            except ValueError as exc:
+                assert "weight_names" in str(exc), exc
+            else:
+                raise AssertionError("tuple-of-str weight_names was accepted by load_epoch_ckpt")
+        finally:
+            epoch_ckpt.json.loads = real_loads
+    print("garbage / truncated / empty / missing / directory / list-null-string meta / bad weight_names (message names weight_names) / tuple-of-str at load_epoch_ckpt: REFUSED exit 2, no traceback, no output")
 
 
 def check_low_disk_space_is_refused() -> None:

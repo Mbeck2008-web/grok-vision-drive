@@ -27,6 +27,9 @@ S12 road snap runs only on ROAD_SNAP_CAMS (all but narrow; switchable).
 S7b ground_clamp caps +inf on a downward ray at the ground hit; NaN stays NaN.
 S3b CamDepthFilter does not push on/above-road input below the road plane.
 S15 a road px the snap rejects renders at its raw depth (not deleted by snap / clamp / cap).
+S14 snap: ego-hood px are excluded; wide snaps to a 15 m ground hit only.
+S16 the depth-edge cut has no snapped exemption (shared edge_cut_far_side).
+S17 splat radius cap (W//60) covers the 0.25 m ground grid near the chase camera (behind-car strip).
 S13 ground splats reach the next camera row: on-plane points' footprint grows to the ground row spacing past
    the old 6*(d/fy) cap (rear/repeater holes); off-plane points keep the cap.
 S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
@@ -479,6 +482,86 @@ def check_ground_footprint() -> None:
     assert off.sum() > 1000 and np.all(fw[off] <= 6.0 * wall[off] / cam.fy + 1e-9)
 
 
+def check_snap_range_and_exclude() -> None:
+    """S14: (a) px in ``exclude`` (ego hood, never drawn) are not snapped, so a hood that the plane would
+    flatten is not counted as snapped road (gate (b): wide 0-15 m was 12.5% hood px, 0.76% without them);
+    (b) wide snaps only to a 15 m ground hit (at 15-25 m, 0.30 m of height is ~5 m of depth: f160 had 20 of 22
+    snapped px with GT z > 0.30 there); rear keeps 25 m."""
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7, w=640, h=360)
+    raw = np.where(down, hit * 1.5, 80.0)
+    road = down.copy()
+    ex = np.zeros(hit.shape, bool); ex[240:, 120:520] = True
+    _, m0 = sf.road_snap(cam, raw, road)
+    out, m1 = sf.road_snap(cam, raw, road, exclude=ex)
+    assert (m0 & ex).sum() > 200, "fixture: exclude region must contain snappable px"
+    assert not (m1 & ex).any() and np.array_equal(m1, m0 & ~ex) and np.array_equal(out[ex], raw[ex])
+    assert np.array_equal(out[m1], hit[m1])
+    _, mw = sf.snap_road_for_cam("wide", cam, raw, road)
+    assert sf.ROAD_SNAP_RANGE_M["wide"] == 15.0
+    assert mw.any() and hit[mw].max() <= 15.0 + 1e-9, "wide must not snap a ground hit beyond 15 m"
+    assert (m0 & (hit > 15.0) & (hit <= sf.ROAD_SNAP_MAX_M)).any(), "fixture: there is road at 15-25 m"
+    cam_r = camera_from_angles("rear", (0.0, -2.25, 0.78), 180.0, -10.0, 80.0, 640, 360, near_m=0.05, far_m=100.0)
+    dzr = sf._pixel_rays(cam_r)[..., 2]; dr = dzr < -1e-6
+    hr = np.where(dr, cam_r.pos[2] / np.where(dr, -dzr, 1.0), np.inf)
+    _, mr = sf.snap_road_for_cam("rear", cam_r, np.where(dr, hr * 1.5, 80.0), dr.copy())
+    assert (mr & (hr > 15.0)).any() and hr[mr].max() <= sf.ROAD_SNAP_MAX_M + 1e-9, "rear keeps the 25 m range"
+
+
+def check_edge_cut_includes_snapped() -> None:
+    """S16 (Skeptic): the depth-edge cut has no snapped exemption. A px snapped onto the plane (depth = ground hit)
+    that sits next to a farther surface is moved to the 5x5 far side like any other px; the cut still never
+    pushes a px under its own ground hit."""
+    import inspect
+    assert "snapped" not in inspect.signature(sf.edge_cut_far_side).parameters
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    ghit = np.where(down, hit * 2.0, np.inf)                        # allowance past the plane hit for the far side (a step the cut may take)
+    snap = np.where(down, hit, 80.0)                                # snapped road: exactly on the plane
+    d = snap.copy()
+    step = down & (xs >= 80) & (hit < 12.0)
+    d[step] = snap[step] * 1.5                                      # a farther surface on the right (step > 12% inv per px = depth edge)
+    sky = np.zeros(hit.shape, bool)
+    out = sf.edge_cut_far_side(d, sky, ghit)
+    left = down & (xs == 79) & (hit < 12.0)                      # snapped px next to the edge (the only column with a big gradient)
+    moved = left & (np.abs(out - d) > 1e-6)
+    assert left.sum() > 15 and moved.sum() > 0.8 * left.sum(), (int(moved.sum()), int(left.sum()))
+    assert np.all(out[moved] > d[moved]) and np.all(out[down] <= ghit[down] * (1 + 1e-6)), "cut must not go under the road"
+    out2 = sf.edge_cut_far_side(d, sky, np.where(down, hit, np.inf))  # margin 1.0: past the ground hit -> never cut
+    assert np.array_equal(out2[down & (xs < 80)], d[down & (xs < 80)])
+
+
+def check_splat_radius_covers_ground_grid() -> None:
+    """S17 (Skeptic, behind-car strip): the ground grid keeps one point per 0.25 m cell; at ~3 m from the pose A chase
+    camera that is ~39 px apart, so a splat radius capped at 8 px (W//120 at 960) leaves a third of the road cells just
+    behind the car without a splat. The cap (splat_max_radius_px) must cover that lattice; the preview uses it."""
+    ch = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 960, 540, 0.0)
+    g = np.arange(-12, 12, 0.25) + 0.125; gy = np.arange(-8, 30, 0.25) + 0.125
+    X, Y = np.meshgrid(g, gy)
+    P = np.c_[X.ravel(), Y.ravel(), np.zeros(X.size)]
+    cx, cy = np.meshgrid(np.arange(-4.4, 4.4, 0.25) + 0.125, np.arange(-0.9, 0.0, 0.25) + 0.125)
+    C = np.c_[cx.ravel(), cy.ravel(), np.zeros(cx.size)]
+    u, v, z = sf.project(ch, C)
+    vis = np.isfinite(z) & (z > ch.near_m) & (u >= 0) & (u < 960) & (v >= 0) & (v < 540)
+    assert vis.sum() > 100
+    ui, vi = np.floor(u[vis]).astype(int), np.floor(v[vis]).astype(int)
+
+    def hole(r):
+        _, _, obs = sf.splat(ch, P, np.full((len(P), 3), 128, np.uint8), np.full(len(P), 0.3), splat_scale=1.0, max_radius_px=r)
+        k = np.ones((3, 3), bool)
+        pad = np.pad(obs, 1)
+        dil = np.zeros_like(obs)
+        for dy in range(3):
+            for dx in range(3):
+                dil |= pad[dy:dy + obs.shape[0], dx:dx + obs.shape[1]]
+        return float((~dil[vi, ui]).mean())
+    assert hole(8) > 0.2, "fixture: the old 8 px cap must leave the strip open"
+    r = sf.splat_max_radius_px(960)
+    assert r > 8 and hole(r) <= 0.02, (r, hole(r))
+    assert sf.splat_max_radius_px(1) == 2
+    tool = (ROOT / "tools" / "rv_stable_preview.py").read_text(encoding="utf-8")
+    assert "max_radius_px=S.splat_max_radius_px(a.width)" in tool and "// 120" not in tool, "preview must use the helper"
+    assert "S.edge_cut_far_side(" in tool and "~snapped" not in tool, "preview must use the shared edge cut without exemption"
+
+
 def check_flag_and_deps() -> None:
     assert sf.STABLE_FILL_DEFAULT_ON is False
     tree = ast.parse(MOD.read_text(encoding="utf-8"))
@@ -557,7 +640,8 @@ if __name__ == "__main__":
                check_depth_filter_flicker_and_reset, check_compose_explains_every_pixel,
                check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership,
                check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_rejected_road_px_render_raw,
-               check_filter_keeps_ground, check_ground_footprint, check_flag_and_deps):
+               check_filter_keeps_ground, check_ground_footprint, check_snap_range_and_exclude,
+               check_edge_cut_includes_snapped, check_splat_radius_covers_ground_grid, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

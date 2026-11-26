@@ -373,6 +373,9 @@ ROAD_SNAP_MAX_ABOVE_M: float = 0.30
 # gains at 0-5 m (f160 0.11 -> 0.07, held-out f100 0.20 -> 0.06) and is unchanged at 5-15 m. Side cams: see gate (b) in
 # tests/props (pillarL/R, repeatR snap curb/car px).
 ROAD_SNAP_CAMS: tuple[str, ...] = ("wide", "main", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+# Wide's horizon band: at a 15-25 m ground hit the ray is ~3 deg below the horizon, so 0.30 m of height is ~5 m of depth and the
+# runtime z test cannot tell road from a 0.3-0.5 m curb/step there (f160: 20 of 22 snapped px GT z > 0.30 at 15-30 m). Wide snaps to 15 m only.
+ROAD_SNAP_RANGE_M: dict[str, float] = {"wide": 15.0}
 
 
 def _erode(mask: np.ndarray, r: int) -> np.ndarray:
@@ -394,7 +397,8 @@ def _erode(mask: np.ndarray, r: int) -> np.ndarray:
 
 def road_snap(cam: CameraPose, depth: np.ndarray, road: np.ndarray, *, ground_z: float = 0.0,
               max_hit_m: float = ROAD_SNAP_MAX_M, erode_px: int = ROAD_SNAP_ERODE_PX,
-              max_above_m: float = ROAD_SNAP_MAX_ABOVE_M) -> tuple[np.ndarray, np.ndarray]:
+              max_above_m: float = ROAD_SNAP_MAX_ABOVE_M,
+              exclude: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Road pixels lie on the road: replace their depth with the exact ground-plane hit.
 
     The net's depth is a 12x16 grid per crop, upsampled; across the near road the true depth changes
@@ -402,7 +406,8 @@ def road_snap(cam: CameraPose, depth: np.ndarray, road: np.ndarray, *, ground_z:
     farther out) and the main/wide seams on the road do not meet. For pixels the net labels road, the
     camera mount already gives the answer at full resolution. Only pixels ``erode_px`` inside the
     road label, with a downward ray hitting within ``max_hit_m``, and not already more than ``max_above_m``
-    above the plane by the net's own depth (wall/car/pole under a coarse label), are snapped. Returns (depth, mask).
+    above the plane by the net's own depth (wall/car/pole under a coarse label), are snapped. ``exclude`` (e.g. the
+    ego hood, never drawn) px are not snapped. Returns (depth, mask).
     """
     d = np.asarray(depth, np.float64)
     rd = np.asarray(road, bool)
@@ -417,6 +422,8 @@ def road_snap(cam: CameraPose, depth: np.ndarray, road: np.ndarray, *, ground_z:
     with np.errstate(invalid="ignore"):
         above = np.isfinite(d) & (h + d * dz > float(max_above_m))   # net puts it > max_above_m over the plane
     snap = _erode(rd, int(erode_px)) & down & (hit <= float(max_hit_m)) & ~above
+    if exclude is not None:
+        snap &= ~np.asarray(exclude, bool)
     return np.where(snap, hit, d), snap
 
 
@@ -424,10 +431,50 @@ def snap_road_for_cam(cam_id: str, cam: CameraPose, depth: np.ndarray, road: np.
     """``road_snap`` for ROAD_SNAP_CAMS; other cams come back unchanged with an empty mask."""
     d = np.asarray(depth, np.float64)
     if cam_id in ROAD_SNAP_CAMS:
+        if cam_id in ROAD_SNAP_RANGE_M:
+            kw["max_hit_m"] = min(float(kw.get("max_hit_m", ROAD_SNAP_MAX_M)), ROAD_SNAP_RANGE_M[cam_id])
         return road_snap(cam, d, road, **kw)
     if d.shape != (cam.height, cam.width) or np.shape(road) != d.shape:
         raise ValueError(f"depth {d.shape} / road {np.shape(road)} must be the camera shape {(cam.height, cam.width)}")
     return d.copy(), np.zeros(d.shape, bool)
+
+
+EDGE_CUT_GRAD_FRAC: float = 0.12   # |grad inv| > 0.12 * inv marks a depth edge
+EDGE_CUT_DILATE_PX: int = 5
+
+
+def edge_cut_far_side(depth: np.ndarray, sky: np.ndarray, ground_hit: np.ndarray) -> np.ndarray:
+    """Depth edges: re-place edge pixels on the far side (5x5 local max), so no sheet joins fg and bg.
+
+    Applies to EVERY pixel, snapped ones included (no snapped exemption: a snapped px next to a farther
+    surface is cut like any other), but never under the road: where the far side is past the pixel's own
+    ``ground_hit`` (ray's ground-plane hit x clamp margin; +inf for upward rays) the pixel keeps its depth.
+    """
+    d = np.asarray(depth, np.float64)
+    inv = 1.0 / np.maximum(d, 1e-3)
+    gy, gx = np.gradient(inv)
+    cut = np.hypot(gx, gy) > EDGE_CUT_GRAD_FRAC * inv
+    r = EDGE_CUT_DILATE_PX // 2
+    f32 = d.astype(np.float32)
+    pad = np.pad(f32, r, mode="constant", constant_values=-np.inf)
+    h_, w_ = f32.shape
+    far_side = np.full_like(f32, -np.inf)
+    for dy in range(2 * r + 1):            # 5x5 grey dilation (max filter); border ignored, NaN ignored (== cv2.dilate)
+        for dx in range(2 * r + 1):
+            far_side = np.fmax(far_side, pad[dy:dy + h_, dx:dx + w_])
+    return np.where(cut & ~np.asarray(sky, bool) & (far_side <= ground_hit), far_side, d)
+
+
+def splat_max_radius_px(width: int) -> int:
+    """Chase splat radius cap (px) for a chase image ``width`` wide.
+
+    W//40 (24 px at 960; was W//120 = 8): the ground grid keeps one point per 0.25 m cell, which at ~3 m from the chase
+    camera (the road just behind the car, bottom edge of pose A) is ~39 px apart, so an 8 px cap left 0.24-0.30 of the
+    behind-car road cells without a splat (pose A f40/f160/f110, Breaker's strip metric; cap 12: 0.07, 16: 0.01-0.03,
+    24: 0.000-0.013, flat beyond 24). Only px whose geometric radius 0.5*fy*foot/z exceeds 8 change, i.e. ground near the
+    chase camera (z < ~15 x footprint).
+    """
+    return max(2, int(width) // 40)
 
 
 def yield_mask(cam: CameraPose, better: Sequence[CameraPose], *, margin_px: float = 4.0, probe_m: float = 200.0) -> np.ndarray:

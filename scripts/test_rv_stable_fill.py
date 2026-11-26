@@ -26,6 +26,7 @@ S11 snap rejection (runtime, no GT): a road-labelled px whose net depth puts it 
 S12 road snap runs only on ROAD_SNAP_CAMS (wide).
 S7b ground_clamp caps +inf on a downward ray at the ground hit; NaN stays NaN.
 S3b CamDepthFilter does not push on/above-road input below the road plane.
+S15 a road px the snap rejects renders at its raw depth (not deleted by snap / clamp / cap).
 S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
    (narrow 250, main/wide 250, 100 m cams 99.5); non-sky pixels beyond the cap or +inf are
    drawn AT the cap (kept, not dropped); sky stays sky; nearer depth is untouched.
@@ -274,6 +275,14 @@ def check_road_snap() -> None:
     assert sf.ROAD_SNAP_MAX_M == 25.0
     R = 20.0  # this small fixture's horizon is only ~60 m out, so test the range gate at 20 m
     out, m = sf.road_snap(cam, raw, road, max_hit_m=R)
+    # S9 spec change (38c9827, ruled by GVD: snap rejection > 0.30 m above the plane), flagged for Michael's sign-off:
+    #   OLD: core = erode(road) & (dz < 0) & (hit <= R);            assert m == core   (every in-range road px snaps)
+    #   NEW: core = erode(road) & (dz < 0) & (hit <= R) & ~above;   assert m == core   (px > 0.30 m above the plane do not)
+    # Why OLD no longer holds: this fixture's raw depth bends *above* the road farther out, and at runtime that floating-road
+    # band is indistinguishable from a wall/pole/car under a coarse 12x16 road label (S11). The ruling is to leave such px at
+    # raw depth. NEW is LOOSER in one way: the fixture no longer guarantees that a road that bends up gets flattened there
+    # (the 'too-near band' px below). It is compensated by (1) asserting the band exists, (2) the exact-plane assert on all
+    # snapped px, (3) S11 (rejected stays put) and S15 (rejected still renders at raw depth).
     above = (cam.pos[2] + raw * dz) > sf.ROAD_SNAP_MAX_ABOVE_M   # net already puts it > 0.30 m up: not road (S11)
     core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= R) & ~above
     assert m.tolist() == core.tolist() and core.sum() > 1000
@@ -396,6 +405,28 @@ def check_clamp_inf() -> None:
     assert np.isnan(out).all() and not m.any(), "NaN stays invalid"
 
 
+def check_rejected_road_px_render_raw() -> None:
+    """S15 (Breaker/Skeptic): a road px the snap rejects (net depth puts it > 0.30 m above the plane: a floating
+    road band) is 'not snapped, drawn at raw depth', not deleted: through road_snap -> ground_clamp -> far_to_cap it
+    keeps its exact raw depth and stays a valid, finite, drawn px (traced on f40: 0% of rejected wide px are lost to
+    snap/clamp/cap; the only drops are the ownership yield and the ego mask, same as snap off)."""
+    cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
+    h = float(cam.pos[2])
+    raw = np.where(down, np.maximum((h - 0.5) / np.where(down, -dz, 1.0), 0.31), 80.0)   # 0.5 m above the plane
+    road = np.ones(hit.shape, bool)
+    z_pred = h + raw * dz
+    out, m = sf.road_snap(cam, raw, road)
+    rej = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & down & (hit <= sf.ROAD_SNAP_MAX_M) & (z_pred > sf.ROAD_SNAP_MAX_ABOVE_M)
+    assert rej.sum() > 500, "fixture must have a floating road band"
+    assert not m[rej].any() and np.array_equal(out[rej], raw[rej]), "rejected px must keep raw depth"
+    out2, cl = sf.ground_clamp(cam, out, margin=1.0)
+    assert not cl[rej].any() and np.array_equal(out2[rej], raw[rej]), "ground_clamp must not touch a px above the plane"
+    cap = sf.depth_cap_m(300.0)
+    out3, far = sf.far_to_cap(out2, np.zeros(hit.shape, bool), cap)
+    valid = np.isfinite(out3) & (out3 > 0.3) & (out3 <= cap)
+    assert valid[rej].all() and not far[rej].any() and np.array_equal(out3[rej], raw[rej]), "rejected px must render"
+
+
 def check_filter_keeps_ground() -> None:
     """S3b (Breaker F): CamDepthFilter never puts a pixel below the road plane that its input had on or
     above it (the floor-lookup blend of a neighbouring ray's carried point dipped snapped road 5 cm)."""
@@ -482,7 +513,7 @@ if __name__ == "__main__":
     for fn in (check_metrics, check_damped_view_less_jitter, check_damped_follows_turn,
                check_depth_filter_flicker_and_reset, check_compose_explains_every_pixel,
                check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership,
-               check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_filter_keeps_ground, check_flag_and_deps):
+               check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_rejected_road_px_render_raw, check_filter_keeps_ground, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

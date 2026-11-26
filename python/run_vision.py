@@ -434,6 +434,22 @@ def start_cpp_viz(args: argparse.Namespace, cameras: dict[str, Any] | None = Non
         return None
 
 
+def _reality_view_flag_on(args: argparse.Namespace, cameras: dict[str, Any] | None = None) -> bool:
+    """Resolve RV live-boundary flag (literal True only, no env bypass) without importing rv_contract."""
+    if getattr(args, "reality_view", False) is True:
+        return True
+    if cameras is None:
+        from python.viz.stage import _load_viz_files
+
+        cameras, _vram = _load_viz_files()
+    from collections.abc import Mapping
+
+    if not isinstance(cameras, Mapping):
+        return False
+    viz = cameras.get("viz")
+    return isinstance(viz, Mapping) and viz.get("reality_view_enabled") is True
+
+
 def start_reality_view(args: argparse.Namespace, cameras: dict[str, Any] | None = None) -> Any:
     """``--reality-view`` / ``viz.reality_view_enabled``: separate RV child or None.
 
@@ -441,17 +457,18 @@ def start_reality_view(args: argparse.Namespace, cameras: dict[str, Any] | None 
     When enabled, spawns only a separate child process (no in-process renderer)
     and never blocks or stops the supervisor.
     """
-    from python.viz.rv_contract import RvClient, reality_view_enabled
-
-    if cameras is None:
-        from python.viz.stage import _load_viz_files
-
-        cameras, _vram = _load_viz_files()
-    if not reality_view_enabled(cameras, cli_reality_view=bool(getattr(args, "reality_view", False))):
+    if not _reality_view_flag_on(args, cameras):
         return None
     try:
         import atexit
+        from python.viz.rv_contract import RvClient, reality_view_enabled
 
+        if cameras is None:
+            from python.viz.stage import _load_viz_files
+
+            cameras, _vram = _load_viz_files()
+        if not reality_view_enabled(cameras, cli_reality_view=getattr(args, "reality_view", False) is True):
+            return None
         client = RvClient()
         atexit.register(client.close)
         client.launch()

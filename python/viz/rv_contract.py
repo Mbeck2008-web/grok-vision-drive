@@ -7,13 +7,16 @@ NO 3DGS math, and imports NO safety-path modules (heartbeat/AEB/engage/frame_gat
 """
 from __future__ import annotations
 
+import ctypes
 import math
+import os
+import signal
 import subprocess
 import struct
 import sys
 import threading
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -47,6 +50,10 @@ RV_FLAG_VALID = 1 << 2
 # reserved(I), pose_4x4(16f)
 SLOT_HEADER_STRUCT = struct.Struct("<8sIIQddIIIIII16f")
 SLOT_HEADER_SIZE = SLOT_HEADER_STRUCT.size
+
+# Max legal output from schema: long side <= RV_MAX_LONG_SIDE (640),
+# RGB uint8 (3 B/px) + float32 depth (4 B/px) + 128-B header.
+RV_DEFAULT_SLOT_BYTES = SLOT_HEADER_SIZE + RV_MAX_LONG_SIDE * RV_MAX_LONG_SIDE * (3 + 4)
 
 _FORBIDDEN_DEPTH_KEYS: frozenset[str] = frozenset(
     {
@@ -294,8 +301,10 @@ def validate_rv_output(out: RvOutputSpec) -> None:
     if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
         raise RvSchemaError(f"rgb must be uint8 (H, W, 3), got {rgb.shape} {rgb.dtype}")
     h, w = int(rgb.shape[0]), int(rgb.shape[1])
-    if h <= 0 or w <= 0:
-        raise RvSchemaError(f"rgb dimensions must be positive, got {(h, w)}")
+    if h <= 0 or w <= 0 or max(h, w) > RV_MAX_LONG_SIDE:
+        raise RvSchemaError(
+            f"rgb dimensions {(h, w)} must be positive with long side <= {RV_MAX_LONG_SIDE}"
+        )
     if out.depth is None:
         raise RvSchemaError("depth buffer is required alongside RGB output")
     depth = np.asarray(out.depth)
@@ -345,7 +354,7 @@ def unpack_output_slot(buf: bytes | bytearray | memoryview) -> tuple[RvShmHeader
     hdr = RvShmHeader.unpack(buf)
     if (hdr.flags & RV_FLAG_HAS_DEPTH) == 0:
         raise RvSchemaError("SHM output slot missing required RV_FLAG_HAS_DEPTH")
-    if hdr.width <= 0 or hdr.height <= 0:
+    if hdr.width <= 0 or hdr.height <= 0 or max(hdr.width, hdr.height) > RV_MAX_LONG_SIDE:
         raise RvSchemaError(f"invalid output dimensions {(hdr.width, hdr.height)}")
     rgb_nbytes = hdr.width * hdr.height * 3
     depth_nbytes = hdr.width * hdr.height * 4
@@ -436,6 +445,41 @@ class DoubleBufferSlotLayout:
             return bytes(self._slots[idx][:n])
 
 
+_PR_SET_PDEATHSIG = 1
+
+
+def _load_linux_prctl() -> Any:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = libc.prctl
+        fn.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        fn.restype = ctypes.c_int
+        return fn
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_LINUX_PRCTL = _load_linux_prctl()
+
+
+def pdeathsig_preexec(parent_pid: int | None = None) -> Callable[[], None] | None:
+    """Return a Linux preexec_fn setting PR_SET_PDEATHSIG(SIGTERM); None off Linux."""
+    if not sys.platform.startswith("linux") or _LINUX_PRCTL is None:
+        return None
+    expected_ppid = os.getpid() if parent_pid is None else int(parent_pid)
+    prctl_fn = _LINUX_PRCTL
+    sig = int(signal.SIGTERM)
+
+    def _preexec() -> None:
+        prctl_fn(_PR_SET_PDEATHSIG, sig, 0, 0, 0)
+        if os.getppid() != expected_ppid:
+            os._exit(0)
+
+    return _preexec
+
+
 class RvClient:
     """Supervisor-side handle to the separate Reality View child process.
 
@@ -443,7 +487,7 @@ class RvClient:
     and performs only non-blocking copy-only slot handoff (no in-process render).
     """
 
-    def __init__(self, slot_bytes: int = 1024 * 1024, *, module: str = RV_RENDERER_MODULE) -> None:
+    def __init__(self, slot_bytes: int = RV_DEFAULT_SLOT_BYTES, *, module: str = RV_RENDERER_MODULE) -> None:
         self.module = str(module)
         self._ring = DoubleBufferSlotLayout(slot_bytes=slot_bytes)
         self._proc: subprocess.Popen[bytes] | None = None
@@ -460,11 +504,16 @@ class RvClient:
         if self.is_alive():
             return self.child_pid
         try:
+            popen_kw: dict[str, Any] = {}
+            preexec = pdeathsig_preexec(os.getpid())
+            if preexec is not None:
+                popen_kw["preexec_fn"] = preexec
             self._proc = subprocess.Popen(
                 [sys.executable, "-m", self.module, "--serve"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                **popen_kw,
             )
             self.note = f"reality-view: separate stub process pid={self._proc.pid} (placeholder active until live depth)"
             return self._proc.pid

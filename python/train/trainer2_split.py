@@ -25,7 +25,14 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from python.train.continual import HOLDOUT_GAP_S
+from python.train.continual import (
+    HOLDOUT_BUFFER_M,
+    HOLDOUT_CELL_M,
+    HOLDOUT_GAP_S,
+    _row_xy,
+    cell_holdout_labels,
+    cell_of,
+)
 
 FORMAT = "gvd-trainer2-split-1"
 RUN_FORMAT = "gvd-trainer2-run-1"
@@ -34,9 +41,15 @@ RUN_MANIFEST = "run_manifest.json"
 SPLITS = ("train", "holdout")
 DECISION_TIERS = ("iteration", "2.0")
 KEY_FIELDS = ("source", "i", "t", "map", "session")
+# PROPOSAL pending Michael (GVD call 2026-11-25, interpreting "held out of all
+# training"): the held-out map is also barred from the matched holdout used for
+# stage exit, model selection and the 25% RMS gate. False keeps held-out-map
+# rows out of train only. The choice is recorded in the manifest and hashed.
+BAR_HELDOUT_MAP_FROM_HOLDOUT = True
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 __all__ = [
+    "BAR_HELDOUT_MAP_FROM_HOLDOUT",
     "DECISION_TIERS",
     "FORMAT",
     "HOLDOUT_GAP_S",
@@ -103,26 +116,67 @@ def _row_map(row: Mapping[str, Any], source_maps: Mapping[str, Any]) -> str | No
     return str(value).strip()
 
 
+def _cell_key(label: Any) -> tuple[int, int]:
+    return (int(label[0]), int(label[1]))
+
+
+def _cells_block(cells: Mapping[str, Any]) -> dict[str, Any]:
+    """The listed holdout cells (a ``continual.choose_holdout_cells`` spec) as plain data."""
+    try:
+        listed = sorted({(int(c["cx"]), int(c["cy"])) for c in cells.get("cells") or []})
+        cell_m = float(cells.get("cell_m", HOLDOUT_CELL_M))
+        buffer_m = float(cells.get("buffer_m", HOLDOUT_BUFFER_M))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SplitError(f"cells spec is malformed: {exc}") from exc
+    if not listed:
+        raise SplitError("cells spec lists no holdout cell")
+    if not (math.isfinite(cell_m) and cell_m > 0 and math.isfinite(buffer_m) and buffer_m >= 0):
+        raise SplitError("cells spec needs a positive finite cell_m and a finite buffer_m >= 0")
+    return {
+        "cell_m": cell_m,
+        "buffer_m": buffer_m,
+        "listed": [list(c) for c in listed],
+        "train": [],
+        "holdout": [],
+    }
+
+
 def build_split_manifest(
     plan: Iterable[Mapping[str, Any]],
     *,
     source_maps: Mapping[str, Any] | None = None,
     heldout_map: str | None,
     gap_s: float = HOLDOUT_GAP_S,
+    cells: Mapping[str, Any] | None = None,
+    bar_heldout_from_holdout: bool = BAR_HELDOUT_MAP_FROM_HOLDOUT,
 ) -> dict[str, Any]:
     """Split manifest from a #187 pass plan (``continual.pass_plan`` / ``combined_pass_plan``).
 
     Each key is ``[source, i, t, map, session]``, sorted by (source, i), unique per split.
     A (source, i) in both splits is refused. A train row within ``gap_s`` of a
     holdout row of the same recording is purged (counted in ``purged_gap_rows``).
+    A recording that has holdout rows needs a finite ``t`` on every one of its
+    rows, train and holdout: without it the purge cannot be proven, so the build
+    is refused (never silently kept).
     Rows on ``heldout_map`` go to no split (counted in ``heldout_map_rows``).
+    With ``bar_heldout_from_holdout=False`` (PROPOSAL pending Michael) they are
+    barred from train only and stay in the holdout.
     When ``heldout_map`` is set, a row whose map is unknown is refused: the
     manifest cannot prove it is not on the held-out map.
+    ``cells`` (a ``continual.choose_holdout_cells`` spec, ``--holdout-cells``)
+    turns the geographic split on: every holdout row must sit in a listed cell,
+    every train row outside the listed cells and their ``buffer_m``. A train row
+    in the buffer or without a position is purged (counted in
+    ``purged_buffer_rows``); a train row inside a listed cell, or a holdout row
+    outside every listed cell, is refused.
     """
     maps = dict(source_maps or {})
     held_map = None if heldout_map is None or str(heldout_map).strip() == "" else str(heldout_map).strip()
+    cells_block = None if cells is None else _cells_block(cells)
     seen: dict[str, dict[tuple[str, int], tuple[float | None, str | None, tuple[str, str]]]] = {s: {} for s in SPLITS}
+    cell_of_key: dict[str, dict[tuple[str, int], tuple[int, int]]] = {s: {} for s in SPLITS}
     excluded: set[tuple[str, int]] = set()
+    purged_buffer = 0
     for item in plan:
         kind = str(item.get("kind") or "")
         if kind not in SPLITS:
@@ -135,14 +189,37 @@ def build_split_manifest(
                     f"row {key} has no map (no row 'map' and no source_maps entry); "
                     f"cannot prove it is not on held-out map {held_map!r}"
                 )
-            if held_map is not None and row_map == held_map:
+            if held_map is not None and row_map == held_map and (kind == "train" or bar_heldout_from_holdout):
                 excluded.add(key)
                 continue
+            if cells_block is not None:
+                label = cell_holdout_labels([row], cells, gap_s=0.0)[0]
+                if kind == "holdout" and label != "hold":
+                    raise SplitError(f"holdout row {key} is not inside a listed holdout cell (label {label!r})")
+                if kind == "train":
+                    if label == "hold":
+                        raise SplitError(f"train row {key} sits inside a listed holdout cell")
+                    if label == "gap":
+                        if key not in seen["train"]:
+                            purged_buffer += 1
+                        continue
+                xy = _row_xy(row)
+                if xy is None:  # unreachable: a hold/train label needs a position
+                    raise SplitError(f"row {key} has no position under a cells split")
+                cell_of_key[kind].setdefault(key, cell_of(xy, cells_block["cell_m"]))
             seen[kind].setdefault(key, (_time(row), row_map, _group(row)))
     both = sorted(set(seen["train"]) & set(seen["holdout"]))
     if both:
         raise SplitError(f"{len(both)} row(s) in both train and holdout, first {both[0]}")
     hold_times: dict[tuple[str, str], list[float]] = {}
+    hold_groups = {val[2] for val in seen["holdout"].values()}
+    for split in SPLITS:
+        for key, (stamp, _m, group) in seen[split].items():
+            if stamp is None and group in hold_groups:
+                raise SplitError(
+                    f"{split} row {key} has no finite t but its recording {group} has holdout rows; "
+                    f"the {gap_s:g} s gap cannot be enforced"
+                )
     for _key, (stamp, _m, group) in seen["holdout"].items():
         if stamp is not None:
             hold_times.setdefault(group, []).append(stamp)
@@ -159,6 +236,7 @@ def build_split_manifest(
     manifest: dict[str, Any] = {
         "format": FORMAT,
         "heldout_map": held_map,
+        "heldout_map_bars_holdout": bool(bar_heldout_from_holdout),
         "gap_s": gap,
         "purged_gap_rows": purged,
         "heldout_map_rows": len(excluded),
@@ -168,6 +246,11 @@ def build_split_manifest(
             [key[0], key[1], val[0], val[1], val[2][1]]
             for key, val in sorted(seen[split].items(), key=lambda kv: kv[0])
         ]
+    if cells_block is not None:
+        for split in SPLITS:
+            cells_block[split] = [list(cell_of_key[split][key]) for key in sorted(seen[split])]
+        manifest["cells"] = cells_block
+        manifest["purged_buffer_rows"] = purged_buffer
     manifest["sha256"] = manifest_sha256(manifest)
     check_split_manifest(manifest)
     return manifest
@@ -175,6 +258,29 @@ def build_split_manifest(
 
 def _keys(manifest: Mapping[str, Any], split: str) -> list[tuple[str, int]]:
     return [(str(k[0]), int(k[1])) for k in manifest.get(split) or []]
+
+
+def _check_cells(manifest: Mapping[str, Any]) -> None:
+    """Cells disjoint when the geographic split is on."""
+    block = manifest.get("cells")
+    if block is None:
+        return
+    try:
+        listed = {_cell_key(c) for c in block["listed"]}
+        per_split = {s: [_cell_key(c) for c in block[s]] for s in SPLITS}
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        raise SplitError(f"cells block is malformed: {exc}") from exc
+    if not listed:
+        raise SplitError("cells block lists no holdout cell")
+    for split in SPLITS:
+        if len(per_split[split]) != len(manifest.get(split) or []):
+            raise SplitError(f"cells block has {len(per_split[split])} {split} cells for {len(manifest.get(split) or [])} rows")
+    for key, cell in zip(manifest.get("train") or [], per_split["train"]):
+        if cell in listed:
+            raise SplitError(f"train row {key[:2]} is inside holdout cell {cell}")
+    for key, cell in zip(manifest.get("holdout") or [], per_split["holdout"]):
+        if cell not in listed:
+            raise SplitError(f"holdout row {key[:2]} is in cell {cell}, which is not a listed holdout cell")
 
 
 def check_split_manifest(manifest: Mapping[str, Any]) -> None:
@@ -197,11 +303,19 @@ def check_split_manifest(manifest: Mapping[str, Any]) -> None:
         raise SplitError(f"{len(both)} row(s) in both train and holdout, first {both[0]}")
     held_map = manifest.get("heldout_map")
     if held_map is not None:
+        bars_holdout = manifest.get("heldout_map_bars_holdout", True)
         for split in SPLITS:
             for key in manifest.get(split) or []:
-                if key[3] is None or str(key[3]) == str(held_map):
-                    raise SplitError(f"{split} row {key[:2]} is on held-out map {held_map!r} (or has no map)")
+                if key[3] is None:
+                    raise SplitError(f"{split} row {key[:2]} has no map; cannot prove it is not on held-out map {held_map!r}")
+                if str(key[3]) == str(held_map) and (split == "train" or bars_holdout):
+                    raise SplitError(f"{split} row {key[:2]} is on held-out map {held_map!r}")
     hold_times: dict[tuple[str, str], list[float]] = {}
+    hold_groups = {(str(key[0]), str(key[4])) for key in manifest.get("holdout") or []}
+    for split in SPLITS:
+        for key in manifest.get(split) or []:
+            if key[2] is None and (str(key[0]), str(key[4])) in hold_groups:
+                raise SplitError(f"{split} row {key[:2]} has no finite t in a recording with holdout rows")
     for key in manifest.get("holdout") or []:
         if key[2] is not None:
             hold_times.setdefault((str(key[0]), str(key[4])), []).append(float(key[2]))
@@ -210,6 +324,7 @@ def check_split_manifest(manifest: Mapping[str, Any]) -> None:
         near = hold_times.get((str(key[0]), str(key[4])))
         if key[2] is not None and near and min(abs(float(key[2]) - h) for h in near) < gap:
             raise SplitError(f"train row {key[:2]} is within the {gap:g} s gap of a holdout row")
+    _check_cells(manifest)
 
 
 def require_heldout_map(manifest: Mapping[str, Any]) -> str:
@@ -288,14 +403,19 @@ def preregister(
     seed: int,
     ssl_pretrain: bool,
     decision_tier: str,
-    registry: Path | str | None = None,
+    registry: Path | str,
 ) -> dict[str, Any]:
     """Write ``run_manifest.json`` before training. Returns it.
 
     The same run again (a resume) returns the existing manifest. Another seed
     for the same arm (split, config, SSL on/off, tier) is refused, in this
-    folder and in ``registry`` when given.
+    folder and in ``registry``. ``registry`` is required (keyword, no default):
+    a re-roll in a new run folder is only visible through a folder shared by
+    every run of the experiment, so a caller cannot forget it. Point it at one
+    directory per experiment, e.g. next to ``split_manifest.json``.
     """
+    if registry is None or str(registry).strip() == "":
+        raise SplitError("registry is required: pass the experiment's shared run registry folder")
     out = Path(out_dir)
     if decision_tier not in DECISION_TIERS:
         raise SplitError(f"decision tier {decision_tier!r} not in {DECISION_TIERS}")
@@ -327,21 +447,19 @@ def preregister(
         if old.get("seed") != run["seed"]:
             raise SplitError(f"{target} pre-registered seed {old.get('seed')}; seed {seed} would be a re-roll")
         raise SplitError(f"{target} pre-registered a different run; start a new folder for a new arm")
-    reg_file: Path | None = None
-    if registry is not None:
-        reg_dir = Path(registry)
-        reg_dir.mkdir(parents=True, exist_ok=True)
-        reg_file = reg_dir / f"{_arm(run)}.json"
-        if reg_file.exists():
-            prior = _load(reg_file, "run registry entry")
-            if int(prior.get("seed", -1)) != run["seed"]:
-                raise SplitError(
-                    f"arm already pre-registered with seed {prior.get('seed')} ({prior.get('out_dir')}); "
-                    f"seed {seed} would be a re-roll"
-                )
+    reg_dir = Path(registry)
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    reg_file = reg_dir / f"{_arm(run)}.json"
+    if reg_file.exists():
+        prior = _load(reg_file, "run registry entry")
+        if int(prior.get("seed", -1)) != run["seed"]:
+            raise SplitError(
+                f"arm already pre-registered with seed {prior.get('seed')} ({prior.get('out_dir')}); "
+                f"seed {seed} would be a re-roll"
+            )
     out.mkdir(parents=True, exist_ok=True)
     _write_atomic(target, run)
-    if reg_file is not None and not reg_file.exists():
+    if not reg_file.exists():
         _write_atomic(reg_file, {"seed": run["seed"], "out_dir": str(out.resolve()), "run_sha256": run["sha256"]})
     return run
 

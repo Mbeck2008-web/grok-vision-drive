@@ -459,6 +459,19 @@ def check_ssl_empty_split_refuses_when_trainer_trains() -> None:
     assert train_scene.ssl_empty_split_refusal(rec, []) is None
     assert train_scene.ssl_empty_split_refusal({"empty_split": False}, train_plan) is None
 
+    # Untagged 3 s (30 rows at 10 Hz): SSL's 4 s purge empties the train side, the trainer
+    # plan still has 24 train rows, so this is the exit-2 branch (not "SSL steps aside").
+    from python.data.cam_hold import plan_labels
+    from python.train.continual import CHUNK_MAX, pass_plan
+    from python.train.exp_ssl import ssl_rows_from_split
+
+    untagged = [{"i": i, "t": 0.1 * i, "dt_s": None if i == 0 else 0.1} for i in range(30)]
+    plan_3s = pass_plan(untagged, CHUNK_MAX, CHUNK_MAX // 2, blocks=1)
+    n_train_3s = sum(1 for v in plan_labels(plan_3s).values() if v == "train")
+    assert n_train_3s == 24 and not ssl_rows_from_split(untagged, {"multi": False}, holdout_blocks=1), (n_train_3s,)
+    msg_3s = train_scene.ssl_empty_split_refusal(rec, plan_3s)
+    assert msg_3s and "--no-ssl-pretrain" in msg_3s and "24 train rows" in msg_3s, msg_3s
+
     def run_cli(strips: Path, base: Path, *, no_rows_for_ssl: bool) -> tuple[int | None, str]:
         old = (data_root.free_bytes, os.environ.get("GVD_DATA_DIR"), sys.argv, exp_ssl.ssl_rows_from_split)
         data_root.free_bytes = lambda _path: 500 * 1024 ** 3
@@ -491,11 +504,26 @@ def check_ssl_empty_split_refuses_when_trainer_trains() -> None:
         assert "scene schedule" not in text and not list((base / "ck").glob("*.npz")), "training must not have started"
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
-        strips = _short_recording(base, 30)  # 3 s: SSL 0 rows and the trainer plan 0 train rows too
+        # Drop the segment tag: a plain 3 s (30-row) plan has 24 trainer train rows and 0 SSL rows.
+        strips = _short_recording(base, 30)
+        state = strips / "state.jsonl"
+        rows = [json.loads(line) for line in state.read_text(encoding="utf-8").splitlines() if line.strip()]
+        for row in rows:
+            row.pop("segment", None)
+        state.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        code, text = run_cli(strips, base, no_rows_for_ssl=False)
+        assert code == 2, (code, text)
+        assert "--no-ssl-pretrain" in text and "24 train rows" in text, text
+        assert "scene schedule" not in text and not list((base / "ck").glob("*.npz")), "training must not have started"
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        # Same 30 rows with the fixture's segment tag: the short-segment startup plan has 0 train
+        # windows, so SSL steps aside and the trainer reports (it still vals the holdout tail).
+        strips = _short_recording(base, 30)
         code, text = run_cli(strips, base, no_rows_for_ssl=False)
         assert code is None and "0 train rows; no stem" in text, (code, text)
         assert "default SSL pretraining has 0 train rows" not in text, "no refusal when the trainer has nothing to train either"
-    print("empty SSL split + trainer plan with 56 train rows -> exit 2 naming --no-ssl-pretrain before training; both 0 -> SSL steps aside OK")
+    print("empty SSL split: untagged 3 s plan (24 trainer / 0 SSL) exits 2 naming --no-ssl-pretrain; segmented 3 s (0/0) steps aside; 120-row stub also exits 2 OK")
 
 
 def check_ssl_recorded_in_stats_and_ckpt() -> None:
@@ -532,7 +560,21 @@ def check_ssl_recorded_in_stats_and_ckpt() -> None:
                     assert rec["on"] is False and rec["key"] is None, rec
                 else:
                     assert rec["on"] is True and rec["key"] == "feedface00000001" and rec["rows"] == 7 and rec["reused"] is True, rec
-    print("ssl record: stats['ssl'] and every ckpt meta['ssl'] carry on/why/key/rows/reused (off when not requested) OK")
+        # No training rows: the early `_empty()` return must still carry stats["ssl"].
+        empty = base / "empty"
+        empty.mkdir()
+        (empty / "state.jsonl").write_text("", encoding="utf-8")
+        (empty / "gt.jsonl").write_text("", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            empty_stats = train_directory(empty, epochs=1, lr=1e-5, capability=None, export_path=None, free_vram_bytes=0,
+                                          free_ram_bytes=8_000_000_000, resume=False, open_panel=False, autostart=True,
+                                          cams=("main",), heads=("lane_gt",), augment=False, workers=0, min_valid=0.0,
+                                          holdout_blocks=1, scale=SCALE, status_root=base / "st_empty",
+                                          ssl_meta=runs["on"])
+        assert empty_stats["windows"] == 0 and empty_stats["strips"] == 0, empty_stats
+        rec = empty_stats["ssl"]
+        assert rec["on"] is True and rec["key"] == "feedface00000001" and rec["rows"] == 7 and rec["reused"] is True, rec
+    print("ssl record: stats['ssl'] and every ckpt meta['ssl'] carry on/why/key/rows/reused; the no-rows _empty() return includes ssl too OK")
 
 
 def check_ssl_oom_exits_2_and_releases_cuda() -> None:
@@ -546,9 +588,18 @@ def check_ssl_oom_exits_2_and_releases_cuda() -> None:
     import python.train.scene_net as scene_net
 
     oom = torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
+    oom_str = RuntimeError("CUDA error: out of memory")
+    assert train_scene._is_cuda_oom(oom) is True
+    assert train_scene._is_cuda_oom(oom_str) is True
+    assert train_scene._is_cuda_oom(RuntimeError("boom: not memory")) is False
     # main(): OOM -> exit 2, message names the opt-out, train_directory never runs.
     with tempfile.TemporaryDirectory() as tmp:
         h = _MainHarness(Path(tmp), ssl_error=oom)
+        code, text = h.run([])
+        assert code == 2 and not h.kw and "--no-ssl-pretrain" in text and "out of GPU memory" in text, (code, h.kw, text)
+        # String-match fallback through main(): a plain RuntimeError (not torch.cuda.OutOfMemoryError).
+        assert not isinstance(oom_str, torch.cuda.OutOfMemoryError)
+        h = _MainHarness(Path(tmp), ssl_error=oom_str)
         code, text = h.run([])
         assert code == 2 and not h.kw and "--no-ssl-pretrain" in text and "out of GPU memory" in text, (code, h.kw, text)
         h = _MainHarness(Path(tmp), ssl_error=RuntimeError("boom: not memory"))
@@ -618,7 +669,7 @@ def check_ssl_oom_exits_2_and_releases_cuda() -> None:
     finally:
         torch.cuda.empty_cache = saved[1]
     assert calls == [], "a CPU stage has no CUDA cache to release"
-    print("ssl OOM: main exits 2 naming --no-ssl-pretrain (train_directory not run); empty_cache runs after the stage on ok and OOM; non-OOM errors propagate OK")
+    print("ssl OOM: main exits 2 naming --no-ssl-pretrain on OutOfMemoryError and on RuntimeError('CUDA error: out of memory'); empty_cache after the stage on ok and OOM; non-OOM errors propagate OK")
 
 
 def check_ssl_stem_key_tracks_recipe_and_content() -> None:

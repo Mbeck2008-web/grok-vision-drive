@@ -50,6 +50,12 @@ YAW_MAX_DEG_PER_100M = 2.0
 # reconstruct the GT path this closely. Stated up front; not tuned after a run.
 REPLAY_MAX_M_PER_100M = 0.3
 REPLAY_MAX_DEG_PER_100M = 0.3
+# sbr / electric_800: state pos is the BeamNG jbeam ref node, not the bicycle-model
+# (no-sideslip / rear-axle) point that a heading-aligned integrator tracks.
+# Metres the ref node sits forward of that point, measured on the dev clip
+# clip_015 as median(-v_lat / yaw_rate) on turning frames. Not measured on
+# clip_028 or clip_008.
+SBR_REF_AHEAD_OF_AXLE_M = 1.76
 MS_PER_FRAME_MAX = 100.0
 
 
@@ -162,18 +168,15 @@ def _drift(d: Path, subdir: str):
     for i in range(1, len(state)):
         cur = gray(state[i])
         dt = float(state[i]["ego"]["sim_t"] - state[i - 1]["ego"]["sim_t"])
-        o.step(float(state[i]["veh"]["wheelspeed"]), dt, M.camera_yaw_delta(prev, cur, fx))
-        travel += math.dist(gt[i]["pos"][:2], gt[i - 1]["pos"][:2])
+        # Magnitude from wheelspeed; sign from the GT axle step (eval-only).
+        # Runtime wheel speed is unsigned — see the GT_Y7 docstring.
+        dist, _dyaw = _signed_axle_step(gt[i - 1], gt[i])
+        speed = math.copysign(float(state[i]["veh"]["wheelspeed"]), dist if dist != 0.0 else 1.0)
+        o.step(speed, dt, M.camera_yaw_delta(prev, cur, fx))
+        travel += abs(dist)
         prev = cur
-    h0 = heading(gt[0])
-    dx, dy = gt[-1]["pos"][0] - gt[0]["pos"][0], gt[-1]["pos"][1] - gt[0]["pos"][1]
-    gx = math.sin(h0) * dx - math.cos(h0) * dy
-    gy = math.cos(h0) * dx + math.sin(h0) * dy
-    gh = _wrap(heading(gt[-1]) - h0)
-    x, y, h = o.pose()
-    err_m = math.hypot(x - gx, y - gy)
-    yaw_err = _wrap(h - gh)
-    return travel, 100.0 * err_m / travel, 100.0 * math.degrees(abs(yaw_err)) / travel, err_m, math.degrees(yaw_err)
+    err_m, yaw_deg, m100, d100 = _score_end_axle(o, gt, travel)
+    return travel, m100, d100, err_m, yaw_deg
 
 
 def check_gt_y6_drift_clip008():
@@ -191,19 +194,43 @@ def _gt_heading(g) -> float:
     return math.atan2(g["dir"][1], g["dir"][0])
 
 
-def _score_end(o: M.EgoOdometry, gt, travel: float):
-    """End-point error in the ego-0 frame, same convention as test_rv_ego_motion GT_E12."""
+def _fwd_xy(g) -> np.ndarray:
+    d = np.asarray(g["dir"][:2], np.float64)
+    n = float(np.linalg.norm(d))
+    if n < 1e-12:
+        raise ValueError("zero-length GT dir")
+    return d / n
+
+
+def _axle_xy(g, ahead_m: float = SBR_REF_AHEAD_OF_AXLE_M) -> np.ndarray:
+    """No-sideslip (rear-axle) point: ref-node pos pulled back along body heading."""
+    return np.asarray(g["pos"][:2], np.float64) - float(ahead_m) * _fwd_xy(g)
+
+
+def _signed_axle_step(prev, cur, ahead_m: float = SBR_REF_AHEAD_OF_AXLE_M) -> tuple[float, float]:
+    """(signed axle displacement along mid-heading, body yaw change).
+
+    The sign is from the GT pose (eval-only). At runtime wheel speed is unsigned;
+    reversing would need a sign source (gear is not camera-only).
+    """
+    dyaw = _wrap(_gt_heading(cur) - _gt_heading(prev))
+    mid = _gt_heading(prev) + 0.5 * dyaw
+    fwd = np.array([math.cos(mid), math.sin(mid)])
+    dist = float((_axle_xy(cur, ahead_m) - _axle_xy(prev, ahead_m)) @ fwd)
+    return dist, dyaw
+
+
+def _score_end_axle(o: M.EgoOdometry, gt, travel: float, ahead_m: float = SBR_REF_AHEAD_OF_AXLE_M):
+    """End-point error of the no-sideslip point in the ego-0 frame (GT_E12 convention)."""
     h0 = _gt_heading(gt[0])
-    dx, dy = gt[-1]["pos"][0] - gt[0]["pos"][0], gt[-1]["pos"][1] - gt[0]["pos"][1]
-    gx = math.sin(h0) * dx - math.cos(h0) * dy
-    gy = math.cos(h0) * dx + math.sin(h0) * dy
+    end = _axle_xy(gt[-1], ahead_m) - _axle_xy(gt[0], ahead_m)
+    gx = math.sin(h0) * end[0] - math.cos(h0) * end[1]
+    gy = math.cos(h0) * end[0] + math.sin(h0) * end[1]
     gh = _wrap(_gt_heading(gt[-1]) - h0)
     x, y, h = o.pose()
     err_m = math.hypot(x - gx, y - gy)
     yaw_err = _wrap(h - gh)
-    m100 = 100.0 * err_m / travel
-    d100 = 100.0 * math.degrees(abs(yaw_err)) / travel
-    return err_m, math.degrees(yaw_err), m100, d100
+    return err_m, math.degrees(yaw_err), 100.0 * err_m / travel, 100.0 * math.degrees(abs(yaw_err)) / travel
 
 
 def _load_gt_clip(name: str, subdir: str):
@@ -223,6 +250,13 @@ def check_gt_y7_integrator_replay():
     Tolerance, stated before any run and not tuned: <= 0.3 m per 100 m and
     <= 0.3 deg per 100 m on both clip_028 and clip_008. A miss is an
     integrator or harness bug, not a reason to loosen the 2.0 / 2.0 camera-yaw bar.
+
+    The GT ``pos`` is the BeamNG ref node, about SBR_REF_AHEAD_OF_AXLE_M forward
+    of the no-sideslip point a heading-aligned integrator tracks; that offset
+    swings in yaw. Step distance is the signed displacement of the no-sideslip
+    point along the mid-heading (needed on clip_008's reverse start). Sign comes
+    from GT (eval-only). Runtime wheelspeed is unsigned; a live sign would need
+    a source (gear is not camera-only). EgoOdometry already uses a midpoint step.
     """
     clips = ((CLIP_A, "clip028"), (CLIP_B, "clip008"))
     found = 0
@@ -236,13 +270,12 @@ def check_gt_y7_integrator_replay():
         o = M.EgoOdometry()
         travel = 0.0
         for i in range(1, len(gt)):
-            dist = math.dist(gt[i]["pos"][:2], gt[i - 1]["pos"][:2])
-            dyaw = _wrap(_gt_heading(gt[i]) - _gt_heading(gt[i - 1]))
-            # GT step distance as speed*dt (dt = 1, speed = dist). Unsigned path length.
+            # GT yaw + signed GT step distance of the no-sideslip point (not the ref node).
+            dist, dyaw = _signed_axle_step(gt[i - 1], gt[i])
             o.step(dist, 1.0, dyaw)
-            travel += dist
+            travel += abs(dist)
         assert travel >= 1.0, travel
-        err_m, yaw_deg, m100, d100 = _score_end(o, gt, travel)
+        err_m, yaw_deg, m100, d100 = _score_end_axle(o, gt, travel)
         print(f"  {name} GT-replay: travel {travel:.2f} m, end err {err_m:.3f} m "
               f"({m100:.3f} m/100m), yaw err {yaw_deg:.3f} deg ({d100:.3f} deg/100m)")
         results.append((name, m100, d100))
@@ -261,24 +294,22 @@ def check_dev_clip015_info():
     from PIL import Image  # test-only
 
     fx = float(state[1]["cams"]["main"]["K"][0])
+    # Treat state ego as the EVAL_ONLY GT pose (same fields) for the axle harness.
+    gt = [{"pos": s["ego"]["pos"], "dir": s["ego"]["dir"]} for s in state]
     o = M.EgoOdometry()
     travel = 0.0
     prev = np.asarray(Image.open(DEV_CLIP / state[0]["cams"]["main"]["file"]).convert("L"), np.float64) / 255.0
     for i in range(1, len(state)):
         cur = np.asarray(Image.open(DEV_CLIP / state[i]["cams"]["main"]["file"]).convert("L"), np.float64) / 255.0
-        o.step(float(state[i]["veh"]["wheelspeed"]), float(state[i]["ego"]["sim_t"] - state[i - 1]["ego"]["sim_t"]),
-               M.camera_yaw_delta(prev, cur, fx))
-        travel += math.dist(state[i]["ego"]["pos"][:2], state[i - 1]["ego"]["pos"][:2])
+        dt = float(state[i]["ego"]["sim_t"] - state[i - 1]["ego"]["sim_t"])
+        dist, _dyaw = _signed_axle_step(gt[i - 1], gt[i])
+        speed = math.copysign(float(state[i]["veh"]["wheelspeed"]), dist if dist != 0.0 else 1.0)
+        o.step(speed, dt, M.camera_yaw_delta(prev, cur, fx))
+        travel += abs(dist)
         prev = cur
-    h0 = math.atan2(state[0]["ego"]["dir"][1], state[0]["ego"]["dir"][0])
-    dx = state[-1]["ego"]["pos"][0] - state[0]["ego"]["pos"][0]
-    dy = state[-1]["ego"]["pos"][1] - state[0]["ego"]["pos"][1]
-    gx, gy = math.sin(h0) * dx - math.cos(h0) * dy, math.cos(h0) * dx + math.sin(h0) * dy
-    gh = _wrap(math.atan2(state[-1]["ego"]["dir"][1], state[-1]["ego"]["dir"][0]) - h0)
-    x, y, h = o.pose()
-    em = math.hypot(x - gx, y - gy)
-    print(f"  clip_015 (dev, info only): travel {travel:.1f} m, end err {em:.2f} m ({100*em/travel:.2f} m/100m), "
-          f"yaw err {math.degrees(_wrap(h-gh)):.2f} deg ({100*abs(math.degrees(_wrap(h-gh)))/travel:.2f} deg/100m)")
+    err_m, yaw_deg, m100, d100 = _score_end_axle(o, gt, travel)
+    print(f"  clip_015 (dev, info only): travel {travel:.1f} m, end err {err_m:.2f} m ({m100:.2f} m/100m), "
+          f"yaw err {yaw_deg:.2f} deg ({d100:.2f} deg/100m)")
 
 
 def main() -> None:

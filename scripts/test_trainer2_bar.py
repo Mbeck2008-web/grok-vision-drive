@@ -7,8 +7,8 @@ check_slice_rules_table_pins_what_a_card_may_claim, check_slice_rules_table_matc
 check_unlabelable_slices_config_proposal_pending_michael,
 check_iteration_bar_requires_labelable_slices_and_missed, check_slice_rules_are_frozen,
 check_unmeasured_is_not_passing, check_unknown_intervention_kind_raises,
-check_backstop_config_proposal_pending_michael (AEB and hand-rule activations count as
-interventions: GVD call 2026-11-25, a PROPOSAL pending Michael), check_drive_record_gates.
+check_backstop_config_decided_michael (AEB and hand-rule activations are tallied but do
+not count as interventions: DECIDED, Michael 2026-11-26), check_drive_record_gates.
 Pure Python.
 """
 from __future__ import annotations
@@ -113,7 +113,11 @@ def check_intervention_tally() -> None:
 
     assert set(INTERVENTION_KINDS) == {
         "takeover", "collision", "missed_stop_sign", "missed_red_light", "curb_strike", "aeb", "hand_rule"}
-    t = tally_interventions([{"kind": "aeb", "t": 3.0}, {"kind": "hand_rule", "t": 9.0}, {"kind": "takeover", "t": 12.0}])
+    events = [{"kind": "aeb", "t": 3.0}, {"kind": "hand_rule", "t": 9.0}, {"kind": "takeover", "t": 12.0}]
+    t = tally_interventions(events)  # default: backstop tallied, not counted (DECIDED Michael 2026-11-26)
+    assert t == {"takeover": 1, "collision": 0, "missed_stop_sign": 0, "missed_red_light": 0, "curb_strike": 0,
+                 "aeb": 1, "hand_rule": 1, "backstop": 2, "total": 1}, t
+    t = tally_interventions(events, count_backstop=True)
     assert t == {"takeover": 1, "collision": 0, "missed_stop_sign": 0, "missed_red_light": 0, "curb_strike": 0,
                  "aeb": 1, "hand_rule": 1, "backstop": 2, "total": 3}, t
     try:
@@ -139,7 +143,7 @@ def check_2_0_bar_not_claimed_without_iqu45_drive() -> None:
         "drive_minutes": [_drive("day"), _drive("night", minutes=29.9)],
         "heldout_map": [_drive("day"), _drive("night", mapname="italy")],
         "random_traffic": [_drive("day"), _drive("night", traffic=False)],
-        "interventions": [_drive("day"), _drive("night", events=[{"kind": "aeb", "t": 100.0}])],
+        "interventions": [_drive("day"), _drive("night", events=[{"kind": "takeover", "t": 100.0}])],
     }
     for why, drives in cases.items():
         res = naming_bar(new, prev, split_manifest=split, drives=drives)
@@ -419,33 +423,36 @@ def check_unknown_intervention_kind_raises() -> None:
     print("interventions: unknown or mis-cased event kinds raise instead of reading as a clean drive OK")
 
 
-def check_backstop_config_proposal_pending_michael() -> None:
-    """OPEN QUESTION, PROPOSAL pending Michael: do AEB / hand-rule activations count as interventions?
+def check_backstop_config_decided_michael() -> None:
+    """DECIDED (Michael 2026-11-26): AEB / hand-rule activations do NOT count as interventions.
 
-    Default True is GVD's 2026-11-25 call, not his ruling. Both settings are pinned so his answer is a
-    one-line change of BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS.
+    They are still tallied and reported under ``backstop``. Both settings stay pinned
+    (``count_backstop=True`` still counts them).
     """
     from python.train import trainer2_bar as bar
 
-    assert bar.BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS is True  # PROPOSAL pending Michael
+    assert bar.BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS is False  # DECIDED (Michael 2026-11-26)
     assert bar.BACKSTOP_KINDS == ("aeb", "hand_rule")
     events = [{"kind": "aeb", "t": 1.0}, {"kind": "hand_rule", "t": 2.0}]
-    on = bar.tally_interventions(events)
+    on = bar.tally_interventions(events, count_backstop=True)
     off = bar.tally_interventions(events, count_backstop=False)
+    assert bar.tally_interventions(events) == off  # the default is the decided setting
     assert on["total"] == 2 and on["backstop"] == 2, on
     assert off["total"] == 0 and off["backstop"] == 2 and off["aeb"] == 1 and off["hand_rule"] == 1, off
     assert bar.tally_interventions([{"kind": "collision"}], count_backstop=False)["total"] == 1
     new, prev = _card(0.15), _card(0.20)
     split = {"heldout_map": "utah"}
     drives = [_drive("day"), _drive("night", events=events)]
-    counted = bar.naming_bar(new, prev, split_manifest=split, drives=drives)
+    default = bar.naming_bar(new, prev, split_manifest=split, drives=drives)
+    assert default["name"] == "2.0" and default["interventions"][1]["backstop"] == 2, default
+    counted = bar.naming_bar(new, prev, split_manifest=split, drives=drives, count_backstop=True)
     assert counted["name"] == "1.x" and any(f.startswith("interventions:") for f in counted["fail"]), counted
     reported = bar.naming_bar(new, prev, split_manifest=split, drives=drives, count_backstop=False)
     assert reported["name"] == "2.0", reported
     assert reported["interventions"][1]["backstop"] == 2, reported["interventions"]  # still reported
     core = [_drive("day"), _drive("night", events=[{"kind": "curb_strike", "t": 5.0}])]
     assert bar.naming_bar(new, prev, split_manifest=split, drives=core, count_backstop=False)["name"] == "1.x"
-    print("backstop: AEB / hand-rule count as interventions by default (PROPOSAL pending Michael); both settings pinned OK")
+    print("backstop: AEB / hand-rule tallied but not counted by default (DECIDED Michael 2026-11-26); both settings pinned OK")
 
 
 def check_drive_record_gates() -> None:
@@ -624,7 +631,7 @@ def main() -> int:
         check_unlabelable_slices_config_proposal_pending_michael,
         check_unmeasured_is_not_passing,
         check_unknown_intervention_kind_raises,
-        check_backstop_config_proposal_pending_michael,
+        check_backstop_config_decided_michael,
         check_drive_record_gates,
     )
     failed = 0

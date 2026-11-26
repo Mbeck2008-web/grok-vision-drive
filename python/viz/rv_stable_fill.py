@@ -349,6 +349,52 @@ def ground_clamp(cam: CameraPose, depth: np.ndarray, *, ground_z: float = 0.0, m
     return np.where(clamp, zmax, d), clamp
 
 
+ROAD_CLASS_IDS: tuple[int, ...] = (2,)   # net semantic id for drivable road (clip015: GT/ground-hit 0.86-1.04)
+ROAD_SNAP_MAX_M: float = 25.0           # beyond this the flat-ground assumption and the coarse class grid get unsafe
+ROAD_SNAP_ERODE_PX: int = 4             # stay this many px inside the road class (12x16 class grid edges are blocky)
+
+
+def _erode(mask: np.ndarray, r: int) -> np.ndarray:
+    """Square binary erosion (radius ``r`` px), numpy only; outside the image counts as False."""
+    m = np.asarray(mask, bool)
+    if r <= 0:
+        return m.copy()
+    h, w = m.shape
+    pad = np.zeros((h + 2 * r, w + 2 * r), bool)
+    pad[r:r + h, r:r + w] = m
+    rows = np.ones((h + 2 * r, w), bool)
+    for k in range(2 * r + 1):
+        rows &= pad[:, k:k + w]
+    out = np.ones((h, w), bool)
+    for k in range(2 * r + 1):
+        out &= rows[k:k + h]
+    return out
+
+
+def road_snap(cam: CameraPose, depth: np.ndarray, road: np.ndarray, *, ground_z: float = 0.0,
+              max_hit_m: float = ROAD_SNAP_MAX_M, erode_px: int = ROAD_SNAP_ERODE_PX) -> tuple[np.ndarray, np.ndarray]:
+    """Road pixels lie on the road: replace their depth with the exact ground-plane hit.
+
+    The net's depth is a 12x16 grid per crop, upsampled; across the near road the true depth changes
+    by ~10x over a few grid rows, so the upsampled road bends (below the road near the car, above it
+    farther out) and the main/wide seams on the road do not meet. For pixels the net labels road, the
+    camera mount already gives the answer at full resolution. Only pixels ``erode_px`` inside the
+    road label, with a downward ray hitting within ``max_hit_m``, are snapped. Returns (depth, mask).
+    """
+    d = np.asarray(depth, np.float64)
+    rd = np.asarray(road, bool)
+    if d.shape != (cam.height, cam.width) or rd.shape != d.shape:
+        raise ValueError(f"depth {d.shape} / road {rd.shape} must be the camera shape {(cam.height, cam.width)}")
+    h = float(cam.pos[2]) - float(ground_z)
+    if not (h > 0 and math.isfinite(h)):
+        return d.copy(), np.zeros(d.shape, bool)
+    dz = _pixel_rays(cam)[..., 2]
+    down = dz < -1e-6
+    hit = np.where(down, h / np.where(down, -dz, 1.0), np.inf)
+    snap = _erode(rd, int(erode_px)) & down & (hit <= float(max_hit_m))
+    return np.where(snap, hit, d), snap
+
+
 def unproject(cam: CameraPose, depth: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
     d = np.asarray(depth, np.float64)[ys, xs]
     xc = ((xs + 0.5 - cam.cx) / cam.fx) * d

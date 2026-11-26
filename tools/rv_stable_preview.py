@@ -19,7 +19,8 @@ ap.add_argument("--width", type=int, default=480); ap.add_argument("--height", t
 ap.add_argument("--chase", default="damped", choices=["rigid", "damped"]); ap.add_argument("--omega", type=float, default=1.5)
 ap.add_argument("--depth-filter", type=int, default=1); ap.add_argument("--grid", type=int, default=1)
 ap.add_argument("--fill", type=int, default=1); ap.add_argument("--sky", type=int, default=1); ap.add_argument("--prior", type=int, default=1)
-ap.add_argument("--ground-clamp", type=int, default=1)
+ap.add_argument("--ground-clamp", type=int, default=1); ap.add_argument("--clamp-margin", type=float, default=1.0)
+ap.add_argument("--road-snap", type=int, default=1)
 ap.add_argument("--max-depth", choices=["v2", "cap"], default="cap", help="v2: drop depth >= 120 m (old). cap: per-cam cap, far drawn at cap")
 ap.add_argument("--pose-src", default="vo", choices=["vo", "gt"]); ap.add_argument("--depth-src", default="pred", choices=["pred", "gt"])
 ap.add_argument("--classify-dir", default=""); ap.add_argument("--classify-crop", default="0,0,960,540")
@@ -44,6 +45,7 @@ def proc_res(c):
 CAM_POSE = {}
 CLAMP_STATS: dict = {}
 FAR_STATS: dict = {}
+SNAP_STATS: dict = {}
 for cid, c in cams_json.items():
     if cid in CAMS:
         pw, ph = proc_res(c)
@@ -63,7 +65,7 @@ def cam_frame(cam, idx):
     bgr = cv2.imread(str(root / "raw" / cam / "000" / f"{idx:06d}.png"), cv2.IMREAD_COLOR)
     rgb = cv2.cvtColor(cv2.resize(bgr, (pw, ph), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
     fs = (fy_full(c) * 192.0 / H0) / FY_REF
-    inv_acc = np.zeros((ph, pw)); wacc = np.zeros((ph, pw)); sky = np.zeros((ph, pw), bool)
+    inv_acc = np.zeros((ph, pw)); wacc = np.zeros((ph, pw)); sky = np.zeros((ph, pw), bool); road = np.zeros((ph, pw), bool)
     k = 0
     while f"{cam}/{idx}/{k}/d" in P.files:
         x0, cw = P[f"{cam}/{idx}/{k}/x0"]; d = P[f"{cam}/{idx}/{k}/d"] * fs; s = P[f"{cam}/{idx}/{k}/s"]
@@ -71,6 +73,7 @@ def cam_frame(cam, idx):
         inv_acc[:, a0:a1] += cv2.resize((1.0 / np.maximum(d, 0.1)).astype(np.float32), (a1 - a0, ph), interpolation=cv2.INTER_LINEAR)
         wacc[:, a0:a1] += 1
         sky[:, a0:a1] |= cv2.resize((s == SKY).astype(np.uint8), (a1 - a0, ph), interpolation=cv2.INTER_NEAREST) > 0
+        road[:, a0:a1] |= cv2.resize(np.isin(s, S.ROAD_CLASS_IDS).astype(np.uint8), (a1 - a0, ph), interpolation=cv2.INTER_NEAREST) > 0
         k += 1
     if k == 0:
         return None
@@ -81,8 +84,12 @@ def cam_frame(cam, idx):
         depth = np.where(g > 0, g, np.inf)
         sky = ~(g > 0) | (g >= min(c["far_m"] * S.GT_NO_HIT_FRAC, 655.0))  # far plane / uint16 cm saturation = no hit
     clamp_frac = 0.0
+    snapped = np.zeros((ph, pw), bool)
+    if a.road_snap and a.depth_src != "gt":
+        depth, snapped = S.road_snap(CAM_POSE[cam], depth, road & ~sky)
+    SNAP_STATS.setdefault(cam, []).append(float(np.mean(snapped)))
     if a.ground_clamp and a.depth_src != "gt":
-        depth, cl = S.ground_clamp(CAM_POSE[cam], depth)
+        depth, cl = S.ground_clamp(CAM_POSE[cam], depth, margin=a.clamp_margin)
         clamp_frac = float(np.mean(cl & ~sky))
     CLAMP_STATS.setdefault(cam, []).append(clamp_frac)
     # depth edges: re-place edge pixels on the far side (local max), so no sheet joins fg and bg
@@ -90,7 +97,7 @@ def cam_frame(cam, idx):
     gy, gx = np.gradient(inv)
     cut = np.hypot(gx, gy) > 0.12 * inv
     far_side = cv2.dilate(depth.astype(np.float32), np.ones((5, 5), np.uint8))
-    depth = np.where(cut & ~sky, far_side, depth)
+    depth = np.where(cut & ~sky & ~snapped, far_side, depth)
     if a.max_depth == "cap":
         cap = S.depth_cap_m(c["far_m"])
         depth, farm = S.far_to_cap(depth, sky, cap)
@@ -225,6 +232,7 @@ fr = sorted((out / "frames").glob("f*.png"))
 if len(fr) >= 3:
     res["temporal_jitter"] = round(S.temporal_jitter([cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB) for f in fr]), 4)
 res["ground_clamp_frac_by_cam"] = {c: round(float(np.mean(v)), 5) for c, v in CLAMP_STATS.items()}
+res["road_snap_frac_by_cam"] = {c: round(float(np.mean(v)), 5) for c, v in SNAP_STATS.items()}
 res["far_at_cap_frac_by_cam"] = {c: round(float(np.mean(v)), 5) for c, v in FAR_STATS.items()}
 res["depth_cap_m_by_cam"] = {c: round(S.depth_cap_m(cams_json[c]["far_m"]), 2) for c in CAMS}
 res["config"] = vars(a)

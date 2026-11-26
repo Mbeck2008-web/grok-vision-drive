@@ -17,6 +17,10 @@ S5 classify_unknown: fractions sum to the unknown fraction and each cause lands 
 S7 ground clamp: a camera cannot see below the road. Depth farther than the downward ray's
    ground-plane hit (wide cam 88.7 deg vFOV, pitch -8, 1.24 m up) is capped there (x margin);
    true road, nearer surfaces (hood, walls) and rays at/above the horizon are untouched.
+S9 road is flat: net-labelled road pixels (>= 4 px inside the label, downward ray hitting within
+   25 m) are placed exactly on the ground plane, whatever the coarse net depth says, so the near road
+   cannot bend down/up and two cameras' road meets; road label edges, road beyond 25 m, non-road and
+   upward rays are left alone.
 S8 draw distance: per-cam cap = min(GT far plane x 0.995, depth-head far class 250 m)
    (narrow 250, main/wide 250, 100 m cams 99.5); non-sky pixels beyond the cap or +inf are
    drawn AT the cap (kept, not dropped); sky stays sky; nearer depth is untouched.
@@ -253,6 +257,34 @@ def check_far_drawn_at_cap() -> None:
         pass
 
 
+def check_road_snap() -> None:
+    cam = camera_from_angles("wide", (0.0, 1.5, 1.24), 0.0, -8.0, 88.7, 160, 90, near_m=0.05, far_m=300.0)
+    ys, xs = np.mgrid[0:90, 0:160]
+    rays = sf._pixel_rays(cam); dz = rays[..., 2]
+    hit = np.where(dz < -1e-6, 1.24 / np.where(dz < -1e-6, -dz, 1.0), np.inf)
+    # net-like bent road: 2.5x too far at the bottom, 0.5x too near mid-way (the clip015 tunnel shape)
+    bend = np.interp(ys, [0, 45, 89], [1.0, 0.5, 2.5])
+    raw = np.where(np.isfinite(hit), hit * bend, 80.0)
+    road = (ys >= 40) & (xs >= 30) & (xs < 130)
+    out, m = sf.road_snap(cam, raw, road)
+    core = sf._erode(road, sf.ROAD_SNAP_ERODE_PX) & (dz < -1e-6) & (hit <= sf.ROAD_SNAP_MAX_M)
+    assert m.tolist() == core.tolist() and core.sum() > 1000
+    z = cam.pos[2] + out * dz
+    assert np.max(np.abs(z[m])) < 1e-9, "snapped road must lie on the ground plane"
+    zr = cam.pos[2] + raw * dz
+    assert np.max(np.abs(zr[core])) > 0.5, "fixture must actually bend"
+    assert np.array_equal(out[~m], raw[~m]), "non-road / label edge / far road untouched"
+    edge = road & ~sf._erode(road, sf.ROAD_SNAP_ERODE_PX)
+    assert edge.any() and not m[edge].any(), "label edge is not snapped"
+    far_road = road & (hit > sf.ROAD_SNAP_MAX_M) & np.isfinite(hit)
+    assert far_road.any() and not m[far_road].any(), "road beyond 25 m is not snapped"
+    try:
+        sf.road_snap(cam, raw, road[:, :10])
+        raise AssertionError("shape mismatch must raise")
+    except ValueError:
+        pass
+
+
 def check_flag_and_deps() -> None:
     assert sf.STABLE_FILL_DEFAULT_ON is False
     tree = ast.parse(MOD.read_text(encoding="utf-8"))
@@ -297,6 +329,10 @@ def test_far_drawn_at_cap() -> None:
     check_far_drawn_at_cap()
 
 
+def test_road_snap() -> None:
+    check_road_snap()
+
+
 def test_flag_and_deps() -> None:
     check_flag_and_deps()
 
@@ -304,7 +340,7 @@ def test_flag_and_deps() -> None:
 if __name__ == "__main__":
     for fn in (check_metrics, check_damped_view_less_jitter, check_damped_follows_turn,
                check_depth_filter_flicker_and_reset, check_compose_explains_every_pixel,
-               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_flag_and_deps):
+               check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

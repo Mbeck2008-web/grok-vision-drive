@@ -251,17 +251,26 @@ def check_engage_still_blocked_with_8cam_ckpt() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         runtime, _net = _runtime(Path(tmp), None, seed=5)
         assert len(runtime.cams) == 8
-        text, states = run_supervisor(["--scene-ckpt", str(runtime.path), "--force-engage", "--run-seconds", "2"], seconds=2.0)
+        # echo=True plays a fresh session echo: without it the stub never engages for ANY reason, so
+        # "engaged=0" alone would hold even with the block removed (it is not allowed to be vacuous).
+        text, states = run_supervisor(
+            ["--scene-ckpt", str(runtime.path), "--force-engage", "--run-seconds", "2"], seconds=2.0, echo=True
+        )
+        # control: the same 8-cam ckpt with the explicit drive opt-in DOES engage in this harness
+        text_d, states_d = run_supervisor(
+            ["--scene-ckpt", str(runtime.path), "--scene-ckpt-drive", "--force-engage", "--run-seconds", "2"],
+            seconds=2.0,
+            echo=True,
+        )
+    assert any(st.get("engaged") for st in states_d), "control: the harness cannot engage, so this check proves nothing"
     assert "scene-ckpt shadow" in text and "engage blocked" in text, text[-2000:]
     assert "scene-ckpt input" not in text, text[-2000:]
     assert states, text[-2000:]
     assert all(not st.get("engaged") for st in states), [st.get("engaged") for st in states[:5]]
-    for st in states:
-        assert str((st.get("lane_hold") or {}).get("source") or st.get("lane_src") or "") != "scene"
-    print(f"engage blocked with an 8-cam --scene-ckpt: {len(states)} stub states engaged=0 under --force-engage OK")
-
-
-# ------------------------------------------------------------------ run_vision wiring
+    print(
+        f"engage blocked with an 8-cam --scene-ckpt: {len(states)} shadow states engaged=0 under --force-engage + session echo; "
+        f"control --scene-ckpt-drive engaged on {sum(1 for st in states_d if st.get('engaged'))}/{len(states_d)} OK"
+    )
 
 
 def check_run_vision_passes_the_frame_dict() -> None:

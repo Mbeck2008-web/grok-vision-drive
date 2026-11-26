@@ -398,7 +398,7 @@ SSIM ≥ 0.45, vehicle centre error ≤ 3 m, stale age 200 ms, GT ranges
 | Fake wall (unobserved) | Fails if more than 1% of the **2 px-eroded** unobserved mask is opaque (opacity ≥ 0.1 and valid depth) (`UNOBSERVED_OPAQUE_MAX_FRAC`, `UNOBSERVED_EDGE_ERODE_PX`). Hatch / fog / empty (RGB paint with opacity 0) is allowed. The 2 px erosion ignores billboard bleed at the region border. |
 | Missing opacity | `RvOutputSpec` has no opacity channel. `opacity=None` means every valid-depth pixel is treated as opaque. |
 | Camera / ego conventions | OpenCV camera frame (x right, y down, z forward). Depth is z-depth in metres. `t_ego_cam` is camera → ego. Ego is x forward, y left, z up. A rendered-depth hole is non-finite or ≤ 0. |
-| SSIM definition | Wang *et al.* mean SSIM, uniform **7×7** window (`SSIM_WINDOW`; valid region, no padding, no Gaussian), per-channel then averaged, K1 = 0.01, K2 = 0.03, L = 255, population moments (E[x²] − μ²). No new dependency. |
+| SSIM definition | Wang *et al.* mean SSIM, uniform **box 7×7** window (`SSIM_WINDOW`; valid region, no padding, **not a Gaussian** — this window choice is a spec proposal, Redesigner, not Michael's), per-channel then averaged, K1 = 0.01, K2 = 0.03, L = 255, population moments (E[x²] − μ²). No new dependency. A library cross-check would call `skimage.metrics.structural_similarity(..., gaussian_weights=False, win_size=7, use_sample_covariance=True)`; scikit-image was not installed on the box that implemented this, so there is no library number in the tests. Note: that skimage flag uses sample covariance (/N−1); this scorer uses population moments, which agree on constant images (zero variance) and differ on textured ones. |
 
 ## Acceptance criteria (eventual implementation)
 

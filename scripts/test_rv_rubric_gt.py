@@ -16,6 +16,10 @@ Checks:
 - check_spec_constants_match_doc       (module thresholds parse equal to the spec table)
 - check_psnr_ssim_inclusive_edges      (exact 16.0 dB / 0.45 pass; next-below fails)
 - check_ssim_reference                 (closed-form Wang SSIM; no library on this box)
+- check_exact_boundary_pins            (opacity 0.1, veh 3.0 m, unobs 1%, ghost 25%, road 0.20 / 50%)
+- check_checklist_one_fail_is_not_passed  (exactly one item failing => passed is False)
+- check_psnr_peak_is_255               (MSE 25.5^2 => 20.0 dB; kills 255->256)
+- check_ssim_guards                    (shape mismatch and <7px raise ValueError)
 """
 from __future__ import annotations
 
@@ -800,6 +804,204 @@ def check_ssim_reference() -> None:
     })
 
 
+def _blank_gt(**kw):
+    """Minimal GtFrame; keywords override defaults."""
+    base = dict(
+        depth=np.full((H, W), 10.0, np.float32),
+        rgb=np.zeros((H, W, 3), np.uint8),
+        intrinsics=intrinsics(50.0),
+        t_ego_cam=cam_pose([0.0, 0.0, 2.0], 0.0),
+        road_mask=np.zeros((H, W), dtype=bool),
+        vehicle_mask=np.zeros((H, W), dtype=bool),
+        unobserved_mask=np.zeros((H, W), dtype=bool),
+        vehicle_center_ego=np.zeros(3),
+    )
+    base.update(kw)
+    return rub.GtFrame(**base)
+
+
+def check_exact_boundary_pins() -> None:
+    """Exact published boundaries. Direction of each gate is taken from the scorer.
+
+    Opacity >= 0.1, vehicle err > 3 m fails (so == 3.0 passes), unobserved
+    frac > 1% fails (so == 1% passes), ghost >= 25% of vehicle px fails
+    (so == 25% fails), road AbsRel <= 0.20 passes, road coverage >= 50% passes.
+    Inputs are built so the computed metric lands on the boundary exactly.
+    """
+    # --- opacity == 0.1 is covered (op >= 0.1); just below is not ---
+    flat = _flat_gt(10.0)
+    d10 = np.full((H, W), 10.0, np.float32)
+    op = np.full((H, W), 0.1, np.float64)
+    res = rub.score_metrics(rub.RenderedView(out=make_out(flat.rgb, d10), opacity=op), flat)
+    assert res.items["coverage"] and res.values["coverage"] == 1.0
+    assert rub._covered(d10.astype(np.float64), op).all()
+    below = np.full((H, W), np.nextafter(0.1, 0.0))
+    assert not rub._covered(d10.astype(np.float64), below).any()
+
+    # --- vehicle centre error == 3.0 m passes (fails only when err > 3) ---
+    gt, rgb, depth, opacity, _ = build_scene()
+    view = rub.RenderedView(out=make_out(rgb, depth), opacity=opacity)
+    harness = good_harness()
+    est = np.median(
+        rub._unproject_px(depth.astype(np.float64), gt, gt.vehicle_mask & (opacity >= 0.1))[:, :2],
+        axis=0,
+    )
+    at = rub.GtFrame(
+        **{**gt.__dict__, "vehicle_center_ego": np.array([est[0] + 3.0, est[1], gt.vehicle_center_ego[2]])}
+    )
+    r = rub.score_checklist(view, at, harness, repo_root=ROOT)
+    assert r.values["vehicle_center_err_m"] == 3.0, r.values
+    assert r.items["vehicle_placed_once"] is True
+    over = rub.GtFrame(
+        **{**gt.__dict__, "vehicle_center_ego": np.array([est[0] + 3.0 + 1e-9, est[1], gt.vehicle_center_ego[2]])}
+    )
+    r_over = rub.score_checklist(view, over, harness, repo_root=ROOT)
+    assert r_over.items["vehicle_placed_once"] is False
+
+    # --- unobserved opaque frac == 1% passes (fails only when frac > 0.01) ---
+    # A 14x14 solid block erodes (r=2) to 10x10 = 100 px, so 1 painted px is exact 1%.
+    un = np.zeros((H, W), dtype=bool)
+    un[10:24, 10:24] = True
+    eroded = rub._erode(un, rub.UNOBSERVED_EDGE_ERODE_PX)
+    assert int(eroded.sum()) == 100
+    ys, xs = np.nonzero(eroded)
+    depth_u = np.zeros((H, W), np.float64)
+    op_u = np.zeros((H, W), np.float64)
+    depth_u[ys[0], xs[0]] = 5.0
+    op_u[ys[0], xs[0]] = 1.0
+    gt_u = _blank_gt(unobserved_mask=un)
+    view_u = rub.RenderedView(out=make_out(gt_u.rgb, depth_u), opacity=op_u)
+    vals, fails = {}, []
+    assert rub._item_unobserved(depth_u, view_u, gt_u, vals, fails) is True
+    assert vals["unobserved_opaque_frac"] == 0.01, vals
+    depth_u[ys[1], xs[1]] = 5.0
+    op_u[ys[1], xs[1]] = 1.0
+    vals, fails = {}, []
+    assert rub._item_unobserved(depth_u, view_u, gt_u, vals, fails) is False
+    assert vals["unobserved_opaque_frac"] == 0.02
+
+    # --- ghost px == 25% of the vehicle FAILS (n_ghost >= 0.25 * n_veh) ---
+    # 8x8 vehicle (64) + compact 4x4 ghost (16) that survives a 1 px opening.
+    vm = np.zeros((H, W), dtype=bool)
+    vm[20:28, 20:28] = True
+    gh = np.zeros((H, W), dtype=bool)
+    gh[20:24, 40:44] = True
+    assert int(vm.sum()) == 64 and int(gh.sum()) == 16
+    d_g = np.zeros((H, W), np.float64)
+    op_g = np.zeros((H, W), np.float64)
+    gt_d = np.full((H, W), np.nan)
+    d_g[vm] = 10.0
+    op_g[vm] = 1.0
+    gt_d[vm] = 10.0  # on-surface vehicle
+    d_g[gh] = 10.0
+    op_g[gh] = 1.0  # GT stays NaN => off-surface; height ~2 m > 0.5 m
+    gt_v = _blank_gt(depth=gt_d.astype(np.float32), vehicle_mask=vm)
+    est_xy = np.median(rub._unproject_px(d_g, gt_v, vm)[:, :2], axis=0)
+    gt_v = rub.GtFrame(**{**gt_v.__dict__, "vehicle_center_ego": np.array([est_xy[0], est_xy[1], 0.0])})
+    view_v = rub.RenderedView(out=make_out(gt_v.rgb, d_g), opacity=op_g)
+    vals, fails = {}, []
+    assert rub._item_vehicle(d_g, view_v, gt_v, vals, fails) is False, vals
+    assert vals["vehicle_ghost_px"] == 16
+    assert vals["vehicle_center_err_m"] == 0.0
+    # one fewer ghost pixel (3x5=15) is under 25% and must pass
+    gh15 = np.zeros((H, W), dtype=bool)
+    gh15[20:23, 40:45] = True
+    assert int(gh15.sum()) == 15
+    d15, op15 = np.zeros((H, W), np.float64), np.zeros((H, W), np.float64)
+    d15[vm], op15[vm] = 10.0, 1.0
+    d15[gh15], op15[gh15] = 10.0, 1.0
+    view15 = rub.RenderedView(out=make_out(gt_v.rgb, d15), opacity=op15)
+    vals, fails = {}, []
+    assert rub._item_vehicle(d15, view15, gt_v, vals, fails) is True, vals
+    assert vals["vehicle_ghost_px"] == 15
+
+    # --- road AbsRel == 0.20 passes (err <= 0.20).
+    # One road pixel so np.mean does not drift: |6-5|/5 == 0.20 exactly in float64
+    # (a 100-pixel mean of the same ratio is 0.1999... and would not kill <= to <).
+    road1 = np.zeros((H, W), dtype=bool)
+    road1[40, 40] = True
+    gt_r1 = _blank_gt(road_mask=road1, depth=np.full((H, W), 5.0, np.float32))
+    d_r, op_r = np.zeros((H, W), np.float64), np.zeros((H, W), np.float64)
+    d_r[40, 40], op_r[40, 40] = 6.0, 1.0
+    view_r = rub.RenderedView(out=make_out(gt_r1.rgb, d_r), opacity=op_r)
+    fails = []
+    assert rub._item_road_surface(d_r, view_r, gt_r1, fails) is True, fails
+    err = float(np.mean(np.abs(d_r[road1] - 5.0) / 5.0))
+    assert err == 0.20 == rub.ROAD_ABS_REL_MAX
+    d_hi = d_r.copy()
+    d_hi[40, 40] = 6.1
+    fails = []
+    assert rub._item_road_surface(d_hi, view_r, gt_r1, fails) is False
+
+    # --- road coverage == 50% passes (frac >= 0.50); 50 of 100 road px, perfect depth ---
+    road = np.zeros((H, W), dtype=bool)
+    road[40:50, 40:50] = True
+    assert int(road.sum()) == 100
+    gt_r = _blank_gt(road_mask=road, depth=np.full((H, W), 10.0, np.float32))
+    d_c, op_c = np.zeros((H, W), np.float64), np.zeros((H, W), np.float64)
+    for (yy, xx) in np.argwhere(road)[:50]:
+        d_c[yy, xx], op_c[yy, xx] = 10.0, 1.0
+    view_c = rub.RenderedView(out=make_out(gt_r.rgb, d_c), opacity=op_c)
+    fails = []
+    assert rub._item_road_surface(d_c, view_c, gt_r, fails) is True, fails
+    assert float((rub._covered(d_c, op_c) & road).sum()) / 100.0 == 0.50
+    # 49/100 fails
+    yy, xx = np.argwhere(road)[0]
+    d_c[yy, xx], op_c[yy, xx] = 0.0, 0.0
+    view_c = rub.RenderedView(out=make_out(gt_r.rgb, d_c), opacity=op_c)
+    fails = []
+    assert rub._item_road_surface(d_c, view_c, gt_r, fails) is False
+    print("PASS check_exact_boundary_pins")
+
+
+def check_checklist_one_fail_is_not_passed() -> None:
+    """score_checklist.passed uses all(); one failing item must yield passed is False."""
+    gt, rgb, depth, opacity, _ = build_scene()
+    view = rub.RenderedView(out=make_out(rgb, depth), opacity=opacity)
+    harness = good_harness()
+    # packer that never sets the stale flag: only stale_indicator fails
+    r = rub.score_checklist(
+        view, gt, harness, repo_root=ROOT, pack=lambda out, age_ms: rvc.pack_output_slot(out, age_ms=0.0)
+    )
+    assert _items_failed(r) == ["stale_indicator"], _items_failed(r)
+    assert r.passed is False
+    print("PASS check_checklist_one_fail_is_not_passed")
+
+
+def check_psnr_peak_is_255() -> None:
+    """PSNR uses peak 255, not 256: uniform error 25.5 => MSE=25.5**2 => exactly 20.0 dB."""
+    a = np.zeros((8, 8, 3), dtype=np.float64)
+    b = np.full((8, 8, 3), 25.5, dtype=np.float64)
+    got = rub.psnr_db(a, b)
+    assert got == 20.0, got
+    # a one-level uint8 error is 10*log10(255**2) ; pin the 255 peak against 256
+    one = np.zeros((4, 4, 3), dtype=np.uint8)
+    two = np.ones((4, 4, 3), dtype=np.uint8)
+    got1 = rub.psnr_db(one, two)
+    assert abs(got1 - 48.1308036086791) < 1e-12, got1
+    print("PASS check_psnr_peak_is_255", {"mse_650.25": got, "mse_1": got1})
+
+
+def check_ssim_guards() -> None:
+    """ssim raises on RGB shape mismatch and on images smaller than the 7x7 window."""
+    ok = np.zeros((7, 7, 3), dtype=np.uint8)
+    rub.ssim(ok, ok)  # minimum legal size must be accepted
+    try:
+        rub.ssim(ok, np.zeros((7, 8, 3), dtype=np.uint8))
+    except ValueError as exc:
+        assert "ssim needs equal" in str(exc), exc
+    else:
+        raise AssertionError("ssim must raise ValueError on RGB shape mismatch")
+    for shape in ((6, 8, 3), (8, 6, 3), (6, 6, 3)):
+        img = np.zeros(shape, dtype=np.uint8)
+        try:
+            rub.ssim(img, img)
+        except ValueError:
+            continue
+        raise AssertionError(f"ssim must raise ValueError for size {shape} < 7px")
+    print("PASS check_ssim_guards")
+
+
 def main() -> None:
     check_useful_view_metrics()
     check_useful_view_checklist()
@@ -809,6 +1011,10 @@ def main() -> None:
     check_spec_constants_match_doc()
     check_psnr_ssim_inclusive_edges()
     check_ssim_reference()
+    check_exact_boundary_pins()
+    check_checklist_one_fail_is_not_passed()
+    check_psnr_peak_is_255()
+    check_ssim_guards()
     print("test_rv_rubric_gt: ok")
 
 

@@ -85,6 +85,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "kill wait; no second Tech is launched)."
         ),
     )
+    parser.add_argument(
+        "--stop-file",
+        default=None,
+        help="Pause file checked before each clip (default <out>/STOP). When it exists the running "
+             "clip finishes and is tagged, no new clip starts, and session.json gets "
+             "stop_reason=stop_file. Pass an empty string to disable.",
+    )
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -105,6 +112,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if bad:
         parser.error(f"unknown edge case(s) {bad}")
     args.edge_cases = cases or None
+    if args.stop_file is None:
+        args.stop_file = args.out / "STOP"
+    elif not str(args.stop_file).strip():
+        args.stop_file = None
+    else:
+        args.stop_file = Path(args.stop_file)
     args.extra = extra
     return args
 
@@ -144,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         extra=args.extra,
         gfx=args.gfx,
         after_clip=after_clip,
+        stop_file=args.stop_file,
     )
     print(f"session {session}")
     if watchdog.halt_reason:

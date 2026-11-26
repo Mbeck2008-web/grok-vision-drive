@@ -76,6 +76,15 @@ def _long_clip_s(text: str) -> tuple[float, float]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", type=Path, required=True, help="Root folder; a new clips_<stamp> session goes under it.")
+    parser.add_argument(
+        "--session-id",
+        default=None,
+        help=(
+            "Name the session folder clips_<id> and write it to session.json as session_id "
+            "(the supervisor passes one per launch so it reads its own session, not the newest). "
+            "Default: a timestamp."
+        ),
+    )
     parser.add_argument("--clips", type=int, default=20, help="Clips in this session.")
     parser.add_argument("--seed", type=int, default=0, help="Session seed: the same seed gives the same plans.")
     parser.add_argument("--maps", type=_maps, default=_maps(DEFAULT_MAPS), help="Comma-separated map pool.")
@@ -240,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         long_min_s=args.long_clip_s[0],
         long_max_s=args.long_clip_s[1],
         long_highway_frac=args.long_clip_highway_frac,
+        session_id=args.session_id,
     )
     print(f"session {session}")
     if watchdog.halt_reason:

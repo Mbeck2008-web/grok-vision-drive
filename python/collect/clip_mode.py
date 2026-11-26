@@ -716,6 +716,7 @@ def run_clips(
     long_min_s: float = DEFAULT_LONG_CLIP_MIN_S,
     long_max_s: float = DEFAULT_LONG_CLIP_MAX_S,
     long_highway_frac: float = DEFAULT_LONG_HIGHWAY_FRAC,
+    session_id: str | None = None,
 ) -> Path:
     """Record ``clips`` clips into a new session folder. ``runner(argv)`` runs the collector.
 
@@ -729,7 +730,7 @@ def run_clips(
     """
     maps = tuple(maps)
     cases = tuple(edge_cases or EDGE_CASES)
-    session = new_session_dir(root)
+    session = new_session_dir(root, session_id)
     results: list[dict[str, Any]] = []
     stop_reason: str | None = None
     manifest = session / "session.json"
@@ -748,6 +749,7 @@ def run_clips(
             "chase_cam": bool(chase),
             "ego_model": EGO_MODEL,
             "gfx": gfx,
+            "session_id": session.name[len("clips_"):],
             "long_clips": int(long_clips),
             "long_min_s": float(long_min_s),
             "long_max_s": float(long_max_s),

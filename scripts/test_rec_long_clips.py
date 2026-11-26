@@ -693,6 +693,49 @@ def check_unreadable_road_dump_is_not_a_highway_map() -> None:
     print("unreadable or missing road dump is not a highway map")
 
 
+def check_session_id_names_this_launch() -> None:
+    """--session-id names the folder and is written to session.json (rec_loop matches on it)."""
+    from scripts.gvd_test_env import collect_root
+
+    cli = _cli()
+    with collect_root() as root:
+        def runner(argv: list[str]) -> int:
+            _fake_recording(Path(argv[argv.index("--out") + 1]), rows=50)
+            return 0
+
+        from python.collect.clip_mode import run_clips
+
+        session = run_clips(root, clips=1, seed=1, maps=("west_coast_usa",), max_traffic=0,
+                            runner=runner, session_id="LAUNCH_7")
+        assert session.name == "clips_LAUNCH_7", session.name
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["session_id"] == "LAUNCH_7", manifest
+        # No id: the stamp names it and the manifest still says which id it is.
+        auto = run_clips(root, clips=1, seed=1, maps=("west_coast_usa",), max_traffic=0, runner=runner)
+        m2 = json.loads((auto / "session.json").read_text(encoding="utf-8"))
+        assert m2["session_id"] == auto.name[len("clips_"):], (m2, auto.name)
+        # The CLI forwards it.
+        args = cli.parse_args(["--out", str(root), "--session-id", "CLI_9"])
+        assert args.session_id == "CLI_9"
+        assert cli.parse_args(["--out", str(root)]).session_id is None
+        captured: dict = {}
+        orig = cli.run_clips
+
+        def spy(out, **kw):
+            captured.update(kw)
+            kw["runner"] = runner
+            return orig(out, **kw)
+
+        cli.run_clips = spy
+        try:
+            assert cli.main(["--out", str(root), "--clips", "1", "--maps", "west_coast_usa", "--session-id", "CLI_9"]) == 0
+        finally:
+            cli.run_clips = orig
+        assert captured["session_id"] == "CLI_9", captured
+        assert (root / "clips_CLI_9" / "session.json").is_file()
+    print("session id: names the folder, lands in session.json, CLI forwards it")
+
+
 def main() -> None:
 
     check_default_off_unchanged()
@@ -712,6 +755,7 @@ def main() -> None:
     check_no_highway_pool_delivers_drive_around_long_clips()
     check_keep_planned_highway_map_and_remap_varies()
     check_unreadable_road_dump_is_not_a_highway_map()
+    check_session_id_names_this_launch()
     print("test_rec_long_clips: OK")
 
 

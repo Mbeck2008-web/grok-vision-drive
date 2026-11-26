@@ -28,6 +28,10 @@ COLLAPSE_STD = 0.01
 PROBE_N = 8
 GUARD_EVERY = 200
 DEFAULT_MAX_ROWS = 4000
+# Bump when the pretext changes (mask ratio, target, guard, optimiser, code): it is part of
+# the stem cache key, so a stem from the old recipe is never reused silently.
+SSL_RECIPE = 1
+MASK_RATIO = 0.25
 
 
 class SslError(ValueError):
@@ -285,6 +289,38 @@ def ssl_plan(args: Any, *, resuming: bool) -> tuple[bool, str]:
     return True, "on (default)"
 
 
+def _frame_digest(image: Any) -> str:
+    """sha256 over one canvas as the pretext reads it (dtype, shape, bytes); a missing frame has its own digest."""
+    import hashlib
+
+    if image is None:
+        return "none"
+    if hasattr(image, "detach"):
+        arr = image.detach().cpu().numpy()
+    else:
+        arr = np.asarray(image)
+    arr = np.ascontiguousarray(arr)
+    digest = hashlib.sha256()
+    digest.update(f"{arr.dtype.str}{arr.shape}".encode("ascii"))
+    digest.update(arr.tobytes())
+    return digest.hexdigest()
+
+
+def content_hashes(rows: list[Mapping[str, Any]], image_fn) -> dict[str, str]:
+    """Per source: one sha256 over its rows' frame digests, in row order.
+
+    Same ids with different pixels (a re-export in place) give a different hash.
+    """
+    import hashlib
+
+    per_source: dict[str, Any] = {}
+    for row in rows:
+        src = str(row.get("source") or "")
+        digest = per_source.setdefault(src, hashlib.sha256())
+        digest.update(f"{int(row['i'])}:{_frame_digest(image_fn(row))};".encode("ascii"))
+    return {src: digest.hexdigest() for src, digest in sorted(per_source.items())}
+
+
 def _even_subset(rows: list[Mapping[str, Any]], max_rows: int) -> list[Mapping[str, Any]]:
     if int(max_rows) <= 0 or len(rows) <= int(max_rows):
         return list(rows)
@@ -308,8 +344,9 @@ def default_ssl_stem(
 
     ``rows`` must be train rows (``ssl_rows_from_split``); any other kind is
     refused. ``max_rows`` evenly spaced rows are used (0 = all). The file is
-    ``ssl_stem_<key>.npz``, keyed by the row list and settings; an existing
-    file with that key is reused, never overwritten, and no stem is deleted.
+    ``ssl_stem_<key>.npz``, keyed by the row list, the settings, ``SSL_RECIPE``
+    and a hash of the frame content (read once per picked row, per source); an
+    existing file with that key is reused, never overwritten, and no stem is deleted.
     """
     import hashlib
     import json
@@ -327,6 +364,12 @@ def default_ssl_stem(
         "epochs": int(epochs),
         "max_rows": int(max_rows),
         "ema": EMA_MOMENTUM,
+        "recipe": SSL_RECIPE,
+        "mask_ratio": MASK_RATIO,
+        "collapse_std": COLLAPSE_STD,
+        "probe_n": PROBE_N,
+        "guard_every": GUARD_EVERY,
+        "content": content_hashes(picked, image_fn),
         "extra": dict(key_extra or {}),
     }
     key = hashlib.sha256(json.dumps(key_doc, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
@@ -386,7 +429,7 @@ def masked_token_pretext_loss(
     net: Any,
     image: Any,
     *,
-    mask_ratio: float = 0.25,
+    mask_ratio: float = MASK_RATIO,
     rng: np.random.RandomState | None = None,
     target: Any = None,
 ) -> Any:

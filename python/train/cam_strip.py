@@ -33,6 +33,9 @@ ROAD_EDGE_HEAD = "road_edge"
 # Opt-in stop-line scalar (``--heads lane_gt,stop_line``). Training only.
 # Not an ONNX output and not a sign point.
 STOP_LINE_HEAD = "stop_line"
+# Opt-in Trainer 2.0 Reality View depth (``--aux-depth --heads ...,depth_hires``):
+# a 48x64 depth + far map replaces the 12x16 aux_depth grid. Training only.
+DEPTH_HIRES_HEAD = "depth_hires"
 # ONNX outputs each head writes (scene_net.OUTPUT_FIELDS, split by head). An
 # export carries every output; the ones whose head was not in --heads are
 # random-init and are listed in ``gvd_outputs_untrained``.
@@ -78,7 +81,7 @@ def parse_heads(text: str | None) -> tuple[str, ...]:
     if not parts:
         return HEAD_NAMES
     names: list[str] = []
-    optional = (CTL_HEAD, ROAD_EDGE_HEAD, STOP_LINE_HEAD)
+    optional = (CTL_HEAD, ROAD_EDGE_HEAD, STOP_LINE_HEAD, DEPTH_HIRES_HEAD)
     for part in parts:
         key = _HEAD_ALIASES.get(part.lower(), part.lower())
         if key not in HEAD_NAMES and key not in optional:

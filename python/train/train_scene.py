@@ -873,7 +873,7 @@ def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
 
     extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name, None) is not None}
     # Training-only aux / road_edge: must travel with the slice or scene_loss skips them.
-    for name in ("aux_depth", "aux_sem_logits", "road_edge", "stop_line"):
+    for name in ("aux_depth", "aux_depth_far", "aux_sem_logits", "road_edge", "stop_line"):
         value = getattr(pred, name, None)
         if value is not None:
             extra[name] = value[index]
@@ -1452,6 +1452,7 @@ def _row_labels(
         road_edge=("road_edge" in (heads or ())),
         stop_line=("stop_line" in (heads or ())),
         aux_cache=aux_cache,
+        depth_hires=("depth_hires" in (heads or ())),
     )
 
 
@@ -2551,6 +2552,7 @@ def train_directory(
     use_ctl = bool(train_heads) and "ctl" in train_heads
     use_road_edge = bool(train_heads) and "road_edge" in train_heads
     use_stop_line = bool(train_heads) and "stop_line" in train_heads
+    use_depth_hires = bool(train_heads) and "depth_hires" in train_heads
     use_aux_sensors = bool(aux_depth) or bool(aux_sem)
     aux_depth_w = float(aux_depth_weight) if aux_depth else 0.0
     aux_sem_w = float(aux_sem_weight) if aux_sem else 0.0
@@ -2558,6 +2560,8 @@ def train_directory(
         raise SystemExit("sensor aux is wired into the scratch net only (--backbone scratch)")
     if use_road_edge and backbone not in ("", "scratch"):
         raise SystemExit("road_edge is wired into the scratch net only (--backbone scratch)")
+    if use_depth_hires and not aux_depth:
+        raise SystemExit("--heads ...,depth_hires needs --aux-depth (it replaces the 12x16 aux_depth grid)")
     if use_stop_line and backbone not in ("", "scratch"):
         raise SystemExit("stop_line is wired into the scratch net only (--backbone scratch)")
     if use_ctl and backbone not in ("", "scratch"):
@@ -2927,6 +2931,7 @@ def train_directory(
                     road_edge=use_road_edge,
                     stop_line=use_stop_line,
                     route_cond=bool(route_cond),
+                    depth_hires=use_depth_hires,
                     **dict(model_net_kwargs or {}),
                 ).to(device)
                 if grad_ckpt:

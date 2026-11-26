@@ -906,6 +906,7 @@ def labels_for_row(
     aux_cache: Any = None,
     stop_line: bool = False,
     brake_light_head: bool | None = None,
+    depth_hires: bool = False,
 ) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
@@ -970,6 +971,7 @@ def labels_for_row(
             want_sem=bool(aux_sem),
             want_road_edge=False,
             aux_cache=aux_cache,
+            want_depth_hires=bool(depth_hires),
         )
     from python.train.vehicle_labels import traffic_object_labels
 
@@ -1198,6 +1200,8 @@ class ScenePrediction:
     ctl_brake: Any = None
     # Training-only aux / road_edge (never default ONNX outputs).
     aux_depth: Any = None
+    # depth_hires only: (B, 1, 48, 64) far/sky logit beside the 48x64 aux_depth.
+    aux_depth_far: Any = None
     aux_sem_logits: Any = None
     road_edge: Any = None
     # Training-only stop-line scalar (y_m, valid). Not an ONNX output.
@@ -1606,29 +1610,43 @@ def _scene_loss_body(
     if float(aux_depth_weight) > 0.0 and getattr(pred, "aux_depth", None) is not None and "aux_depth" in target and "aux_depth_valid" in target:
         from python.train.sensor_aux import AuxTargetError
 
-        pd = pred.aux_depth.to(device=device, dtype=dtype)
-        gd = target["aux_depth"].to(device=device, dtype=dtype)
-        md = target["aux_depth_valid"].to(device=device, dtype=dtype)
-        # Depth head is N1HW. _prediction_at drops N, leaving 1HW.
-        # Labeler targets are HW (or NHW when stacked). Align all three to NHW.
-        if pd.dim() >= 3 and pd.shape[-3] == 1:
-            pd = pd.squeeze(-3)
-        if gd.dim() >= 3 and gd.shape[-3] == 1:
-            gd = gd.squeeze(-3)
-        if md.dim() >= 3 and md.shape[-3] == 1:
-            md = md.squeeze(-3)
-        if pd.dim() == 2:
-            pd = pd.unsqueeze(0)
-        if gd.dim() == 2:
-            gd = gd.unsqueeze(0)
-        if md.dim() == 2:
-            md = md.unsqueeze(0)
-        if tuple(pd.shape) != tuple(gd.shape) or tuple(pd.shape) != tuple(md.shape):
-            raise AuxTargetError(
-                f"aux_depth shape mismatch pred={tuple(pd.shape)} goal={tuple(gd.shape)} mask={tuple(md.shape)}"
-            )
-        if bool((md > 0.5).any()):
-            aux_depth_term = (functional.smooth_l1_loss(pd, gd, reduction="none") * md).sum() / md.sum().clamp(min=1.0)
+        if getattr(pred, "aux_depth_far", None) is not None:
+            # depth_hires: log-metre smooth-L1 on valid cells + far/sky BCE (python/train/depth_hires.py).
+            from python.train.depth_hires import depth_hires_loss
+
+            if "aux_depth_far" not in target or "aux_depth_far_valid" not in target:
+                raise AuxTargetError("depth_hires prediction needs aux_depth_far / aux_depth_far_valid targets")
+            try:
+                depth_part, far_part = depth_hires_loss(
+                    pred.aux_depth.to(device=device, dtype=dtype), pred.aux_depth_far.to(device=device, dtype=dtype), target
+                )
+            except ValueError as exc:
+                raise AuxTargetError(str(exc)) from exc
+            aux_depth_term = depth_part + far_part
+        else:
+            pd = pred.aux_depth.to(device=device, dtype=dtype)
+            gd = target["aux_depth"].to(device=device, dtype=dtype)
+            md = target["aux_depth_valid"].to(device=device, dtype=dtype)
+            # Depth head is N1HW. _prediction_at drops N, leaving 1HW.
+            # Labeler targets are HW (or NHW when stacked). Align all three to NHW.
+            if pd.dim() >= 3 and pd.shape[-3] == 1:
+                pd = pd.squeeze(-3)
+            if gd.dim() >= 3 and gd.shape[-3] == 1:
+                gd = gd.squeeze(-3)
+            if md.dim() >= 3 and md.shape[-3] == 1:
+                md = md.squeeze(-3)
+            if pd.dim() == 2:
+                pd = pd.unsqueeze(0)
+            if gd.dim() == 2:
+                gd = gd.unsqueeze(0)
+            if md.dim() == 2:
+                md = md.unsqueeze(0)
+            if tuple(pd.shape) != tuple(gd.shape) or tuple(pd.shape) != tuple(md.shape):
+                raise AuxTargetError(
+                    f"aux_depth shape mismatch pred={tuple(pd.shape)} goal={tuple(gd.shape)} mask={tuple(md.shape)}"
+                )
+            if bool((md > 0.5).any()):
+                aux_depth_term = (functional.smooth_l1_loss(pd, gd, reduction="none") * md).sum() / md.sum().clamp(min=1.0)
         total = total + float(aux_depth_weight) * aux_depth_term
     if float(aux_sem_weight) > 0.0 and getattr(pred, "aux_sem_logits", None) is not None and "aux_sem" in target and "aux_sem_valid" in target:
         from python.train.sensor_aux import AuxTargetError
@@ -1838,6 +1856,7 @@ if torch is not None:
             stop_line: bool = False,
             route_cond: bool = False,
             *,
+            depth_hires: bool = False,
             stem_channels: tuple[int, ...] | None = None,
             gru_hidden: int | None = None,
             preset: str = "small",
@@ -1892,12 +1911,25 @@ if torch is not None:
             self.aux_h = int(AUX_H)
             self.aux_w = int(AUX_W)
             self.sem_class_max = int(SEM_CLASS_MAX)
+            # Trainer 2.0 Reality View: a 48x64 depth + far FPN decoder replaces the
+            # 1x1 12x16 depth head. Needs aux_sensors (--aux-depth). Off by default.
+            self.depth_hires = bool(depth_hires)
+            if self.depth_hires and not self.aux_sensors:
+                raise ValueError("depth_hires needs aux_sensors (--aux-depth)")
             if self.aux_sensors:
                 cin = int(getattr(self.stem, "out_channels", STEM_CHANNELS[-1]))
-                self.aux_depth_head = nn.Conv2d(cin, 1, kernel_size=1, bias=True)
+                if self.depth_hires:
+                    from python.train.depth_hires import ARCH_TOKEN, build_depth_hires_head
+
+                    stage_channels = tuple(int(m.out_channels) for m in self.stem.conv if isinstance(m, nn.Conv2d))
+                    self.depth_hires_head = build_depth_hires_head(stage_channels)
+                else:
+                    self.aux_depth_head = nn.Conv2d(cin, 1, kernel_size=1, bias=True)
                 self.aux_sem_head = nn.Conv2d(cin, self.sem_class_max, kernel_size=1, bias=True)
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
                 self.pause_arch = arch + f":aux={self.aux_h}x{self.aux_w}"
+                if self.depth_hires:
+                    self.pause_arch += ARCH_TOKEN
             if self.road_edge:
                 self.road_edge_head = nn.Linear(hidden, int(ROAD_EDGE_DIM))
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
@@ -2029,14 +2061,7 @@ if torch is not None:
             feat = _apply_route(self, feat, route)
             pred = _heads_batch(self, feat, cond)
             if bool(getattr(self, "aux_sensors", False)) and main_feat is not None:
-                import torch.nn.functional as functional
-
-                depth = self.aux_depth_head(main_feat)
-                sem = self.aux_sem_head(main_feat)
-                depth = functional.adaptive_avg_pool2d(depth, (self.aux_h, self.aux_w))
-                sem = functional.adaptive_avg_pool2d(sem, (self.aux_h, self.aux_w))
-                pred.aux_depth = depth
-                pred.aux_sem_logits = sem
+                _aux_dense(self, main_feat, pred)
             end_state = SceneState(h=h_new, tokens=tokens_ring, mask=mask_ring)
             return pred, end_state, end_state
 
@@ -2071,14 +2096,7 @@ if torch is not None:
             feat = _apply_route(self, feat, route)
             pred = _heads_batch(self, feat, cond)
             if bool(getattr(self, "aux_sensors", False)) and main_feat is not None:
-                import torch.nn.functional as functional
-
-                depth = self.aux_depth_head(main_feat)
-                sem = self.aux_sem_head(main_feat)
-                depth = functional.adaptive_avg_pool2d(depth, (self.aux_h, self.aux_w))
-                sem = functional.adaptive_avg_pool2d(sem, (self.aux_h, self.aux_w))
-                pred.aux_depth = depth
-                pred.aux_sem_logits = sem
+                _aux_dense(self, main_feat, pred)
             return pred, SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
 
         def _encode(self, image: Any) -> Any:
@@ -2103,12 +2121,33 @@ if torch is not None:
                     narrow = 256 if self.scale >= 0.999 else max(1, int(round(256 * self.scale)))
                     crop = _letterbox_wide(crop, self.canvas_h, narrow)
                 if bool(getattr(self, "aux_sensors", False)) and str(sec.cam_id) == "main":
-                    feat_map = self.stem.features(crop)
+                    if bool(getattr(self, "depth_hires", False)):
+                        from python.train.depth_hires import stem_pyramid
+
+                        # Same ops as stem.features; every stage kept for the decoder.
+                        main_feat = stem_pyramid(self.stem, crop)
+                        feat_map = main_feat[-1]
+                    else:
+                        feat_map = self.stem.features(crop)
+                        main_feat = feat_map
                     parts.append(self.stem.embed(feat_map))
-                    main_feat = feat_map
                 else:
                     parts.append(self.stem(crop))
             return torch.cat(parts, dim=-1).unsqueeze(1), main_feat
+
+    def _aux_dense(net: SceneNet, main_feat: Any, pred: ScenePrediction) -> None:
+        """Training-only dense heads on the main-sector stem: depth (12x16, or 48x64 + far) and 12x16 sem."""
+        import torch.nn.functional as functional
+
+        if bool(getattr(net, "depth_hires", False)):
+            depth, far = net.depth_hires_head(main_feat)
+            pred.aux_depth = depth
+            pred.aux_depth_far = far
+            top = main_feat[-1]
+        else:
+            top = main_feat
+            pred.aux_depth = functional.adaptive_avg_pool2d(net.aux_depth_head(top), (net.aux_h, net.aux_w))
+        pred.aux_sem_logits = functional.adaptive_avg_pool2d(net.aux_sem_head(top), (net.aux_h, net.aux_w))
 
     def _lane_gt_output(net: SceneNet, feat: Any) -> Any:
         raw = net.lane_gt_head(feat)
@@ -2228,7 +2267,7 @@ if torch is not None:
 
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
         extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name) is not None}
-        for name in ("aux_depth", "aux_sem_logits", "road_edge", "stop_line"):
+        for name in ("aux_depth", "aux_depth_far", "aux_sem_logits", "road_edge", "stop_line"):
             value = getattr(pred, name, None)
             if value is not None:
                 extra[name] = value[index]

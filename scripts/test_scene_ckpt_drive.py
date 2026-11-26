@@ -325,7 +325,11 @@ def check_drive_without_ckpt_refused() -> None:
 
 
 def check_multicam_ckpt_loads_drive_stops() -> None:
-    """A cams!=('main',) ckpt must raise at load; drive must not steer on it."""
+    """A cams!=('main',) ckpt loads and sees the live frame dict (PR2b); drive with no prediction still stops.
+
+    A tick that lacks a camera the ckpt needs is flagged (missing_cams) and drive treats it as no
+    prediction: scripts/test_scene_ckpt_8cam.py check_missing_cams_flagged_each_of_8.
+    """
     import tempfile
 
     import torch
@@ -584,7 +588,7 @@ def check_overlay_caption_drawn_through_draw() -> None:
 
 
 def check_same_tick_observe_documented() -> None:
-    """Pred is computed on this tick's main frame (no cached / aged pred).
+    """Pred is computed on this tick's live camera frames (no cached / aged pred).
 
     Code pointer: python/run_vision.py observe(ckpt_frames, tick_dt) (this tick's live
     8-camera frame dict) then apply_scene_ckpt_lane in the same loop body. No

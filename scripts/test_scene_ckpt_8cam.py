@@ -13,7 +13,10 @@ Checks
     train   : train_scene._load_bgr -> cam_strip.extract_cams (8 cams) -> scene_net._strip_nchw  (augment off)
     live    : strip_writer.compose_strip(frames) -> scene_lane_runtime._strip_nchw
     ckpt    : SceneCkptRuntime.observe(frames) -> the tensor SceneNet.forward actually receives
+* check_scene_ckpt_is_8cam (spec l.222/l.278): the --scene-ckpt canvas IS the full 8-cam compose_strip.
 * the 8-cam checkpoint loads; main-only is gone (an ndarray frame is refused; a dict without main is empty).
+* a camera the ckpt needs but the tick lacks is flagged (missing_cams), logged once per change, and drive treats it as no prediction.
+* scale<1 is applied and a wrong canvas size raises SceneCkptInputError; run_vision asks the backend for all the ckpt's cams.
 * engage stays hard-blocked in --scene-ckpt shadow mode with an 8-cam checkpoint.
 * run_vision passes the live frame dict (not ``main``) to observe.
 
@@ -23,9 +26,16 @@ Checks
 from __future__ import annotations
 
 import ast
+import contextlib
+import dataclasses
 import hashlib
+import io
+import json
+import os
+import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import numpy as np
@@ -68,7 +78,7 @@ def _fixture_frames() -> dict:
     return frames
 
 
-def _runtime(tmp: Path, cams: tuple[str, ...] | None, seed: int = 3):
+def _runtime(tmp: Path, cams: tuple[str, ...] | None, seed: int = 3, scale: float = 1.0):
     import torch
 
     from python.train.scene_ckpt_runtime import SceneCkptRuntime
@@ -76,7 +86,8 @@ def _runtime(tmp: Path, cams: tuple[str, ...] | None, seed: int = 3):
     from test_scene_ckpt_shadow import _write_ckpt
 
     torch.manual_seed(seed)
-    net = (SceneNet(cams=cams) if cams else SceneNet()).cpu().eval()
+    kwargs = {} if scale >= 0.999 else {"scale": scale}
+    net = (SceneNet(cams=cams, **kwargs) if cams else SceneNet(**kwargs)).cpu().eval()
     return SceneCkptRuntime(_write_ckpt(tmp, net)), net
 
 
@@ -167,11 +178,15 @@ def check_train_live_input_identical() -> None:
 # ------------------------------------------------------------------ runtime behaviour
 
 
-def check_main_canvas_is_the_full_strip() -> None:
+def check_scene_ckpt_is_8cam() -> None:
+    """Spec trainer_2.md l.222/l.278: the --scene-ckpt input is the full 8-cam compose_strip, not main-only."""
     from python.data.strip_writer import SECTORS, STRIP_ORDER, compose_strip
     from python.train.scene_ckpt_runtime import _main_canvas
 
     frames = _fixture_frames()
+    with tempfile.TemporaryDirectory() as tmp:
+        rt, _ = _runtime(Path(tmp), None)
+        assert tuple(rt.cams) == tuple(STRIP_ORDER) and (rt.canvas_h, rt.canvas_w) == (192, 2272), (rt.cams, rt.canvas_w)
     canvas = _main_canvas(frames, tuple(STRIP_ORDER), 192, 2272, 1.0)
     assert _bytes(canvas) == _bytes(compose_strip(frames)), "canvas is not compose_strip(live 8-cam dict)"
     wide = next(s for s in SECTORS if s.cam_id == "wide")
@@ -185,7 +200,7 @@ def check_main_canvas_is_the_full_strip() -> None:
     other = _main_canvas(moved, tuple(STRIP_ORDER), 192, 2272, 1.0)
     diff_cols = np.where(np.any(other != canvas, axis=(0, 2)))[0]
     assert diff_cols.size and int(diff_cols.min()) >= wide.x0 and int(diff_cols.max()) < wide.x1, "wide change leaked or was dropped"
-    print("_main_canvas == compose_strip(8-cam dict); wide sector present and wide-only edits stay in the wide sector OK")
+    print("scene-ckpt is 8-cam: ckpt cams == STRIP_ORDER, _main_canvas == compose_strip(8-cam dict); wide sector present and wide-only edits stay in the wide sector OK")
 
 
 def check_multicam_loads_and_observes() -> None:
@@ -231,7 +246,28 @@ def check_main_only_input_is_gone() -> None:
             raise AssertionError("a grayscale wide frame was accepted")
         ok = rt.observe(frames, 0.1)
         assert ok.lane_gt is not None and ok.canvas_shape == (192, 2272, 3), ok.canvas_shape
-    print("main-only input gone: bare ndarray refused, None/{}/no-main empty, bad wide refused, full dict predicts OK")
+        # (a) the cam_main alias is a main picture: a dict with cam_main (and no main) predicts, same as main
+        aliased = {k: v for k, v in frames.items() if k != "main"}
+        aliased["cam_main"] = frames["main"]
+        via_alias = rt.observe(aliased, 0.1)
+        assert via_alias.lane_gt is not None, "a dict with cam_main and no main must predict (alias dropped)"
+        assert tuple(via_alias.missing_cams) == (), via_alias.missing_cams
+        # (b) cam_main is shape-checked like every other camera, and the error names it
+        gray_alias = dict(aliased)
+        gray_alias["cam_main"] = np.zeros((480, 640), dtype=np.uint8)
+        try:
+            rt.observe(gray_alias, 0.1)
+        except SceneCkptInputError as exc:
+            assert "cam_main" in str(exc), exc
+        else:
+            raise AssertionError("a grayscale cam_main was accepted")
+        # (c) an empty (0-size) array is a missing camera, not a shape error: the tick still predicts
+        emptied = dict(frames)
+        emptied["wide"] = np.zeros((0, 640, 3), dtype=np.uint8)
+        part = rt.observe(emptied, 0.1)
+        assert part.lane_gt is not None, "an empty wide array must be treated as missing, not refused"
+        assert tuple(part.missing_cams) == ("wide",), part.missing_cams
+    print("main-only input gone: bare ndarray refused, None/{}/no-main empty, bad wide refused, cam_main alias predicts and is shape-checked, empty array = missing OK")
 
 
 # ------------------------------------------------------------------ engage stays blocked
@@ -303,12 +339,175 @@ def check_run_vision_passes_the_frame_dict() -> None:
     print("run_vision: scene_ckpt.observe(ckpt_frames, ...) with ckpt_frames = getattr(bundle, 'frames', None) OK")
 
 
+# ------------------------------------------------------------------ missing cameras (Skeptic 2 r1, fix 1)
+
+
+def _pout():
+    return types.SimpleNamespace(
+        path_ego=[(0.0, 5.0)], path_conf=0.9, lane_conf=0.9, lane_source="", path_debug_preview=True
+    )
+
+
+def check_missing_cams_flagged_each_of_8() -> None:
+    from python.data.strip_writer import STRIP_ORDER
+    from python.train.scene_ckpt_runtime import SceneCkptPred, apply_scene_ckpt_lane, scene_ckpt_as_state
+
+    frames = _fixture_frames()
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        rt, _ = _runtime(Path(tmp), None)
+        full = rt.observe(frames, 0.1)
+        assert tuple(full.missing_cams) == () and full.as_state()["missing_cams"] == [], full.missing_cams
+        control = dataclasses.replace(full, lane_x=-0.5, confidence=0.99)  # a confident, complete prediction
+        assert apply_scene_ckpt_lane(_pout(), control, drive=True) == "lane", "control: a complete confident pred must steer"
+        for cam in STRIP_ORDER:
+            dropped = {k: v for k, v in frames.items() if k != cam}
+            pred = rt.observe(dropped, 0.1)
+            assert tuple(pred.missing_cams) == (cam,), (cam, pred.missing_cams)
+            assert pred.as_state()["missing_cams"] == [cam], (cam, pred.as_state())
+            st = scene_ckpt_as_state(pred, drive=True, engaged=False, steer=0.0)
+            assert st["missing_cams"] == [cam], (cam, st)
+            if cam == "main":
+                assert pred.lane_gt is None, "no main picture: no prediction"
+            else:
+                assert pred.lane_gt is not None, f"shadow still computes without {cam} (it is flagged, not hidden)"
+            # --scene-ckpt-drive: a flagged tick is no prediction. Even a confident lane_x must not steer.
+            forged = dataclasses.replace(
+                SceneCkptPred(lane_gt=np.zeros(14, dtype=np.float32), lane_x=-0.5, confidence=0.99, canvas_shape=(192, 2272, 3)),
+                missing_cams=(cam,),
+            )
+            for what, pr in (("observed", pred), ("forged confident", forged)):
+                pout = _pout()
+                assert apply_scene_ckpt_lane(pout, pr, drive=True, min_conf=0.0, no_conf_gate=True) == "stop", (cam, what)
+                assert pout.path_ego == [] and pout.lane_source == "scene_ckpt/stop", (cam, what, pout)
+            # shadow is unchanged: it never steers either way
+            assert apply_scene_ckpt_lane(_pout(), pred, drive=False) == "shadow"
+        # an empty (0-size) array and the cam_main alias
+        empty = dict(frames)
+        empty["rear"] = np.zeros((0, 0, 3), dtype=np.uint8)
+        assert tuple(rt.observe(empty, 0.1).missing_cams) == ("rear",)
+        aliased = {k: v for k, v in frames.items() if k != "main"}
+        aliased["cam_main"] = frames["main"]
+        assert tuple(rt.observe(aliased, 0.1).missing_cams) == (), "cam_main counts as main"
+        nothing = rt.observe(None, 0.1)
+        assert tuple(nothing.missing_cams) == tuple(STRIP_ORDER) and nothing.lane_gt is None, nothing.missing_cams
+        # a main-only ckpt only needs main: absent side cameras are not "missing" for it
+        m1 = Path(tmp) / "m1"
+        m1.mkdir()
+        rt1, _ = _runtime(m1, ("main",), seed=6)
+        only_main = rt1.observe({"main": frames["main"]}, 0.1)
+        assert tuple(only_main.missing_cams) == () and only_main.lane_gt is not None
+    print("missing_cams flagged for each of the 8 cams dropped in turn (pred + state), drive stops on every one, shadow unchanged OK")
+
+
+def check_missing_cams_logged_once_per_change() -> None:
+    frames = _fixture_frames()
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as tmp:
+        rt, _ = _runtime(Path(tmp), None)
+        no_wide = {k: v for k, v in frames.items() if k != "wide"}
+        no_wide_rear = {k: v for k, v in no_wide.items() if k != "rear"}
+        with contextlib.redirect_stdout(buf):
+            for tick in (frames, frames, no_wide, no_wide, no_wide, no_wide_rear, no_wide_rear, frames, frames):
+                rt.observe(tick, 0.1)
+    lines = [ln for ln in buf.getvalue().splitlines() if "scene-ckpt cams missing" in ln]
+    assert len(lines) == 3, lines
+    assert "wide" in lines[0] and "rear" not in lines[0], lines[0]
+    assert "wide" in lines[1] and "rear" in lines[1], lines[1]
+    assert "none" in lines[2], lines[2]
+    print("missing cams logged once per change (3 lines for 9 ticks, none for the complete ticks) OK")
+
+
+# ------------------------------------------------------------------ scale and canvas guard (Skeptic 2 r1, fix 4)
+
+
+def check_scale_applied_and_canvas_guard() -> None:
+    from python.data.strip_writer import STRIP_ORDER, compose_strip
+    from python.train.cam_strip import extract_cams, scale_canvas
+    from python.train.scene_ckpt_runtime import SceneCkptInputError, _main_canvas
+
+    frames = _fixture_frames()
+    names = tuple(STRIP_ORDER)
+    want = scale_canvas(extract_cams(compose_strip(frames), names), 0.5, names)
+    assert want.shape != (192, 2272, 3), want.shape
+    with tempfile.TemporaryDirectory() as tmp:
+        rt, _ = _runtime(Path(tmp), None, scale=0.5)
+        assert (rt.canvas_h, rt.canvas_w) == tuple(want.shape[:2]), ((rt.canvas_h, rt.canvas_w), want.shape)
+        direct = _main_canvas(frames, names, rt.canvas_h, rt.canvas_w, 0.5)
+        assert _bytes(direct) == _bytes(want), "scale 0.5 canvas is not scale_canvas(extract_cams(compose_strip(frames)))"
+        pred, canvas, _tensor = _observe_capture(rt, frames)
+        assert tuple(canvas.shape) == tuple(want.shape) and _bytes(canvas) == _bytes(want), canvas.shape
+        assert pred.canvas_shape == tuple(want.shape)
+        # a wrong canvas size is a SceneCkptInputError (run_vision catches that), never a bare ValueError from forward
+        try:
+            _main_canvas(frames, names, 192, 2000, 1.0)
+        except SceneCkptInputError as exc:
+            assert "canvas" in str(exc), exc
+        else:
+            raise AssertionError("a canvas of the wrong width was accepted")
+        rt.canvas_w = 1000
+        try:
+            rt.observe(frames, 0.1)
+        except SceneCkptInputError:
+            pass
+        else:
+            raise AssertionError("observe accepted a canvas that does not match the checkpoint")
+    print(f"scale 0.5 canvas == scale_canvas(...) {tuple(want.shape)}; wrong canvas size raises SceneCkptInputError OK")
+
+
+# ------------------------------------------------------------------ run_vision asks for the cameras (Skeptic 2 r1, fix 3)
+
+_NEEDED_DRIVER = """
+import json, sys
+ckpt, out = sys.argv[1], sys.argv[2]
+sys.argv = ["run_vision.py", "--backend", "stub", "--hz", "20", "--encode", "cpu", "--scene-ckpt", ckpt, "--run-seconds", "1"]
+import python.run_vision as rv
+real = rv.make_backend
+calls = []
+def fake_make_backend(*a, **k):
+    be = real(*a, **k)
+    def set_needed_cameras(cams):
+        calls.append([str(c) for c in cams])
+        json.dump(calls, open(out, "w"))
+    be.set_needed_cameras = set_needed_cameras
+    return be
+rv.make_backend = fake_make_backend
+rv.main()
+"""
+
+
+def check_run_vision_requests_all_ckpt_cams() -> None:
+    from python.data.strip_writer import STRIP_ORDER
+    from gvd_test_env import isolated_home
+
+    for cams, want in ((None, set(STRIP_ORDER)), (("main",), {"main"}), (("wide", "main"), {"wide", "main"})):
+        with tempfile.TemporaryDirectory() as tmp:
+            rt, _ = _runtime(Path(tmp), cams, seed=8)
+            out = Path(tmp) / "needed.json"
+            with isolated_home(prefix="gvd-needed-"):
+                env = dict(os.environ, PYTHONPATH=str(ROOT))
+                proc = subprocess.run(
+                    [sys.executable, "-B", "-u", "-c", _NEEDED_DRIVER, str(rt.path), str(out)],
+                    cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=180,
+                )
+            blob = proc.stdout + proc.stderr
+            assert proc.returncode == 0, blob[-2000:]
+            assert out.is_file(), "set_needed_cameras was never called for --scene-ckpt:\n" + blob[-1500:]
+            calls = json.loads(out.read_text())
+            assert len(calls) == 1 and set(calls[0]) == want and len(calls[0]) == len(want), (cams, calls)
+            assert "capture cameras=" in blob and all(c in blob for c in want), blob[-1500:]
+    print("run_vision --scene-ckpt: backend.set_needed_cameras gets all 8 cams for the 8-cam ckpt (and exactly the ckpt cams for 1- and 2-cam ckpts) OK")
+
+
 CHECKS = (
     check_fixture_is_real_8cam,
     check_train_live_input_identical,
-    check_main_canvas_is_the_full_strip,
+    check_scene_ckpt_is_8cam,
     check_multicam_loads_and_observes,
     check_main_only_input_is_gone,
+    check_missing_cams_flagged_each_of_8,
+    check_missing_cams_logged_once_per_change,
+    check_scale_applied_and_canvas_guard,
+    check_run_vision_requests_all_ckpt_cams,
     check_engage_still_blocked_with_8cam_ckpt,
     check_run_vision_passes_the_frame_dict,
 )

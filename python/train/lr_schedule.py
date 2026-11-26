@@ -78,12 +78,15 @@ class WarmupCosine:
         s = max(0, int(step))
         floor = self.floor_frac * self.peak
         if s < self.warmup_steps:
-            return self.peak * float(s + 1) / float(self.warmup_steps)
+            # quotient first: it is exactly 1.0 on the last warmup step (peak * n / n can be 1 ulp
+            # above peak) and cannot overflow for a huge peak
+            return self.peak * (float(s + 1) / float(self.warmup_steps))
         decay = self.total_steps - self.warmup_steps
         if decay <= 0:
             return self.peak
         frac = min(1.0, float(s - self.warmup_steps) / float(decay))
-        return floor + (self.peak - floor) * 0.5 * (1.0 + math.cos(math.pi * frac))
+        # min(): floor + (peak - floor) * 1.0 can round 1 ulp above peak at the cosine start
+        return min(self.peak, floor + (self.peak - floor) * 0.5 * (1.0 + math.cos(math.pi * frac)))
 
     def state_dict(self) -> dict[str, Any]:
         return {

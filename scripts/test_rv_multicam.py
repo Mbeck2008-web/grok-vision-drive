@@ -22,6 +22,8 @@ M10 Ego mask: the wide camera's hood region is masked; other cameras are untouch
 M11 Focal scale: Z correction is f_cam/f_ref (not inverted); zero, negative, and NaN focals are refused.
 M12 Ego-box cull: points inside EGO_BOX_SBR are dropped; points outside (X, Y, or Z) are kept.
 M13 Fused-point cap: MAX_FUSED_POINTS is 1_200_000; over-cap concat downsamples deterministically to the cap.
+M14 Static rule through unproject_camera: points above STATIC_MAX_HEIGHT_M are not static, points
+    at or below are; a tall point from a past frame is dropped by accumulate on the next frame.
 """
 from __future__ import annotations
 
@@ -365,6 +367,50 @@ def check_fused_point_cap():
     # Equal-to-cap is kept as-is (the downsample is strict-greater).
     exact = M.concat_points([_blob(cap, 2)], cap=cap)
     assert exact.n == cap
+
+
+def check_static_rule_and_ghost_drop():
+    assert M.STATIC_MAX_HEIGHT_M == 0.35
+    cam = _cam("main", 0.0, w=8, h=8, pitch=0.0)  # level, ego-Z of a pixel = 1.3 - (row+0.5-4)/fy*depth
+    d = np.ones((8, 8), np.float32)
+    valid = np.zeros((8, 8), bool)
+    rgb = np.zeros((8, 8, 3), np.uint8)
+    # Rows 5 / 2 are 1.5 px below / above the principal point, so ego-Z = 1.3 -/+ 1.5 / fy * depth.
+    for row, col, z_want, color in ((5, 4, 0.34, 1), (5, 3, 0.36, 2), (2, 2, 1.6, 3)):
+        d[row, col] = abs(1.3 - z_want) * cam.fy / 1.5  # -> ego-Z == z_want
+        valid[row, col] = True
+        rgb[row, col] = color
+    d[0, 4] = 6.0  # row 0 sees well above the camera
+    valid[0, 4] = True
+    rgb[0, 4] = 4
+    d[7, 4] = 5.0  # row 7 sees the ground below the camera height
+    valid[7, 4] = True
+    rgb[7, 4] = 5
+    fp = M.unproject_camera(cam, rgb, d, valid)
+    assert fp.n == 5
+    by_color = {int(c[0]): (float(pt[2]), bool(s)) for c, pt, s in zip(fp.cols, fp.pts, fp.static)}
+    assert abs(by_color[1][0] - 0.34) < 1e-4 and by_color[1][1] is True, by_color
+    assert abs(by_color[2][0] - 0.36) < 1e-4 and by_color[2][1] is False, by_color
+    assert abs(by_color[3][0] - 1.6) < 1e-4 and by_color[3][1] is False, by_color
+    assert by_color[4][0] > M.STATIC_MAX_HEIGHT_M and by_color[4][1] is False, by_color
+    assert by_color[5][0] < 0.0 and by_color[5][1] is True, by_color
+    assert np.array_equal(fp.static, fp.pts[:, 2] <= M.STATIC_MAX_HEIGHT_M)
+    # A car-height point seen last frame must not reappear after the ego moved on: only the
+    # static points survive accumulate, moved by the ego motion (1 m forward -> Y - 1).
+    pose_then, pose_now = (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+    out = M.accumulate(M.empty_points(), [(fp, pose_then)], pose_now)
+    assert out.n == int(fp.static.sum()) == 2
+    assert set(int(c[0]) for c in out.cols) == {1, 5}, out.cols
+    assert not np.any(out.pts[:, 2] > M.STATIC_MAX_HEIGHT_M)
+    src_static = fp.pts[fp.static]
+    order_out = np.argsort(out.cols[:, 0])
+    order_src = np.argsort(fp.cols[fp.static][:, 0])
+    assert np.allclose(out.pts[order_out][:, 1], src_static[order_src][:, 1] - 1.0, atol=1e-4)
+    # Backdrop points are never carried forward either.
+    back = np.zeros((8, 8), bool)
+    back[7, 4] = True
+    fpb = M.unproject_camera(cam, rgb, d, valid, backdrop=back)
+    assert M.accumulate(M.empty_points(), [(fpb, pose_then)], pose_now).n == 1
 
 
 def main() -> None:

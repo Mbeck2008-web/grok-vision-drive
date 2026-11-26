@@ -13,7 +13,7 @@ Checks (python/train/depth_hires.py, opt-in ``--aux-depth --heads ...,depth_hire
   check_far_term_is_half_masked_bce   the far term is exactly FAR_LOSS_WEIGHT (0.5) x masked BCE on a known target
   check_prediction_at_copies_keep_far per-row scene_loss through BOTH _prediction_at copies (train_scene, scene_net) is depth + far
   check_train_directory_trains_hires  train_directory on a main_depth fixture: 48x64 labels, far head wired, ckpt carries the head
-  check_fpn_stride4_skip_matters      the stride-4 skip (lat[0](c2)) changes the 48x64 output and gets a nonzero grad
+  check_fpn_laterals_and_smooth      every FPN lateral (lat[0..2] on c2/c3/c4) and the 3x3 smooth conv change the 48x64 output / get a nonzero grad
   check_depth_floor_on_negative_logits  aux_depth >= 0.1 (MIN_DEPTH_M) even for large negative logits
 Torch checks skip visibly without torch.
 """
@@ -559,32 +559,55 @@ def check_train_directory_trains_hires() -> None:
     print(f"train_directory: {len(calls)} scene_loss calls with 48x64 labels + far logit; aux_depth == depth + far; "
           f"ckpt has {HEAD_PREFIX}* and {ARCH_TOKEN} OK")
 
-def check_fpn_stride4_skip_matters() -> None:
-    """The stride-4 skip ``+ self.lat[0](c2)`` must affect the 48x64 output (not just a bilinear upsample of 24x32)."""
+def check_fpn_laterals_and_smooth() -> None:
+    """Every FPN lateral and the 3x3 smooth conv must affect the 48x64 output.
+
+    ``lat[0](c2)`` is the stride-4 skip, ``lat[1](c3)`` the stride-8 skip,
+    ``lat[2](c4)`` the stride-16 starting map, and ``smooth`` the 3x3 after the
+    merge. Dropping any one of them must fail this check.
+    """
     torch = _torch()
     if torch is None:
-        skip_check("check_fpn_stride4_skip_matters", "torch not installed")
+        skip_check("check_fpn_laterals_and_smooth", "torch not installed")
         return
     from python.train.depth_hires import stem_pyramid
 
     net = _net(torch, True, 1.0).train()
+    head = net.depth_hires_head
     img = _image(torch, net)
     with torch.no_grad():
         pyr = [m.detach().clone() for m in stem_pyramid(net.stem, img[:, :, :, net.sectors[0].x0 : net.sectors[0].x1])]
-    # Perturbing only the stride-4 map (pyramid[-3] == c2) must change metres and/or the far logit.
-    with torch.no_grad():
-        base_d, base_f = net.depth_hires_head(pyr)
-        tweaked = [m.clone() for m in pyr]
-        tweaked[-3] = tweaked[-3] + 1.0
-        d2, f2 = net.depth_hires_head(tweaked)
-    assert not torch.allclose(base_d, d2) or not torch.allclose(base_f, f2), "stride-4 stem map did not change the 48x64 output"
-    # And lat[0] (the 1x1 on c2) must receive a nonzero gradient.
-    net.depth_hires_head.zero_grad(set_to_none=True)
-    depth, far = net.depth_hires_head([m.requires_grad_(False) for m in pyr])
+        base_d, base_f = head(pyr)
+    # pyramid[-3:] is (c2, c3, c4) at strides 4, 8, 16. Perturbing any one must change metres or the far logit.
+    maps = (
+        (-3, "stride-4 c2 / lat[0]"),
+        (-2, "stride-8 c3 / lat[1]"),
+        (-1, "stride-16 c4 / lat[2]"),
+    )
+    deltas = []
+    for idx, name in maps:
+        with torch.no_grad():
+            tweaked = [m.clone() for m in pyr]
+            tweaked[idx] = tweaked[idx] + 1.0
+            d2, f2 = head(tweaked)
+        changed = not torch.allclose(base_d, d2) or not torch.allclose(base_f, f2)
+        assert changed, f"{name} did not change the 48x64 output"
+        deltas.append((name, float((base_d - d2).abs().max()), float((base_f - f2).abs().max())))
+    # Each lateral and the 3x3 smooth must receive a nonzero gradient.
+    head.zero_grad(set_to_none=True)
+    depth, far = head([m.requires_grad_(False) for m in pyr])
     (depth.sum() + far.sum()).backward()
-    grad = net.depth_hires_head.lat[0].weight.grad
-    assert grad is not None and float(grad.abs().sum()) > 0.0, "lat[0] (stride-4 skip) got no gradient"
-    print(f"fpn stride-4 skip: c2 perturbation changes output (max |d| {float((base_d-d2).abs().max()):.4f}); lat[0] grad sum {float(grad.abs().sum()):.3g} OK")
+    grads = []
+    for i, name in enumerate(("lat[0] (stride-4)", "lat[1] (stride-8)", "lat[2] (stride-16)")):
+        grad = head.lat[i].weight.grad
+        assert grad is not None and float(grad.abs().sum()) > 0.0, f"{name} got no gradient"
+        grads.append((name, float(grad.abs().sum())))
+    sg = head.smooth.weight.grad
+    assert sg is not None and float(sg.abs().sum()) > 0.0, "smooth (3x3) got no gradient"
+    grads.append(("smooth", float(sg.abs().sum())))
+    delta_txt = ", ".join(f"{n} |d|={dd:.4f}" for n, dd, _df in deltas)
+    grad_txt = ", ".join(f"{n} {g:.3g}" for n, g in grads)
+    print(f"fpn laterals+smooth: perturbation changes output ({delta_txt}); grads {grad_txt} OK")
 
 
 def check_depth_floor_on_negative_logits() -> None:
@@ -623,7 +646,7 @@ def main() -> int:
         check_far_term_is_half_masked_bce,
         check_prediction_at_copies_keep_far,
         check_train_directory_trains_hires,
-        check_fpn_stride4_skip_matters,
+        check_fpn_laterals_and_smooth,
         check_depth_floor_on_negative_logits,
     )
     failed = 0

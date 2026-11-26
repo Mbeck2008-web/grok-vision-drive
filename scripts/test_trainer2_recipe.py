@@ -722,8 +722,11 @@ def check_retention_real_paths() -> None:
         assert rec.may_unlink_checkpoint(other_partial, owned_partials=(root / "y.partial",)) is False
         onnx = root / "m.onnx"
         onnx.write_bytes(b"o")
+        (root / "run.ckpt_meta.json").write_text("{}")  # ckpt-named sidecar, other suffix
+        (root / "notes.txt").write_text("n")
         snap = rec.snapshot_checkpoints(root)
         assert "m.onnx" in snap and "old.ckpt" in snap and "x.ckpt.partial-9" not in snap, snap
+        assert "run.ckpt_meta.json" in snap and "notes.txt" not in snap, snap
         old.unlink()
         try:
             rec.assert_old_checkpoints_untouched(snap, rec.snapshot_checkpoints(root))
@@ -776,7 +779,26 @@ def check_more_pins() -> None:
     from python.train.scene_net import HEAD_NAMES, head_names
     assert head_names(()) == frozenset() and head_names([]) == frozenset()
     assert head_names(None) == frozenset(HEAD_NAMES)
-    print("accum batch==4 boundary, stage 7 heads, cfg joint/rv, stage 0 stem lr, head_names(()) == none OK")
+    # BEV (stages 3/4) is not on this checkout: its head must not be reported as existing
+    assert not (ROOT / "python" / "train" / "bev_lss.py").exists()
+    assert rec.default_heads_exist()["3"] is False and rec.default_heads_exist()["4"] is False
+    # the preset-known and VRAM guards are independent of the deploy-size list (defence in depth)
+    from python.train.model_size import PRESETS
+    assert float(PRESETS["medium"].est_vram_gb) > rec.LIVE_INFER_VRAM_GB
+    saved = rec.DEPLOY_PRESETS
+    rec.DEPLOY_PRESETS = frozenset(saved | {"medium", "no_such_preset"})
+    try:
+        for name, word in (("medium", "GB"), ("no_such_preset", "unknown")):
+            try:
+                rec.student_export_fits_deploy(preset=name, student_param_count=1, exported_param_count=1)
+            except rec.RecipeRefused as exc:
+                assert word in str(exc), exc
+            else:
+                raise AssertionError(f"{name} must be refused even if listed as a deploy size")
+    finally:
+        rec.DEPLOY_PRESETS = saved
+    print("accum batch==4 boundary, stage 7 heads, cfg joint/rv, stage 0 stem lr, head_names(()) == none, "
+          "no BEV head, VRAM / unknown-preset guards independent OK")
 
 
 def check_balanced_loss_keeps_extras() -> None:

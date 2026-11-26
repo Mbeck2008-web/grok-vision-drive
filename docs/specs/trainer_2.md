@@ -11,21 +11,22 @@ VRAM numbers are **measured** (repo source cited) or **est.** (math shown). The 
 
 One opt-in trainer recipe, `train_scene --recipe trainer2` (**new** flag in `python/train/train_scene.py`; default off, so every existing command is bit-identical). It trains the existing `SceneNet` with the existing `SharedStem` (`python/train/scene_net.py`) through a fixed curriculum, with per-task loss/grad monitoring, GradNorm, head ramps, warmup+cosine and per-group LR. It must beat today's trainer on a pre-registered, matched holdout, with one hashed run each. Optional late add-on: a bigger offline teacher distilled into the small live student.
 
-Inputs: **7-cam set**: `repeatL, pillarL, main, narrow, pillarR, repeatR, rear`. GVD is removing `wide` from the model inputs, the recorder and every wide-derived lane/polyline (`lanes.py:810` `src="wide"`, `path_predictor.py:564-590`, `pipeline.py:338`; see `/workspace/gvd-notes/wide_aeb_check.md`). Trainer 2.0 reads the cam list from `python/data/strip_writer.STRIP_ORDER` after that removal. It never names `wide`, and no input or target comes from wide. With 7 cams the sector token is 7×64 = 448 wide, not `TOKEN_DIM` 512. `SceneNet` already adds `self.skip = Linear(448, 512)` when `token_dim != gru_hidden`, so the arch tag changes and 8-cam heads/GRU checkpoints do not load. The `SharedStem` weights are cam-agnostic (one stem shared over every sector), so `--init-stem` from an 8-cam run is legal.
+Inputs, **today on `98af813`**: 8 cams. `strip_writer.STRIP_ORDER` = `repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear` (`WIDE_CAMS` = {wide, rear}, 2272×192 canvas).
+**Spec target: 7 cams** = `repeatL, pillarL, main, narrow, pillarR, repeatR, rear`. This is **conditional on GVD's wide-removal PR landing first**. That PR removes `wide` from the model inputs, the recorder and every wide-derived lane/polyline (`lanes.py:810` `src="wide"`, `path_predictor.py:564-590`, `pipeline.py:338`; `/workspace/gvd-notes/wide_aeb_check.md`). As of 6:40 PM it is **on hold** while Michael weighs 7 missed stop-sign brakes from a 22–37.5° blind gap without wide. No Trainer 2.0 PR that assumes 7 cams merges before it. Trainer 2.0 reads the cam list from `STRIP_ORDER` (never a hard-coded list), so it follows whatever main has. It never names `wide`, and no input or target comes from wide. With 7 cams the sector token is 7×64 = 448 wide, not `TOKEN_DIM` 512. `SceneNet` already adds `self.skip = Linear(448, 512)` when `token_dim != gru_hidden`, so the arch tag changes and 8-cam heads/GRU checkpoints do not load. The `SharedStem` weights are cam-agnostic (one stem shared over every sector), so `--init-stem` from an 8-cam run is legal.
 
 ## Train input = live input (Michael, 6:37 PM)
 
-Every head trains on the same stitched 7-cam strip the live model receives. The one stitch function is `python/data/strip_writer.compose_strip` (`SECTORS` from `STRIP_ORDER`, per-sector `place_sector`; canvas `CANVAS_H`=192 × `CANVAS_W`).
+Every head trains on the same stitched strip the live model receives: 7-cam once the wide removal lands, and today's 8-cam on `98af813`. The one stitch function is `python/data/strip_writer.compose_strip` (`SECTORS` from `STRIP_ORDER`, per-sector `place_sector`; canvas `CANVAS_H`=192 × `CANVAS_W`).
 - Train: `train_scene._frame_row` → `_load_bgr` → `scene_loader.load_canvas` → `raw_frames.load_training_bgr` → `compose_strip(load_raw_cameras(...))`. Hold-last rows go `held_canvas` → `compose_strip`. Then optional `cam_strip.extract_cams` / `scale_canvas`, and train-only `photometric_jitter` (`--augment`).
 - Live: `run_vision.py:1551` `compose_strip(frames)` → `scene_guard.observe` → `scene_lane_runtime._strip_nchw` (uint8 → float32 /255, HWC→NCHW).
 - **Gap found:** `scene_ckpt_runtime._main_canvas` (`--scene-ckpt`) builds `compose_strip({"main": frame})`, which is **main-only**. A 7-cam head would get a black canvas outside main there. Trainer 2.0 heads must not ship on that path until it feeds all 7 cams (a GVD runtime change, outside these PRs; Open question 5).
 - **Normalization** must be one function (**new** `python/train/strip_tensor.py::strip_to_nchw`, moved verbatim from `_strip_nchw`; `exp_ssl.frame_to_nchw` and the trainer call it).
-- `check_train_live_input_identical`: on the same recorded fixture frames (`tests/fixtures`), the train builder (augment off) and the live builder (`compose_strip` + `_strip_nchw`) give **byte-identical** float32 NCHW tensors. A sha256 is pinned per fixture, covering cam order (`STRIP_ORDER`, 7 names, no `wide`), sector crop/x0/x1, resolution and /255. Any drift fails the pin. `--scale` < 1 and `--augment` are train-only and are refused in a recipe meant for a live export.
+- `check_train_live_input_identical`: on the same recorded fixture frames (`tests/fixtures`), the train builder (augment off) and the live builder (`compose_strip` + `_strip_nchw`) give **byte-identical** float32 NCHW tensors. A sha256 is pinned per fixture, covering cam order (`STRIP_ORDER`; 7 names with no `wide` after the prerequisite PR), sector crop/x0/x1, resolution and /255. Any drift fails the pin. `--scale` < 1 and `--augment` are train-only and are refused in a recipe meant for a live export.
 
 ## Non-goals
 
 - **Safety path untouched**: heartbeat, AEB and engage (`python/control/actuate.py`, `python/control/ego_speed.py`, `python/sensors/live_hold.py`, `python/control/echo_link.py`, `python/perception/cipv.py`, `beamng_mod/.../gvd/main.lua`). No trainer module is imported by them (`check_safety_path_no_trainer_imports`).
-- No live change. Live runtime (`scene_ckpt_runtime.py`, `scene_live.py`) and the ONNX export contract stay as they are, apart from the 7-cam arch that GVD's wide removal brings.
+- No live change. Live runtime (`scene_ckpt_runtime.py`, `scene_live.py`) and the ONNX export contract stay as they are, apart from the 7-cam arch that GVD's wide-removal PR (prerequisite, on hold) would bring.
 - No new heavy backbone live. The deployed model is `tiny`/`small` (`python/train/model_size.PRESETS`), YOLOv8n stays for objects, and no new deps.
 - No BEV/LSS, 3DGS or refiner *architecture* here. Those stages train heads that Phases 5/6/9 add. Until a head exists on main, its stage is **skipped and logged**, not faked.
 - No checkpoint is ever deleted: old 8-cam `.npz`/ONNX and epoch snapshots are kept. The trainer writes new files only.
@@ -83,13 +84,15 @@ Each stage resumes the previous stage's best checkpoint (written by `python/trai
   - **missed brakes:** the predicted brake profile does not reach v < 0.5 m/s by stop line + 1 m. **Must be 0.**
   - **false brakes:** `ctl_brake` > 0.3 with no stop event within 40 m, counted per km.
   - **stop distance:** signed m from the stop line at v < 0.5 m/s, median and p95.
+- **Known risk: 22–37.5° blind gap.** Without `wide`, stop signs at 22–37.5° off-axis fall between the main/narrow and pillar FOVs. GVD's check counted 7 missed stop-sign brakes. A camera-only learned brake cannot see what no camera sees, so this gap caps the learned version. The hand rule and AEB stay as the backstop. If the wide removal lands, the gap is accepted per Michael's decision, not fixed here.
+- **Side-angle holdout slice:** a separate `stop_side_angle` slice covers events whose stop sign bearing from ego is 15–45° at first GT visibility. It is reported on its own (missed/false/stop distance), and 0 missed brakes is required on it too. It is never pooled away into the overall number.
 - **Comparator:** the hand-coded rule replayed read-only (`predict_path` on the same recorded holdout frames' detections), on the same split manifest, metrics and events. One hashed run each, no re-rolls.
 - **Retirement rule:** the hand-coded rule and AEB are **never** removed or weakened in any Trainer 2.0 PR. Retiring the hand-coded stop rule needs all of: 0 missed brakes on the matched holdout, ≤ the rule's false-brake rate, and stop distance p95 no worse. Then **Michael's explicit OK** and a separate PR outside Trainer 2.0. AEB (`cipv.aeb`, `plan.aeb`) is not part of that retirement and stays as the backstop.
 - `ctl` and `stop_line` stay offline/not exported in Trainer 2.0. Using a learned brake live is a later, separately gated spec.
 
 ## VRAM budgets (two)
 
-Canvas for 7 cams at scale 1 (est.): 6×256 + 1×340 (`rear`, 16:9) + 6×8 gap = **1924×192** (`strip_writer` constants). Stem = 4 stride-2 3×3 convs. Activations per frame ≈ Σ(C·H·W) × 3 stored tensors (conv/GN/ReLU) × 4 B.
+Canvas for 7 cams at scale 1 (est., assuming the removal keeps the other sector widths): 6×256 + 1×340 (`rear`, 16:9) + 6×8 gap = **1924×192** (`strip_writer` constants). Today's 8-cam canvas is 2272×192, so every activation figure below is ×1.18 on today's main. Stem = 4 stride-2 3×3 convs. Activations per frame ≈ Σ(C·H·W) × 3 stored tensors (conv/GN/ReLU) × 4 B.
 
 **Train budget: full GTX 1080 Ti 11 GB, game off** (Michael, 6:07 PM). Target ≤ 10 GB allocated, leaving ~1 GB for context and fragmentation (est.).
 - Student `small` (32,64,128,128): (96·962·32 + 48·481·64 + 24·241·128 + 12·121·128) = 5.36 M floats ×3 ×4 B ≈ **64 MB/frame**, ×T=16 ≈ **1.03 GB/window** without `--grad-ckpt`. With `--grad-ckpt` (exists, scratch net only), ≈ one tick (~64 MB) + tokens. Weights+grad+AdamW ≈ 2.2 M params (`architecture_parameter_count()` = 2,195,486 for 8-cam) ×16 B ≈ 35 MB. Batch: `--batch 0` auto-fit (`resolve_scene_batch` / `_probe_cuda`, exists) → est. ~8 windows without ckpt.
@@ -118,7 +121,7 @@ All live in `scripts/test_trainer2_*.py`. Torch parts use `gvd_test_env.skip_che
 - `check_no_wide_targets`: every target builder used by the recipe refuses rows/polylines with `src == "wide"` or a wide-cam origin. AST check: no `"wide"` literal in the `trainer2_*` modules.
 - `check_safety_path_no_trainer_imports`: an AST walk from the safety modules listed in Non-goals never reaches `python.train.*`.
 - `check_train_live_input_identical` (hash pin, see Train input = live input), `check_strip_order_7cam`.
-- `check_stop_labels_train_only` (stop GT/`brake_ai` is never an input; GT modules are unreachable from live entry points), `check_stop_events_split_safe` (events are counted in holdout rows only), `check_stop_metrics_on_fixture` (a hand-built clip with 1 missed brake, 1 false brake and a known stop distance gives exactly those numbers), `check_hand_rule_untouched` (sha256 pin of `path_predictor.py`, `pipeline.py`, `actuate.py`, `cipv.py` at the base SHA; any Trainer 2.0 PR that changes them fails).
+- `check_stop_labels_train_only` (stop GT/`brake_ai` is never an input; GT modules are unreachable from live entry points), `check_stop_events_split_safe` (events are counted in holdout rows only), `check_stop_side_angle_slice` (a 30° fixture event lands in `stop_side_angle` and is reported separately), `check_stop_metrics_on_fixture` (a hand-built clip with 1 missed brake, 1 false brake and a known stop distance gives exactly those numbers), `check_hand_rule_untouched` (sha256 pin of `path_predictor.py`, `pipeline.py`, `actuate.py`, `cipv.py` at the base SHA; any Trainer 2.0 PR that changes them fails).
 - `check_ssl_ema_no_collapse`, `check_ssl_rows_train_only`.
 - `check_curriculum_order_and_gates`: stage order is fixed, a stage with a missing head is skipped and logged, and the non-regression gate rejects a checkpoint.
 - `check_head_ramp_linear`, `check_gradnorm_weights_sum_and_clamp`, `check_per_task_grad_norm_logged`.
@@ -135,6 +138,7 @@ All live in `scripts/test_trainer2_*.py`. Torch parts use `gvd_test_env.skip_che
 4. Teacher = `xl` preset (proposed), or is a larger offline teacher worth an IQU45 VRAM measurement first?
 5. `--scene-ckpt` live input is main-only (`scene_ckpt_runtime._main_canvas`). Should GVD switch it to the full 7-cam `compose_strip` before any Trainer 2.0 head goes live?
 6. Stop-event thresholds (40 m, 2 m/s, 0.5 m/s, +1 m, brake 0.3): OK as the pinned definition?
+7. If the wide removal does not land, does Trainer 2.0 train on 8 cams (the spec works either way through `STRIP_ORDER`), with the no-wide checks dropped?
 
 ## Appendix A: file touch list
 
@@ -171,7 +175,8 @@ CI (torch CPU) runs the same suite on the draft PR. Skeptic re-runs it in `/work
 
 1. **PR 0**: this spec.
 2. **PR 1**: split manifest + pre-registration (`trainer2_split.py`). Tests: `check_trainer2_split_no_overlap`, `check_manifest_hashed_before_train`, `check_no_seed_reroll`.
-3. **PR 2**: 7-cam / no-wide guards + safety-import check. Tests: `check_trainer_no_wide_input`, `check_no_wide_targets`, `check_safety_path_no_trainer_imports`. Lands after GVD's wide removal.
+2b. **Prerequisite (GVD's, not Trainer 2.0): wide-removal PR** on main. Currently on hold for Michael's stop-sign decision. PR 2 and every 7-cam-assuming PR wait for it. PR 1, PR 3, PR 4 and the safety-import check do not depend on the cam set and can land first.
+3. **PR 2**: 7-cam / no-wide guards + safety-import check. Tests: `check_trainer_no_wide_input`, `check_no_wide_targets`, `check_safety_path_no_trainer_imports`. **Blocked on 2b.**
 3b. **PR 2b**: one input builder. `strip_to_nchw` plus the train/live hash pin. Tests: `check_train_live_input_identical`, `check_strip_order_7cam`. No live behavior change.
 4. **PR 3**: LR schedule + `SceneNet.param_groups`. Tests: `check_warmup_cosine_shape`, `check_param_groups_lr_mult`, `check_resume_keeps_schedule`, `check_recipe_off_is_bit_identical`.
 5. **PR 4**: per-task grad norms, GradNorm, ramps. Tests: `check_per_task_grad_norm_logged`, `check_gradnorm_weights_sum_and_clamp`, `check_head_ramp_linear`.

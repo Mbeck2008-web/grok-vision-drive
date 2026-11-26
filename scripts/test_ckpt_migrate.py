@@ -42,6 +42,12 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _same_bits(a, b) -> bool:
+    """Same dtype, same shape, same bytes (np.array_equal would pass 0.0 == -0.0 and widen dtypes)."""
+    a, b = np.asarray(a), np.asarray(b)
+    return a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes()
+
+
 def make_old_ckpt(dirpath: Path, name: str = "strips.run20261107T011144Z.ckpt_ep11_step77.npz") -> Path:
     """A real tiny SceneNet state_dict whose object_class_head is 96 rows (distinct, known values)."""
     from python.train.epoch_ckpt import build_net, write_epoch_ckpt
@@ -51,6 +57,7 @@ def make_old_ckpt(dirpath: Path, name: str = "strips.run20261107T011144Z.ckpt_ep
     hidden = weights["object_class_head.weight"].shape[1]
     weights["object_class_head.weight"] = (np.arange(96)[:, None] * 1000 + np.arange(hidden)[None, :]).astype(np.float32)
     weights["object_class_head.bias"] = (np.arange(96) + 0.5).astype(np.float32)
+    weights["object_class_head.weight"][0, 0] = np.float32(-0.0)  # a value np.array_equal cannot tell from +0.0
     path = dirpath / name
     write_epoch_ckpt(path, weights, dict(META_FIELDS), min_free_bytes=0)
     return path
@@ -191,7 +198,7 @@ def check_migrate_values_and_loads() -> None:
         assert list(a["weights"]) == list(b["weights"])
         for key in a["weights"]:
             if key not in HEAD_KEYS:
-                assert np.array_equal(a["weights"][key], b["weights"][key]), key
+                assert _same_bits(a["weights"][key], b["weights"][key]), key
         n_new, n_old = len(OBJECT_CLASSES), len(OLD_NAMES)
         for key in HEAD_KEYS:
             ow, nw = a["weights"][key], b["weights"][key]
@@ -200,7 +207,7 @@ def check_migrate_values_and_loads() -> None:
             for slot in range(N_OBJECTS):
                 for j, name in enumerate(OBJECT_CLASSES):
                     i = OLD_NAMES.index(name)
-                    assert np.array_equal(nw[slot * n_new + j], ow[slot * n_old + i]), (key, slot, name)
+                    assert _same_bits(nw[slot * n_new + j], ow[slot * n_old + i]), (key, slot, name)
         # dropped class: none of its old rows (values encode the old row) survive
         w = b["weights"]["object_class_head.weight"]
         gone = {slot * n_old + OLD_NAMES.index(OLD_WORD) for slot in range(N_OBJECTS)}
@@ -220,7 +227,7 @@ def check_migrate_values_and_loads() -> None:
         net = build_net(meta, b["weights"])
         load_into_net(net, b["weights"])
         got = net.state_dict()["object_class_head.weight"].numpy()
-        assert np.array_equal(got, w)
+        assert _same_bits(got, w)
     print("migrated ckpt: row j == old row map[j] for weight+bias x16 slots, dropped rows gone, input sha unchanged, loads under guard")
 
 
@@ -234,7 +241,7 @@ def check_refusals() -> None:
         out = d / "o.npz"
         mig.migrate_file(old, out)
         first = _sha(out)
-        # overwrite refused unless --force; input never overwritten
+        # an existing output is always refused; input never overwritten
         try:
             mig.migrate_file(old, out)
         except mig.MigrationRefused as exc:
@@ -242,10 +249,9 @@ def check_refusals() -> None:
         else:
             raise AssertionError("overwrite not refused")
         assert _sha(out) == first
-        mig.migrate_file(old, out, force=True)
         for same in (old, d / "." / old.name):
             try:
-                mig.migrate_file(old, same, force=True)
+                mig.migrate_file(old, same)
             except mig.MigrationRefused as exc:
                 assert "input" in str(exc), exc
             else:
@@ -334,13 +340,295 @@ def check_cli() -> None:
         d = Path(tmp)
         old = make_old_ckpt(d)
         out = d / "cli.migrated5.npz"
-        cmd = [sys.executable, str(ROOT / "scripts/migrate_ckpt_classes.py"), str(old), str(out)]
+        cmd = [sys.executable, str(ROOT / "scripts/migrate_ckpt_classes.py"), str(old), str(out), "--min-free-gb", "0"]
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, timeout=120)
         assert r.returncode == 0, r.stdout + r.stderr
         assert "96 -> 80" in r.stdout and OLD_WORD in r.stdout and out.name in r.stdout, r.stdout
         again = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, timeout=120)
-        assert again.returncode != 0 and "exists" in (again.stdout + again.stderr), again.stdout + again.stderr
-    print("cli: exit 0 with summary; second run refused (exit != 0)")
+        assert again.returncode == 2 and "REFUSED" in again.stderr and "exists" in again.stderr, (again.returncode, again.stdout, again.stderr)
+    print("cli: exit 0 with summary; second run REFUSED exit 2")
+
+
+# ------------------------------------------------------------------ rework (#266): never replace, refuse bad input
+
+
+def _cli(*args: str):
+    import subprocess
+
+    cmd = [sys.executable, str(ROOT / "scripts/migrate_ckpt_classes.py"), *args]
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, timeout=120)
+
+
+def _plain_ckpt(path: Path) -> bytes:
+    """A valid 80-output (non-migrated) epoch ckpt: stands in for a real model file."""
+    from python.train.epoch_ckpt import build_net, write_epoch_ckpt
+
+    net = build_net(META_FIELDS)
+    w = {k: v.detach().cpu().numpy().copy() for k, v in net.state_dict().items()}
+    write_epoch_ckpt(path, w, dict(META_FIELDS), min_free_bytes=0)
+    return path.read_bytes()
+
+
+def check_existing_output_never_replaced() -> None:
+    import inspect
+
+    import migrate_ckpt_classes as mig
+
+    assert "force" not in inspect.signature(mig.migrate_file).parameters, "migrate_file still has a force switch"
+    assert "force" not in mig.build_parser().format_help().lower(), "--force still in --help"
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        src_before = _sha(old)
+        migrated = d / "was_migrated.npz"
+        mig.migrate_file(old, migrated)
+        plain = d / "real_model.npz"
+        _plain_ckpt(plain)
+        garbage = d / "not_a_ckpt.npz"
+        garbage.write_bytes(b"precious bytes, not an npz")
+        for dst in (plain, migrated, garbage):
+            before = dst.read_bytes()
+            # API: refused, bytes identical
+            try:
+                mig.migrate_file(old, dst)
+            except mig.MigrationRefused as exc:
+                assert "exists" in str(exc), exc
+            else:
+                raise AssertionError(f"{dst.name}: existing output not refused")
+            assert dst.read_bytes() == before, f"{dst.name} changed"
+            # CLI: exit 2, REFUSED, bytes identical
+            r = _cli(str(old), str(dst), "--min-free-gb", "0")
+            assert r.returncode == 2 and "REFUSED" in r.stderr and "exists" in r.stderr, (dst.name, r.returncode, r.stdout, r.stderr)
+            assert dst.read_bytes() == before and hashlib.sha256(before).hexdigest() == _sha(dst), f"{dst.name} changed via CLI"
+            # --force no longer exists: argparse error, exit 2, nothing replaced
+            r = _cli(str(old), str(dst), "--force", "--min-free-gb", "0")
+            assert r.returncode == 2 and "--force" in r.stderr and "unrecognized" in r.stderr, (dst.name, r.returncode, r.stderr)
+            assert dst.read_bytes() == before, f"{dst.name} changed by --force"
+        assert _sha(old) == src_before
+        assert not list(d.glob("*.partial*"))
+    print("existing output (non-migrated ckpt, migrated ckpt, garbage) refused exit 2, bytes identical; --force is an argparse error exit 2")
+
+
+def check_dangling_symlink_output_refused() -> None:
+    import migrate_ckpt_classes as mig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        link = d / "out.npz"
+        try:
+            os.symlink(d / "nowhere.npz", link)
+        except (OSError, NotImplementedError):
+            print("symlink not permitted here; skipped")
+            return
+        try:
+            mig.migrate_file(old, link)
+        except mig.MigrationRefused:
+            pass
+        else:
+            raise AssertionError("dangling symlink output accepted")
+        assert not (d / "nowhere.npz").exists()
+    print("dangling-symlink output refused, target not created")
+
+
+def check_two_old_classes_one_new_class_refused() -> None:
+    import migrate_ckpt_classes as mig
+    from python.train.scene_net import OBJECT_CLASSES
+
+    policy = dict(mig.CLASS_POLICY)
+    policy["bus"] = "truck"  # truck <- truck and bus
+    try:
+        mig.build_mapping(mig.OLD_CLASSES, OBJECT_CLASSES, policy)
+    except mig.MappingError as exc:
+        text = str(exc)
+        assert "truck" in text and "bus" in text and "both map" in text and "merge" in text, text
+    else:
+        raise AssertionError("two old classes mapping to one new class was accepted")
+    # same through the file API: nothing written
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        saved = dict(mig.CLASS_POLICY)
+        mig.CLASS_POLICY["bus"] = "truck"
+        try:
+            try:
+                mig.migrate_file(old, d / "never.npz")
+            except mig.MappingError:
+                pass
+            else:
+                raise AssertionError("migrate_file accepted a merge")
+        finally:
+            mig.CLASS_POLICY.clear()
+            mig.CLASS_POLICY.update(saved)
+        assert not (d / "never.npz").exists() and not list(d.glob("*.partial*"))
+    print("two old classes -> one new class: MappingError naming both, no output")
+
+
+def check_output_appearing_after_precheck_is_refused() -> None:
+    import migrate_ckpt_classes as mig
+    from python.train import epoch_ckpt
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        dst = d / "race.npz"
+        precious = b"someone else's file, created after the exists() check"
+        real_serialise = epoch_ckpt.serialise
+
+        def serialise_then_race(weights, meta):
+            blob = real_serialise(weights, meta)
+            dst.write_bytes(precious)  # appears after every pre-check, before the create step
+            return blob
+
+        epoch_ckpt.serialise = serialise_then_race
+        try:
+            try:
+                mig.migrate_file(old, dst)
+            except mig.MigrationRefused as exc:
+                assert "exists" in str(exc), exc
+            else:
+                raise AssertionError("an output that appeared after the pre-check was replaced")
+        finally:
+            epoch_ckpt.serialise = real_serialise
+        assert dst.read_bytes() == precious, "racing file was overwritten"
+        assert not list(d.glob("*.partial*")), "temp file left behind"
+    print("output created after the pre-check: refused, file intact, no temp left")
+
+
+def check_unreadable_input_is_refused_exit_2() -> None:
+    import migrate_ckpt_classes as mig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        good = make_old_ckpt(d)
+        blob = good.read_bytes()
+        garbage = d / "garbage.npz"
+        garbage.write_bytes(b"this is not a zip file at all" * 10)
+        truncated = d / "truncated.npz"
+        truncated.write_bytes(blob[: len(blob) // 2])
+        empty = d / "empty.npz"
+        empty.write_bytes(b"")
+        missing = d / "missing.npz"
+        folder = d / "folder.npz"
+        folder.mkdir()
+        for bad in (garbage, truncated, empty, missing, folder):
+            out = d / (bad.stem + ".out.npz")
+            try:
+                mig.migrate_file(bad, out)
+            except mig.MigrationRefused:
+                pass
+            else:
+                raise AssertionError(f"{bad.name}: accepted")
+            assert not out.exists() and not list(d.glob("*.partial*")), bad.name
+            r = _cli(str(bad), str(out), "--min-free-gb", "0")
+            assert r.returncode == 2 and "REFUSED" in r.stderr and "Traceback" not in r.stderr, (bad.name, r.returncode, r.stderr)
+            assert not out.exists(), bad.name
+    print("garbage / truncated / empty / missing / directory input: REFUSED exit 2, no traceback, no output")
+
+
+def check_low_disk_space_is_refused() -> None:
+    import shutil
+
+    import migrate_ckpt_classes as mig
+    from python.train.epoch_ckpt import DEFAULT_MIN_FREE_GB, GB
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        dst = d / "low.npz"
+        real = shutil.disk_usage
+        shutil.disk_usage = lambda p: shutil._ntuple_diskusage(10 * GB, 10 * GB - int(DEFAULT_MIN_FREE_GB * GB) + 1000, int(DEFAULT_MIN_FREE_GB * GB) - 1000)
+        try:
+            try:
+                mig.migrate_file(old, dst)
+            except mig.MigrationRefused as exc:
+                assert "low space" in str(exc), exc
+            else:
+                raise AssertionError("low-space write accepted")
+            assert not dst.exists() and not list(d.glob("*.partial*"))
+            # the floor is the trainer's: lowering it explicitly lets the same write through
+            mig.migrate_file(old, dst, min_free_bytes=0)
+            assert dst.exists()
+        finally:
+            shutil.disk_usage = real
+    print("low free space: refused with the epoch-ckpt message, nothing written; floor 0 lets it through")
+
+
+def check_link_oserror_is_refused() -> None:
+    import errno
+
+    import migrate_ckpt_classes as mig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        dst = d / "perm.npz"
+        real_link = os.link
+
+        def boom(src, dst_, *a, **k):
+            raise OSError(errno.EPERM, "Operation not permitted")
+
+        os.link = boom
+        try:
+            try:
+                mig.migrate_file(old, dst)
+            except mig.MigrationRefused as exc:
+                assert "perm.npz" in str(exc), exc
+            else:
+                raise AssertionError("OSError from os.link escaped as a non-refusal")
+        finally:
+            os.link = real_link
+        assert not dst.exists() and not list(d.glob("*.partial*")), "temp or output left behind"
+    print("os.link OSError (not EEXIST): MigrationRefused, temp file cleaned")
+
+
+def check_input_read_once_hash_matches_loaded_bytes() -> None:
+    import migrate_ckpt_classes as mig
+    from python.train.epoch_ckpt import load_epoch_ckpt
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        old = make_old_ckpt(d)
+        original = old.read_bytes()
+        other = Path(tmp) / "other"
+        other.mkdir()
+        alt = make_old_ckpt(other)
+        w = load_epoch_ckpt(alt)
+        # a different checkpoint (distinct head values) that will replace the input mid-run
+        from python.train.epoch_ckpt import write_epoch_ckpt
+
+        w["weights"]["object_class_head.bias"] = w["weights"]["object_class_head.bias"] + 1000
+        alt.unlink()
+        write_epoch_ckpt(alt, w["weights"], dict(w["meta"]), min_free_bytes=0)
+        replacement = alt.read_bytes()
+        assert replacement != original
+        real_load = np.load
+        state = {"swapped": False}
+
+        def swap_then_load(*a, **k):
+            if not state["swapped"]:
+                state["swapped"] = True
+                old.write_bytes(replacement)  # the file changes under the tool after it was first read
+            return real_load(*a, **k)
+
+        np.load = swap_then_load
+        out = d / "out.npz"
+        try:
+            mig.migrate_file(old, out)
+        finally:
+            np.load = real_load
+        got = load_epoch_ckpt(out)
+        assert got["meta"]["migration"]["source_sha256"] == hashlib.sha256(original).hexdigest(), "source_sha256 is not the hash of the bytes loaded"
+        ref = load_epoch_ckpt_from(original, d / "ref.npz")
+        assert _same_bits(got["weights"]["object_class_head.bias"][:5], ref["object_class_head.bias"][[0, 1, 2, 3, 5]]), "migrated weights came from different bytes than the hash"
+    print("input read once: source_sha256 is the hash of exactly the bytes that were migrated, even if the file changes mid-run")
+
+
+def load_epoch_ckpt_from(blob: bytes, path: Path) -> dict:
+    from python.train.epoch_ckpt import load_epoch_ckpt
+
+    path.write_bytes(blob)
+    return load_epoch_ckpt(path)["weights"]
 
 
 CHECKS = (
@@ -352,12 +640,25 @@ CHECKS = (
     check_refusals,
     check_sibling_does_not_unrefuse,
     check_cli,
+    check_existing_output_never_replaced,
+    check_dangling_symlink_output_refused,
+    check_two_old_classes_one_new_class_refused,
+    check_output_appearing_after_precheck_is_refused,
+    check_unreadable_input_is_refused_exit_2,
+    check_low_disk_space_is_refused,
+    check_link_oserror_is_refused,
+    check_input_read_once_hash_matches_loaded_bytes,
 )
 
 
 def main() -> None:
+    import shutil
+
     failed = []
+    real_usage = shutil.disk_usage
     for fn in CHECKS:
+        # the tool keeps write_epoch_ckpt's 8 GB free-space floor: pretend a roomy disk so the checks do not depend on the host
+        shutil.disk_usage = real_usage if fn is check_low_disk_space_is_refused else (lambda p: shutil._ntuple_diskusage(10**13, 0, 10**13))
         try:
             fn()
             print(f"PASS {fn.__name__}")
@@ -365,6 +666,7 @@ def main() -> None:
             failed.append(fn.__name__)
             print(f"FAIL {fn.__name__}: {type(exc).__name__}: {str(exc)[:300]}")
             traceback.print_exc(limit=2)
+    shutil.disk_usage = real_usage
     if failed:
         print(f"test_ckpt_migrate: {len(failed)} FAILED: {', '.join(failed)}")
         sys.exit(1)

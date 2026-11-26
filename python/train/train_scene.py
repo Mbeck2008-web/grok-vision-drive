@@ -3987,7 +3987,10 @@ def train_directory(
                     "lane_rms": None if scored.get("rms") is None else float(scored["rms"]),
                     "lane_r": None if scored.get("r") is None else float(scored["r"]),
                     "holdout_loss": float(mean),
-                    **({} if aux_ev is None else {"depth_absrel": aux_ev.absrel(), "sem_miou": aux_ev.miou()}),
+                    **({} if aux_ev is None else {
+                        "depth_absrel": aux_ev.absrel(), "sem_miou": aux_ev.miou(),
+                        "depth_cells": int(aux_ev.rel_n), "sem_cells": int(aux_ev.sem_n),
+                    }),
                 }
             )
             holder["epochs_run"] = int(epoch) + 1
@@ -4606,8 +4609,6 @@ def _run_trainer2_recipe(
     plan = plan_curriculum(stages=wanted)
     live = [s.id for s in plan if s.action == "run"]
     require_measurable_stages(live)  # a stage that cannot exit stops the run before anything trains
-    if "0" in live and bool(getattr(args, "no_ssl_pretrain", False)):
-        raise RecipeRefused("stage 0 is SSL; drop --no-ssl-pretrain or pass --stage to skip 0")
     if "0" in live:
         from python.train.exp_ssl import ssl_plan
 
@@ -4616,7 +4617,8 @@ def _run_trainer2_recipe(
         except ValueError as exc:
             raise RecipeRefused(str(exc)) from exc
         if not stage0_on:
-            raise RecipeRefused(f"stage 0 is SSL but SSL is {stage0_why}; pass --stage to skip 0")
+            # e.g. "off (--no-ssl-pretrain)": stage 0 is SSL, so the run cannot have it off.
+            raise RecipeRefused(f"stage 0 is SSL but SSL is {stage0_why}; drop that flag or pass --stage to skip 0")
     ssl_on = "0" in live
     if export_path is not None:
         if Path(export_path).exists():

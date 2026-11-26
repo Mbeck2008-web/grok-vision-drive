@@ -1034,12 +1034,21 @@ def check_recipe_stages_train_on_fixture() -> None:
                         heads=kw["heads"], aux_depth=kw["aux_depth"], aux_sem=kw["aux_sem"], aux_depth_weight=1.0,
                         aux_sem_weight=1.0 if kw["aux_sem"] else 0.0, augment=False, workers=0, min_valid=0.0,
                         holdout_blocks=1, scale=1.0, status_root=base / f"st{sid}", ckpt_dir=base / f"ck{sid}",
-                        exact_epochs=1, recipe="trainer2", recipe_stage=sid)
+                        exact_epochs=2, recipe="trainer2", recipe_stage=sid, aux_measure=True)
             except Exception as exc:
                 raise AssertionError(f"stage {sid} crashed: {type(exc).__name__}: {exc}\n{buf.getvalue()[-2000:]}") from exc
             finally:
                 torch.nn.utils.clip_grad_norm_, train_scene._backward_and_maybe_step = real
             assert int(stats["windows"]) > 0 and seen, (sid, stats.get("windows"), len(seen))
+            # every holdout pass scores depth AbsRel / sem mIoU (stage 1 trains them; later stages only re-measure)
+            evals = stats["holdout_evals"]
+            assert len(evals) == 2, (sid, evals)
+            for e in evals:
+                assert e["depth_absrel"] is not None and np.isfinite(e["depth_absrel"]) and e["depth_absrel"] > 0.0, (sid, e)
+                assert e["sem_miou"] is not None and 0.0 <= e["sem_miou"] <= 1.0, (sid, e)
+                assert e["depth_cells"] > 0 and e["sem_cells"] > 0, (sid, e)
+            # the pooled sums restart each pass: the same holdout rows give the same cell counts (not 2x on the 2nd)
+            assert evals[0]["depth_cells"] == evals[1]["depth_cells"] and evals[0]["sem_cells"] == evals[1]["sem_cells"], evals
             if kw["aux_depth"]:
                 assert any(g.get("aux_depth_head.weight", 0.0) > 0.0 for g in seen), (sid, seen)
             if "lane_gt" in kw["heads"]:

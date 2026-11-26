@@ -60,8 +60,11 @@ Open question, PROPOSAL pending Michael (2026-11-26 ruling): a red light that
 turns green during the approach, after which the car drives on, **counts as a
 missed stop** today (the event is typed by the lamp state at first entry and
 needs the held stop; the literal spec). Whether it should not count is his call.
-``RED_TO_GREEN_PROCEED_IS_MISS`` documents the current behaviour; it is pinned
-by ``check_red_to_green_proceed_current_behaviour``.
+``RED_TO_GREEN_PROCEED_IS_MISS`` (default ``True`` = today's behaviour, still a
+PROPOSAL) selects it: ``False`` drops a red/yellow approach whose lamp turned green
+before the line (``y > 0``) and that was not held; green seen only past the line is
+still a miss. Both settings are pinned by ``check_red_to_green_proceed_current_behaviour``
+and ``check_red_to_green_flag_false_drops_the_approach``.
 """
 
 from __future__ import annotations
@@ -81,7 +84,8 @@ LIGHT_CLASS = "traffic_light"
 STOP_LAMPS = ("red", "yellow")
 MAX_DT_S = 1.0
 _EPS = 1e-6
-# PROPOSAL pending Michael: current behaviour, not a switch. Red at entry, green later, car drives on = missed stop.
+# PROPOSAL pending Michael. True (default, the literal spec): red at entry, green later, car drives on
+# = a missed stop. False: such an approach is dropped (see _events_for_source). Read at call time.
 RED_TO_GREEN_PROCEED_IS_MISS = True
 
 __all__ = [
@@ -216,6 +220,18 @@ def _events_for_source(rows: list[Mapping[str, Any]], speed_key: str = "v") -> l
             else:
                 run_start = None
         state = str(entry_tgt.get("state") or "unknown") if entry_tgt.get("cls") == LIGHT_CLASS else None
+        if not RED_TO_GREEN_PROCEED_IS_MISS and held_at is None and state in STOP_LAMPS:
+            # PROPOSAL pending Michael (off by default): a lamp that turned green before the
+            # car reached the line (y > 0), after which it drove on, is not a stop event.
+            # Green seen only past the line (y <= 0) is not a release: that is still a miss.
+            if any(
+                str(s.get("state")) == "green"
+                for r, y in window
+                if y > 0.0
+                for s in (r.get("stops") or [])
+                if str(s["id"]) == sid
+            ):
+                continue
         ev = {
             "source": str(rows[entry].get("source") or ""),
             "id": sid,

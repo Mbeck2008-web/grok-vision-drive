@@ -13,7 +13,8 @@ check_stop_events_split_safe, check_stop_labels_train_only,
 check_hand_rule_untouched, check_missing_gt_row_does_not_end_the_window,
 check_speed_key_scores_the_predicted_profile, check_side_angle_uses_first_visibility_not_entry,
 check_km_counts_holdout_rows_only, check_no_nan_in_scores,
-check_red_to_green_proceed_current_behaviour (PROPOSAL pending Michael).
+check_red_to_green_proceed_current_behaviour and
+check_red_to_green_flag_false_drops_the_approach (PROPOSAL pending Michael).
 Pure Python (no torch).
 """
 from __future__ import annotations
@@ -312,6 +313,10 @@ def check_speed_key_scores_the_predicted_profile() -> None:
     res = se.score(parked, speed_key="pred_v")
     assert res["events"] == 1 and res["missed"] == 0, res
     assert se.score(rows)["km"] == se.score(rows, speed_key="pred_v")["km"] > 0.0
+    # km is the recorded v integrated over the holdout rows (the 12 pred_v = 0 rows must still count at v).
+    want_km = sum(max(0.0, float(b["v"])) * (float(b["t"]) - float(a["t"])) for a, b in zip(rows, rows[1:])) / 1000.0
+    assert math.isclose(se.score(rows)["km"], want_km, rel_tol=1e-9), (se.score(rows)["km"], want_km)
+    assert math.isclose(se.score(rows, speed_key="pred_v")["km"], want_km, rel_tol=1e-9)
     # No fallback to v: a missing, non-numeric, NaN or negative speed_key value is refused.
     for bad in (None, "fast", float("nan"), float("inf"), -1.0, "missing"):
         rows2 = approach(hold_s=1.0)
@@ -428,6 +433,53 @@ def check_red_to_green_proceed_current_behaviour() -> None:
     print("red->green then proceed: counted as a missed red light today (PROPOSAL pending Michael; pinned) OK")
 
 
+def _lamp_turns(rows, *, at_or_below):
+    """Switch the lamp to green on rows with y <= ``at_or_below`` (copy of the rows' targets)."""
+    for r in rows:
+        if r["stops"][0]["y"] <= at_or_below:
+            r["stops"][0]["state"] = "green"
+    return rows
+
+
+def check_red_to_green_flag_false_drops_the_approach() -> None:
+    """PROPOSAL pending Michael: the other setting of RED_TO_GREEN_PROCEED_IS_MISS (default stays True)."""
+    from python.train import stop_events as se
+
+    def light(state, **kw):
+        return approach(cls="traffic_light", state=state, stop_at_y=kw.pop("stop_at_y", None), v0=6.0, y0=45.0, brake=0.0, **kw)
+
+    def run(rows, flag):
+        saved = se.RED_TO_GREEN_PROCEED_IS_MISS
+        se.RED_TO_GREEN_PROCEED_IS_MISS = flag
+        try:
+            return se.score(rows)
+        finally:
+            se.RED_TO_GREEN_PROCEED_IS_MISS = saved
+
+    assert se.RED_TO_GREEN_PROCEED_IS_MISS is True, "default must stay True while the question is open"
+    for lamp in ("red", "yellow"):
+        rows = _lamp_turns(light(lamp), at_or_below=15.0)
+        assert rows[0]["stops"][0]["state"] == lamp
+        on, off = run(rows, True), run(rows, False)
+        assert on["events"] == 1 and on["missed"] == 1, (lamp, on)
+        assert off["events"] == 0 and off["missed"] == 0 and off["detail"] == [], (lamp, off)
+        assert se.RED_TO_GREEN_PROCEED_IS_MISS is True, "the flag was not restored"
+    # Still a miss with the flag False: the lamp never changes, or turns green only past the line (y <= 0).
+    steady = run(light("red"), False)
+    assert steady["events"] == 1 and steady["missed"] == 1, steady
+    late = run(_lamp_turns(light("red"), at_or_below=0.0), False)
+    assert late["events"] == 1 and late["missed"] == 1, late
+    # A held stop is a held stop, whether or not the lamp turned green meanwhile.
+    held = _lamp_turns(light("red", stop_at_y=2.0, hold_s=1.0), at_or_below=5.0)
+    for flag in (True, False):
+        res = run(held, flag)
+        assert res["events"] == 1 and res["missed"] == 0, (flag, res)
+    # A stop sign has no lamp: the flag changes nothing.
+    sign = approach(stop_at_y=None)
+    assert run(sign, False)["missed"] == run(sign, True)["missed"] == 1
+    print("red->green flag: False drops a red/yellow approach released before the line; late green, steady red, held stop and signs unchanged OK")
+
+
 def main() -> int:
     checks = (
         check_stop_event_requires_hold,
@@ -443,6 +495,7 @@ def main() -> int:
         check_km_counts_holdout_rows_only,
         check_no_nan_in_scores,
         check_red_to_green_proceed_current_behaviour,
+        check_red_to_green_flag_false_drops_the_approach,
     )
     failed = 0
     for check in checks:

@@ -1585,6 +1585,39 @@ def check_edge_cut_never_touches_sky() -> None:
     assert not bad, f"the edge cut changed sky px: {bad}"
 
 
+# Exact cut-px counts on the fixed synthetic edge scenes above: (px the cut moved, sum of the depth change over them, m).
+# Measured on a5978d5 (cut: 5x5 far side, |grad inv| > 0.12 inv, never past the ground hit). A change of the dilate
+# window (+-1 px radius) or of the 0.12 threshold (-> 0.13) changes these. Tolerance on the sum only absorbs float noise.
+EDGE_CUT_PINS = {
+    "main": (131, 319952.345), "pillarL": (300, 1959808.126), "pillarR": (332, 2279718.148),
+    "repeatL": (258, 1589485.703), "repeatR": (230, 1179667.853), "rear": (207, 819837.046),
+}
+EDGE_CUT_SUM_TOL = 0.05
+
+
+def edge_cut_pin_violations(runs, pins=EDGE_CUT_PINS):
+    bad = []
+    for cid, (n_pin, s_pin) in pins.items():
+        rows = runs[cid]
+        n = sum(int(_moved(di, do).sum()) for _, _, di, do in rows)
+        sm = sum(float(np.sum((do - di)[_moved(di, do)])) for _, _, di, do in rows)
+        if n != n_pin or abs(sm - s_pin) > EDGE_CUT_SUM_TOL:
+            bad.append(f"{cid}: cut moved {n} px (sum {sm:.3f} m), pinned {n_pin} px (sum {s_pin:.3f} m)")
+    return bad
+
+
+def check_edge_cut_pin_counts() -> None:
+    """Exact edge-cut px count and depth-change sum per snap cam on the fixed synthetic edge scenes (real cam_frame).
+    Pins the 5x5 dilate window and the 0.12 gradient threshold: a +-1 px window radius or a 0.13 threshold moves them."""
+    runs = edge_cut_runs()
+    assert set(runs) == set(EDGE_CUT_PINS), f"pins cover {sorted(EDGE_CUT_PINS)}, snap cams are {sorted(runs)}"
+    got = {cid: (sum(int(_moved(di, do).sum()) for _, _, di, do in rows),
+                 round(sum(float(np.sum((do - di)[_moved(di, do)])) for _, _, di, do in rows), 3)) for cid, rows in runs.items()}
+    print(f"  edge cut (px moved, sum dz m) per snap cam, synthetic scenes: {got}", flush=True)
+    bad = edge_cut_pin_violations(runs)
+    assert not bad, "; ".join(bad)
+
+
 def pose_a_chase():
     n = pv().ns
     d = pv().defaults
@@ -3900,6 +3933,7 @@ CHECKS = [
     check_snapped_pixels_not_exempt_from_edge_cut,
     check_cut_then_clamp_order_and_nothing_under_road,
     check_edge_cut_never_touches_sky,
+    check_edge_cut_pin_counts,
     check_road_labelled_object_top_stays_put,
     check_behind_car_strip_holes,
     check_clip015_render_edge_and_holes,

@@ -113,6 +113,9 @@ OBJ_ID = 13
 NONROAD_ID = 0
 
 
+SKIPPED = "skipped"
+
+
 # ------------------------------------------------------------------ real preview code, loaded
 class _FakeNpz(dict):
     @property
@@ -388,7 +391,7 @@ def check_cam_specs_match_config() -> None:
         import yaml
     except ImportError:
         skip_check("cam_specs_match_config", "pyyaml not installed")
-        return
+        return SKIPPED
     cfg = yaml.safe_load((ROOT / "config" / "cameras.yaml").read_text(encoding="utf-8"))
     by = {c["id"]: c for c in cfg["cameras"]}
     for cid, s in CAM_SPECS.items():
@@ -499,7 +502,7 @@ def check_yield_edges() -> None:
     """Y fuzz edges: no better cam, empty overlap, full overlap, 1x1, zero-size refused, depth-free."""
     if not hasattr(sf, "yield_mask"):
         skip_check("yield_edges", "no yield_mask on this revision")
-        return
+        return SKIPPED
     p = pv()
     wide, main = p.cam["wide"], p.cam["main"]
     assert not sf.yield_mask(wide, []).any()
@@ -529,7 +532,7 @@ def check_yield_pillars_unaffected() -> None:
     p = pv()
     if not p.has_yield:
         skip_check("yield_pillars_unaffected", "no ownership on this revision")
-        return
+        return SKIPPED
     for cid in ("pillarL", "pillarR"):
         if cid in p.ns["YIELD"]:
             assert not p.ns["YIELD"][cid].any(), (cid, float(p.ns["YIELD"][cid].mean()))
@@ -545,7 +548,7 @@ def check_yield_wide_never_wins_inside_main() -> None:
     p = pv()
     if not p.has_yield:
         skip_check("yield_wide_never_wins_inside_main", "no ownership on this revision")
-        return
+        return SKIPPED
     wide, main = p.cam["wide"], p.cam["main"]
     rays = sf._pixel_rays(wide).reshape(-1, 3)
     probe = np.asarray(wide.pos) + rays * (200.0 / np.linalg.norm(rays, axis=1, keepdims=True))
@@ -652,6 +655,23 @@ def check_pin_clamp_inf_then_cap() -> None:
     out, _ = sf.far_to_cap(out, np.zeros(d.shape, bool), 250.0)
     z = heights(cam, out)
     assert z[g["down"]].min() >= -TOL_Z, f"+inf depth on a downward ray -> z={z[g['down']].min():.2f} m"
+
+
+def check_pin_objects_snapped_flat() -> None:
+    """O: with the net's 12x16 class grid, thin objects on the road share a road-majority cell, sit
+    >= 4 px inside the road label and are snapped onto z = 0 (python/viz/rv_stable_fill.py road_snap).
+    Main cam, lat 0.5 m: a curb at 20 m and a pole at 24 m (inside the 25 m snap range)."""
+    p = pv()
+    bad = []
+    for cid, kind, r in (("main", "curb", 20.0), ("main", "pole", 24.0)):
+        cam = p.cam[cid]
+        gt, fine, face, _ = object_scene(cam, kind, r, 0.5)
+        _, d, v, _ = p.run(cid, np.where(np.isfinite(gt), gt, 1e4), coarse(fine))
+        zg, zr = heights(cam, gt), heights(cam, d)
+        flat = face & v & (zg > OBJ_TOL_M) & (np.abs(zr) <= TOL_Z)
+        if flat.any():
+            bad.append(f"{kind}@{r:g}m: {int(flat.sum())}/{int((face & v).sum())} px flattened, GT z up to {zg[flat].max():.2f} m -> 0.00")
+    assert not bad, "; ".join(bad)
 
 
 def graded_road_bins(snap_max_m=None):
@@ -779,7 +799,7 @@ def check_clip015_near_road_bias() -> None:
     """H on real clip015 f40/f160: near road 0-15 m median |dz| <= 0.08 m and p90 |dz| <= 0.20 m."""
     if clip015_paths() is None:
         skip_check("clip015_near_road_bias", "clip015 not on this host (set GVD_RV_CLIP015, GVD_RV_CLIP015_PREDS, GVD_RV_CLIP015_GT)")
-        return
+        return SKIPPED
     m = _clip()
     print("clip015 bins (median dz, median |dz|, p90 |dz|, n):", _fmt_bins(m["bins"]), flush=True)
     print("clip015 wide-pillar seams (report only, scoped out):", m["seam_wide_pillar"], flush=True)
@@ -791,7 +811,7 @@ def check_clip015_far_bin_no_worse() -> None:
     """H on real clip015: 25-60 m bin no worse than with the 4df1176 snap range (25 m)."""
     if clip015_paths() is None:
         skip_check("clip015_far_bin_no_worse", "clip015 not on this host")
-        return
+        return SKIPPED
     if "road_snap_max_m" not in pv().defaults:
         return  # 4df1176 itself
     cur = _clip()["bins"][(25.0, 60.0)]
@@ -802,7 +822,7 @@ def check_clip015_far_bin_no_worse() -> None:
 def check_clip015_open_road_seam() -> None:
     if clip015_paths() is None:
         skip_check("clip015_open_road_seam", "clip015 not on this host")
-        return
+        return SKIPPED
     for f, (px, med, n, worst) in _clip()["seam_open"]:
         assert n == 0 or med <= SEAM_MEDIAN_M, (f, med, n, worst)
 
@@ -948,6 +968,8 @@ def _build_props():
         depth = np.where(rng.random(g["hit"].shape) < 0.5, val, cap)
         _, d, v, _ = p.run(cid, depth, np.full(depth.shape, NONROAD_ID))
         up = ~g["down"]
+        if p.has_yield and cid in p.ns["YIELD"]:
+            up = up & ~p.ns["YIELD"][cid]   # owned by main (ownership), not a far pixel dropped
         assert np.all(d[v] <= cap)
         big = up & (depth >= cap)
         assert np.all(v[big]) and np.all(d[big] >= cap * (1 - CAP_REL)), float(d[big].min())
@@ -1057,10 +1079,29 @@ CHECKS = [
     check_pin_filter_unsnaps_road,
     check_pin_filter_far_past_cap,
     check_pin_clamp_inf_then_cap,
+    check_pin_objects_snapped_flat,
 ]
 
-# name -> the counterexample it fails on at this head (filled from real runs; see the report).
-KNOWN_FAILING: dict[str, str] = {}
+# name -> the counterexample it fails on at 783fedd (real runs, rv-evidence/props_report_783fedd.log).
+# Responsible code: E = tools/rv_stable_preview.py cam_frame depth-edge cut
+#   ``depth = np.where(cut & ~sky & ~snapped, far_side, depth)`` (runs AFTER ground_clamp, nothing re-clamps);
+# F = python/viz/rv_stable_fill.py CamDepthFilter.update ``out_l[cy, cx] = ...`` (runs after cam_frame,
+#   blends a neighbouring ray's carried point; nothing re-clamps or re-caps);
+# N = road_snap on the net's coarse 12x16 class grid (python/viz/rv_stable_fill.py road_snap).
+KNOWN_FAILING: dict[str, str] = {
+    "check_pin_label_edge_dip": "E: S9 tunnel fixture, wide: label-edge px z=-0.2376 m at row 89 col 67, ground range 13.97 m",
+    "check_pin_object_base_dip": "E: exact ground + 3x12 px face 2% nearer at ~8 m, wide col 46: road under it z=-0.1276 m at 9.53 m",
+    "check_pin_horizon_band_dip": "E: exact flat ground, no road label, wide: dips from 17.76 m, z=-1.0168 m at 29.90 m",
+    "check_pin_filter_unsnaps_road": "F: exact ground, road everywhere, perfect pose, 3 frames x 1 m, wide: z=-0.0533 m at 14.96 m",
+    "check_pin_filter_far_past_cap": "F: non-sky wall at 1e5 m, wide, yaw 3 deg/frame: at-cap px span [239.98, 260.43] m, cap 250",
+    "check_pin_clamp_inf_then_cap": "ground_clamp keeps +inf on a downward ray, far_to_cap draws it at cap: z=-274.22 m (unit; not reachable from preds)",
+    "check_pin_objects_snapped_flat": "N: main curb@20 m 50/100 px flattened (GT 0.10 m -> 0.00); pole@24 m 2/32 px flattened",
+    "prop_near_rows_no_dip": "E: narrow, bend knots (1.0, 1.0, 0.5), road rows >= 50%, full width: z=-0.0320 m at row 142 col 3, 9.28 m",
+    "prop_filter_keeps_ground": "F: narrow, 1.0 m/frame, 2 frames, perfect pose, exact ground: z=-0.0063 m at 14.52 m",
+    "prop_filter_keeps_cap": "F: narrow, yaw 1.0 deg/frame: at-cap px span [249.49, 250.51] m",
+    "prop_objects_keep_height": "N: main pole at 4.0 m, lat 0.0: px at GT z 1.114 m rendered at 0.000 m",
+    "check_clip015_near_road_bias": "clip015 near road 0-15 m bias belongs to gvd/rv-ground-plane (Redesigner's gate 0.08/0.20 m)",
+}
 
 _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}
 
@@ -1075,7 +1116,9 @@ def _first_line(e: BaseException) -> str:
 def _run_one(fn) -> bool:
     name = fn.__name__
     try:
-        fn()
+        if fn() == SKIPPED:
+            print(f"SKIP {name}" + (" (known failing; not evaluated here)" if name in KNOWN_FAILING else ""), flush=True)
+            return True
     except AssertionError as e:
         if _REPORT:
             print(f"FAIL {name}: {_first_line(e)}", flush=True)

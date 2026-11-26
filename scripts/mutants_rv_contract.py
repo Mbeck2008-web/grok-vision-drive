@@ -164,7 +164,7 @@ MUTANTS: list[Mutant] = [
     ),
     Mutant(
         "no_armed_line",
-        [(STUB, '    _emit(f"RV_WATCH_ARMED mode=', '    (f"RV_WATCH_ARMED mode=')],
+        [(STUB, '    _emit(\n        f"RV_WATCH_ARMED mode=', '    (\n        f"RV_WATCH_ARMED mode=')],
     ),
     Mutant(
         "drop_parent_pid",
@@ -205,17 +205,17 @@ def _run_test(timeout_s: float) -> tuple[int, str]:
         return 124, f"TIMEOUT after {exc.timeout}s"
 
 
-def _apply(m: Mutant) -> dict[Path, bytes]:
-    originals: dict[Path, bytes] = {}
+def _apply(m: Mutant, originals: dict[Path, bytes]) -> str:
+    """Apply edits, recording originals first. Returns '' or a pattern error."""
     for rel, old, new in m.edits:
         path = ROOT / rel
         if path not in originals:
             originals[path] = path.read_bytes()
         text = path.read_text(encoding="utf-8")
         if text.count(old) != 1:
-            raise RuntimeError(f"{m.name}: pattern must match exactly once in {rel} (found {text.count(old)}): {old!r}")
+            return f"pattern must match exactly once in {rel} (found {text.count(old)}): {old[:80]!r}"
         path.write_text(text.replace(old, new, 1), encoding="utf-8")
-    return originals
+    return ""
 
 
 def _restore(originals: dict[Path, bytes]) -> None:
@@ -256,10 +256,13 @@ def main() -> int:
         if m.platforms and not any(sys.platform.startswith(p) for p in m.platforms):
             status, detail = "NOT_RUN", f"platform-bound to {m.platforms}"
         else:
-            originals = _apply(m)
+            originals: dict[Path, bytes] = {}
             try:
-                err = _compiles(list(originals))
-                if err:
+                perr = _apply(m, originals)
+                err = "" if perr else _compiles(list(originals))
+                if perr:
+                    status, detail = "INVALID", perr
+                elif err:
                     status, detail = "INVALID", f"does not compile: {err}"
                 else:
                     rc, out = _run_test(args.timeout)

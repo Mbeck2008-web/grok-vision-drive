@@ -738,14 +738,24 @@ def clip_metrics(clip: Path, preds: Path, gt_root: Path, frames=(40, 160), overr
     cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
     P = np.load(preds)
     p = Preview(overrides, root=clip, P=P, cams=cams)
+    def _frames(cid):
+        return sorted({int(k.split("/")[1]) for k in P.files if k.startswith(cid + "/") and k.endswith("/d")})
+    def _nearest(cid, target):
+        frs = _frames(cid)
+        return min(frs, key=lambda i: (abs(i - target), i)) if frs else None
     acc = {b: [] for b in BINS}
     acc_cam: dict = {}
     near = []
     seams_open, seams_wp = [], []
+    used = {}
     for f in frames:
         pts = {}
         for cid in [c for c in ("main", "wide", "pillarL", "pillarR") if c in p.cam]:
-            fr = p.run(cid, None, None, idx=f)
+            idx = _nearest(cid, f)
+            if idx is None:
+                continue
+            used.setdefault(cid, {})[f] = idx
+            fr = p.run(cid, None, None, idx=idx)
             if fr is None:
                 continue
             _, d, v, sky = fr
@@ -757,7 +767,7 @@ def clip_metrics(clip: Path, preds: Path, gt_root: Path, frames=(40, 160), overr
             pts[cid] = sf.unproject(cam, d, ys, xs)
             if cid not in ("main", "wide"):
                 continue
-            g = cv2.imread(str(gt_root / f"{cid}_depth" / "000" / f"{f:06d}.png"), cv2.IMREAD_UNCHANGED)
+            g = cv2.imread(str(gt_root / f"{cid}_depth" / "000" / f"{idx:06d}.png"), cv2.IMREAD_UNCHANGED)
             if g is None:
                 continue
             g = gt_at_proc(g.astype(np.float32) / 100.0, pw, ph)
@@ -765,10 +775,10 @@ def clip_metrics(clip: Path, preds: Path, gt_root: Path, frames=(40, 160), overr
             road = np.zeros((ph, pw), bool)
             sx = pw / W0
             k = 0
-            while f"{cid}/{f}/{k}/s" in P.files:
-                x0, cw = P[f"{cid}/{f}/{k}/x0"]
+            while f"{cid}/{idx}/{k}/s" in P.files:
+                x0, cw = P[f"{cid}/{idx}/{k}/x0"]
                 a0, a1 = int(round(x0 * sx)), int(round((x0 + cw) * sx))
-                s = P[f"{cid}/{f}/{k}/s"]
+                s = P[f"{cid}/{idx}/{k}/s"]
                 road[:, a0:a1] |= cv2.resize(np.isin(s, sf.ROAD_CLASS_IDS).astype(np.uint8), (a1 - a0, ph),
                                              interpolation=cv2.INTER_NEAREST) > 0
                 k += 1
@@ -793,7 +803,7 @@ def clip_metrics(clip: Path, preds: Path, gt_root: Path, frames=(40, 160), overr
     bins = {b: stats(np.concatenate(parts) if parts else np.zeros(0)) for b, parts in acc.items()}
     by_cam = {c: {b: stats(np.concatenate(v) if v else np.zeros(0)) for b, v in d_.items()} for c, d_ in acc_cam.items()}
     return {"bins": bins, "bins_by_cam": by_cam, "near": stats(np.concatenate(near) if near else np.zeros(0)),
-            "seam_open": seams_open, "seam_wide_pillar": seams_wp}
+            "seam_open": seams_open, "seam_wide_pillar": seams_wp, "used": used}
 
 
 _CLIP: dict = {}

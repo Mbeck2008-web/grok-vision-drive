@@ -15,7 +15,7 @@ Checks (python/train/depth_hires.py, opt-in ``--aux-depth --heads ...,depth_hire
   check_train_directory_trains_hires  train_directory on a main_depth fixture: 48x64 labels, far head wired, ckpt carries the head
   check_fpn_laterals_and_smooth      every FPN lateral (lat[0..2] on c2/c3/c4) and the 3x3 smooth conv change the 48x64 output / get a nonzero grad
   check_depth_floor_on_negative_logits  aux_depth >= 0.1 (MIN_DEPTH_M) even for large negative logits
-  check_fpn_norm_relu_bilinear        GroupNorm(num_groups=4) + post-smooth ReLU + bilinear upsample at scale 1 and 0.5: types/order, every interpolate is bilinear, 2x not 2x2-constant, non-neg pre-head
+  check_fpn_norm_relu_bilinear        GroupNorm(num_groups=4) + post-smooth ReLU + bilinear upsample at scale 1 and 0.5: types/order, every interpolate is bilinear with align_corners False/None, 2x not 2x2-constant, non-neg pre-head
 Torch checks skip visibly without torch.
 """
 from __future__ import annotations
@@ -639,7 +639,9 @@ def check_fpn_norm_relu_bilinear() -> None:
     Structural: ``lat`` / ``smooth`` / ``norm`` / ``out`` types and order;
     ``norm.num_groups == 4``; every ``interpolate(`` in ``depth_hires.py`` uses
     ``mode="bilinear"`` (call count == bilinear count). Behavioural, at scale 1
-    *and* 0.5 (0.5 is what runs the final 48x64 interpolate): ``norm`` gets a
+    *and* 0.5 (0.5 is what runs the final 48x64 interpolate): the interpolate
+    spy asserts ``mode=="bilinear"`` and ``align_corners in (False, None)`` on
+    every call (so the source-count is not the only guard); ``norm`` gets a
     nonzero gradient; the tensor entering ``out`` is non-negative (ReLU); a 2x
     upsample is not piecewise-constant over 2x2 blocks (bilinear, not nearest).
     """
@@ -699,8 +701,12 @@ def check_fpn_norm_relu_bilinear() -> None:
         real_interp = functional.interpolate
 
         def spy(x, size=None, scale_factor=None, mode="nearest", align_corners=None, **kw):
+            assert mode == "bilinear", f"scale {scale}: interpolate mode={mode!r}, expected 'bilinear'"
+            assert align_corners in (False, None), (
+                f"scale {scale}: interpolate align_corners={align_corners!r}, expected False or None"
+            )
             y = real_interp(x, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners, **kw)
-            ups.append((mode, y.detach(), tuple(x.shape[-2:]), tuple(y.shape[-2:])))
+            ups.append((mode, align_corners, y.detach(), tuple(x.shape[-2:]), tuple(y.shape[-2:])))
             return y
 
         pre_out: dict = {}
@@ -718,14 +724,19 @@ def check_fpn_norm_relu_bilinear() -> None:
             functional.interpolate = real_interp
             hook.remove()
 
-        assert ups and all(mode == "bilinear" for mode, *_ in ups), (scale, ups)
-        for mode, y, src_hw, dst_hw in ups:
+        assert ups, f"scale {scale}: interpolate spy saw no calls"
+        for mode, ac, y, src_hw, dst_hw in ups:
+            assert mode == "bilinear", (scale, mode, ac, src_hw, dst_hw)
+            assert ac in (False, None), (scale, mode, ac, src_hw, dst_hw)
             _not_2x2_constant(y, src_hw, dst_hw, mode)
         if scale == 0.5:
-            finals = [u for u in ups if u[3] == (48, 64) and u[2] != (48, 64)]
-            assert finals, f"scale 0.5 never interpolated to 48x64 (final branch did not run); spy={[(m, a, b) for m, _, a, b in ups]}"
-            assert all(m == "bilinear" for m, *_ in finals)
-            for mode, y, src_hw, dst_hw in finals:
+            finals = [u for u in ups if u[4] == (48, 64) and u[3] != (48, 64)]
+            assert finals, (
+                "scale 0.5 never interpolated to 48x64 (final branch did not run); "
+                f"spy={[(m, ac, a, b) for m, ac, _, a, b in ups]}"
+            )
+            for mode, ac, y, src_hw, dst_hw in finals:
+                assert mode == "bilinear" and ac in (False, None), (mode, ac, src_hw, dst_hw)
                 _not_2x2_constant(y, src_hw, dst_hw, mode)
         ng = head_s.norm.weight.grad
         assert ng is not None and float(ng.abs().sum()) > 0.0, f"scale {scale}: GroupNorm got no gradient (self.norm was not in the forward path)"
@@ -736,7 +747,7 @@ def check_fpn_norm_relu_bilinear() -> None:
     print(
         f"fpn norm/relu/bilinear: children {names}; GroupNorm num_groups=4; "
         f"{n_interp} interpolate(s) in depth_hires.py all bilinear; "
-        f"scale 1: {n_ups[1.0][0]} interp(s); scale 0.5: {n_ups[0.5][0]} interp(s) incl. 48x64; "
+        f"scale 1: {n_ups[1.0][0]} interp(s); scale 0.5: {n_ups[0.5][0]} interp(s) incl. 48x64, all align_corners False/None; "
         f"norm grad {n_ups[1.0][1]:.3g}/{n_ups[0.5][1]:.3g}; pre-head min {n_ups[1.0][2]:.4g} (>=0) OK"
     )
 

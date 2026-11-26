@@ -62,11 +62,24 @@ _rng = np.random.default_rng(7)
 _A = _rng.standard_normal((96, 96)).astype(np.float32)
 
 
+def _calibrate(ms: float) -> int:
+    x, n, t0 = _A, 0, time.perf_counter()
+    while (time.perf_counter() - t0) * 1000.0 < ms * 20:
+        x = np.tanh(x @ _A * 0.01)
+        n += 1
+    return max(n // 20, 1)
+
+
+_INFER_ITERS: int | None = None
+
+
 def stub_infer() -> float:
-    """Fixed CPU work standing in for vision infer (~INFER_MS)."""
-    t0 = time.perf_counter()
+    """Fixed CPU work (a fixed iteration count, ~INFER_MS) standing in for vision infer."""
+    global _INFER_ITERS
+    if _INFER_ITERS is None:
+        _INFER_ITERS = _calibrate(INFER_MS)
     x = _A
-    while (time.perf_counter() - t0) * 1000.0 < INFER_MS:
+    for _ in range(_INFER_ITERS):
         x = np.tanh(x @ _A * 0.01)
     return float(x[0, 0])
 
@@ -282,6 +295,10 @@ def check_supervisor_after_apply_is_copy_only() -> None:
         base = link.frames_handed
         got = run_loop(link, 80, trace=trace)
         handed = link.frames_handed - base
+        link.handoff()
+        fresh = time.monotonic()
+        assert link.main_view({}, W, H, now=fresh) is None, "healthy link degraded"
+        assert link.main_view({}, W, H, now=fresh + 1.0) is not None, "a frozen generator (no new frame for 1 s) did not degrade"
     finally:
         link.close()
     foreign, gen = copy_only_report(calls)
@@ -353,8 +370,56 @@ def check_torn_or_stale_frame_dropped() -> None:
         link.viz_slot.close()
 
 
+def check_writer_lap_during_copy_is_dropped() -> None:
+    """If the writer laps the buffer during the memcpy, the copy is dropped, not published."""
+    src, dst = rv_link.RvSlot.create(64), rv_link.RvSlot.create(64)
+    real = rv_link._BUF
+    calls = {"n": 0}
+
+    class LapOnRecheck:
+        size = real.size
+
+        def pack_into(self, *a):
+            return real.pack_into(*a)
+
+        def unpack_from(self, buf, off=0):
+            calls["n"] += 1
+            seq, frame, n = real.unpack_from(buf, off)
+            if calls["n"] == 3:  # src newest, dst begin_write, then the src re-check
+                return seq + 2, frame, n
+            return seq, frame, n
+
+    try:
+        src.publish(b"x" * 64)
+        rv_link._BUF = LapOnRecheck()
+        try:
+            assert src.copy_newest_to(dst, 0) is None, "torn copy was published"
+        finally:
+            rv_link._BUF = real
+        assert calls["n"] >= 3
+        assert dst.read_into(bytearray(64), 0) is None, "dst exposed a torn frame"
+        assert src.copy_newest_to(dst, 0) == 1  # clean retry next tick works
+    finally:
+        src.close()
+        dst.close()
+
+
+def check_children_run_below_supervisor_priority() -> None:
+    link = slow_link()
+    link.start()
+    try:
+        if sys.platform != "win32":
+            me = os.getpriority(os.PRIO_PROCESS, 0)
+            for pid in (link.gen_pid, link.viz_pid):
+                assert os.getpriority(os.PRIO_PROCESS, pid) >= me + rv_link.CHILD_NICE, pid
+    finally:
+        link.close()
+
+
 def main() -> None:
     check_rv_link_is_copy_only_source()
+    check_writer_lap_during_copy_is_dropped()
+    check_children_run_below_supervisor_priority()
     check_torn_or_stale_frame_dropped()
     check_gates_catch_inline_generator()
     check_supervisor_after_apply_is_copy_only()

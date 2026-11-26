@@ -141,6 +141,15 @@ class RvSlot:
                 pass
 
 
+CHILD_NICE = 10
+
+
+def _lower_priority() -> None:  # runs in the child before exec (POSIX)
+    import os
+
+    os.nice(CHILD_NICE)
+
+
 class RvLink:
     """Supervisor-side handle: gen child -> gen slot -> handoff -> viz slot -> viz child."""
 
@@ -160,7 +169,13 @@ class RvLink:
     def start(self) -> None:
         self.gen_slot = RvSlot.create(self.slot_bytes)
         self.viz_slot = RvSlot.create(self.slot_bytes)
-        quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        quiet: dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        # Children run below the supervisor's priority so a busy generator or
+        # renderer yields the CPU to the safety loop, never the other way round.
+        if sys.platform == "win32":
+            quiet["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS  # type: ignore[attr-defined]
+        else:
+            quiet["preexec_fn"] = _lower_priority
         self._gen = subprocess.Popen([sys.executable, *self.gen_argv, "--rv-shm", self.gen_slot.name], **quiet)
         self._viz = subprocess.Popen([sys.executable, *self.viz_argv, "--rv-shm", self.viz_slot.name], **quiet)
 

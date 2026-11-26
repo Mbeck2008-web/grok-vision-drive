@@ -71,6 +71,7 @@ GT is eval-only: it never enters cam_frame (pred mode).
 from __future__ import annotations
 
 import ast
+import inspect
 import atexit
 import json
 import math
@@ -212,6 +213,26 @@ def _assign_names(node) -> set:
     return names
 
 
+def snap_hook_bound_args(orig, a, k) -> tuple:
+    """Bind a snap function's (*a, **k) by parameter name (inspect.signature).
+
+    road_snap is ``(cam, depth, road, ...)``; snap_road_for_cam is ``(cam_id, cam, depth, road, ...)``.
+    Positional a[1] is depth only for road_snap — using it for snap_road_for_cam treats the CameraPose as
+    depth and crashes (``float() argument ... not 'CameraPose'``). Always pull ``depth`` and ``road`` by
+    name; raise if either parameter is missing.
+    """
+    try:
+        ba = inspect.signature(orig).bind(*a, **k)
+    except TypeError as e:
+        raise TypeError(f"snap hook could not bind {getattr(orig, '__name__', orig)}: {e}") from e
+    ba.apply_defaults()
+    missing = [n for n in ("depth", "road") if n not in ba.arguments]
+    if missing:
+        raise TypeError(f"{getattr(orig, '__name__', orig)} has no parameter {missing} "
+                        f"(got {list(ba.arguments)}); cannot hook snap")
+    return ba.arguments["depth"], ba.arguments["road"], ba
+
+
 class Preview:
     """The preview's own per-camera code, executed against fake inputs (or a real clip)."""
 
@@ -254,14 +275,15 @@ class Preview:
 
             def _wrap(self, name, *a, **k):
                 hk = object.__getattribute__(self, "_hook")
-                cam = a[0] if a else k.get("cam")
-                dep = a[1] if len(a) > 1 else k.get("depth")
+                orig = getattr(object.__getattribute__(self, "_real"), name)
+                dep, road, ba = snap_hook_bound_args(orig, a, k)
+                cam = ba.arguments.get("cam", ba.arguments.get("cam_id"))
                 if not hk.get("_in"):
                     hk["pre"] = None if dep is None else np.array(dep, np.float64, copy=True)
-                hk["calls"].append((name, getattr(cam, "name", None) or getattr(cam, "cam_id", None) or id(cam)))
+                hk["calls"].append((name, getattr(cam, "name", None) or getattr(cam, "cam_id", None) or cam))
                 hk["_in"] = hk.get("_in", 0) + 1
                 try:
-                    out, m = getattr(object.__getattribute__(self, "_real"), name)(*a, **k)
+                    out, m = orig(*a, **k)
                 finally:
                     hk["_in"] -= 1
                 hk["mask"] = m
@@ -2579,6 +2601,64 @@ def check_clip015_streak_wide_snap_off() -> None:
     assert not bad, "; ".join(bad[:12]) + (f" (+{len(bad) - 12} more)" if len(bad) > 12 else "")
 
 
+def check_snap_hook_binds_depth_by_name() -> None:
+    """The snap hook must bind ``depth`` / ``road`` by parameter name, not by positional a[1].
+
+    snap_road_for_cam's signature is (cam_id, cam, depth, road): a[1] is a CameraPose, so the old hook
+    crashed with TypeError: float() argument ... not 'CameraPose'. This check builds a function with that
+    exact signature, passes a non-float cam object, and asserts the hook reads the depth array. A mutant
+    that still uses positional a[1] is caught (it would treat cam as depth). Missing depth/road params fail loudly.
+    """
+    class Cam:
+        name = "narrow"
+
+    def snap_road_for_cam(cam_id, cam, depth, road):  # exact runtime signature
+        return np.array(depth, np.float64, copy=True), np.asarray(road, bool)
+
+    cam = Cam()
+    depth = np.arange(12, dtype=np.float64).reshape(3, 4)
+    road = np.ones((3, 4), bool)
+    args = ("narrow", cam, depth, road)
+    dep, rd, ba = snap_hook_bound_args(snap_road_for_cam, args, {})
+    assert dep is depth, f"depth bound to {type(dep).__name__}, not the array (cam={type(cam).__name__})"
+    assert rd is road
+    assert ba.arguments["cam"] is cam and ba.arguments["cam_id"] == "narrow"
+    pre = np.array(dep, np.float64, copy=True)
+    assert np.array_equal(pre, depth)
+
+    def mutant_positional_a1(orig, a, k):  # the old hook
+        return a[1] if len(a) > 1 else k.get("depth")
+
+    mut = mutant_positional_a1(snap_road_for_cam, args, {})
+    assert mut is cam, "mutant fixture no longer takes a[1] as depth (test bug)"
+    try:
+        np.array(mut, np.float64, copy=True)
+    except (TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("mutant positional a[1] was not caught (cam coerced to an array)")
+    # also: a function with no depth/road param must fail loudly
+    def no_depth(cam, mask):
+        return cam, mask
+    try:
+        snap_hook_bound_args(no_depth, (cam, road), {})
+    except TypeError as e:
+        assert "depth" in str(e) and "road" in str(e), e
+    else:
+        raise AssertionError("missing depth/road parameters were not rejected")
+    # and the Preview hook uses the binder: wrap a fake snap_road_for_cam through _SHook
+    p = Preview()
+    hook = p.ns["S"]
+    object.__setattr__(hook, "_real", types.SimpleNamespace(snap_road_for_cam=snap_road_for_cam,
+                                                            road_snap=sf.road_snap))
+    p.snap_hook.update(mask=None, pre=None, calls=[], _in=0)
+    out, m = hook.snap_road_for_cam("narrow", cam, depth, road)
+    assert np.array_equal(out, depth) and np.array_equal(p.snap_hook["pre"], depth), p.snap_hook
+    assert p.snap_hook["calls"] and p.snap_hook["calls"][0][0] == "snap_road_for_cam"
+    print(f"  hook bound depth by name for snap_road_for_cam(cam_id, cam={type(cam).__name__}, depth, road); "
+          f"mutant a[1] caught (got {type(mut).__name__}); missing-param TypeError ok", flush=True)
+
+
 def check_snap_hook_hit() -> None:
     """Harness self-test (Redesigner 2026-11-26): the snap hook must be hit by the runtime's real per-cam snap
     path, or gate (b) passes vacuously. Dev f40, every cam: >= 1 hooked snap call per cam whose frame has net
@@ -2744,56 +2824,186 @@ def check_runtime_never_reads_gt() -> None:
 
 
 SNAP_REJECT_Z = 0.30
-SNAP_REJECT_CAMS = ("main", "narrow", "pillarL", "pillarR", "repeatL", "repeatR", "rear")   # non-wide snap cams
+# Literal contract (Skeptic 15:11): ROAD_SNAP_CAMS must equal this set. Imported from the runtime when
+# present; never used as the snap-cam list by itself (a dropped cam must not silently shrink the check).
+EXPECTED_ROAD_SNAP_CAMS = frozenset({"main", "pillarL", "pillarR", "repeatL", "repeatR", "rear"})
+
+
+def runtime_road_snap_cams(src=None):
+    """The snap-cam set from the runtime (python.viz.rv_stable_fill / preview ns). None if the name is absent (this head)."""
+    if src is not None:
+        return frozenset(src.ROAD_SNAP_CAMS) if hasattr(src, "ROAD_SNAP_CAMS") else None
+    if hasattr(sf, "ROAD_SNAP_CAMS"):
+        return frozenset(sf.ROAD_SNAP_CAMS)
+    return None
+
+
+def assert_road_snap_cams(cams) -> None:
+    """ROAD_SNAP_CAMS must equal the literal set; dropping a cam (e.g. pillarR) must FAIL, not shrink the check."""
+    got = frozenset(cams)
+    assert got == EXPECTED_ROAD_SNAP_CAMS, (
+        f"ROAD_SNAP_CAMS {sorted(got)} != literal {sorted(EXPECTED_ROAD_SNAP_CAMS)} "
+        f"(dropped {sorted(EXPECTED_ROAD_SNAP_CAMS - got)}; extra {sorted(got - EXPECTED_ROAD_SNAP_CAMS)})"
+    )
+
+
+def resolve_road_snap_cams(src=None):
+    """The snap-cam set used by the reject check.
+
+    The literal fallback is allowed only on heads *without* snap_road_for_cam. If
+    ``hasattr(src, 'snap_road_for_cam')`` is true, a missing ROAD_SNAP_CAMS is a FAIL
+    (clear message), not a fallback. When the set is present it must equal the literal.
+    """
+    src = sf if src is None else src
+    cams = runtime_road_snap_cams(src)
+    if hasattr(src, "snap_road_for_cam") and cams is None:
+        raise AssertionError(
+            "snap_road_for_cam is present but ROAD_SNAP_CAMS is missing; "
+            "the literal fallback is only allowed on heads without snap_road_for_cam"
+        )
+    if cams is None:
+        return EXPECTED_ROAD_SNAP_CAMS
+    assert_road_snap_cams(cams)
+    return cams
+
+
+def _snap_scene(cam):
+    rz = sf._pixel_rays(cam)[..., 2]
+    h = float(np.asarray(cam.pos)[2])
+    down = rz < -1e-6
+    hit = np.where(down, h / np.where(down, -rz, 1.0), np.inf)
+    cand = down & (hit < 12.0) & (hit > 2.0)
+    if not cand.any():
+        return None
+    H, W = cand.shape
+    zpred = np.where(np.arange(W)[None, :] < W // 2, 0.5, 0.05) * np.ones((H, 1))
+    d = np.where(cand, (h - zpred) / np.where(down, -rz, 1.0), 50.0)
+    return {"d": d, "road": np.ones((H, W), bool), "cand": cand, "zpred": zpred, "raised": cand & (zpred > SNAP_REJECT_Z),
+            "low": cand & (zpred < SNAP_REJECT_Z)}
 
 
 def _snap_fns():
     """The runtime snap entry points present on this head (road_snap always; snap_road_for_cam if it exists)."""
-    fns = [("road_snap", lambda cam, cid, d, road: sf.road_snap(cam, d, road))]
+    fns = [("road_snap", lambda cam, cid, d, road: sf.road_snap(cam, d, road), False)]
     if hasattr(sf, "snap_road_for_cam"):
-        fns.append(("snap_road_for_cam", lambda cam, cid, d, road: sf.snap_road_for_cam(cid, cam, d, road)))
+        fns.append(("snap_road_for_cam", lambda cam, cid, d, road: sf.snap_road_for_cam(cid, cam, d, road), True))
     return fns
 
 
-def snap_rejection_violations(snap_fn) -> list:
-    """Behavioural: a road-class px whose pred point sits 0.5 m above the ground must NOT be snapped to the plane;
-    a road px whose pred point is 0.05 m above ground must still be snapped (rejection is one-sided, not 'no snap')."""
+def snap_rejection_violations(snap_fn, snap_cams) -> list:
+    """Reject+snap assertions only for cams in snap_cams (ROAD_SNAP_CAMS). Behavioural: a road-class px whose
+    pred point sits 0.5 m above the ground must NOT be snapped; a road px at 0.05 m must still be snapped."""
     p = Preview()
     bad = []
-    for cid in SNAP_REJECT_CAMS:
+    for cid in snap_cams:
         if cid not in p.cam:
             continue
-        cam = p.cam[cid]
-        rz = sf._pixel_rays(cam)[..., 2]
-        h = float(np.asarray(cam.pos)[2])
-        down = rz < -1e-6
-        hit = np.where(down, h / np.where(down, -rz, 1.0), np.inf)
-        cand = down & (hit < 12.0) & (hit > 2.0)
-        if not cand.any():
+        sc = _snap_scene(p.cam[cid])
+        if sc is None:
             continue
-        ys, xs = np.nonzero(cand)
-        H, W = cand.shape
-        # left half: pred z = 0.5 m (raised: curb / car side labelled road); right half: pred z = 0.05 m
-        zpred = np.where(np.arange(W)[None, :] < W // 2, 0.5, 0.05) * np.ones((H, 1))
-        d = np.where(cand, (h - zpred) / np.where(down, -rz, 1.0), 50.0)
-        road = np.ones((H, W), bool)
-        out, mask = snap_fn(cam, cid, d.copy(), road)
-        raised = cand & (zpred > SNAP_REJECT_Z)
-        low = cand & (zpred < SNAP_REJECT_Z)
-        moved_raised = int((np.asarray(mask, bool) & raised).sum())
-        kept_low = int((np.asarray(mask, bool) & low).sum())
+        out, mask = snap_fn(p.cam[cid], cid, sc["d"].copy(), sc["road"])
+        moved_raised = int((np.asarray(mask, bool) & sc["raised"]).sum())
+        kept_low = int((np.asarray(mask, bool) & sc["low"]).sum())
         if moved_raised:
-            bad.append(f"{cid}: {moved_raised}/{int(raised.sum())} road px with pred z 0.5 m snapped to the plane")
-        if low.sum() > 50 and kept_low < 0.5 * int(low.sum()):
-            bad.append(f"{cid}: only {kept_low}/{int(low.sum())} road px with pred z 0.05 m snapped (rejection not one-sided)")
+            bad.append(f"{cid}: {moved_raised}/{int(sc['raised'].sum())} road px with pred z 0.5 m snapped to the plane")
+        if sc["low"].sum() > 50 and kept_low < 0.5 * int(sc["low"].sum()):
+            bad.append(f"{cid}: only {kept_low}/{int(sc['low'].sum())} road px with pred z 0.05 m snapped (rejection not one-sided)")
+    return bad
+
+
+def snap_unlisted_cam_violations(snap_fn, snap_cams) -> list:
+    """For every cam NOT in ROAD_SNAP_CAMS (narrow, and any other), snap_road_for_cam must change zero road px."""
+    p = Preview()
+    bad = []
+    for cid, cam in p.cam.items():
+        if cid in snap_cams:
+            continue
+        sc = _snap_scene(cam)
+        if sc is None:
+            continue
+        src = sc["d"].copy()
+        out, mask = snap_fn(cam, cid, src, sc["road"])
+        n = int(np.asarray(mask, bool).sum())
+        changed = int((~np.isclose(np.asarray(out, np.float64), src, equal_nan=True)).sum())
+        if n or changed:
+            bad.append(f"{cid}: snap_road_for_cam changed {changed} px / snapped {n} (must be 0; cam is not in ROAD_SNAP_CAMS)")
     return bad
 
 
 def check_snap_rejects_raised_pred_z() -> None:
-    """Skeptic (13:59): the one-sided pred-z > 0.30 m rejection must be in the snap path for the non-wide snap cams
-    (road_snap / snap_road_for_cam). Behavioural (synthetic pred z 0.5 vs 0.05 m road px) + mutant: a snap that
-    ignores pred z must fail this check. Expected FAIL on dee9827 (road_snap has no such rejection; normal FAIL,
-    Fix item for Redesigner); must pass on the fix SHA."""
+    """Skeptic (13:59 / 15:11): the one-sided pred-z > 0.30 m rejection must be in the snap path for cams in
+    ROAD_SNAP_CAMS (imported from the runtime; must equal the literal
+    {main, pillarL, pillarR, repeatL, repeatR, rear} so dropping a cam cannot silently shrink the check).
+    The literal fallback is allowed only when snap_road_for_cam is absent; if that entry point exists,
+    a missing ROAD_SNAP_CAMS is a FAIL, not a fallback. Behavioural (synthetic pred z 0.5 vs 0.05 m) +
+    mutants: no rejection; a snap that acts on narrow; a ROAD_SNAP_CAMS that drops pillarR; snap_road_for_cam
+    present with ROAD_SNAP_CAMS deleted. Positive control: stub snap_road_for_cam + literal set, set-equality
+    passes (rejection aside). For every cam not in the set, snap_road_for_cam must change zero road px.
+    Scoping correction, not a loosening. Expected FAIL on this head (road_snap has no rejection; normal FAIL,
+    Fix item for Redesigner) with a raised-pred-z message on a snap cam, not narrow or a missing set."""
+    # mutant: dropping pillarR from ROAD_SNAP_CAMS must FAIL the set-equality assertion
+    dropped = EXPECTED_ROAD_SNAP_CAMS - {"pillarR"}
+    try:
+        assert_road_snap_cams(dropped)
+    except AssertionError as e:
+        dropped_caught = True
+        print(f"  mutant drop pillarR from ROAD_SNAP_CAMS: caught ({e})", flush=True)
+    else:
+        dropped_caught = False
+    assert dropped_caught, "mutant that drops pillarR from ROAD_SNAP_CAMS was not caught"
+
+    def _stub_snap_road_for_cam(cam_id, cam, depth, road):  # exact runtime signature
+        return depth, np.zeros(np.shape(depth), bool)
+
+    def _snap_module_snapshot():
+        return (hasattr(sf, "snap_road_for_cam"), getattr(sf, "snap_road_for_cam", None),
+                hasattr(sf, "ROAD_SNAP_CAMS"), getattr(sf, "ROAD_SNAP_CAMS", None))
+
+    def _restore_snap_module(had_fn, fn, had_set, sset):
+        if had_fn:
+            sf.snap_road_for_cam = fn
+        elif hasattr(sf, "snap_road_for_cam"):
+            delattr(sf, "snap_road_for_cam")
+        if had_set:
+            sf.ROAD_SNAP_CAMS = sset
+        elif hasattr(sf, "ROAD_SNAP_CAMS"):
+            delattr(sf, "ROAD_SNAP_CAMS")
+
+    snap_state = _snap_module_snapshot()
+    try:
+        # mutant: snap_road_for_cam present, ROAD_SNAP_CAMS absent -> must FAIL, not fall back
+        sf.snap_road_for_cam = _stub_snap_road_for_cam
+        if hasattr(sf, "ROAD_SNAP_CAMS"):
+            delattr(sf, "ROAD_SNAP_CAMS")
+        try:
+            resolve_road_snap_cams(sf)
+            missing_caught, missing_msg = False, None
+        except AssertionError as e:
+            missing_caught, missing_msg = True, str(e)
+        assert missing_caught, (
+            "mutant: snap_road_for_cam present but ROAD_SNAP_CAMS absent was not caught (literal fallback used)"
+        )
+        print(f"  mutant missing ROAD_SNAP_CAMS with snap_road_for_cam: caught ({missing_msg})", flush=True)
+
+        # positive control: stub snap_road_for_cam + ROAD_SNAP_CAMS equal to the literal -> set-equality passes
+        sf.snap_road_for_cam = _stub_snap_road_for_cam
+        sf.ROAD_SNAP_CAMS = tuple(sorted(EXPECTED_ROAD_SNAP_CAMS))
+        ctrl = resolve_road_snap_cams(sf)
+        assert_road_snap_cams(ctrl)
+        print(f"  positive control stub snap_road_for_cam + ROAD_SNAP_CAMS == literal: set-equality passed ({sorted(ctrl)})",
+              flush=True)
+    finally:
+        _restore_snap_module(*snap_state)
+        # the head's real attributes must be back before any later snap call
+        assert _snap_module_snapshot() == snap_state, "failed to restore sf snap attributes after mutants"
+
+    snap_cams = resolve_road_snap_cams()
+    if runtime_road_snap_cams() is not None:
+        print(f"  ROAD_SNAP_CAMS (from runtime) {sorted(snap_cams)} == literal {sorted(EXPECTED_ROAD_SNAP_CAMS)}", flush=True)
+    else:
+        print(f"  ROAD_SNAP_CAMS absent on this head and snap_road_for_cam is absent; "
+              f"reject+snap scoped to the literal fallback {sorted(snap_cams)}", flush=True)
+
     def mutant(cam, cid, d, road):   # rejection removed: snap decided on a ground-level depth, then applied to d
         rz = sf._pixel_rays(cam)[..., 2]
         h = float(np.asarray(cam.pos)[2])
@@ -2806,15 +3016,27 @@ def check_snap_rejects_raised_pred_z() -> None:
         out, m = sf.road_snap(cam, d, road)
         m = m & ~(z > SNAP_REJECT_Z)
         return np.where(m, out, d), m
-    mut = snap_rejection_violations(mutant)
+    def mutant_snaps_narrow(cam, cid, d, road):  # scoping mutant: snaps a cam that is not in ROAD_SNAP_CAMS
+        return sf.road_snap(cam, d, road)
+
+    mut = snap_rejection_violations(mutant, snap_cams)
     assert mut, "mutant without the pred-z rejection was not caught"
-    ref = snap_rejection_violations(reference)
+    ref = snap_rejection_violations(reference, snap_cams)
     assert not ref, f"positive control (road_snap + rejection) flagged: {ref}"
+    narrow_mut = snap_unlisted_cam_violations(mutant_snaps_narrow, snap_cams)
+    assert narrow_mut, "mutant that snaps a cam outside ROAD_SNAP_CAMS (narrow) was not caught"
+    print(f"  mutant (snaps unlisted cam) caught: {narrow_mut}", flush=True)
+
     bad = []
-    for name, fn in _snap_fns():
-        v = snap_rejection_violations(fn)
-        print(f"  snap rejection {name}: " + ("; ".join(v) if v else "raised road px kept, ground road px snapped"), flush=True)
+    for name, fn, is_per_cam in _snap_fns():
+        v = snap_rejection_violations(fn, snap_cams)
+        print(f"  snap rejection {name} (cams {sorted(snap_cams)}): " +
+              ("; ".join(v) if v else "raised road px kept, ground road px snapped"), flush=True)
         bad += [f"{name} {x}" for x in v]
+        if is_per_cam:
+            u = snap_unlisted_cam_violations(fn, snap_cams)
+            print(f"  unlisted cams under {name}: " + ("; ".join(u) if u else "zero road px changed"), flush=True)
+            bad += [f"{name} {x}" for x in u]
     print(f"  mutant (no rejection) caught: {len(mut)} cams", flush=True)
     assert not bad, "; ".join(bad)
 
@@ -3573,6 +3795,7 @@ CHECKS = [
     check_clip015_ripple_wide_periodicity,
     check_clip015_ripple_other_cams,
     check_clip015_streak_wide_snap_off,
+    check_snap_hook_binds_depth_by_name,
     check_snap_hook_hit,
     info_clip015_footprint_row_gaps,
     check_clip015_ringA_poseB_holes,

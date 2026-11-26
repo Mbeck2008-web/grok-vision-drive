@@ -76,6 +76,15 @@ def _assert_perm(order: np.ndarray, n: int) -> None:
     assert np.array_equal(np.sort(order), np.arange(n))
 
 
+def _msg(fn, *a, **k) -> str:
+    """The ValueError message fn raises (fails if it does not raise ValueError)."""
+    try:
+        fn(*a, **k)
+    except ValueError as e:
+        return str(e)
+    raise AssertionError("expected ValueError")
+
+
 def _raises(exc, fn, *a, **k) -> bool:
     try:
         fn(*a, **k)
@@ -174,6 +183,18 @@ def check_nan_inf() -> None:
     # out-of-range finite depths clip to the end bins
     oor = np.array([-3.0, 1e6, 0.0, 250.0, 100.0], np.float32)
     assert sort_splats(oor, NEAR, FAR).tolist() == [1, 3, 4, 0, 2]
+    # large tie-heavy arrays WITH NaN: stability must hold past numpy's small-array insertion sort
+    rng = np.random.default_rng(21)
+    big = rng.integers(0, 40, 6000).astype(np.float32) * np.float32(1.7)
+    big[rng.random(6000) < 0.1] = np.nan
+    big[rng.random(6000) < 0.02] = np.inf
+    nan_idx = np.flatnonzero(np.isnan(big))
+    valid = np.flatnonzero(~np.isnan(big))
+    c = np.clip(big[valid].astype(np.float64), NEAR, FAR)
+    qk = np.floor((c - NEAR) / (FAR - NEAR) * 65535.0 + 0.5).astype(np.int64)
+    for desc in (True, False):
+        want = np.concatenate([valid[np.argsort(-qk if desc else qk, kind="stable")], nan_idx])
+        assert np.array_equal(sort_splats(big, NEAR, FAR, desc), want), desc
     print("check_nan_inf: OK")
 
 
@@ -189,6 +210,21 @@ def check_validation_and_purity() -> None:
     for bad_desc in (1, 0, None, "yes"):
         assert _raises(ValueError, sort_splats, d, NEAR, FAR, bad_desc), repr(bad_desc)
     assert sort_splats(d, NEAR, FAR, descending=np.bool_(False)).tolist() == [1, 2, 0]
+    # error messages name the offending argument (what a caller / log reader sees)
+    for fn in (sort_splats, quantize_depth):
+        assert _msg(fn, d, True, 5.0).startswith("near must be a real number"), fn
+        assert _msg(fn, d, "a", 5.0).startswith("near must be a real number"), fn
+        assert _msg(fn, d, 0.0, True).startswith("far must be a real number"), fn
+        assert _msg(fn, d, 0.0, None).startswith("far must be a real number"), fn
+        assert "finite near < far" in _msg(fn, d, 2.0, 1.0), fn
+        assert "near=2.0" in _msg(fn, d, 2.0, 1.0) and "far=1.0" in _msg(fn, d, 2.0, 1.0), fn
+        assert _msg(fn, np.zeros((2, 2)), NEAR, FAR) == "depth must be 1-D, got shape (2, 2)", fn
+        assert _msg(fn, np.array([True]), NEAR, FAR).startswith("depth must be a real numeric array"), fn
+        assert "bool" in _msg(fn, np.array([True]), NEAR, FAR), fn
+    assert _msg(quantize_depth, np.array([np.nan]), NEAR, FAR).startswith("NaN has no depth key")
+    assert _msg(sort_splats, d, NEAR, FAR, 1) == "descending must be a bool, got 1"
+    # kind-'u' / 'i' depth arrays are accepted (numeric kinds), other kinds are not
+    assert sort_splats(np.array([3, 1, 2], np.uint8), NEAR, FAR).tolist() == [0, 2, 1]
     # integer and float64 / float16 inputs are accepted and agree with the float64 reference
     assert sort_splats(np.array([3, 1, 2], np.int32), NEAR, FAR).tolist() == [0, 2, 1]
     assert sort_splats(d.astype(np.float64), NEAR, FAR).tolist() == [0, 2, 1]

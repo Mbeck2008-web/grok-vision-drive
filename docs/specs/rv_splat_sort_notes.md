@@ -73,6 +73,25 @@ instead of by their float depth.
   splats (same bin, overlapping footprint, different colour) can still blend in a
   different order. That is the accepted cost, and the CPU renderer test measures it.
 
+## Measured cost of the tie rule (CPU render of one fixed scene, test-run numbers)
+
+`check_render_instrument` composites a seeded 5000-splat scene (96x72 px, 5x5 Gaussian
+footprints, the bench's premultiplied-alpha pass with the `z*a` depth channel) once in the
+old float `argsort(-d)` order and once in the new order. This is a test mimic of the bench
+GL pass, not the repo renderer: no CPU splat renderer with an order hook exists on main
+(`rv_a_gen.render_sh0` is not merged; `reality_view_c` sorts internally).
+
+- Natural scene (random float depths, 852 of 5000 positions differ): max per-pixel depth
+  diff **0.000254 m** (quantum 0.003051 m), max colour diff **21.6/255**, alpha diff 0.
+- Adversarial scene (400 coincident splats in one quantum on top): max depth diff
+  **0.001571 m**, max colour diff **117.3/255**, alpha diff 0. Proven bound: depth diff
+  <= one quantum, because total transmittance per bin is order independent.
+- All depths > 1 quantum apart: renders bit-identical.
+
+So the depth instrument moves by at most one quantum (3 mm), but colour can differ at
+pixels where splats that are within 3 mm of each other overlap. That is the accepted
+behavior change; GVD decides whether it is acceptable on IQU45.
+
 ## Why `np.argsort(uint16, kind="stable")`
 
 NumPy (2.5.4 here) implements stable sorts of 16-bit-or-smaller integers as a radix

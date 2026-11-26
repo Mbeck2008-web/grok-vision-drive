@@ -14,11 +14,18 @@ W  (a) edge-position error of pred-road pixels vs GT depth at the same pixel:
    Reason (Tracer / Skeptic): hard 0 unreachable: one-sided z_pred>+0.30 gate catches only
    46-100% of off-ground px (logs/rv_side4.txt); GT cm quantization + pose jitter push true
    road just over 0.30 m past 15 m; hence <=1% 0-15 m, <=3% 15-30 m (Skeptic).
-   Denominator (explicit): snapped pixels with finite GT depth, counted per cam and range
-   bin (range = hypot(x,y) of that pixel's GT unprojection). Numerator: those snapped
-   pixels whose GT z > 0.30 m at that same pixel's GT depth. Not all road px, not all
-   valid px, not z_pred. p99 |GT z| of snapped pixels is printed as a road-noise number,
-   info only (no noise margin in the gate).
+   Denominator (GATED, Skeptic ruling 2026-11-26): snapped px that are still DRAWN, i.e. valid in
+   cam_frame after the runtime yield (rv_stable_preview L115) and ego-mask (L118) drops, with
+   finite GT depth, counted per cam and range bin (range = hypot(x,y) of that pixel's GT
+   unprojection). Numerator: those px with GT z > 0.30 m at that px's GT depth (unchanged).
+   Limits unchanged. Reason: hood/yield px are dropped before render with snap on or off, so
+   the earlier gate counted px Michael never sees. All-snapped px (incl. yield/hood-dropped)
+   is printed every run as INFO, both as k/n and %, n shown at both ranges. The mask comes
+   from the runtime path itself (cam_frame's own `valid`); no mask array is copied into
+   this test. check_runtime_mask_growth fails if the yield / ego masked px count on dev
+   frames f40/f110/f160 grows beyond what 783fedd masks (recorded below).
+   p99 |GT z| of drawn snapped px is printed as a road-noise number, info only (no noise margin
+   in the gate).
    Note: net mask too wide is not measured: GT road = net px within 1 m of plane.
    The old seg-based width gate is kept but skips unless GVD_RV_CLIP015_GTSEG is set
    (clip015 has no GT seg).
@@ -919,7 +926,7 @@ def clip_depth_metrics(frames, overrides=None):
     P = np.load(preds)
     p = Preview(overrides, root=clip, P=P, cams=cams)
     avail = {cid: pred_frames(P, cid) for cid in p.cam}
-    snap_rows = []          # (cid, target, used, lo, hi, n_snap, n_bad, p99_abs_z)
+    snap_rows = []          # (cid, target, used, lo, hi, n_drawn, n_bad_drawn, p99_abs_z_drawn, n_all_snapped, n_bad_all)
     edge_rows = []          # (cid, target, lo, hi, med_err, p90_err, med_lat, n, max_overshoot)
     dz_rows = []            # (cid, target, med_|dz|, p90_|dz|, n) in 0-15 m
     foot_rows = []          # (cid, target, frac_ok, n)
@@ -945,17 +952,28 @@ def clip_depth_metrics(frames, overrides=None):
             if gtd is None:
                 continue
             net = _net_road(P, cid, idx, W0, pw, ph)
-            # (b) snap misplacement
+            # (b) snap misplacement. GATED denominator = snapped px still DRAWN: valid in cam_frame, i.e.
+            # after the runtime yield (L115) and ego-mask (L118) drops (Skeptic ruling 2026-11-26).
+            # `v` comes from the same cam_frame call; no mask is copied into the test.
+            # INFO denominator = all snapped px with finite GT depth.
             ys, xs = np.nonzero(snap & np.isfinite(gtd))
             if ys.size:
                 pg = sf.unproject(cam, gtd, ys, xs)
                 rng = np.hypot(pg[:, 0], pg[:, 1])
-                for lo, hi in ((0.0, 15.0), (15.0, 30.0)):
-                    k = (rng >= lo) & (rng < hi)
-                    n = int(k.sum())
-                    n_bad = int((pg[k, 2] > SNAP_BAD_Z).sum()) if n else 0
-                    p99 = float(np.percentile(np.abs(pg[k, 2]), 99)) if n else float("nan")
-                    snap_rows.append((cid, target, idx, lo, hi, n, n_bad, p99))
+                drawn_px = v[ys, xs]
+            else:
+                pg = np.zeros((0, 3))
+                rng = np.zeros(0)
+                drawn_px = np.zeros(0, bool)
+            for lo, hi in ((0.0, 15.0), (15.0, 30.0)):
+                ka = (rng >= lo) & (rng < hi)
+                kd = ka & drawn_px
+                n_all = int(ka.sum())
+                n_bad_all = int((pg[ka, 2] > SNAP_BAD_Z).sum()) if n_all else 0
+                n = int(kd.sum())
+                n_bad = int((pg[kd, 2] > SNAP_BAD_Z).sum()) if n else 0
+                p99 = float(np.percentile(np.abs(pg[kd, 2]), 99)) if n else float("nan")
+                snap_rows.append((cid, target, idx, lo, hi, n, n_bad, p99, n_all, n_bad_all))
             # (a) edge position of pred-road pixels vs GT depth
             ys, xs = np.nonzero(v & net & np.isfinite(gtd) & np.isfinite(d))
             if ys.size:
@@ -1020,33 +1038,48 @@ def _need_clip(name):
     return True
 
 
-def _fmt_snap(rows):
-    out = {}
-    for cid, tgt, idx, lo, hi, n, n_bad, p99 in rows:
-        frac = (n_bad / n) if n else 0.0
-        out.setdefault((cid, f"{lo:g}-{hi:g}"), []).append(
-            f"f{tgt}->i{idx} {100 * frac:.2f}% ({n_bad}/{n}) p99|z|={p99:.3f}m")
-    return out
+def _pct(k, n):
+    return "n/a (n=0)" if n == 0 else f"{100 * k / n:.2f}%"
+
+
+def print_snap_both(rows, label):
+    """Both numbers every run, per cam / range bin / frame, k/n and %, n always shown:
+    DRAWN-only (GATED) and all-snapped (INFO)."""
+    print(f"{label} gate (b) per cam/bin/frame: DRAWN-only (GATED) | all-snapped (INFO); k/n = snapped px with "
+          f"GT z>{SNAP_BAD_Z} m at that px's GT depth / snapped px with finite GT depth "
+          f"(drawn = valid in cam_frame after runtime yield L115 + ego mask L118)", flush=True)
+    pooled = {}
+    for cid, tgt, idx, lo, hi, n, n_bad, p99, n_all, n_bad_all in rows:
+        print(f"  {cid:8s} f{tgt}->i{idx} {lo:g}-{hi:g} m: DRAWN(gated) {n_bad}/{n} {_pct(n_bad, n)} | "
+              f"all-snapped(info) {n_bad_all}/{n_all} {_pct(n_bad_all, n_all)} | p99|z| drawn {p99:.3f} m", flush=True)
+        a = pooled.setdefault((cid, lo, hi), [0, 0, 0, 0])
+        a[0] += n_bad; a[1] += n; a[2] += n_bad_all; a[3] += n_all
+    for (cid, lo, hi), (k, n, ka, na) in sorted(pooled.items()):
+        print(f"  {cid:8s} POOLED {lo:g}-{hi:g} m: DRAWN(gated) {k}/{n} {_pct(k, n)} | "
+              f"all-snapped(info) {ka}/{na} {_pct(ka, na)}", flush=True)
 
 
 def snap_misplace_gate(m, label):
-    """<= 1% snapped px with GT z > 0.30 m at 0-15 m; <= 3% at 15-30 m. Per cam, side/rear/wide.
+    """<= 1% DRAWN snapped px with GT z > 0.30 m at 0-15 m; <= 3% at 15-30 m. Per cam, side/rear/wide.
 
-    Denominator: snapped pixels with finite GT depth, counted per cam and range bin
+    Denominator (GATED): snapped px that are still drawn after the runtime yield/ego masks (valid in
+    cam_frame, rv_stable_preview L115/L118), with finite GT depth, per cam and range bin
     (range = hypot(x, y) of that pixel's GT unprojection).
-    Numerator: those snapped pixels whose GT z > 0.30 m at that same pixel's GT depth.
-    Not all road px, not all valid px, not z_pred.
+    Numerator: those px whose GT z > 0.30 m at that same pixel's GT depth.
+    All-snapped (incl. yield/hood-dropped px) is printed as INFO only.
+    Reason: hood/yield px are dropped before render with snap on or off, so the earlier gate counted
+    px Michael never sees (Skeptic ruling).
     """
-    print(f"{label} snap misplace gate (b): denom = snapped px with finite GT depth, per cam/bin "
-          f"(range = hypot(x,y) of that px's GT unprojection); numer = snapped px with GT z > "
-          f"{SNAP_BAD_Z} m at that px's GT depth. Not all road px, not all valid px, not z_pred. "
-          f"p99 |GT z| is road noise, not a margin. "
+    print(f"{label} snap misplace gate (b): denom = snapped px still DRAWN (valid in cam_frame after runtime "
+          f"yield/ego masks) with finite GT depth, per cam/bin (range = hypot(x,y) of that px's GT unprojection); "
+          f"numer = those px with GT z > {SNAP_BAD_Z} m at that px's GT depth. Not all road px, not z_pred. "
+          f"All-snapped is INFO only. p99 |GT z| is road noise, not a margin. "
           f"Note: net mask too wide is not measured: GT road = net px within 1 m of plane.",
           flush=True)
-    print(f"{label} snap misplace counts:", _fmt_snap(m["snap"]), flush=True)
+    print_snap_both(m["snap"], label)
     print(f"{label} nearest frames:", m["used"], flush=True)
     acc = {}  # (cid, lo, hi) -> [n_bad, n]
-    for cid, tgt, idx, lo, hi, n, n_bad, p99 in m["snap"]:
+    for cid, tgt, idx, lo, hi, n, n_bad, p99, n_all, n_bad_all in m["snap"]:
         if cid not in SNAP_PLACE_CAMS:
             continue
         a = acc.setdefault((cid, lo, hi), [0, 0])
@@ -1059,7 +1092,7 @@ def snap_misplace_gate(m, label):
         frac = n_bad / n
         lim = SNAP_BAD_NEAR if hi <= 15.0 else SNAP_BAD_FAR
         if frac > lim:
-            bad.append(f"{cid} {lo:g}-{hi:g} m: {100 * frac:.2f}% ({n_bad}/{n}) snapped px with GT z > {SNAP_BAD_Z} m (max {100 * lim:g}%)")
+            bad.append(f"{cid} {lo:g}-{hi:g} m: {100 * frac:.2f}% ({n_bad}/{n}) drawn snapped px with GT z > {SNAP_BAD_Z} m (max {100 * lim:g}%)")
     assert not bad, f"{label} snap misplace: " + "; ".join(bad)
 
 
@@ -1160,6 +1193,87 @@ def clip_poseB_holes(target=POSE_B_FRAME):
     holes = hole_fraction(chase, np.concatenate(rend) if rend else np.zeros((0, 3)),
                           np.concatenate(gtp) if gtp else np.zeros((0, 3)))
     return {"holes": {0.0: holes}, "used": used, "chase": "poseB"}  # one view, keyed like hole_gate expects? 
+
+
+# Runtime yield / ego mask counts on 783fedd (dev frames), per frame and cam, measured by running the
+# runtime cam_frame three ways on the same frame/pred index: normal, ownership off (a.ownership=0),
+# EGO_MASK emptied. yield px = valid-with-ownership-off & ~valid; ego px = valid-with-EGO_MASK-off & ~valid.
+# Recorded from this test on 783fedd (rv-side-evidence/mask_counts_783fedd.log). Growth fails.
+MASK_FRAMES = (40, 110, 160)
+MASK_LIMITS: dict = {   # {(frame, cam): (yield_px, ego_px)}, 783fedd, dev frames (cams not listed drop 0)
+    (40, "pillarL"): (0, 0), (40, "pillarR"): (0, 0), (40, "wide"): (3998, 9216),
+    (110, "pillarL"): (0, 0), (110, "pillarR"): (0, 0), (110, "wide"): (2814, 9216),
+    (160, "pillarL"): (0, 0), (160, "pillarR"): (0, 0), (160, "wide"): (2814, 9216),
+}
+
+
+def runtime_mask_counts(frames=MASK_FRAMES):
+    """{(frame, cid): (yield_px, ego_px, idx)} from the runtime cam_frame; also checks the dropped px lie
+    only in the runtime's own YIELD / EGO_MASK regions (subset)."""
+    clip, preds, gt_root = clip_paths()
+    cams = {c["id"]: c for c in json.loads((clip / "cameras.json").read_text())["cameras"]}
+    P = np.load(preds)
+    p = Preview(root=clip, P=P, cams=cams)
+    out, stray = {}, []
+    for target in frames:
+        for cid in p.cam:
+            if cid not in p.ns.get("YIELD_TO", {}) and cid not in p.ns.get("EGO_MASK", {}):
+                continue
+            idx = nearest_idx(pred_frames(P, cid), target)
+            if idx is None:
+                continue
+            fr = p.run(cid, None, None, idx=idx)
+            if fr is None:
+                continue
+            v = fr[2]
+            own, ego_mask = p.a.ownership, p.ns["EGO_MASK"]
+            try:
+                p.a.ownership = 0
+                v_no_yield = p.run(cid, None, None, idx=idx)[2]
+            finally:
+                p.a.ownership = own
+            try:
+                p.ns["EGO_MASK"] = {}
+                v_no_ego = p.run(cid, None, None, idx=idx)[2]
+            finally:
+                p.ns["EGO_MASK"] = ego_mask
+            y_px = v_no_yield & ~v
+            e_px = v_no_ego & ~v
+            ph, pw = v.shape
+            region_y = np.asarray(p.ns["YIELD"][cid], bool) if cid in p.ns.get("YIELD", {}) else np.zeros(v.shape, bool)
+            region_e = np.zeros(v.shape, bool)
+            if cid in ego_mask:
+                r0, c0, c1 = ego_mask[cid]
+                region_e[int(r0 * ph):, int(c0 * pw):int(c1 * pw)] = True
+            if (y_px & ~region_y).any() or (e_px & ~region_e).any():
+                stray.append(f"f{target} {cid}: {(y_px & ~region_y).sum()} yield-dropped px outside YIELD, "
+                             f"{(e_px & ~region_e).sum()} ego-dropped px outside EGO_MASK")
+            out[(target, cid)] = (int(y_px.sum()), int(e_px.sum()), idx)
+    return out, stray
+
+
+def check_runtime_mask_growth() -> None:
+    """The runtime yield / ego masks must not drop more px than 783fedd on dev frames f40/f110/f160.
+
+    A mask that grows hides more snapped px from the drawn-only denominator of gate (b) (it shrinks the
+    denominator), so a fix could pass the gate by masking more. Counts come from the runtime cam_frame
+    (L115 / L118) on the same frame; limits are the 783fedd counts. Subset check: dropped px lie inside
+    the runtime's own YIELD / EGO_MASK regions.
+    """
+    if not _need_clip("runtime_mask_growth"):
+        return SKIPPED
+    if not MASK_LIMITS:
+        raise AssertionError("MASK_LIMITS not recorded")
+    cur, stray = runtime_mask_counts()
+    print("runtime mask px (yield, ego) per frame/cam [limit]:",
+          {f"f{f}/{c}": (v[0], v[1], "limit", MASK_LIMITS.get((f, c))) for (f, c), v in sorted(cur.items())}, flush=True)
+    bad = []
+    for (f, c), (y, e, idx) in sorted(cur.items()):
+        ly, le = MASK_LIMITS.get((f, c), (0, 0))
+        if y > ly or e > le:
+            bad.append(f"f{f} {c}: yield {y} (max {ly}), ego {e} (max {le})")
+    assert not bad, "runtime masks grew beyond 783fedd: " + "; ".join(bad)
+    assert not stray, "masked px outside the runtime's own YIELD/EGO_MASK region: " + "; ".join(stray)
 
 
 def check_clip015_snap_misplace() -> None:
@@ -1931,6 +2045,7 @@ CHECKS = [
     check_behind_car_strip_holes,
     check_clip015_render_edge_and_holes,
     check_clip015_capture_holes,
+    check_runtime_mask_growth,
     check_clip015_snap_misplace,
     check_holdout_snap_misplace,
     check_clean_holdout_snap_misplace,
@@ -1964,9 +2079,9 @@ KNOWN_FAILING: dict[str, str] = {
     "check_snapped_pixels_not_exempt_from_edge_cut": "NEW vs a56f514: 456/456 snapped px at a depth edge were exempt from the cut (tools/rv_stable_preview.py: `cut & ~sky & ~snapped`, added at 4df1176). wide, left-half road 2.5x / right unsnapped 2.5x, clamp on.",
     "prop_side_objects_keep_height": "N: pillarL pole at x=-2.0, y0=0.0: lost 0.592 m",
     "check_road_labelled_object_top_stays_put": "N: pillarR car top 218 px moved outward (GT z 1.50 m); curb top 1487 px, height lost 0.15 m; main car top also snapped outward",
-    "check_clip015_snap_misplace": "f40/f160: pillarR 18.10% (f40 36.90%/f160 3.50%), repeatR 4.65% (f40 9.99%), wide 15.00% at 0-15 m; wide 59.35% at 15-30 m (GT z>0.30)",
-    "check_holdout_snap_misplace": "f100/f200: wide 15.00% and pillarR 4.44% at 0-15 m; wide 37.67%, rear 6.25%, repeatL 5.29% at 15-30 m",
-    "check_clean_holdout_snap_misplace": "f70: pillarR 55.49%, pillarL 41.55%, repeatR 24.60%, wide 14.34%, rear 5.16% at 0-15 m; wide 79.38%, rear 9.44% at 15-30 m",
+    "check_clip015_snap_misplace": "f40/f160 DRAWN-only: pillarR 18.10% (7317/40432; f40 36.90%/f160 3.50%), repeatR 4.65% (1835/39434), wide 10.12% (3555/35133; was 15.00% all-snapped 7461/49726) at 0-15 m; wide 61.64% (188/305; all-snapped 59.35% 219/369) at 15-30 m (GT z>0.30)",
+    "check_holdout_snap_misplace": "f100/f200 DRAWN-only: wide 4.46% (1562/34986; was 15.00% all-snapped) and pillarR 4.44% at 0-15 m; wide 30.80% (182/591; was 37.67%), rear 6.25%, repeatL 5.29% at 15-30 m",
+    "check_clean_holdout_snap_misplace": "f70 DRAWN-only: pillarR 55.49%, pillarL 41.55%, repeatR 24.60%, wide 11.39% (2067/18147; was 14.34% all-snapped), rear 5.16% at 0-15 m; wide 79.38% (77/97), rear 9.44% at 15-30 m",
     "check_clip015_edge_position": "f40/f160: wide 5-15 m median 1.334/p90 5.119 vs 10%/20% of |x_gt| 4.36 m; also narrow/main 5-15 p90 over the 20% gate",
     "check_holdout_edge_position": "f100/f200: wide 5-15 m median 0.551/p90 5.453 vs |x_gt| 5.19 m; narrow/main p90 over at 5-15 m",
     "check_clean_holdout_edge_position": "f70: wide 5-15 m median 2.183/p90 4.595; pillarL 5-15 m 2.453/5.904; pillarR 0-5 m 0.568/6.308",
@@ -1985,9 +2100,9 @@ _REPORT = os.environ.get("RV_PROPS_REPORT", "").strip() in {"1", "true", "yes"}
 
 def main() -> None:
     print("Note: net mask too wide is not measured: GT road = net px within 1 m of plane.", flush=True)
-    print("gate (b): denom = snapped px with finite GT depth, counted per cam/bin "
-          "(range = hypot(x,y) of that px's GT unprojection); "
-          "numer = snapped px with GT z > 0.30 m at that px's GT depth.", flush=True)
+    print("gate (b): denom = snapped px still DRAWN (valid in cam_frame after runtime yield L115 / ego mask L118) "
+          "with finite GT depth, per cam/bin (range = hypot(x,y) of that px's GT unprojection); "
+          "numer = those px with GT z > 0.30 m at that px's GT depth. All-snapped is INFO.", flush=True)
     ok = all([_run_one(fn) for fn in CHECKS])
     ok = _run_hypothesis_props_or_skip() and ok
     if not ok:

@@ -674,7 +674,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--scene-ckpt",
         default="",
-        help="Load a train_scene epoch .npz and run SceneNet on the main camera (CPU). "
+        help="Load a train_scene epoch .npz and run SceneNet on the live camera frames the checkpoint lists (all 8 for an 8-cam ckpt; CPU). "
         "Default is shadow: draw lane_gt, block engage, never actuate. "
         "Pass --scene-ckpt-drive to let lane_x steer through the modular controller.",
     )
@@ -969,6 +969,7 @@ def main(clock=None) -> None:
         print(f"[GVD] live_input_long_side={long_side} (--live-long-side)", flush=True)
     backend = make_backend(backend_name if args.backend != "auto" else backend_name, long_side=long_side)
     if scene_ckpt is not None and hasattr(backend, "set_needed_cameras"):
+        # The ckpt's own cams: all 8 for an 8-cam ckpt (pinned by scripts/test_scene_ckpt_8cam.py).
         needed = tuple(getattr(scene_ckpt, "cams", ()) or ("main",))
         backend.set_needed_cameras(needed)
         print(
@@ -1646,7 +1647,8 @@ def main(clock=None) -> None:
                         route_vec = runtime_route_vec(
                             st.get("nav") if isinstance(st.get("nav"), dict) else {}, route_intent_result
                         )
-                    ckpt_pred = scene_ckpt.observe(main, tick_dt, route=route_vec)
+                    ckpt_frames = getattr(bundle, "frames", None)
+                    ckpt_pred = scene_ckpt.observe(ckpt_frames, tick_dt, route=route_vec)
                 except SceneCkptInputError as exc:
                     print(f"[GVD] scene-ckpt input: {exc}", flush=True)
                     ckpt_pred = None

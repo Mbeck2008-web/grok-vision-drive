@@ -1,4 +1,5 @@
 # Dev / CI only. Never needed to run GVD.
-# Property + fuzz tests: scripts/test_learned_lanes_props.py (skipped visibly without it).
+# Property + fuzz tests: scripts/test_learned_lanes_props.py and
+# scripts/test_rv_c_proto.py (CI fails those checks if hypothesis is missing).
 hypothesis==6.170.17
 # Mutation testing is run by hand (not in CI): pip install mutmut==3.8.1

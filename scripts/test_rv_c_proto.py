@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -57,6 +58,8 @@ from python.viz.reality_view_c import (  # noqa: E402
     encode_png_bytes,
     is_reality_view_enabled,
     render_chase_depth_billboards,
+    _unit_vec,
+    _unproject_view,
 )
 
 # Pinned sha256 of the deterministic 320x180 synthetic depth+pose PNG fixture.
@@ -417,6 +420,29 @@ def _build_props():
 
 PROPS = _build_props()
 
+def _ci_requires_hypothesis() -> bool:
+    """True when running under CI (GITHUB_ACTIONS or CI=true/1/yes)."""
+    def _on(name: str) -> bool:
+        return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+    return _on("CI") or _on("GITHUB_ACTIONS")
+
+
+def _run_hypothesis_props_or_skip() -> None:
+    """Run property tests; fail hard under CI if hypothesis is missing, else skip locally."""
+    if given is not None:
+        for prop in PROPS:
+            prop()
+            print(f"{prop.__name__}: holds OK")
+        return
+    if _ci_requires_hypothesis():
+        raise SystemExit(
+            "FAIL hypothesis_properties: hypothesis is not installed under CI "
+            f"(CI={os.environ.get('CI')!r}, GITHUB_ACTIONS={os.environ.get('GITHUB_ACTIONS')!r}). "
+            "CI must install requirements-dev.txt (hypothesis==6.170.17)."
+        )
+    skip_check("hypothesis_properties", "hypothesis not installed (dev-only dep; CI installs it)")
+
+
 
 
 def check_mutation_and_edge_cases() -> None:
@@ -638,6 +664,55 @@ def check_mutation_and_edge_cases() -> None:
             raise AssertionError(f"expected ValueError for zero {vec_fld}")
         except ValueError:
             pass
+
+    # Direct private-helper tests that kill previously surviving non-equivalent mutants
+    # x__unit_vec__mutmut_16: norm == 1e-12 must be rejected by <=, not only <
+    try:
+        _unit_vec((1e-12, 0.0, 0.0), "v")
+        raise AssertionError("expected ValueError for norm == 1e-12")
+    except ValueError:
+        pass
+    u_eps = _unit_vec((2e-12, 0.0, 0.0), "v")
+    assert abs(u_eps[0] - 1.0) < 1e-9 and abs(u_eps[1]) < 1e-9 and abs(u_eps[2]) < 1e-9
+
+    # x__unit_vec__mutmut_20: must divide by the norm, not multiply
+    assert _unit_vec((3.0, 0.0, 0.0), "v") == (1.0, 0.0, 0.0)
+    assert _unit_vec((0.0, 4.0, 0.0), "v") == (0.0, 1.0, 0.0)
+    assert _unit_vec((0.0, 0.0, 5.0), "v") == (0.0, 0.0, 1.0)
+
+    # x__unproject_view__mutmut_90/_95/_96: empty-view return shapes must be (0, 3)
+    empty_pts, empty_cols = _unproject_view(
+        DepthColorView(c1x2, np.full((1, 2, 3), 10, np.uint8), np.full((1, 2), np.nan, np.float32))
+    )
+    assert empty_pts.shape == (0, 3) and empty_pts.dtype == np.float64
+    assert empty_cols.shape == (0, 3) and empty_cols.dtype == np.uint8
+
+    # x_render_chase_depth_billboards__mutmut_162: px == out_w is strictly outside the frustum
+    # A 16-wide source sharing the 8-wide chase pose puts pixel x=12 at uc=8.5, floor(px)=8 == out_w.
+    chase_frustum = camera_from_angles("c8", (0.0, 0.0, 1.0), 0.0, 0.0, 45.0, 8, 8, near_m=0.1, far_m=50.0)
+    src_frustum = camera_from_angles("s16", (0.0, 0.0, 1.0), 0.0, 0.0, 45.0, 16, 8, near_m=0.1, far_m=50.0)
+    d_edge = np.full((8, 16), np.nan, dtype=np.float32)
+    d_edge[4, 12] = 5.0
+    rgb_edge = np.zeros((8, 16, 3), dtype=np.uint8)
+    rgb_edge[4, 12] = (200, 10, 10)
+    r_edge = render_chase_depth_billboards(
+        [DepthColorView(src_frustum, rgb_edge, d_edge)], chase_frustum, billboard_radius_px=0
+    )
+    assert r_edge.point_count == 0 and not bool(r_edge.observed.any())
+    assert np.all(r_edge.rgb == np.asarray(UNKNOWN_RGB, dtype=np.uint8))
+
+
+    # Exact MAX_INPUT_PIXELS (2000x2000 = 4_000_000) must be accepted; one more pixel is already refused above.
+    cam_cap = camera_from_angles("cap", (0.0, 0.0, 1.0), 0.0, 0.0, 45.0, 8, 8, near_m=0.1, far_m=50.0)
+    h_cap, w_cap = 2000, 2000
+    assert h_cap * w_cap == MAX_INPUT_PIXELS
+    r_cap_eq = render_chase_depth_billboards(
+        [DepthColorView(cam_cap, np.zeros((h_cap, w_cap, 3), dtype=np.uint8), np.full((h_cap, w_cap), np.nan, dtype=np.float32))],
+        cam_cap,
+        billboard_radius_px=0,
+    )
+    assert r_cap_eq.point_count == 0 and not bool(r_cap_eq.observed.any())
+
     print("check_mutation_and_edge_cases: OK")
 
 
@@ -648,12 +723,7 @@ def main() -> None:
     check_invariants_examples()
     check_mutation_and_edge_cases()
     check_png_pin()
-    if given is None:
-        skip_check("hypothesis_properties", "hypothesis not installed (dev-only dep; CI installs it)")
-    else:
-        for prop in PROPS:
-            prop()
-            print(f"{prop.__name__}: holds OK")
+    _run_hypothesis_props_or_skip()
     print("test_rv_c_proto: OK")
 
 
@@ -683,8 +753,7 @@ def test_png_pin() -> None:
 
 
 def test_hypothesis_props() -> None:
-    for prop in PROPS:
-        prop()
+    _run_hypothesis_props_or_skip()
 
 
 def test_mutation_and_edge_cases() -> None:

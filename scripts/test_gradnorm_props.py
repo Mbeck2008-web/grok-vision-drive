@@ -36,6 +36,7 @@ import json
 import math
 import os
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +52,7 @@ try:
 except ImportError:  # dev-only dep (requirements-dev.txt); CI fails instead of skipping
     given = None
 
-from python.train.lr_schedule import WarmupCosine, apply_lr  # noqa: E402
+from python.train.lr_schedule import WarmupCosine, apply_lr, stage_peak  # noqa: E402
 from python.train.trainer2_balance import (  # noqa: E402
     W_MAX,
     W_MIN,
@@ -187,6 +188,143 @@ def check_documented_edges() -> None:
     # warmup > total clamps to total; negative warmup -> 0
     assert WarmupCosine(1.0, 5, warmup_steps=99).warmup_steps == 5
     assert WarmupCosine(1.0, 5, warmup_steps=-4).warmup_steps == 0
+
+
+
+# ------------------------------------------------- references (independent of the module)
+
+def _ref_project(raw: list[float], total: float, lo: float = W_MIN, hi: float = W_MAX) -> list[float]:
+    """Exact water-filling with Fractions: the c with sum(clamp(c * w_i, lo, hi)) == total, no bisection."""
+    n = len(raw)
+    order = sorted(range(n), key=lambda i: raw[i])
+    w = [Fraction(max(raw[i], 1e-12)) for i in order]
+    flo, fhi = Fraction(lo), Fraction(hi)
+    ftot = max(n * flo, min(n * fhi, Fraction(total)))  # the module's 1e-12 tolerance, exactly
+    for a in range(n + 1):  # the a lowest are clamped to lo, the b highest to hi
+        for b in range(n - a + 1):
+            fixed = a * flo + b * fhi
+            mid = w[a : n - b]
+            if not mid:
+                if fixed != ftot:
+                    continue
+                vals = [flo] * a + [fhi] * b
+            else:
+                c = (ftot - fixed) / sum(mid)
+                ok = (a == 0 or w[a - 1] * c <= flo) and w[a] * c >= flo and w[n - b - 1] * c <= fhi and (b == 0 or w[n - b] * c >= fhi)
+                if not ok:
+                    continue
+                vals = [flo] * a + [x * c for x in mid] + [fhi] * b
+            out = [0.0] * n
+            for rank, i in enumerate(order):
+                out[i] = float(vals[rank])
+            return out
+    raise AssertionError("no water level")
+
+
+def _ref_step(weights, initial, losses, grads, active, alpha, lr):
+    """The spec formula written out once more: returns the new active weights, or None near a sign tie."""
+    n = len(active)
+    for name in active:
+        initial.setdefault(name, max(losses[name], 1e-12))
+    if n < 2:
+        return dict(zip(active, _ref_project([weights[a] for a in active], float(n)))) if n else {}
+    big_g = [weights[a] * grads[a] for a in active]
+    g_bar = sum(big_g) / n
+    ratio = [losses[a] / initial[a] for a in active]
+    r_bar = sum(ratio) / n
+    new = []
+    for a, bg, rt in zip(active, big_g, ratio):
+        r = rt / r_bar if r_bar > 0 else 1.0
+        try:
+            target = g_bar * r ** alpha
+        except OverflowError:
+            target = math.inf
+        diff = bg - target
+        if diff != 0.0 and abs(diff) <= 1e-9 * max(abs(bg), abs(target)):
+            return None  # float sign tie: the reference may legitimately round the other way
+        new.append(weights[a] - lr * (grads[a] if diff > 0 else -grads[a] if diff < 0 else 0.0))
+    return dict(zip(active, _ref_project(new, float(n))))
+
+
+def _raises(fn, *a, **k) -> str:
+    try:
+        fn(*a, **k)
+    except ValueError as e:
+        return str(e)
+    raise AssertionError(f"{fn.__name__ if hasattr(fn, '__name__') else fn} did not raise ValueError")
+
+
+def check_error_messages_name_the_problem() -> None:
+    from python.train.trainer2_balance import HeadRamp as HR
+
+    assert "ramp_steps" in _raises(HR, {"a": 0}, 0)
+    assert "unreachable" in _raises(project_weights, {"a": 1.0, "b": 1.0}, 0.15)  # below n * lo
+    assert "unreachable" in _raises(project_weights, {"a": 1.0, "b": 1.0}, 20.5)  # above n * hi
+    # the tolerance is 1e-12 on both ends, inclusive; one more order of magnitude is refused
+    assert project_weights({"a": 1.0}, W_MIN - 1e-12)["a"] == W_MIN
+    assert project_weights({"a": 1.0}, W_MAX + 1e-12)["a"] == W_MAX
+    assert "unreachable" in _raises(project_weights, {"a": 1.0}, W_MIN - 1e-9)
+    assert "unreachable" in _raises(project_weights, {"a": 1.0}, W_MAX + 1e-9)
+    assert project_weights({}, 0.0) == {}
+    assert _raises(GradNorm, ["a"], alpha=-1.0).startswith("GradNorm alpha must be finite and >= 0")
+    assert _raises(GradNorm, ["a"], lr=float("nan")).startswith("GradNorm lr must be finite and >= 0")
+    assert "both balanced and fixed" in _raises(GradNorm, ["a"], fixed={"a": 1.0})
+    gn = GradNorm(["a", "b"], fixed={"kd": 0.5})
+    for bad in ("kd", "nope"):  # a fixed term and an unknown name are both refused
+        assert "not a GradNorm-balanced term" in _raises(gn.update, {"a": 1, "b": 1, bad: 1}, {"a": 1, "b": 1, bad: 1}, active=["a", bad])
+    assert _raises(gn.update, {"a": float("nan"), "b": 1.0}, {"a": 1.0, "b": 1.0}, active=["a", "b"]).startswith("loss of 'a'")
+    assert _raises(gn.update, {"a": 1.0, "b": 1.0}, {"a": 1.0, "b": -2.0}, active=["a", "b"]).startswith("grad norm of 'b'")
+    assert "balanced" in _raises(combine_losses, {}, gn, HeadRamp({}), step=0, fixed_losses={"a": 1.0})
+    assert "peak" in _raises(WarmupCosine, 0.0, 10)
+    assert "total_steps" in _raises(WarmupCosine, 1.0, 0)
+    assert "floor_frac" in _raises(WarmupCosine, 1.0, 10, floor_frac=1.5)
+
+
+def check_default_warmup_and_stage_peak() -> None:
+    """Spec: warmup = max(500, 5% of the stage); joint peak = 0.1 x base."""
+    assert WarmupCosine(1.0, 20000).warmup_steps == 1000
+    assert WarmupCosine(1.0, 10001).warmup_steps == 501
+    assert WarmupCosine(1.0, 10000).warmup_steps == 500 and WarmupCosine(1.0, 600).warmup_steps == 500
+    assert stage_peak(0.01, joint=False) == 0.01
+    assert math.isclose(stage_peak(0.01, joint=True), 0.001, rel_tol=1e-15)
+
+
+def check_ramp_values_and_active_names() -> None:
+    r = HeadRamp({"b": 10, "a": 0, "c": 100}, 4)
+    assert [r.factor("b", s) for s in (9, 10, 11, 12, 14, 99)] == [0.0, 0.0, 0.25, 0.5, 1.0, 1.0]
+    assert r.active_names(10) == ["b", "a"] and r.active_names(-1) == [] and r.active_names(100) == ["b", "a", "c"]
+
+
+def check_record_and_combine_exact() -> None:
+    gn = GradNorm(["a", "b"], fixed={"kd": 0.25})
+    ramp = HeadRamp({"a": 0, "b": 0}, 10)
+    rec = grad_norm_record(5, {"b": 2.0, "a": 1.0}, gn, ramp)
+    assert rec == {"step": 5, "shared": "stem.fc.weight", "grad_norm": {"a": 1.0, "b": 2.0},
+                   "weight": {"a": 1.0, "b": 1.0}, "ramp": {"a": 0.5, "b": 0.5}}, rec
+    assert list(rec["grad_norm"]) == ["a", "b"]
+    gn.weights.update({"a": 2.0, "b": 0.5})
+    # ramp * w * L over active heads, plus fixed-weight terms (default weight 1.0 for an unlisted one)
+    total = combine_losses({"a": 3.0, "b": 4.0}, gn, ramp, step=5, fixed_losses={"kd": 8.0, "other": 2.0})
+    assert total == 0.5 * 2.0 * 3.0 + 0.5 * 0.5 * 4.0 + 0.25 * 8.0 + 1.0 * 2.0, total
+    assert combine_losses({}, gn, ramp, step=0) == 0.0
+
+
+def check_equal_heads_take_no_step() -> None:
+    """G_i == target_i exactly (identical heads, r = 1): d L_grad / d w_i is 0, so no weight moves."""
+    for n in (2, 3, 5):
+        names = [f"h{i}" for i in range(n)]
+        gn = GradNorm(names)
+        out = gn.update({k: 2.0 for k in names}, {k: 3.0 for k in names}, active=names)
+        assert all(math.isclose(v, 1.0, rel_tol=0, abs_tol=1e-12) for v in out.values()), out
+    # one head above its target moves down by lr * g, one below moves up (before projection)
+    gn = GradNorm(["a", "b"], alpha=1.0, lr=0.1)
+    out = gn.update({"a": 1.0, "b": 1.0}, {"a": 4.0, "b": 1.0}, active=["a", "b"])
+    assert out["a"] < 1.0 < out["b"] and abs(out["a"] + out["b"] - 2.0) < 1e-12, out
+
+
+def check_overlap_and_unknown_active_refused() -> None:
+    _raises(GradNorm, ["a", "b"], fixed={"b": 2.0})
+    assert GradNorm(["a"], fixed={"b": 2.0}).weight_of("b") == 2.0
 
 
 # ----------------------------------------------------------- hypothesis
@@ -462,7 +600,83 @@ def _build_props():
             assert g["lr"] == rate * m and math.isfinite(g["lr"])
         assert apply_lr(object(), sch, step) == rate  # no param_groups: nothing to write, no crash
 
+
+    mod = st.one_of(st.just(0.0), st.floats(1e-6, 1e6))
+    mod_a = st.floats(0.0, 4.0)
+    mod_lr = st.one_of(st.just(0.0), st.floats(1e-3, 2.0))
+
+    @cfg
+    @given(
+        st.integers(1, 6),
+        mod_a,
+        mod_lr,
+        st.lists(st.tuples(st.lists(st.booleans(), min_size=6, max_size=6), st.lists(st.tuples(mod, mod), min_size=6, max_size=6)), min_size=1, max_size=5),
+    )
+    def prop_gradnorm_update_matches_independent_reference(n, alpha, lr, steps):
+        """Same spec formula, independent projection (exact water-filling). Skips float sign ties."""
+        names = [f"h{i}" for i in range(n)]
+        gn = GradNorm(names, alpha=alpha, lr=lr)
+        weights = {k: 1.0 for k in names}
+        initial: dict[str, float] = {}
+        for mask, vals in steps:
+            active = [k for k, on in zip(names, mask) if on]
+            losses = {k: vals[i][0] for i, k in enumerate(names)}
+            grads = {k: vals[i][1] for i, k in enumerate(names)}
+            ref = _ref_step(weights, initial, losses, grads, active, alpha, lr)
+            got = gn.update(losses, grads, active=active)
+            if ref is None:
+                return
+            for k in active:
+                assert math.isclose(got[k], ref[k], rel_tol=1e-9, abs_tol=1e-9), (k, got[k], ref[k], active, alpha, lr)
+            for k in names:
+                if k not in active:
+                    assert got[k] == weights[k]  # inactive: untouched, exactly
+            weights.update(got)  # lockstep: the reference restarts from the module's own state each step
+            assert gn.initial == initial
+
+    @cfg
+    @given(st.lists(st.one_of(st.floats(1e-12, 1e6), st.floats(0.0, 1.0)), min_size=1, max_size=6), st.floats(0.0, 1.0))
+    def prop_project_weights_matches_exact_water_filling(raw, frac):
+        n = len(raw)
+        total = n * W_MIN + frac * n * (W_MAX - W_MIN)
+        out = project_weights({f"k{i}": v for i, v in enumerate(raw)}, total)
+        ref = _ref_project(raw, total)
+        for i, r in enumerate(ref):
+            assert math.isclose(out[f"k{i}"], r, rel_tol=1e-9, abs_tol=1e-9), (i, out, ref, raw, total)
+
+    @cfg
+    @given(
+        st.integers(1, 5), st.lists(st.integers(-50, 50), min_size=5, max_size=5), st.integers(1, 40), st.integers(-60, 120),
+    )
+    def prop_head_ramp_matches_closed_form(n, entries, ramp_steps, step):
+        names = [f"h{i}" for i in range(n)]
+        ramp = HeadRamp(dict(zip(names, entries)), ramp_steps)
+        for name, s0 in zip(names, entries):
+            want = 0.0 if step < s0 else min(1.0, (step - s0) / ramp_steps)
+            assert ramp.factor(name, step) == want, (name, s0, step, ramp_steps)
+        assert ramp.active_names(step) == [k for k, s0 in zip(names, entries) if step >= s0]
+
+    @cfg
+    @given(st.floats(1e-8, 10.0), st.integers(1, 60000), st.one_of(st.none(), st.integers(0, 60000)), st.floats(0.0, 1.0), st.integers(0, 70000))
+    def prop_lr_matches_closed_form(peak, total, warm, ff, step):
+        sch = WarmupCosine(peak, total, warmup_steps=warm, floor_frac=ff)
+        w = max(0, min(total, math.ceil(0.05 * total) if warm is None and 0.05 * total > 500 else (500 if warm is None else warm)))
+        assert sch.warmup_steps == w
+        floor = ff * peak
+        if step < w:
+            want = peak * (step + 1) / w
+        elif total <= w:
+            want = peak
+        else:
+            frac = min(1.0, (step - w) / (total - w))
+            want = floor + (peak - floor) * (1.0 + math.cos(math.pi * frac)) / 2.0
+        assert math.isclose(sch.lr_at(step), want, rel_tol=1e-12, abs_tol=1e-300), (sch.state_dict(), step, sch.lr_at(step), want)
+
     return [
+        prop_gradnorm_update_matches_independent_reference,
+        prop_project_weights_matches_exact_water_filling,
+        prop_head_ramp_matches_closed_form,
+        prop_lr_matches_closed_form,
         prop_gradnorm_finite_clamped_renormalized,
         prop_gradnorm_long_horizon,
         prop_gradnorm_inactive_garbage_and_zero_heads,
@@ -506,6 +720,12 @@ def _run_hypothesis_props_or_skip() -> None:
 
 def main() -> None:
     check_documented_edges()
+    check_error_messages_name_the_problem()
+    check_default_warmup_and_stage_peak()
+    check_ramp_values_and_active_names()
+    check_record_and_combine_exact()
+    check_overlap_and_unknown_active_refused()
+    check_equal_heads_take_no_step()
     check_pin_alpha_overflow()
     check_pin_huge_grad_norm_keeps_sum()
     check_pin_ctor_refuses_poison_hyperparams()
@@ -524,6 +744,15 @@ if __name__ == "__main__":
 # Pytest entrypoints (for mutmut 3.8.1).
 def test_documented_edges() -> None:
     check_documented_edges()
+
+
+def test_exact_values_and_messages() -> None:
+    check_error_messages_name_the_problem()
+    check_default_warmup_and_stage_peak()
+    check_ramp_values_and_active_names()
+    check_record_and_combine_exact()
+    check_overlap_and_unknown_active_refused()
+    check_equal_heads_take_no_step()
 
 
 def test_pins() -> None:

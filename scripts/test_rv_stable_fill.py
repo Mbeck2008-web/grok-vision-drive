@@ -23,7 +23,7 @@ S9 road is flat: net-labelled road pixels (>= 4 px inside the label, downward ra
    upward rays are left alone.
 S11 snap rejection (runtime, no GT): a road-labelled px whose net depth puts it > 0.30 m above the road
    plane is not snapped (wall labelled road stays put; pole/car under a 12x16 road label keeps height).
-S12 road snap runs only on ROAD_SNAP_CAMS (wide).
+S12 road snap runs only on ROAD_SNAP_CAMS (all but narrow; switchable).
 S7b ground_clamp caps +inf on a downward ray at the ground hit; NaN stays NaN.
 S3b CamDepthFilter does not push on/above-road input below the road plane.
 S15 a road px the snap rejects renders at its raw depth (not deleted by snap / clamp / cap).
@@ -379,17 +379,27 @@ def check_snap_rejects_above_road() -> None:
 
 
 def check_snap_cams() -> None:
-    """S12: road snap runs only on ROAD_SNAP_CAMS (wide): main/narrow net depth beats the flat z=0
-    plane at 10-15 m on clip015 (f40/f160 gate, f100/f200 held-out)."""
-    assert tuple(sf.ROAD_SNAP_CAMS) == ("wide",), sf.ROAD_SNAP_CAMS
+    """S12: road snap runs only on ROAD_SNAP_CAMS: every cam but narrow (GVD 2026-11-26 restored the non-wide cams with the
+    0.30 m rejection; wide stays on until Michael picks). The set is a module constant, so each cam is switchable.
+    (Was ('wide',) in 38c9827: main/narrow lose to the flat plane at 10-15 m, see ROAD_SNAP_CAMS.)"""
+    assert tuple(sf.ROAD_SNAP_CAMS) == ("wide", "main", "pillarL", "pillarR", "repeatL", "repeatR", "rear"), sf.ROAD_SNAP_CAMS
     cam, ys, xs, dz, down, hit = _flat_scene("wide", (0.0, 1.2, 1.24), -8.0, 88.7)
     raw = np.where(down, hit * 1.5, 80.0)
     road = down.copy()
-    o, m = sf.snap_road_for_cam("wide", cam, raw, road)
-    assert m.any()
-    for cid in ("main", "narrow", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+    for cid in sf.ROAD_SNAP_CAMS:
         o, m = sf.snap_road_for_cam(cid, cam, raw, road)
-        assert not m.any() and np.array_equal(o, raw), cid
+        assert m.any() and np.array_equal(o[m], hit[m]), cid
+    o, m = sf.snap_road_for_cam("narrow", cam, raw, road)
+    assert not m.any() and np.array_equal(o, raw), "narrow stays unsnapped"
+    old = sf.ROAD_SNAP_CAMS
+    try:
+        sf.ROAD_SNAP_CAMS = ("narrow",)
+        o, m = sf.snap_road_for_cam("narrow", cam, raw, road)
+        assert m.any()
+        o, m = sf.snap_road_for_cam("wide", cam, raw, road)
+        assert not m.any(), "switching a cam off must work"
+    finally:
+        sf.ROAD_SNAP_CAMS = old
 
 
 def check_clamp_inf() -> None:

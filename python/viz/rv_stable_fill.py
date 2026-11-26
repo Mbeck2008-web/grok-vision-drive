@@ -366,11 +366,13 @@ ROAD_SNAP_ERODE_PX: int = 4             # stay this many px inside the road clas
 # label, not road; snapping it would throw it down and outward onto the plane (Tracer: 37% of snapped px on
 # clip015 f40 pillarR had GT z > 0.3 m, landing +5-7 m outward). Px below the plane (the dips) still snap.
 ROAD_SNAP_MAX_ABOVE_M: float = 0.30
-# Cams whose road is snapped. clip015 road |z err| vs GT, frozen code, median m (scratch/stable/bins5.py): main/narrow
-# lose to snap at 10-15 m (f40 main 0.19 -> 0.33, narrow 0.19 -> 0.34; GT road rises ~0.8 deg off the flat z=0 plane
-# and their net depth follows it); wide with the 0.30 m rejection gains at 0-5 m (f160 0.11 -> 0.07, held-out f100
-# 0.20 -> 0.06) and is unchanged at 5-15 m (its too-near road floats > 0.30 m and is rejected) -> wide only.
-ROAD_SNAP_CAMS: tuple[str, ...] = ("wide",)
+# Cams whose road is snapped (switchable; GVD direction 2026-11-26: restore snap on the non-wide cams, keep the 0.30 m
+# rejection; wide stays as it was until Michael picks). narrow stays unsnapped. NOTE the frozen bins (scratch/stable/bins6.py,
+# median |dz| m, off -> snap + rejection) say main/narrow lose to snap at 5-15 m even with the rejection: f160 main 5-10 m
+# 0.08 -> 0.13, 10-15 m 0.12 -> 0.19; f100 main 10-15 m 0.12 -> 0.18; narrow 10-15 m 0.09 -> 0.21. Wide with the rejection
+# gains at 0-5 m (f160 0.11 -> 0.07, held-out f100 0.20 -> 0.06) and is unchanged at 5-15 m. Side cams: see gate (b) in
+# tests/props (pillarL/R, repeatR snap curb/car px).
+ROAD_SNAP_CAMS: tuple[str, ...] = ("wide", "main", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
 
 
 def _erode(mask: np.ndarray, r: int) -> np.ndarray:

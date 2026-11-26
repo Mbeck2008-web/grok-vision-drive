@@ -33,6 +33,8 @@ _WATCH_MODE_LABEL = {"winhandle": "handle", "pidfd": "pidfd", "ppid": "ppid"}
 # Test-only hook. Never read from env or config. Production --serve leaves this False.
 # Set as a private module attribute from a test process after import, before main().
 _TEST_DISABLE_PDEATHSIG = False
+# Test-only hook (same rules): use the stdin-thread serve loop off win32 too.
+_TEST_FORCE_STDIN_THREAD = False
 
 
 def _schema_version() -> int:
@@ -212,27 +214,33 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _on_sig)
     signal.signal(signal.SIGINT, _on_sig)
 
+    stdin_fd: int | None = None
+    if sys.platform != "win32" and not _TEST_FORCE_STDIN_THREAD:
+        try:
+            stdin_fd = sys.stdin.buffer.fileno()
+        except (AttributeError, OSError, ValueError):
+            stdin_fd = None
+
     # Armed handshake: printed only after the parent watch is open and re-checked.
-    _emit(f"RV_WATCH_ARMED mode={_WATCH_MODE_LABEL.get(watch[0], watch[0])} parent_pid={expected_ppid}")
+    _emit(
+        f"RV_WATCH_ARMED mode={_WATCH_MODE_LABEL.get(watch[0], watch[0])} parent_pid={expected_ppid} "
+        f"stdin={'select' if stdin_fd is not None else 'thread'}"
+    )
     reason = "signal"
     try:
-        stdin_fd: int | None = None
-        if sys.platform != "win32":
-            try:
-                stdin_fd = sys.stdin.buffer.fileno()
-            except (AttributeError, OSError, ValueError):
-                stdin_fd = None
-
         if stdin_fd is None:
             # Windows (and POSIX without a usable stdin fd): stdin EOF on a thread,
             # parent watch polled every _POLL_MS.
             eof_evt = threading.Event()
 
             def _watch_stdin() -> None:
+                # Raw os.read, not sys.stdin.buffer.read: a daemon thread blocked inside
+                # BufferedReader holds its lock, so interpreter shutdown stalls 1 s in
+                # _enter_buffered_busy and then aborts (Fatal Python error, rc != 0).
                 try:
+                    fd = sys.stdin.fileno()
                     while not eof_evt.is_set():
-                        chunk = sys.stdin.buffer.read(1)
-                        if not chunk:
+                        if not os.read(fd, 64):
                             break
                 except (OSError, ValueError, AttributeError):
                     pass

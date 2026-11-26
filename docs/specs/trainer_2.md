@@ -20,7 +20,7 @@ Every head trains on the same stitched 8-cam strip the live model receives, wide
 - Train: `train_scene._frame_row` → `_load_bgr` → `scene_loader.load_canvas` → `raw_frames.load_training_bgr` → `compose_strip(load_raw_cameras(...))`. Hold-last rows go `held_canvas` → `compose_strip`. Then optional `cam_strip.extract_cams` / `scale_canvas`, and train-only `photometric_jitter` (`--augment`).
 - Live: `run_vision.py:1551` `compose_strip(frames)` → `scene_guard.observe` → `scene_lane_runtime._strip_nchw` (uint8 → float32 /255, HWC→NCHW).
 - **Gap found:** `scene_ckpt_runtime._main_canvas` (`--scene-ckpt`) builds `compose_strip({"main": frame})`, which is **main-only**. A multi-cam head would get a black canvas outside main there. Trainer 2.0 heads must not ship on that path until it feeds all 8 cams (a GVD runtime change, outside these PRs; Open question 5).
-- **Normalization** must be one function (**new** `python/train/strip_tensor.py::strip_to_nchw`, moved verbatim from `_strip_nchw`; `exp_ssl.frame_to_nchw` and the trainer call it).
+- **Normalization** exists twice today: trainer `scene_net._strip_nchw`, live `scene_lane_runtime._strip_nchw`. They are cross-checked only on synthetic arrays by `scripts/test_scene_strip_scale.py` (#140, `check_torch_cross`). **New** `python/train/strip_tensor.py::strip_to_nchw` makes it one function (moved verbatim); both sites and `exp_ssl.frame_to_nchw` call it. The new pin below covers the whole stitch → tensor path on real recorded frames, not just the scaling.
 - `check_train_live_input_identical`: on the same recorded fixture frames (`tests/fixtures`), the train builder (augment off) and the live builder (`compose_strip` + `_strip_nchw`) give **byte-identical** float32 NCHW tensors. A sha256 is pinned per fixture, covering cam order (`STRIP_ORDER`, 8 names incl. `wide`), sector crop/x0/x1, resolution and /255. Any drift fails the pin. `--scale` < 1 and `--augment` are train-only and are refused in a recipe meant for a live export.
 
 ## Non-goals
@@ -152,7 +152,7 @@ All live in `scripts/test_trainer2_*.py`. Torch parts use `gvd_test_env.skip_che
 | `python/train/trainer2_split.py` | **new**: manifest, hashes |
 | `python/train/trainer2_distill.py` | **new** (late PR) |
 | `python/train/strip_tensor.py` | **new**: single `strip_to_nchw` (moved from `scene_lane_runtime._strip_nchw`, behavior identical) |
-| `python/train/scene_lane_runtime.py` | **edit**: call `strip_to_nchw` (no behavior change, pinned by hash) |
+| `python/train/scene_lane_runtime.py`, `python/train/scene_net.py` | **edit**: both `_strip_nchw` call `strip_to_nchw` (no behavior change, pinned by hash + `test_scene_strip_scale.py`) |
 | `python/train/stop_events.py`, `scripts/eval_stop_brake.py` | **new**: offline stop events + metrics |
 | `scripts/test_trainer2_*.py` | **new** tests |
 | `python/planning/*`, `python/perception/pipeline.py`, `python/perception/cipv.py`, `python/control/*` | **not touched** (pinned) |

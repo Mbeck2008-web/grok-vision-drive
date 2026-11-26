@@ -378,6 +378,9 @@ def _run_one(fn) -> bool:
             print(f"SKIP {name}" + (" (known failing; not evaluated here)" if name in KNOWN_FAILING else ""), flush=True)
             return True
     except AssertionError as e:
+        if name in SEAL_GUARD_REPORT_ONLY:
+            print(f"INFO {name}: {_first_line(e)}", flush=True)
+            return True
         if _REPORT:
             print(f"FAIL {name}: {_first_line(e)}", flush=True)
             return True
@@ -387,6 +390,9 @@ def _run_one(fn) -> bool:
         print(f"FAIL {name}: {_first_line(e)}", flush=True)
         traceback.print_exc()
         return False
+    if name in SEAL_GUARD_REPORT_ONLY:
+        print(f"ok {name} (report-only; seal guard band, not a gate)", flush=True)
+        return True
     if name in KNOWN_FAILING and not _REPORT:
         print(f"XPASS {name}: passes now; remove it from KNOWN_FAILING ({KNOWN_FAILING[name]})", flush=True)
         return False
@@ -1188,6 +1194,9 @@ def clip_poseB_holes(target=POSE_B_FRAME):
         idx = nearest_idx(pred_frames(P, cid), target)
         if idx is None:
             continue
+        if in_seal_guard(idx):
+            print(f"  seal guard: f{target} {cid} pred idx {idx} in {SEAL_GUARD_RANGES} -> not measured (gating)", flush=True)
+            continue
         used[cid] = idx
         fr = p.run(cid, None, None, idx=idx)
         if fr is None:
@@ -1239,6 +1248,9 @@ def runtime_mask_counts(frames=MASK_FRAMES):
                 continue
             idx = nearest_idx(pred_frames(P, cid), target)
             if idx is None:
+                continue
+            if in_seal_guard(idx):
+                print(f"  seal guard: f{target} {cid} pred idx {idx} in {SEAL_GUARD_RANGES} -> not measured (gating)", flush=True)
                 continue
             fr = p.run(cid, None, None, idx=idx)
             if fr is None:
@@ -1469,6 +1481,9 @@ def clip_behind_car_strip(targets, poses):
         for cid in p.cam:
             idx = nearest_idx(pred_frames(P, cid), target)
             if idx is None:
+                continue
+            if in_seal_guard(idx):
+                print(f"  seal guard: f{target} {cid} pred idx {idx} in {SEAL_GUARD_RANGES} -> not measured (gating)", flush=True)
                 continue
             used[cid] = idx
             fr = p.run(cid, None, None, idx=idx)
@@ -1801,6 +1816,9 @@ def check_clip015_render_edge_and_holes() -> None:
             idx = nearest_idx(pred_frames(P, cid), target)
             if idx is None:
                 continue
+            if in_seal_guard(idx):
+                print(f"  seal guard: f{target} {cid} pred idx {idx} in {SEAL_GUARD_RANGES} -> not measured (gating)", flush=True)
+                continue
             fr = p.run(cid, None, None, idx=idx)
             if fr is None:
                 continue
@@ -1858,6 +1876,9 @@ def clip_capture_holes(frames):
         for cid in p.cam:
             idx = nearest_idx(pred_frames(P, cid), target)
             if idx is None:
+                continue
+            if in_seal_guard(idx):
+                print(f"  seal guard: f{target} {cid} pred idx {idx} in {SEAL_GUARD_RANGES} -> not measured (gating)", flush=True)
                 continue
             used.setdefault(cid, {})[target] = idx
             fr = p.run(cid, None, None, idx=idx)
@@ -3256,6 +3277,99 @@ def check_threshold_frames_outside_seal_guard() -> None:
     assert not bad, f"threshold frames in the seal guard band / reserved: {bad}"
 
 
+SEAL_GUARD_BAND_CONSTANTS = frozenset({"TRACER_HOLDOUT", "CLEAN_HOLDOUT", "F200_FIXTURE"})
+# Helpers a gating check may call; they must skip guard-band pred idxs.
+_SEAL_GATING_HELPERS = frozenset({
+    "clip_poseB_holes", "runtime_mask_counts", "clip_behind_car_strip", "clip_capture_holes",
+    "clip_depth_metrics", "rs_collect", "_dclip", "_rs", "clip_measure",
+})
+
+
+def _seal_guard_refs(fn: ast.AST) -> list:
+    """Names of TRACER_HOLDOUT / CLEAN_HOLDOUT / F200_FIXTURE, or a call to clip_stable_timeline,
+    referenced in this function (those paths read guard-band frames)."""
+    hits = []
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Name) and n.id in SEAL_GUARD_BAND_CONSTANTS:
+            hits.append(n.id)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "clip_stable_timeline":
+            hits.append("clip_stable_timeline")
+    return hits
+
+
+def gating_check_guard_band_hits(src: str, report_only: set, skip: set) -> list:
+    """AST scan: gating check_* functions must not reference holdout/f200 constants or the timeline walker."""
+    tree = ast.parse(src)
+    funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    bad = []
+    for name, node in funcs.items():
+        if not name.startswith("check_") or name in report_only or name in skip:
+            continue
+        refs = _seal_guard_refs(node)
+        if refs:
+            bad.append(f"{name} references {refs}")
+    return bad
+
+
+def check_gating_checks_outside_seal_guard() -> None:
+    """Seal guard band (Skeptic 14:09): no *gating* check or threshold derivation may read a frame or pred idx
+    in 63-107 / 163-207. Report-only checks in SEAL_GUARD_REPORT_ONLY may still print those frames as INFO.
+    Sibling of check_threshold_frames_outside_seal_guard."""
+    src = Path(__file__).read_text(encoding="utf-8")
+    skip = {"check_threshold_frames_outside_seal_guard", "check_gating_checks_outside_seal_guard"}
+    hits = gating_check_guard_band_hits(src, set(SEAL_GUARD_REPORT_ONLY), skip)
+    # mutant: a gating check that calls _dclip(TRACER_HOLDOUT) must be flagged
+    mutant = "def check_mutant_holdout():\n    snap_misplace_gate(_dclip(TRACER_HOLDOUT), 'x')\n"
+    mut_hits = gating_check_guard_band_hits(src + "\n" + mutant, set(SEAL_GUARD_REPORT_ONLY), skip)
+    assert any("check_mutant_holdout" in h and "TRACER_HOLDOUT" in h for h in mut_hits), mut_hits
+    assert not hits, "gating checks still reference seal-guard-band frames: " + "; ".join(hits)
+    # no demoted name remains a KNOWN_FAILING gate
+    still = sorted(SEAL_GUARD_REPORT_ONLY & set(KNOWN_FAILING))
+    assert not still, f"report-only guard-band checks still in KNOWN_FAILING: {still}"
+    # gating frame constants themselves, and every cam's pred idx at those frames after the skip, stay outside the band
+    gating_frames = tuple(dict.fromkeys(list(GATE_FRAMES) + list(RS_THRESH_FRAMES) + list(RS_VERIFY_FRAMES)
+                                        + list(MASK_FRAMES) + [POSE_B_FRAME]))
+    bad = [f for f in gating_frames if f in RS_BURNED or f in HELDOUT2_SEALED]
+    # a *frame number* may sit next to the band (f110=110 is allowed) so long as any cam whose nearest
+    # pred idx falls in the band is skipped by the gating helpers (rear @ f110 idx 107).
+    clip = clip_paths()
+    used_in_band = []
+    if clip is not None:
+        P = np.load(clip[1])
+        avail = {cid: pred_frames(P, cid) for cid in RS_CAMS}
+        # helpers that a gating check still calls must not return a guard-band idx
+        pairs = []
+        for cid, idx in clip_poseB_holes().get("used", {}).items():
+            pairs.append(("clip_poseB_holes", cid, idx))
+        cap_used = clip_capture_holes((40, 160, POSE_B_FRAME)).get("used", {})
+        for cid, by in cap_used.items():
+            for idx in (by.values() if isinstance(by, dict) else [by]):
+                pairs.append(("clip_capture_holes", cid, idx))
+        for rec in clip_behind_car_strip((40, 160, POSE_B_FRAME), (("poseA", pose_a_chase()),)).values():
+            for cid, idx in rec.get("used", {}).items():
+                pairs.append(("clip_behind_car_strip", cid, idx))
+        for (f, cid), (_, _, idx) in runtime_mask_counts()[0].items():
+            pairs.append((f"runtime_mask_counts f{f}", cid, idx))
+        for helper, cid, idx in pairs:
+            if in_seal_guard(idx):
+                used_in_band.append(f"{helper} {cid}:{idx}")
+        # rs_collect / _rs on verify frames (ripple/streak/ringA/false-removal path)
+        off = _rs("off", RS_VERIFY_FRAMES)
+        for f, per in off.items():
+            for cid, r in per.items():
+                if in_seal_guard(r.get("idx")):
+                    used_in_band.append(f"rs_collect f{f} {cid}:{r['idx']}")
+        # GATE_FRAMES (f40/f160) idxs are all outside the band (no skip needed)
+        for f in GATE_FRAMES + RS_THRESH_FRAMES:
+            for cid, av in avail.items():
+                idx = nearest_idx(av, f)
+                if in_seal_guard(f) or in_seal_guard(idx):
+                    bad.append(f"gating frame f{f} {cid}:{idx}")
+    print(f"  gating frames {gating_frames}; AST hits {hits or 0}; helper idxs in band {used_in_band or 0}", flush=True)
+    assert not bad, f"gating frame set in the seal guard band: {bad}"
+    assert not used_in_band, f"gating helpers still measured a guard-band pred idx: {used_in_band}"
+
+
 def check_render_options_do_not_touch_perception() -> None:
     """SAFETY (guard, must pass): sky backdrop on/off and every RV render option leave cam_frame outputs,
     CamDepthFilter inputs/outputs, GroundGrid inputs/outputs and CamEvidence byte-identical (sha256), and
@@ -3452,6 +3566,7 @@ CHECKS = [
     check_render_options_do_not_touch_perception,
     check_import_isolation_rv,
     check_threshold_frames_outside_seal_guard,
+    check_gating_checks_outside_seal_guard,
     check_synthetic_ripple_signature,
     check_synthetic_streak,
     check_clip015_ripple_wide_dz,
@@ -3472,6 +3587,25 @@ CHECKS = [
     check_clip015_poseB_unknown_report,
 ]
 
+# Checks that still *run* and *print* on frames / pred idxs inside the seal guard band (63-107, 163-207)
+# but are REPORT-ONLY (Skeptic 14:09): they must not gate, must not set or feed a limit, and are not in
+# KNOWN_FAILING. Keep the measurement code. info_* names were already report-only.
+SEAL_GUARD_REPORT_ONLY = frozenset({
+    "check_holdout_snap_misplace",            # f100/f200
+    "check_clean_holdout_snap_misplace",      # f70
+    "check_holdout_edge_position",            # f100/f200
+    "check_clean_holdout_edge_position",      # f70
+    "check_holdout_snap_no_worse_than_off",   # f100/f200
+    "check_clean_holdout_snap_no_worse_than_off",  # f70
+    "check_holdout_footprint",                # f100/f200
+    "check_clean_holdout_footprint",          # f70
+    "check_holdout_width",                    # f100/f200
+    "check_holdout_edge_overshoot",           # f100/f200
+    "check_holdout_rear_holes",               # f100/f200
+    "check_behind_car_strip_holes",           # clip_stable_timeline walks 0..f160 (and GT window f+/-10), so it reads 63-107 and 163-170
+    "info_streak_fixture_f200_narrow_car_smear",  # already INFO, f200
+})
+
 # name -> counterexample on 783fedd (real runs after thresholds commit 8b53e6b;
 # rv-side-evidence/props_report_783fedd.log). E = depth-edge cut in tools/rv_stable_preview.py cam_frame
 # (after ground_clamp: far rows pushed below the road, out of the ground band); L = the net's 12x16 class
@@ -3486,18 +3620,9 @@ KNOWN_FAILING: dict[str, str] = {
     "check_road_labelled_object_top_stays_put": "N: pillarR car top 218 px moved outward (GT z 1.50 m); curb top 1487 px, height lost 0.15 m; main car top also snapped outward",
     # pillarR/repeatR (b): michael 2026-11-26 13:50 CT, net seg+depth, Trainer 2.0 -- residual after a pred-z>0.30 rejection only
     "check_clip015_snap_misplace": "f40/f160 DRAWN-only: pillarR 18.10% (7317/40432; f40 36.90%/f160 3.50%), repeatR 4.65% (1835/39434), wide 10.12% (3555/35133; was 15.00% all-snapped 7461/49726) at 0-15 m; wide 61.64% (188/305; all-snapped 59.35% 219/369) at 15-30 m (GT z>0.30) || pillarR/repeatR (b) attribution (Breaker, dev f50/f120 + Tracer swarm-2/logs/rv_snapb.txt f40, rv_snapb_more.txt f20/f50/f120/f150): residual after a one-sided pred-z>0.30 rejection = pred-road px with raw net z<=0.30 (net seg+depth): pillarR f50 2635/6274 (Tracer 2635), repeatR f50 779/1947 (Tracer 779), f120 0/3672 and 0/957 (Tracer 0) -> root cause of the residual 'net seg+depth (pred road on curb, raw z<=0.30), Trainer 2.0'; approval michael 2026-11-26 13:50 CT: \"Yeah, if this issue can be fixed with training on a large data set like the one that we're creating that's perfectly fine\". The rest of the (b) px (raw z>0.30) are snap-created: the rejection is ABSENT on dee9827 (check_snap_rejects_raised_pred_z FAILs, normal FAIL, Fix item Redesigner). Approval does not cover wide or other cams.",
-    "check_holdout_snap_misplace": "f100/f200 DRAWN-only: wide 4.46% (1562/34986; was 15.00% all-snapped) and pillarR 4.44% at 0-15 m; wide 30.80% (182/591; was 37.67%), rear 6.25%, repeatL 5.29% at 15-30 m",
-    "check_clean_holdout_snap_misplace": "f70 DRAWN-only: pillarR 55.49%, pillarL 41.55%, repeatR 24.60%, wide 11.39% (2067/18147; was 14.34% all-snapped), rear 5.16% at 0-15 m; wide 79.38% (77/97), rear 9.44% at 15-30 m",
     "check_clip015_edge_position": "f40/f160: wide 5-15 m median 1.334/p90 5.119 vs 10%/20% of |x_gt| 4.36 m; also narrow/main 5-15 p90 over the 20% gate",
-    "check_holdout_edge_position": "f100/f200: wide 5-15 m median 0.551/p90 5.453 vs |x_gt| 5.19 m; narrow/main p90 over at 5-15 m",
-    "check_clean_holdout_edge_position": "f70: wide 5-15 m median 2.183/p90 4.595; pillarL 5-15 m 2.453/5.904; pillarR 0-5 m 0.568/6.308",
     "check_clip015_snap_no_worse_than_off": "f40/f160: pillarR |dz| median 0.246 vs 0.184 off; pillarL 0.049/0.603 vs 0.048/0.593",
-    "check_holdout_snap_no_worse_than_off": "f100/f200: pillarR p90 0.436 vs 0.285 off",
-    "check_clean_holdout_snap_no_worse_than_off": "f70: pillarR median 0.048 vs 0.035; repeatR p90 0.555 vs 0.415; pillarL 0.098 vs 0.094",
     "check_clip015_footprint": "f40/f160: narrow 45.3%, main 70.4%, wide 83.8%, pillarR 81.9%, repeatL 93.0% (min 95%)",
-    "check_holdout_footprint": "f100/f200: narrow 46.9%, main 72.6%, wide 88.1%, pillarR 89.2%, repeatR 93.4%",
-    "check_clean_holdout_footprint": "f70: pillarL 18.3%, narrow 49.5%, pillarR 58.8%, main 72.2%, wide 86.0%",
-    "check_behind_car_strip_holes": "pose A f40 0.2000 of 160 cells (max v2 0.1456); pose A f160 0.2250 of 160 (max v2 0.0000). Pose B f110 0.0054 of 1491 PASSES (max v2 0.1058). This test: n=160/160; Historian 783fedd was 0.2215/0.2767 (n=158/159) — same definition, small n/frac difference.",
     # ---- ripple / streak / sky (swarm-4 Breaker, wide snap OFF, thresholds by rule on f10/25/50/120/140/155) ----
     # wide coarse-row dz: michael 2026-11-26 13:50 CT, net depth, Trainer 2.0
     "check_clip015_ripple_wide_dz": "NEW (wide snap OFF; snap ON passes these bins at f40/f110/f160): wide |dz| f110 0-5 m 0.130 > 0.080, 5-10 m 0.327 > 0.163; f160 0-5 0.103, 5-10 0.277; f40 15-30 0.435 > 0.417. Root cause: net depth (12x16 coarse-row bands, wide f110 R6..R9 +0.43/+0.19/+0.22/+0.07 m; Tracer swarm-2/logs/rv_ring2.txt), fix in training (Trainer 2.0), not runtime. Approval michael 2026-11-26 13:50 CT: \"Yeah, if this issue can be fixed with training on a large data set like the one that we're creating that's perfectly fine\". Limits unchanged.",

@@ -11,7 +11,8 @@ docs/specs/trainer_2.md, "Loss, gradients, LR" (PR 4):
   ``ramp(t) = min(1, (t - s0) / R)``, ``R = 2000`` (spec proposal). Its
   effective weight is ``ramp * w_i``. An inactive head computes no loss.
 
-The GradNorm weight step uses the closed-form gradient of
+The GradNorm weight step size ``WEIGHT_LR`` = 0.025 is a **proposal** too.
+It uses the closed-form gradient of
 ``L_grad = sum_i |G_i - Gbar * r_i**alpha|`` with ``G_i = w_i * g_i``:
 ``dL_grad / dw_i = sign(G_i - target_i) * g_i`` (the target is held constant,
 as in the paper), so no second backward pass is needed.
@@ -28,6 +29,8 @@ ALPHA = 1.5
 W_MIN = 0.1
 W_MAX = 10.0
 RAMP_STEPS = 2000
+# PROPOSAL (not in the spec before this PR; now listed there as a proposal): step size of the GradNorm
+# weight update, ``w_i <- w_i - WEIGHT_LR * dL_grad/dw_i``. Untuned; pending a real run.
 WEIGHT_LR = 0.025
 SHARED_PARAM = "stem.fc.weight"
 

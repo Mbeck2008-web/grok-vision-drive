@@ -60,7 +60,7 @@ class RouteCar(sf._CrashVehicle):
 
     def __init__(self, stop: Path, route: lr.Route | None = None, rest_polls: int = 5, leave_at_m: float | None = None,
                  tail_polls: int = 40, max_polls: int = 3000, stall_at_m: float | None = None,
-                 recover_to: str | None = None, **_kw: object) -> None:
+                 recover_to: str | None = None, stuck_start: str | None = None, **_kw: object) -> None:
         super().__init__(stop, stop_at=10**9)
         self.route = route
         self.rest_polls, self.leave_at_m, self.tail_polls, self.max_polls = rest_polls, leave_at_m, tail_polls, max_polls
@@ -77,11 +77,25 @@ class RouteCar(sf._CrashVehicle):
         self.stall_poll: int | None = None
         self.span_poll: int | None = None
         self.max_s = 0.0
+        # The smoke failure: the car sits at the route's start and never moves (stationary abort, recover, abort
+        # again). "until_moved": it drives once a teleport puts it on the route 10+ m past the start; "always": never.
+        self.stuck_start = stuck_start
+        self.stuck = stuck_start is not None
+        self.teleports_on_route: list[tuple[float, float]] = []  # (arc length, distance off the route) of each later teleport
 
     def teleport(self, pos, rot_quat=None, reset=False) -> None:
         self.placed.append((tuple(pos), tuple(rot_quat or ())))
         if len(self.placed) == 1:  # the car is on the first pose; later teleports do not move the fake ...
             self.s = 0.0
+        elif self.stuck_start is not None:  # ... except in the stuck-start run: it follows the teleport
+            _i, s, d = lr.project_forward(self.route, pos[0], pos[1], 0, back=0, ahead_m=1e9)
+            self.teleports_on_route.append((s, d))
+            if d > lr.OFF_ROUTE_M:
+                self.parked = True  # a deck pose km away: the car is off the route and at rest
+            else:
+                self.s = s
+                if self.stuck_start == "until_moved" and s >= 10.0:
+                    self.stuck = False
         elif self.recover_to == "end":  # ... unless the recover is asked to land it at the route's end
             self.s = self.route.total_m - 10.0
         elif self.recover_to == "off":  # or off the route
@@ -115,7 +129,7 @@ class RouteCar(sf._CrashVehicle):
         driven = self.polls > self.rest_polls and self.mode == "manual" and self.has_line
         if self.stall_at_m is not None and self.stall is None and self.s >= self.stall_at_m:
             self.stall, self.stall_poll = "stalled", self.polls  # the AI is reset: only a fresh manual mode restarts it
-        if self.stall == "stalled":
+        if self.stall == "stalled" or self.stuck:
             driven = False
         if self.leave_at_m is not None and self.s >= self.leave_at_m:
             self.parked = True  # off the route, and stopped there (a stuck car is a car at rest)
@@ -276,11 +290,78 @@ def check_finish_or_abandon_at_rest_hands_back_to_span() -> None:
     print("collector route run: a route finished or abandoned while the car is at rest after a recover gets span, then the plain AI send")
 
 
+def check_stuck_start_respawns_on_the_route() -> None:
+    """The smoke (2026-11-27, dc43ef3): the car sat at the route's start through a stationary abort, a recover and a
+    second abort. The segment ended, and the respawn came from the paint-coverage deck: 2 km off the route, so
+    the driver went off_route with driven_m = 0 and the clip recorded 10 minutes off the plan. The respawn must be on the route."""
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(route, stuck_start="until_moved")
+    assert code == 0, (code, text[-2500:])
+    assert text.count("collect abort stationary") == 2 and "collect segment end west_coast_usa#0 stationary" in text, text[-3000:]
+    assert len(car.placed) == 3, car.placed  # the route start, the recover, then the respawn that opens the next segment
+    resume = car.teleports_on_route[-1]
+    assert resume[1] < 1.0, f"the respawn is {resume[1]:.0f} m off the planned route (arc {resume[0]:.0f} m): a deck pick, not a route pick"
+    assert abs(resume[0] - lr.RESUME_NUDGE_M) < 2.0, f"respawn at arc {resume[0]:.1f} m: the nudge past the stall point is {lr.RESUME_NUDGE_M} m"
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["state"] == "done" and summary["far_end_reached"] is True, summary
+    assert summary["resumes"] == 1 and abs(summary["skipped_m"] - lr.RESUME_NUDGE_M) < 1e-6, summary
+    assert "collect route resume" in text and "'state': 'off_route'" not in text, text[-2500:]
+    print(f"collector route run: stuck at the start twice -> respawn on the route at {resume[0]:.0f} m ({resume[1]:.1f} m off the line), the route finishes")
+
+
+def check_stuck_route_ends_the_clip_honestly() -> None:
+    """The car never moves wherever it is put: every respawn is on the route, and the collector's own segment-fail
+    guard ends the clip (3 segments with no recorded row) instead of recording minutes off the plan."""
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(route, stuck_start="always")
+    assert code == 2, (code, text[-2500:])
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["resumes"] == 2 and summary["state"] == "following", summary  # never off_route: the deck was not used
+    assert all(d < 1.0 for _s, d in car.teleports_on_route), f"a respawn left the route: {car.teleports_on_route}"
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "segment_fail" and status["stop_code"] == 2, status
+    print("collector route run: a car that never moves is put back on the route twice, then the clip stops (exit 2, segment_fail), never off-route")
+
+
+def check_unresumable_route_ends_the_clip_honestly() -> None:
+    """Nothing left to resume on (here: the route-end margin is raised past the route): the clip stops with a named reason."""
+    route = make_route()
+    saved = lr.RESUME_MIN_LEFT_M
+    lr.RESUME_MIN_LEFT_M = 10.0 ** 6
+    try:
+        code, text, out, car = _no_excursions_flag_run(route, stuck_start="until_moved")
+    finally:
+        lr.RESUME_MIN_LEFT_M = saved
+    assert code == 2, (code, text[-2500:])
+    assert len(car.placed) == 2, f"no deck pick after the failed resume: {car.placed}"  # the route start and the recover
+    assert "route respawn impossible" in text and "of the route are left" in text, text[-2000:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "spawn_failed" and "route respawn impossible" in (status.get("stop_detail") or ""), status
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["resumes"] == 0 and summary["state"] != "off_route", summary
+    print("collector route run: a route that cannot be resumed stops the clip (exit 2, spawn_failed, 'route respawn impossible'), no deck respawn")
+
+
+def check_timed_respawn_stays_off_a_route_clip() -> None:
+    """--respawn-min teleports to a new deck spawn on its own clock. On a route clip that would leave the route mid-drive."""
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(route, extra=["--respawn-min", "0.2"])
+    assert code == 0, (code, text[-2500:])
+    assert len(car.placed) == 1, f"a timed respawn moved the car off the route: {car.placed}"
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["state"] == "done" and summary["resumes"] == 0 and summary["max_off_route_m"] < 1.0, summary
+    print("collector route run: a --respawn-min clock does not teleport a route clip")
+
+
 def main() -> None:
     check_route_runs_through_the_collector()
     check_leaving_the_route_hands_back_to_span()
     check_recover_to_rest_resends_the_window()
     check_finish_or_abandon_at_rest_hands_back_to_span()
+    check_stuck_start_respawns_on_the_route()
+    check_stuck_route_ends_the_clip_honestly()
+    check_unresumable_route_ends_the_clip_honestly()
+    check_timed_respawn_stays_off_a_route_clip()
     print("test_collect_route_drive: OK")
 
 

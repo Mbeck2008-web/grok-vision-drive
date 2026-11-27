@@ -489,7 +489,9 @@ def build_parser() -> argparse.ArgumentParser:
             "The first spawn is the route's highway end, facing along it, and the AI is driven along the route "
             "(highway to the far end, then the return loop) with rolling ai.setLine windows; span roaming takes over "
             "at the end or when the car leaves the route. Needs --maps to be exactly the route's map. Turns excursions "
-            "off and the stall/impact deck respawns off (the stationary abort and recover stays)."
+            "off and the stall/impact deck respawns off (the stationary abort and recover stays). When a stop is not fixed by the "
+            "recover and the segment ends, the respawn is on the route (RESUME_NUDGE_M past the farthest point reached, at "
+            "most MAX_RESUMES times), never a deck draw; with none left the clip stops (spawn_failed). --respawn-min is ignored."
         ),
     )
     parser.add_argument(
@@ -2618,11 +2620,27 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if spawn_deck.summary()["picks"] == 0:
                     return f"{map_name}: no legal on-road spawn (correct side of the road)"
                 return None
-            if route_driver is not None and route_driver.state == "idle" and route_driver.lines_sent == 0:
+            if route_driver is not None and route_driver.active and route_driver.spawns > 0 and (not force or source != "spawn"):
+                return None  # a timed, stall, impact or recheck respawn would draw a deck road far off the route: keep the car on it
+            if route_driver is not None and route_driver.active and route_driver.spawns > 0:
+                # The segment ended (the car stopped and a recover did not move it) with the route still being driven. The
+                # deck would draw a road anywhere on the map: the smoke put the car 2 km off the route and the driver never
+                # got it back. Respawn on the route itself, a nudge past where it got to, or end the clip.
+                picked, why = route_driver.resume()
+                if picked is None:
+                    return f"{map_name}: route respawn impossible: {why}"
+                print(
+                    f"collect route resume {segment_id} s={route_driver.progress_m:.0f}m of {route_driver.route.total_m:.0f}m "
+                    f"nudge={route_driver.skipped_m / max(1, route_driver.resumes):.0f}m resumes={route_driver.resumes} "
+                    f"kind={picked.kind}",
+                    flush=True,
+                )
+            elif route_driver is not None and route_driver.active and route_driver.state == "idle" and route_driver.lines_sent == 0:
                 # The route's own start (a highway end, facing along it), not a deck draw.
                 from python.collect.long_route import route_spawn_pick
 
                 picked = route_spawn_pick(route_driver.route)
+                route_driver.note_start()
                 print(
                     f"collect route start {segment_id} road={route_driver.route.start_road} "
                     f"direction={route_driver.route.direction} highway={route_driver.route.highway_m:.0f}m "

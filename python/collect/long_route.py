@@ -83,6 +83,12 @@ END_TOL_M = 25.0
 FAR_END_TOL_M = 60.0
 SEND_SPEED_DELTA = 0.5
 # Highest AI speed (m/s) on each kind of road; the highway takes the clip's own speed.
+# A respawn on the route (see ``RouteDriver.resume``): past where the car was, so a spot that stalled it is not
+# the spawn again; at most MAX_RESUMES per clip; and not within RESUME_MIN_LEFT_M of the end.
+RESUME_NUDGE_M = 40.0
+RESUME_MIN_LEFT_M = 150.0
+MAX_RESUMES = 3
+
 KIND_SPEED_CAP = {"highway": None, "ramp": 16.0, "city": 14.0, "dirt": 11.0}
 
 
@@ -596,6 +602,9 @@ class RouteDriver:
         self.lines_sent = 0
         self.max_off_route_m = 0.0
         self.far_end_reached = False
+        self.spawns = 0  # route spawns taken: the start (1) and every resume
+        self.resumes = 0
+        self.skipped_m = 0.0  # route metres jumped over by resumes (the nudges), not driven
         self._off = 0
         self._sent_at: float | None = None
         self._sent_speed: float | None = None
@@ -661,6 +670,38 @@ class RouteDriver:
             out.append(pts[j])
         return out
 
+    def note_start(self) -> None:
+        """The collector took the route's own start pose."""
+        self.spawns += 1
+
+    def resume(self) -> tuple[SpawnPick | None, str]:
+        """A respawn on the route itself, ``RESUME_NUDGE_M`` past the farthest point the car reached.
+
+        Called when a segment ends (a stationary abort that a recover did not fix) while the route is still
+        being driven. The deck would pick a road anywhere on the map, kilometres off the route. Returns
+        ``(pick, "")`` and moves the driver to the new place (the next tick re-sends the mode and window), or
+        ``(None, why)`` when the route cannot be resumed: the driver is done or off the route, MAX_RESUMES is
+        used, or too little of the route is left. The caller ends the clip then, rather than record off the plan.
+        """
+        if not self.active:
+            return None, f"route driver is {self.state}"
+        if self.resumes >= MAX_RESUMES:
+            return None, f"the car was already put back on the route {self.resumes}x and stopped again"
+        base = max(self.progress_m, self.route.cum[self.index])
+        s = base + RESUME_NUDGE_M
+        left = self.route.total_m - s
+        if left < RESUME_MIN_LEFT_M:
+            return None, f"only {max(0.0, left):.0f} m of the route are left past {base:.0f} m (need {RESUME_MIN_LEFT_M:.0f} m)"
+        i, pick = route_resume_pick(self.route, s)
+        self.index = i
+        self.progress_m = s
+        self.skipped_m += s - base
+        self.resumes += 1
+        self.spawns += 1
+        self._off = 0
+        self.reset_send()
+        return pick, ""
+
     def reset_send(self) -> None:
         """Forget what was sent (the AI was reset by a spawn or recover): the next tick sends the window again, mode included."""
         self._sent_at = None
@@ -670,7 +711,8 @@ class RouteDriver:
         return {
             "state": self.state, "progress_m": round(self.progress_m, 1), "total_m": round(self.route.total_m, 1),
             "far_end_reached": bool(self.far_end_reached), "lines_sent": int(self.lines_sent),
-            "max_off_route_m": round(self.max_off_route_m, 1)
+            "max_off_route_m": round(self.max_off_route_m, 1),
+            "resumes": int(self.resumes), "skipped_m": round(self.skipped_m, 1),
         }
 
 
@@ -725,6 +767,26 @@ def route_spawn_pick(route: Route, speed: tuple[float, float] | None = None) -> 
     pos, rot = route.start_pose()
     return SpawnPick(kind=HIGHWAY, road_id=str(route.start_road), pos=pos, rot=rot,
                      speed=tuple(speed) if speed is not None else SPEED[HIGHWAY])
+
+
+def route_resume_pick(route: Route, s: float, speed: tuple[float, float] | None = None) -> tuple[int, SpawnPick]:
+    """A spawn pose ``s`` metres along the route, facing along it. Returns ``(segment index, pick)``.
+
+    The points are the legal right-lane line the AI is sent, so the pose is on the road and on the route.
+    Its kind comes from the route's own kinds (``dirt`` takes the city speed range).
+    """
+    cum = route.cum
+    s = min(max(0.0, float(s)), cum[-1])
+    i = max(0, min(len(route.points) - 2, next((k for k in range(len(cum) - 1) if cum[k + 1] >= s), len(cum) - 2)))
+    a, b = route.points[i], route.points[i + 1]
+    t = min(1.0, max(0.0, (s - cum[i]) / max(1e-6, cum[i + 1] - cum[i])))
+    x, y, z = a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t
+    look = next((p for p in route.points[i + 1:] if math.hypot(p[0] - x, p[1] - y) >= 10.0), route.points[-1])
+    kind = route.kinds[min(len(route.kinds) - 1, i + 1)]
+    kind = kind if kind in SPEED else CITY
+    pick = SpawnPick(kind=kind, road_id=f"route@{s:.0f}", pos=(x, y, z + 0.5), rot=_yaw_quat(look[0] - x, look[1] - y),
+                     speed=tuple(speed) if speed is not None else SPEED[kind])
+    return i, pick
 
 
 def drive_tick(driver: RouteDriver, pos: Sequence[float] | None, speed_mps: float, queue: Callable[[str], None]) -> bool:

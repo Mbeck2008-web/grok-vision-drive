@@ -189,7 +189,15 @@ def check_long_plan_duration_spawn_speed_and_tags() -> None:
     assert tags["spawn_kind"] == "highway"
     assert plan.long is True
     assert "long" in plan.tags
-    print("long plan: custom 180-300 s, highway-first route, tagged long + long_highway")
+    # The folder says long, not the edge case the plan happens to carry (the smoke folder was clip_000_cut_in_...).
+    from python.collect.clip_mode import new_clip_dir
+
+    with collect_root() as root:
+        long_dir = new_clip_dir(root, plan)
+        short_dir = new_clip_dir(root, base)
+    assert long_dir.name == f"clip_003_long_{plan.map}", long_dir.name
+    assert plan.edge_case not in long_dir.name.replace(plan.map, "") and short_dir.name == f"clip_003_{base.edge_case}_{base.map}", (long_dir.name, short_dir.name)
+    print("long plan: custom 180-300 s, highway-first route, tagged long + long_highway, folder named clip_NNN_long_<map>")
 
 
 def check_batch_mixes_long_clips() -> None:

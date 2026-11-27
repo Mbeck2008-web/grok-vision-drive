@@ -595,6 +595,70 @@ def check_driver_off_route_and_far_end() -> None:
     print("driver: off-route for 8 ticks hands back to span; the far-end flag is set only after the highway leg")
 
 
+def check_driver_resume_on_the_route() -> None:
+    """A respawn on the route itself: past the farthest point reached, on the line, facing along it; refused when it cannot be."""
+    _g, route = route_of(loop_network(dirt=True), seed=3)
+    drv = lr.RouteDriver(route)
+    drv.note_start()
+    assert drv.spawns == 1 and drv.resumes == 0 and drv.skipped_m == 0.0
+    # At the start, nothing driven: the pick is the nudge along the route, on its line (not a deck pose), facing along it.
+    pick, why = drv.resume()
+    assert why == "" and pick is not None and drv.resumes == 1 and drv.spawns == 2, (pick, why)
+    i, s_, d = lr.project_forward(route, pick.pos[0], pick.pos[1], 0, back=0, ahead_m=1e9)
+    assert d < 0.5 and abs(s_ - lr.RESUME_NUDGE_M) < 0.5, (s_, d)
+    assert abs(pick.pos[2] - (route.points[i][2] + 0.5)) < 2.0, "z is the route's, lifted for the drop"
+    qx, qy, qz, qw = pick.rot
+    yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+    ahead = route.points[i + 1]
+    assert math.cos(yaw) * (ahead[0] - route.points[i][0]) + math.sin(yaw) * (ahead[1] - route.points[i][1]) > 0.0, "faces along the route"
+    assert pick.kind in ("highway", "city", "ramp") and pick.speed[0] > 0.0 and pick.road_id.startswith("route@")
+    assert abs(drv.progress_m - lr.RESUME_NUDGE_M) < 1e-6
+    assert drv.skipped_m == lr.RESUME_NUDGE_M and drv.summary()["resumes"] == 1 and drv.summary()["skipped_m"] == lr.RESUME_NUDGE_M
+    # The next tick at the new place re-sends mode + window (the AI was reset by the teleport), and tracks from there.
+    cmds = drv.commands(pick.pos[0], pick.pos[1], 14.0)
+    assert 'ai.setMode("manual")' in cmds and any(c.startswith("ai.setLine(") for c in cmds), cmds[:3]
+    assert drv.state == "following" and drv.max_off_route_m < 1.0
+    # Driven on to 700 m, stalled again: the next resume is past 700 m, not back at the start.
+    for k, c in enumerate(route.cum):
+        if lr.RESUME_NUDGE_M < c <= 700.0:
+            drv.commands(route.points[k][0], route.points[k][1], 14.0)
+    assert 600.0 <= drv.progress_m <= 700.0 and drv.state == "following", drv.summary()
+    reached = drv.progress_m
+    pick2, why2 = drv.resume()
+    assert pick2 is not None, why2
+    _i, s2, d2 = lr.project_forward(route, pick2.pos[0], pick2.pos[1], 0, back=0, ahead_m=1e9)
+    assert d2 < 0.5 and abs(s2 - (reached + lr.RESUME_NUDGE_M)) < 0.5, (s2, reached)
+    # The cap: MAX_RESUMES then None, with the reason, and the driver untouched by the refusal.
+    while drv.resumes < lr.MAX_RESUMES:
+        assert drv.resume()[0] is not None
+    before = drv.summary()
+    none, why3 = drv.resume()
+    assert none is None and "already" in why3 and drv.summary() == before, (why3, before, drv.summary())
+    # Too little route left: None, with the reason.
+    late = lr.RouteDriver(route)
+    late.note_start()
+    late.progress_m = route.total_m - lr.RESUME_MIN_LEFT_M - lr.RESUME_NUDGE_M + 1.0
+    nope, why4 = late.resume()
+    assert nope is None and "of the route are left" in why4 and late.resumes == 0, why4
+    edge = lr.RouteDriver(route)
+    edge.note_start()
+    edge.progress_m = route.total_m - lr.RESUME_MIN_LEFT_M - lr.RESUME_NUDGE_M - 1.0
+    assert edge.resume()[0] is not None, "just inside the margin still resumes"
+    # A finished or abandoned driver is never resumed (the collector's deck takes over, as before).
+    for state in ("done", "off_route"):
+        dead = lr.RouteDriver(route)
+        dead.note_start()
+        dead.state = state
+        got, why5 = dead.resume()
+        assert got is None and state in why5 and dead.resumes == 0, (state, why5)
+    # The kind and speed come from the route: a dirt stretch takes the city speed range.
+    dirt_s = next((route.cum[k] for k, kd in enumerate(route.kinds) if kd == "dirt" and 0 < k < len(route.points) - 2), None)
+    assert dirt_s is not None
+    _i, dpick = lr.route_resume_pick(route, dirt_s + 1.0)
+    assert dpick.kind == "city" and dpick.speed == lr.SPEED["city"], dpick
+    print("driver resume: on the route line, facing along it, past the farthest point, capped, refused near the end / when done")
+
+
 # ------------------------------------------------------------------ measure
 
 
@@ -655,6 +719,7 @@ def main() -> None:
     check_dirt_preferred_over_equal_city_loop()
     check_unusable_plan_refused()
     check_driver_off_route_and_far_end()
+    check_driver_resume_on_the_route()
     check_measure_route()
     check_real_maps_routes()
     check_west_coast_uses_gravel()

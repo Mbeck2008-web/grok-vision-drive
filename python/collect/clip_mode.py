@@ -500,8 +500,12 @@ def new_session_dir(root: Path | str, stamp: str | None = None) -> Path:
 
 
 def new_clip_dir(session: Path | str, plan: ClipPlan) -> Path:
-    """``clip_<NNN>_<edge>_<map>`` (``_r1``, ``_r2``... when taken). Always a new, empty folder."""
-    base = f"clip_{int(plan.index):03d}_{plan.edge_case}_{plan.map}"
+    """``clip_<NNN>_<edge>_<map>`` (``_r1``, ``_r2``... when taken). Always a new, empty folder.
+
+    A long regular-driving clip has no edge case it is recorded for (its plan still carries one, which the
+    short clips use), so its folder says ``long`` where the edge case would be.
+    """
+    base = f"clip_{int(plan.index):03d}_{'long' if plan.long else plan.edge_case}_{plan.map}"
     for n in range(0, 10000):
         cand = Path(session) / (base if n == 0 else f"{base}_r{n}")
         if _create_new(cand):

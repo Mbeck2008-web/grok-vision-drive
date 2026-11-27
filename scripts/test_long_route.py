@@ -118,7 +118,7 @@ def check_route_shape_synthetic() -> None:
     ret = r.kinds[r.far_end_index + 1 :]
     assert ret, ret
     assert HIGHWAY not in ret[:-2], ("return leg avoids highway", ret[-4:])
-    assert r.return_m > lr.MIN_RETURN_M and r.dirt_m == 0.0 and r.city_m > 3000.0, (r.return_m, r.dirt_m, r.city_m)
+    assert r.return_m > 1500.0 and r.dirt_m == 0.0 and r.city_m > 3000.0, (r.return_m, r.dirt_m, r.city_m)
     # The return loops back to the start end of the highway.
     ex, ey, _ = r.points[-1]
     assert math.hypot(ex - 0.0, ey) < 40.0, (ex, ey)
@@ -183,7 +183,7 @@ def check_real_maps_routes() -> None:
                 assert r is not None, (map_name, seed, d)
                 routes[(seed, d)] = r
                 assert r.highway_m >= lr.MIN_HIGHWAY_M, r.highway_m
-                assert r.return_m >= lr.MIN_RETURN_M, (map_name, seed, d, r.return_m)
+                assert r.return_m >= 1500.0, (map_name, seed, d, r.return_m)
                 assert g.pose_legal(*r.start_pose()), "spawn pose is on the right side of the road"
                 assert HIGHWAY not in r.kinds[r.far_end_index + 1 : -2], "return avoids highway roads"
                 assert r.direction == d, (map_name, seed, d, r.direction)
@@ -266,7 +266,9 @@ def check_driver_sends_the_route_in_order() -> None:
         assert s0 >= prev_first - 1e-6, "lines move forward, never back"
         prev_first = s0
         i1, s1, d1 = lr.project_forward(route, pts[-1][0], pts[-1][1], i0, ahead_m=1e9)
-        assert d1 < 3.0 and s1 > s0 and s1 - s0 <= lr.WINDOW_M + 120.0, (s0, s1)
+        assert d1 < 3.0 and s1 > s0 and s1 - s0 <= 420.0, (s0, s1)
+        if s0 < route.total_m - 700.0:
+            assert s1 - s0 >= 300.0, (s0, s1)  # a full 300 m window (plus the point past it) until the route's end
         assert all(a[0] != b[0] or a[1] != b[1] for a, b in zip(pts, pts[1:]))
     # The first line is the highway, a later one is the return leg (off the highway).
     first_pts = [(float(a), float(b)) for a, b, _v in POS.findall(SET_LINE.match(lines[0]).group(1))]
@@ -376,13 +378,90 @@ def check_collector_hooks() -> None:
     print("collector hooks: plan loads only for its one map, first spawn is the route start, tick sends/hands back/re-sends")
 
 
+def check_end_tolerance_and_constants() -> None:
+    _g, route = route_of(loop_network(dirt=False), seed=2)
+    # 25 m from the end is the end; 40 m is not.
+    for back, done in ((40.0, False), (10.0, True)):
+        drv = lr.RouteDriver(route)
+        pt = _samples(route, route.total_m - back, route.total_m - back, step=1.0)[0]
+        drv.index = len(route.points) - 3
+        drv.progress_m = route.total_m - back - 1.0
+        drv.commands(pt[0], pt[1], 14.0)
+        assert (drv.state == "done") == done, (back, drv.state, drv.progress_m)
+    m = lr.measure_route(route, _samples(route, 0.0, route.total_m - 40.0))
+    assert not m["loop_closed"], m
+    m = lr.measure_route(route, _samples(route, 0.0, route.total_m - 10.0))
+    assert m["loop_closed"], m
+    print("end: 25 m from the end of the route counts as the end, 40 m does not")
+
+
+def check_return_cost_jitter_and_avoid() -> None:
+    g, route = route_of(loop_network(dirt=True), seed=2)
+    hs = [lr._hash01(s, "out", a, b) for s in range(5) for a in range(5) for b in range(5)]
+    assert all(0.0 <= h < 1.0 for h in hs) and len(set(hs)) > 100, "spread over 0..1"
+    assert lr._hash01(1, "out", 3, 4) == lr._hash01(1, "out", 3, 4)
+    assert len({lr._hash01(s, "out", 3, 4) for s in range(20)}) > 15, "the seed matters"
+    assert lr._hash01(1, "out", 3, 4) != lr._hash01(1, "back", 3, 4), "the tag matters"
+    # A city edge of 100 m: cost is length x a jitter in [0.85, 1.7], different per seed, 4x with avoid.
+    ri = next(i for i, r in enumerate(g.roads) if r["id"] == "C2")
+    n0 = g.node_of[(ri, 0)]
+    n1 = g.node_of[(ri, 1)]
+    costs = {s: g.return_cost(s, "out")(n0, n1, 100.0, ri) for s in range(12)}
+    assert all(85.0 - 1e-6 <= c <= 170.0 + 1e-6 for c in costs.values()), costs
+    assert len(set(costs.values())) > 6, "seeded jitter varies the cost"
+    plain = g.return_cost(3, "out")(n0, n1, 100.0, ri)
+    avoided = g.return_cost(3, "out", avoid={n1})(n0, n1, 100.0, ri)
+    assert abs(avoided - 4.0 * plain) < 1e-9, (plain, avoided)
+    dri = next(i for i, r in enumerate(g.roads) if r["id"] == "D2")
+    d0, d1 = g.node_of[(dri, 0)], g.node_of[(dri, 1)]
+    unjittered = lambda a, b: lr.JITTER_LO + (lr.JITTER_HI - lr.JITTER_LO) * lr._hash01(3, "out", a, b)
+    assert abs(g.return_cost(3, "out")(d0, d1, 100.0, dri) - 100.0 * 0.5 * unjittered(d0, d1)) < 1e-9, "unpaved costs half"
+    hri = next(i for i, r in enumerate(g.roads) if r["id"] == "H1")
+    assert g.return_cost(3, "out")(g.node_of[(hri, 0)], g.node_of[(hri, 1)], 100.0, hri) is None, "the return leg never takes the highway"
+    assert g.highway_cost(n0, n1, 100.0, ri) is None and g.highway_cost(g.node_of[(hri, 0)], g.node_of[(hri, 1)], 100.0, hri) == 100.0
+    # A junction link between a city node and a highway node is not a highway-leg edge.
+    assert g.highway_cost(n0, g.node_of[(hri, 0)], 8.0, -1) is None
+    print("return cost: seeded jitter 0.85-1.7, unpaved half, avoid x4, no highway; highway leg highway only")
+
+
+def check_dirt_preferred_over_equal_city_loop() -> None:
+    dirt = 0
+    for seed in range(8):
+        _g, r = route_of(loop_network(dirt=True), seed=seed)
+        # The synthetic city loop and dirt loop are the same length; both are available.
+        assert r.dirt_m > 0.0 or r.city_m > 0.0
+        dirt += 1 if r.dirt_m > r.city_m else 0
+    assert dirt >= 7, dirt
+    print(f"dirt: the return loop takes the dirt road when an equal city road is available ({dirt}/8)")
+
+
+def check_unusable_plan_refused() -> None:
+    import json
+    import tempfile
+
+    _g, route = route_of(loop_network(dirt=True), seed=2)
+    good = route.to_json()
+    with tempfile.TemporaryDirectory() as td:
+        for label, edit in (("far end at the start", {"far_end_index": 0}), ("far end past the end", {"far_end_index": len(route.points)}),
+                            ("one point", {"points": good["points"][:1], "kinds": good["kinds"][:1], "far_end_index": 0})):
+            path = Path(td) / "p.json"
+            path.write_text(json.dumps({**good, **edit}), encoding="utf-8")
+            try:
+                lr.load_route_plan(path, ["synthetic"])
+            except ValueError as exc:
+                assert "no usable route" in str(exc), (label, exc)
+            else:
+                raise AssertionError(f"accepted a plan with {label}")
+    print("collector: a plan with no usable route is refused")
+
+
 def check_driver_off_route_and_far_end() -> None:
     _g, route = route_of(loop_network(dirt=False), seed=2)
     drv = lr.RouteDriver(route)
     x, y, _ = route.points[3]
     assert drv.commands(x, y, 14.0)
     out: list[str] = []
-    for _ in range(lr.OFF_TICKS - 1):
+    for _ in range(7):
         out += drv.commands(x + 500.0, y + 500.0, 14.0)
     assert out == [] and drv.state == "following", "a few off-route ticks are tolerated"
     cmds = drv.commands(x + 500.0, y + 500.0, 14.0)
@@ -392,10 +471,10 @@ def check_driver_off_route_and_far_end() -> None:
     # An off-route blip that recovers resets the count.
     drv2 = lr.RouteDriver(route)
     drv2.commands(x, y, 14.0)
-    for _ in range(lr.OFF_TICKS - 1):
+    for _ in range(7):
         drv2.commands(x + 500.0, y, 14.0)
     drv2.commands(x, y, 14.0)
-    for _ in range(lr.OFF_TICKS - 1):
+    for _ in range(7):
         drv2.commands(x + 500.0, y, 14.0)
     assert drv2.state == "following"
     # Far end flag: not before it, set once the highway leg is driven.
@@ -459,6 +538,10 @@ def main() -> None:
     check_driver_resend_rules()
     check_driver_speed_caps()
     check_collector_hooks()
+    check_end_tolerance_and_constants()
+    check_return_cost_jitter_and_avoid()
+    check_dirt_preferred_over_equal_city_loop()
+    check_unusable_plan_refused()
     check_driver_off_route_and_far_end()
     check_measure_route()
     check_real_maps_routes()

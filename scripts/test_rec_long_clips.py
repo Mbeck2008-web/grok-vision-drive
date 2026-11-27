@@ -901,6 +901,36 @@ def check_manifest_frac_warning_and_forwarding() -> None:
     print("session.json keeps long_highway_frac, run_clips forwards it, the no-highway warning only fires when long clips were asked for")
 
 
+def check_route_direction_is_the_routes_own_and_replanned_with_the_request() -> None:
+    """A map that cannot give the requested direction: the plan records the route's own direction, and plan_route re-plans with the request."""
+    from python.collect import clip_mode, long_route as lr
+    from python.collect.clip_mode import apply_long_highway, plan_clip, plan_route
+    from test_long_route import loop_network
+
+    graph = lr.build_graph(loop_network(dirt=True))  # one-way east: a westbound request is answered eastbound
+    calls: list[tuple] = []
+    orig = clip_mode._route_cached
+
+    def eastbound_only(map_name, seed, direction, duration_s):
+        calls.append((map_name, int(seed), int(direction), float(duration_s)))
+        return lr.plan_highway_route(graph, map_name=map_name, seed=int(seed), direction=int(direction), duration_s=900.0)
+
+    clip_mode._route_cached = eastbound_only
+    try:
+        base = plan_clip(1, seed=3, maps=("west_coast_usa",), max_traffic=0)
+        plan = apply_long_highway(base, min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=1.0, ordinal=1)
+        assert plan.long_route == "highway_loop"
+        assert plan.route_summary["requested_direction"] == 1 and plan.route_summary["direction"] == 0, plan.route_summary
+        assert plan.long_direction == 0, "the tag is the route's own direction, not the request"
+        n = len(calls)
+        route = plan_route(plan)
+        assert calls[n] == calls[0] == ("west_coast_usa", plan.spawn_seed, 1, plan.duration_s), calls
+        assert route.direction == 0 and route.requested_direction == 1
+    finally:
+        clip_mode._route_cached = orig
+    print("direction: the tag is the route's own direction; plan_route asks the planner for the original request")
+
+
 def check_disk_guards_unchanged_for_long_clips() -> None:
     """20 GiB free-space floor and 3.5 GiB per-file cap are unchanged at the 43 GiB/900 s ceiling."""
     from python.collect.clip_mode import LONG_CLIP_DISK_GIB_PER_900S
@@ -1087,6 +1117,7 @@ def _checks() -> None:
     check_default_pool_lands_on_the_no_highway_map()
     check_highway_loop_clips_are_driven_and_measured()
     check_requested_direction_alternates_by_long_clip_order()
+    check_route_direction_is_the_routes_own_and_replanned_with_the_request()
     check_long_plan_guards_and_provenance()
     check_varied_spawn_kind_and_qc_skip()
     check_manifest_frac_warning_and_forwarding()

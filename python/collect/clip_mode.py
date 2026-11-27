@@ -295,7 +295,6 @@ def apply_long_highway(
         route = _route_cached(map_name, int(spawn_seed), direction, float(duration))
         if route is None:
             notes.append(f"no highway end-to-end route could be planned on {map_name}; varied span roaming instead")
-            highway_first = False
     if route is not None:
         route_kind = HIGHWAY_LOOP
         spawn_kind: str | None = HIGHWAY

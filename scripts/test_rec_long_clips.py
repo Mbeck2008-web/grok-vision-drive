@@ -226,7 +226,7 @@ def check_batch_mixes_long_clips() -> None:
             else:
                 assert 30.0 <= dur <= 60.0, (i, dur)
                 assert "long" not in tags.get("tags", [])
-                assert tags.get("long_highway") is not True
+                assert tags.get("long_highway_planned") is not True
                 assert "--segment-min" not in argv
         assert set(long_seen) == want
     print("run_clips: 3 of 10 clips are long regular driving, spread by seed, short clips unchanged")
@@ -350,11 +350,11 @@ def check_long_clips_only_on_highway_maps() -> None:
             tags = json.loads((session / row["dir"] / "clip_tags.json").read_text(encoding="utf-8"))
             if i in want:
                 assert tags["long"] is True, (i, tags)
-                assert tags["long_highway"] is True, (i, tags)
+                assert tags["long_highway_planned"] is True, (i, tags)
                 assert row["map"] in hwy, (i, row)
             else:
                 assert tags.get("long") is not True
-                assert tags["long_highway"] is False
+                assert tags["long_highway_planned"] is False
     print("highway-first routes stay on highway maps; no-highway maps still get varied long clips")
 
 
@@ -440,7 +440,7 @@ def check_long_clip_boundaries_and_tags() -> None:
         clip.mkdir()
         plan = apply_long_highway(base, min_s=180.0, max_s=300.0, maps=("west_coast_usa",), highway_frac=1.0)
         tags = json.loads(write_tags(clip, plan, {"quality": "train", "reasons": []}).read_text(encoding="utf-8"))
-        assert tags["long_highway"] is True
+        assert tags["long_highway_planned"] is True
         assert "long_highway" in tags["tags"]
         session = run_clips(
             root, clips=4, seed=5, maps=("west_coast_usa",), max_traffic=2, runner=runner,
@@ -693,8 +693,10 @@ def check_highway_loop_clips_are_driven_and_measured() -> None:
         manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
         want = long_clip_indices(9, 3, seed=4)
         assert len(seen) == 3, seen
-        assert manifest["long_clips_by_route"] == {"highway_loop": 3, "varied": 0}, manifest["long_clips_by_route"]
+        assert manifest["long_clips_planned"] == 3 and "long_clips_by_route" not in manifest, manifest
+        assert manifest["long_clips_planned_by_route"] == {"highway_loop": 3, "varied": 0}, manifest["long_clips_planned_by_route"]
         measured = []
+        verdicts = []
         for i, row in enumerate(manifest["results"]):
             tags = json.loads((session / row["dir"] / "clip_tags.json").read_text(encoding="utf-8"))
             if i not in want:
@@ -704,14 +706,16 @@ def check_highway_loop_clips_are_driven_and_measured() -> None:
             k = len(measured)
             m = tags["route_measure"]
             measured.append(m)
-            assert row["route_measure"] == m and row["long_route"] == "highway_loop"
+            assert row["route_measure"] == m and row["long_route_planned"] == "highway_loop"
+            assert tags["route_verdict"] == row["route_verdict"]
+            verdicts.append(tags["route_verdict"])
             path = Path(tags["route_plan_file"])
             assert path.parent == session / "_routes" and path.name == f"{row['dir']}.json" and path.is_file()
             assert tags["argv"][tags["argv"].index("--route-plan") + 1] == str(path)
             assert "--no-excursions" in tags["argv"] and "--route" not in tags["argv"]
             assert tags["route_driver"] == {"state": "following", "lines_sent": 7}
             # What the plan said and what the car did are separate numbers.
-            assert tags["route_summary"]["highway_m"] == m["highway_m"] and tags["route_summary"]["total_m"] == m["planned_m"]
+            assert tags["route_summary_planned"]["highway_m"] == m["highway_m"] and tags["route_summary_planned"]["total_m"] == m["planned_m"]
             if drives[k] == 1.0:
                 assert m["far_end_reached"] and m["loop_closed"] and m["highway_fraction"] >= 0.99, m
                 assert m["return_fraction"] >= 0.95 and m["driven_m"] >= 0.97 * m["planned_m"], m
@@ -722,6 +726,11 @@ def check_highway_loop_clips_are_driven_and_measured() -> None:
             else:
                 assert m["far_end_reached"] and not m["loop_closed"], m
                 assert 0.0 < m["return_fraction"] < 1.0, m
+        # Delivered is counted after the run, from the GT measure: only the full drive counts.
+        assert verdicts == [{1.0: "completed", 0.2: "partial"}.get(d, "far_end_only") for d in drives[:3]], (verdicts, drives)
+        assert manifest["long_clip_verdicts"] == {"completed": 1, "partial": 1, "far_end_only": 1}, manifest["long_clip_verdicts"]
+        assert manifest["long_clips_delivered"] == 1, manifest["long_clips_delivered"]
+        assert manifest["long_clips_delivered_by_route"] == {"highway_loop": 1, "varied": 0}
         tot = manifest["long_route_totals"]
         assert tot["route_clips"] == 3 and tot["far_end_reached"] == 2 and tot["loop_closed"] == 1, tot
         assert abs(tot["driven_m"] - sum(m["driven_m"] for m in measured)) < 0.2, (tot, measured)
@@ -753,10 +762,10 @@ def check_requested_direction_alternates_by_long_clip_order() -> None:
         )
         manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
         tags = [json.loads((session / manifest["results"][i]["dir"] / "clip_tags.json").read_text(encoding="utf-8")) for i in want]
-    assert [t["route_summary"]["requested_direction"] for t in tags] == [k % 2 for k in range(6)], tags
-    assert [t["long_direction"] for t in tags] == [k % 2 for k in range(6)]  # the stub network honours the request
+    assert [t["route_summary_planned"]["requested_direction"] for t in tags] == [k % 2 for k in range(6)], tags
+    assert [t["long_direction_planned"] for t in tags] == [k % 2 for k in range(6)]  # the stub network honours the request
     assert len({t["spawn_seed"] for t in tags}) == 6, [t["spawn_seed"] for t in tags]
-    assert all(t["long_route"] == "highway_loop" and t["route_legs"][0] == "highway" for t in tags)
+    assert all(t["long_route_planned"] == "highway_loop" and t["route_legs_planned"][0] == "highway" for t in tags)
 
     # No route can be planned (here forced): the clip is a varied span clip, says so, and is counted as varied.
     logs: list[str] = []
@@ -767,12 +776,13 @@ def check_requested_direction_alternates_by_long_clip_order() -> None:
             log=logs.append,
         )
         manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
-        assert manifest["long_clips_by_route"] == {"highway_loop": 0, "varied": 2}, manifest["long_clips_by_route"]
+        assert manifest["long_clips_planned_by_route"] == {"highway_loop": 0, "varied": 2}, manifest["long_clips_planned_by_route"]
+        assert manifest["long_clip_verdicts"] == {"drive_around": 2} and manifest["long_clips_delivered"] == 2, manifest
         assert manifest["long_route_totals"]["route_clips"] == 0
         for i in long_clip_indices(6, 2, seed=2):
             t = json.loads((session / manifest["results"][i]["dir"] / "clip_tags.json").read_text(encoding="utf-8"))
-            assert t["long"] is True and t["long_highway"] is False and t["long_route"] == "varied"
-            assert t["route_legs"] == ["varied"] and t["route_summary"] is None and t["long_direction"] is None
+            assert t["long"] is True and t["long_highway_planned"] is False and t["long_route_planned"] == "varied"
+            assert t["route_legs_planned"] == ["varied"] and t["route_summary_planned"] is None and t["long_direction_planned"] is None
             assert "--route" in t["argv"] and "--route-plan" not in t["argv"] and "route_measure" not in t
             assert any("no highway end-to-end route" in n for n in t["plan_notes"]), t["plan_notes"]
         assert not (session / "_routes").exists()
@@ -884,7 +894,7 @@ def check_manifest_frac_warning_and_forwarding() -> None:
             )
             manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
         assert manifest["long_highway_frac"] == frac, manifest["long_highway_frac"]
-        seen[frac] = manifest["long_clips_by_route"]
+        seen[frac] = manifest["long_clips_planned_by_route"]
         assert not any("no highway map" in x for x in logs), logs  # the pool has a highway map
     assert seen[0.0] == {"highway_loop": 0, "varied": 4}, seen
     assert seen[1.0] == {"highway_loop": 4, "varied": 0}, seen
@@ -951,6 +961,54 @@ def check_disk_guards_unchanged_for_long_clips() -> None:
 
 
 
+def check_verdicts_follow_exit_quality_and_measure() -> None:
+    """The delivered count is a measured verdict, not a plan label."""
+    from python.collect import long_route as lr
+    from python.collect.clip_mode import MIN_DRIVEN_M, VERDICT_DELIVERED, route_verdict
+
+    ok = {"clip_class": "train"}
+    full = {"far_end_reached": True, "loop_closed": True, "driven_m": 9000.0}
+    far = {"far_end_reached": True, "loop_closed": False, "driven_m": 5000.0}
+    short = {"far_end_reached": False, "loop_closed": False, "driven_m": MIN_DRIVEN_M}
+    none = {"far_end_reached": False, "loop_closed": False, "driven_m": MIN_DRIVEN_M - 1.0}
+    cases = [
+        (0, ok, full, "completed"), (0, ok, far, "far_end_only"), (0, ok, short, "partial"), (0, ok, none, "not_driven"),
+        (0, ok, None, "drive_around"), (1, ok, full, "failed"), (99, ok, None, "failed"),
+        (0, {"clip_class": "reject"}, full, "rejected"), (0, {"clip_class": "pretrain_only"}, full, "completed"),
+    ]
+    for code, qc, measure, want in cases:
+        assert route_verdict(None, code, qc, measure) == want, (code, qc, measure, want)
+    assert VERDICT_DELIVERED == ("completed", "drive_around")
+    # End to end: a failing collector and a clip that stopped early are planned, never delivered.
+    from python.collect.clip_mode import long_clip_indices, run_clips
+    from scripts.gvd_test_env import collect_root
+
+    def runner(argv: list[str]) -> int:
+        out = Path(argv[argv.index("--out") + 1])
+        if "--route-plan" not in argv:
+            _fake_recording(out, rows=50)
+            return 0
+        path = Path(argv[argv.index("--route-plan") + 1])
+        route = lr.Route.from_json(json.loads(path.read_text(encoding="utf-8")))
+        _fake_recording(out, rows=100, pos_at=_pos_along(route, 1.0))
+        seen.append(1)
+        return 3 if len(seen) == 1 else 0  # the first route clip's collector fails after recording a full drive
+
+    seen: list[int] = []
+    with collect_root() as root:
+        session = run_clips(
+            root, clips=4, seed=4, maps=("west_coast_usa",), max_traffic=1, runner=runner,
+            min_s=30.0, max_s=60.0, long_clips=2, long_min_s=600.0, long_max_s=900.0, long_highway_frac=1.0,
+        )
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["long_clips_planned"] == 2 and manifest["long_clips_planned_by_route"]["highway_loop"] == 2
+        first = long_clip_indices(4, 2, seed=4)[0]
+        assert manifest["results"][first]["route_verdict"] == "failed", manifest["results"][first]
+        assert manifest["long_clips_delivered"] == manifest["long_clip_verdicts"].get("completed", 0) == 1, manifest
+        assert manifest["long_clips_delivered_by_route"] == {"highway_loop": 1, "varied": 0}, manifest
+    print("long clip verdicts: exit/quality/GT measure decide delivered; a failed collector is planned, not delivered")
+
+
 def check_no_highway_pool_delivers_drive_around_long_clips() -> None:
     """A pool with no highway map still delivers all requested long clips as varied routes."""
     from python.collect.clip_mode import long_clip_indices, run_clips
@@ -973,16 +1031,18 @@ def check_no_highway_pool_delivers_drive_around_long_clips() -> None:
         want = set(long_clip_indices(6, 3, seed=3))
         manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
         assert manifest["long_clips"] == 3
-        assert manifest["long_clips_delivered"] == 3, manifest
-        by_route = manifest["long_clips_by_route"]
+        assert manifest["long_clips_planned"] == 3 and manifest["long_clips_delivered"] == 3, manifest
+        assert manifest["long_clip_verdicts"] == {"drive_around": 3}, manifest["long_clip_verdicts"]
+        by_route = manifest["long_clips_planned_by_route"]
+        assert manifest["long_clips_delivered_by_route"] == by_route, manifest
         assert by_route.get("varied") == 3 and by_route.get("highway_loop", 0) == 0, by_route
         tagged = 0
         for i, row in enumerate(manifest["results"]):
             tags = json.loads((session / row["dir"] / "clip_tags.json").read_text(encoding="utf-8"))
             if i in want:
                 assert tags["long"] is True
-                assert tags["long_highway"] is False
-                assert tags["long_route"] == "varied"
+                assert tags["long_highway_planned"] is False
+                assert tags["long_route_planned"] == "varied"
                 assert 600.0 <= tags["duration_s"] <= 900.0
                 tagged += 1
             else:
@@ -1122,6 +1182,7 @@ def _checks() -> None:
     check_varied_spawn_kind_and_qc_skip()
     check_manifest_frac_warning_and_forwarding()
     check_disk_guards_unchanged_for_long_clips()
+    check_verdicts_follow_exit_quality_and_measure()
     check_no_highway_pool_delivers_drive_around_long_clips()
     check_keep_planned_highway_map_and_remap_varies()
     check_unreadable_road_dump_is_not_a_highway_map()

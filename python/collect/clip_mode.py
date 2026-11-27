@@ -741,11 +741,13 @@ def write_tags(
         "plan_notes": list(plan.notes),
         "tags": list(plan.tags),
         "long": bool(plan.long),
-        "long_highway": bool(plan.long_highway),
-        "long_route": plan.long_route,
-        "long_direction": plan.long_direction,
-        "route_legs": list(plan.route_legs),
-        "route_summary": plan.route_summary,
+        # Plan-level (what was asked for before the collector ran); the measured outcome is ``route_verdict`` and
+        # ``route_measure`` in the same file, scored from the recorded GT pose.
+        "long_highway_planned": bool(plan.long_highway),
+        "long_route_planned": plan.long_route,
+        "long_direction_planned": plan.long_direction,
+        "route_legs_planned": list(plan.route_legs),
+        "route_summary_planned": plan.route_summary,
         **dict(extra or {}),
     }
     with open(path, "x", encoding="utf-8") as fh:
@@ -778,6 +780,30 @@ def ego_samples(clip: Path | str) -> list[tuple[float, float]]:
 def measure_clip(clip: Path | str, route: "_lr.Route") -> dict[str, Any]:
     """How far the route was actually driven, from the recorded GT pose (not from what the driver sent)."""
     return _lr.measure_route(route, ego_samples(clip))
+
+
+MIN_DRIVEN_M = 100.0
+VERDICT_DELIVERED = ("completed", "drive_around")
+
+
+def route_verdict(plan: ClipPlan, code: int, qc: Mapping[str, Any], measure: Mapping[str, Any] | None) -> str:
+    """What a long clip actually did, from the collector's exit code, the quality check and the GT route measure.
+
+    completed: route clip, far end reached and loop closed (GT pose). drive_around: a varied clip with no route
+    that ran and was not rejected. far_end_only / partial / not_driven: a route clip that fell short.
+    failed / rejected: the collector failed, or the recording is unusable.
+    """
+    if int(code) != 0:
+        return "failed"
+    if qc.get("clip_class") == "reject":
+        return "rejected"
+    if measure is None:
+        return "drive_around"
+    if measure.get("far_end_reached") and measure.get("loop_closed"):
+        return "completed"
+    if measure.get("far_end_reached"):
+        return "far_end_only"
+    return "partial" if float(measure.get("driven_m") or 0.0) >= MIN_DRIVEN_M else "not_driven"
 
 
 def route_totals(measures: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -853,8 +879,14 @@ def run_clips(
             "long_min_s": float(long_min_s),
             "long_max_s": float(long_max_s),
             "long_highway_frac": float(long_highway_frac),
-            "long_clips_delivered": int(long_delivered["highway_loop"] + long_delivered["varied"]),
-            "long_clips_by_route": dict(long_delivered),
+            # Planned = counted when the clip was planned, before its collector ran.
+            "long_clips_planned": int(sum(long_planned.values())),
+            "long_clips_planned_by_route": dict(long_planned),
+            # Delivered = counted after the run: collector exit 0, not rejected, and (route clips) the GT pose
+            # reached the far end and closed the loop. long_clip_verdicts says what the others did.
+            "long_clips_delivered": int(sum(long_delivered.values())),
+            "long_clips_delivered_by_route": dict(long_delivered),
+            "long_clip_verdicts": dict(verdicts),
             "long_route_totals": route_totals(route_measures),
             "results": results,
         }
@@ -863,7 +895,9 @@ def run_clips(
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         tmp.replace(manifest)
 
+    long_planned = {HIGHWAY_LOOP: 0, VARIED: 0}
     long_delivered = {HIGHWAY_LOOP: 0, VARIED: 0}
+    verdicts: dict[str, int] = {}
     route_measures: list[dict[str, Any]] = []
     _save()
     long_at = set(long_clip_indices(int(clips), int(long_clips), int(seed)))
@@ -885,8 +919,8 @@ def run_clips(
                 plan, min_s=long_min_s, max_s=long_max_s, maps=maps,
                 highway_frac=long_highway_frac, ordinal=long_order.index(index),
             )
-            # apply_long_highway always returns a long plan (it raises on an empty pool); count it by its route.
-            long_delivered[plan.long_route] += 1
+            # apply_long_highway always returns a long plan (it raises on an empty pool): planned, not yet delivered.
+            long_planned[plan.long_route] += 1
         clip = new_clip_dir(session, plan)
         route = plan_route(plan)
         route_file = write_route_plan(session, clip, route) if route is not None else None
@@ -907,12 +941,20 @@ def run_clips(
             measure = measure_clip(clip, route)
             info["route_measure"] = measure
             info["route_plan_file"] = str(route_file)
-            entry["long_route"] = plan.long_route
+            entry["long_route_planned"] = plan.long_route
             entry["route_measure"] = measure
             route_measures.append(measure)
             log(f"clip {clip.name}: route driven {measure['driven_m']:.0f} of {measure['planned_m']:.0f} m, "
                 f"highway {measure['highway_fraction']:.0%}, far end {'reached' if measure['far_end_reached'] else 'NOT reached'}, "
                 f"loop {'closed' if measure['loop_closed'] else 'not closed'}")
+        if plan.long:
+            verdict = route_verdict(plan, code, qc, info.get("route_measure"))
+            info["route_verdict"] = verdict
+            entry["route_verdict"] = verdict
+            verdicts[verdict] = verdicts.get(verdict, 0) + 1
+            if verdict in VERDICT_DELIVERED:
+                long_delivered[plan.long_route] += 1
+            log(f"clip {clip.name}: long clip {verdict} (planned {plan.long_route})")
         driver = clip / ROUTE_DRIVER_FILE
         if route is not None and driver.is_file():
             try:

@@ -9,7 +9,10 @@ over non-highway roads (dirt where the dump's road material says unpaved) to a
 different route each time, the direction alternating through the batch. The
 route goes to the collector as ``--route-plan``; afterwards the recorded ego pose
 is scored against it (clip_tags.json ``route_measure``, session.json
-``long_route_totals``). Maps with no highway (or no plannable route) roam
+``long_route_totals``). Delivered long clips are counted after the run from that GT
+measure (``route_verdict`` per clip, ``long_clips_delivered`` / ``long_clip_verdicts`` in
+session.json); ``long_clips_planned*`` and the ``*_planned`` tags are the plan, not the outcome.
+Maps with no highway (or no plannable route) roam
 freely with ``--route span`` and are not skipped. Nothing here has been run
 against a live BeamNG.
 

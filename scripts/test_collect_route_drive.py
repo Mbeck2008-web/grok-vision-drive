@@ -29,7 +29,7 @@ from python.collect import long_route as lr  # noqa: E402
 from python.collect.spawn_mix import CITY, HIGHWAY  # noqa: E402
 
 SPEED = 25.0
-CRAWL_M, CRAWL_V = 6.0, 0.95
+CRAWL_M, CRAWL_V = 4.0, 0.95
 MAP = "west_coast_usa"
 
 
@@ -59,7 +59,7 @@ class RouteCar(sf._CrashVehicle):
     """Starts at rest. Drives the route at SPEED once manual mode and a line were sent; span stops it."""
 
     def __init__(self, stop: Path, route: lr.Route | None = None, rest_polls: int = 5, leave_at_m: float | None = None,
-                 tail_polls: int = 125, max_polls: int = 3000, **_kw: object) -> None:
+                 tail_polls: int = 40, max_polls: int = 3000, **_kw: object) -> None:
         super().__init__(stop, stop_at=10**9)
         self.route = route
         self.rest_polls, self.leave_at_m, self.tail_polls, self.max_polls = rest_polls, leave_at_m, tail_polls, max_polls
@@ -106,10 +106,10 @@ class RouteCar(sf._CrashVehicle):
         if self.leave_at_m is not None and self.s >= self.leave_at_m:
             self.parked = True  # off the route, and stopped there (a stuck car is a car at rest)
         if driven and not self.parked:
-            # The last metres before the route's end tolerance are a crawl (< 1 m/s): the car is not "driving" when
-            # it is handed back, which is when the collector's own span send must still take over.
-            crawl = self.s >= self.route.total_m - lr.END_TOL_M - CRAWL_M
-            self.v = CRAWL_V if crawl else SPEED
+            # The car brakes (5 m/s2) into the route's end and crawls the last metres before the end tolerance (< 1 m/s):
+            # it is not "driving" when it is handed back, which is when the collector's own span send must still take over.
+            left = max(0.0, self.route.total_m - lr.END_TOL_M - CRAWL_M - self.s)
+            self.v = min(SPEED, max(CRAWL_V, math.sqrt(2.0 * 5.0 * left)))
             self.s = min(self.route.total_m, self.s + self.v * 0.1)
         else:
             self.v = max(0.0, self.v - 0.5)  # 5 m/s2: a stop, not an impact

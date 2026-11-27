@@ -62,8 +62,9 @@ class RouteCar(sf._CrashVehicle):
     def __init__(self, stop: Path, route: lr.Route | None = None, rest_polls: int = 5, leave_at_m: float | None = None,
                  tail_polls: int = 40, max_polls: int = 3000, stall_at_m: float | None = None,
                  recover_to: str | None = None, stuck_start: str | None = None,
-                 restall_after_m: float | None = None, **_kw: object) -> None:
+                 restall_after_m: float | None = None, wrong_deck_dz: float = 0.0, **_kw: object) -> None:
         super().__init__(stop, stop_at=10**9)
+        self.wrong_deck_dz = float(wrong_deck_dz or 0.0)
         self.route = route
         self.rest_polls, self.leave_at_m, self.tail_polls, self.max_polls = rest_polls, leave_at_m, tail_polls, max_polls
         self.mode = None
@@ -166,8 +167,12 @@ class RouteCar(sf._CrashVehicle):
         x, y, dx, dy = self._at(self.s)
         if self.parked:
             x += 120.0
+        z = 0.5
+        if self.wrong_deck_dz and self.placed:
+            # Same xy as the teleport, z = requested z + dz (smoke-c resume: +17 m on an overpass deck).
+            x, y, z = self.placed[-1][0][0], self.placed[-1][0][1], self.placed[-1][0][2] + self.wrong_deck_dz
         self.state = {
-            "pos": [x, y, 0.5], "dir": [dx, dy, 0.0], "up": [0.0, 0.0, 1.0],
+            "pos": [x, y, z], "dir": [dx, dy, 0.0], "up": [0.0, 0.0, 1.0],
             "electrics": {"wheelspeed": self.v, "steering_input": 0.0, "throttle_input": 0.3, "brake_input": 0.0},
         }
         done_wait = self.span_poll is not None and self.polls >= self.span_poll + self.tail_polls
@@ -504,6 +509,23 @@ def check_failed_route_resume_placement_stops_the_clip() -> None:
     print("collector route run: a failed resume placement stops the clip (exit 2, spawn_failed), resumes=1, first settle is source=spawn")
 
 
+def check_wrong_deck_start_does_not_send_set_line() -> None:
+    """A route start that settles +17 m above the requested z must not follow or send set_line.
+
+    The existing spawn_failed path handles the error (the clip stops; no retry loop).
+    """
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(route, wrong_deck_dz=17.0)
+    assert code == 2, (code, text[-3000:])
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "spawn_failed", status
+    detail = (status.get("stop_detail") or "") + text
+    assert "could not be placed" in detail or "off the planned z" in detail, detail[-2500:]
+    assert not car.set_line_calls, f"set_line must not go out after a wrong-deck settle: {car.set_line_calls}"
+    assert car.has_line is False
+    print("collector route run: a +17 m wrong-deck start is spawn_failed, no set_line")
+
+
 def main() -> None:
     check_route_runs_through_the_collector()
     check_leaving_the_route_hands_back_to_span()
@@ -517,6 +539,7 @@ def main() -> None:
     check_recheck_stays_off_a_route_clip()
     check_three_resumes_then_the_clip_stops()
     check_failed_route_resume_placement_stops_the_clip()
+    check_wrong_deck_start_does_not_send_set_line()
     print("test_collect_route_drive: OK")
 
 

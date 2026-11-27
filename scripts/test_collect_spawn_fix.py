@@ -1059,6 +1059,21 @@ def check_traffic_slots() -> None:
     print(f"traffic slots ok: ahead {la:.0f} m at ({pa[0]:.1f},{pa[1]:.1f}), behind {lb:.0f} m; fallback and skip noted")
 
 
+def check_route_clips_drop_ahead_traffic() -> None:
+    from python.collect.spawn_mix import drop_ahead_traffic_slots
+
+    slots = [
+        ("ahead", (1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), 25.0),
+        ("behind", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), 20.0),
+        ("ahead2", (2.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), 50.0),
+        ("behind2", (-1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), 45.0),
+    ]
+    out = drop_ahead_traffic_slots(slots)
+    assert [s[0] for s in out] == ["behind", "behind2"], out
+    assert drop_ahead_traffic_slots([]) == []
+    print("route traffic: same-lane ahead slots are dropped; behind slots stay")
+
+
 def check_stall_respawn_helpers() -> None:
     import scripts.collect_scene_lanes as collect
 
@@ -1386,6 +1401,7 @@ def main() -> None:
     check_resume_skips_recorded()
     check_recheck_types_and_resume_run()
     check_traffic_slots()
+    check_route_clips_drop_ahead_traffic()
     check_stall_respawn_helpers()
     check_deck_exhausted_run()
     check_stall_respawn_run()

@@ -2416,7 +2416,88 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
             stall_s = max(0.0, float(live.slow_s)) if reason in ("stationary", "impact") else 0.0
-            if segment_aborts >= 2 and reason in HARD_SEGMENT_REASONS:
+            end_segment = segment_aborts >= 2 and reason in HARD_SEGMENT_REASONS
+            if not end_segment:
+                from python.collect.level_session import place_vehicle, recover_points, snap_to_road
+
+                here = None
+                if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                    here = (float(pos[0]), float(pos[1]), float(pos[2]))
+                placed = None
+                for near in recover_points(here, spawn_pos):
+                    try:
+                        placed = snap_to_road(bng, near)
+                    except Exception as exc:
+                        # Session errors come back as None; anything else is a bad
+                        # road read. Record why, then let it end the run.
+                        run.stop("road_read_error", f"{type(exc).__name__}: {exc}")
+                        raise
+                    if placed is not None:
+                        break
+                if placed is None:
+                    message = f"{segment_id} aborted: {reason}; no road pose to respawn"
+                else:
+                    moved, mrot = placed
+                    shift = place_vehicle(bng, vehicle, moved, mrot)
+                    if shift:
+                        message = f"{segment_id} aborted: {reason}; respawn failed: {shift}"
+                    else:
+                        print(
+                            f"collect recover {segment_id} ({moved[0]:.1f},{moved[1]:.1f},{moved[2]:.1f})",
+                            flush=True,
+                        )
+                        wait_t0, wait_t1, settled_hz = _settle_after_teleport("recover")
+                        if route_driver is not None and route_driver.active:
+                            from python.collect.long_route import route_place_z_error
+
+                            deck_err = route_place_z_error(moved, _settled_xyz(vehicle))
+                            if deck_err:
+                                # Do not start following or send set_line. End the
+                                # segment so the next open is a route resume (the
+                                # cap is consumed; never loop forever on this deck).
+                                print(f"collect recover {segment_id} failed {deck_err}", flush=True)
+                                last_error = f"{segment_id} aborted: {reason}; respawn failed: {deck_err}"
+                                end_segment = True
+                        if not end_segment:
+                            recover_lost_s += stall_s + max(0.0, wait_t1 - wait_t0)
+                            live.reset()
+                            clock = place_excursion_clock(clock, persist=gap_persist, fresh=new_clock)
+                            last_ai = None
+                            held_tag = None
+                            prev_dir = None
+                            prev_dir_t = None
+                            follow = RoadFollow()
+                            lane_track.reset()
+                            label_hit = None
+                            segment_open = False
+                            spawn_pos = moved
+                            spawn_mark = done_s
+                            recheck_mark = done_s
+                            spawn_seq += 1
+                            _reset_gt_gate()
+                            mark_recover = True
+                            impact.reset()
+                            yield_guard.reset()
+                            settle.start(done_s)
+                            settle.note_meta(
+                                source="recover",
+                                segment=segment_id,
+                                wall_t=time.time(),
+                                wait_t0=wait_t0,
+                                wait_t1=wait_t1,
+                                settled_hz=settled_hz,
+                            )
+                            since_spawn[0] = 0.0
+                            return None
+                if not end_segment:
+                    last_error = message
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _publish(None, speed, waypoint)
+                    _write_collect_crash(status_root, last_error, {})
+                    print(f"collect stop {message}", flush=True)
+                    run.stop("recover_failed", message)
+                    return 2
+            if end_segment:
                 recover_lost_s += stall_s
                 action, schedule_cut, _skipped = continue_after_segment_end(
                     done_s,
@@ -2478,72 +2559,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 segment_aborts = 0
                 segment_open = False
                 return None
-            from python.collect.level_session import place_vehicle, recover_points, snap_to_road
-
-            here = None
-            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                here = (float(pos[0]), float(pos[1]), float(pos[2]))
-            placed = None
-            for near in recover_points(here, spawn_pos):
-                try:
-                    placed = snap_to_road(bng, near)
-                except Exception as exc:
-                    # Session errors come back as None; anything else is a bad
-                    # road read. Record why, then let it end the run.
-                    run.stop("road_read_error", f"{type(exc).__name__}: {exc}")
-                    raise
-                if placed is not None:
-                    break
-            if placed is None:
-                message = f"{segment_id} aborted: {reason}; no road pose to respawn"
-            else:
-                moved, mrot = placed
-                shift = place_vehicle(bng, vehicle, moved, mrot)
-                if shift:
-                    message = f"{segment_id} aborted: {reason}; respawn failed: {shift}"
-                else:
-                    print(
-                        f"collect recover {segment_id} ({moved[0]:.1f},{moved[1]:.1f},{moved[2]:.1f})",
-                        flush=True,
-                    )
-                    wait_t0, wait_t1, settled_hz = _settle_after_teleport("recover")
-                    recover_lost_s += stall_s + max(0.0, wait_t1 - wait_t0)
-                    live.reset()
-                    clock = place_excursion_clock(clock, persist=gap_persist, fresh=new_clock)
-                    last_ai = None
-                    held_tag = None
-                    prev_dir = None
-                    prev_dir_t = None
-                    follow = RoadFollow()
-                    lane_track.reset()
-                    label_hit = None
-                    segment_open = False
-                    spawn_pos = moved
-                    spawn_mark = done_s
-                    recheck_mark = done_s
-                    spawn_seq += 1
-                    _reset_gt_gate()
-                    mark_recover = True
-                    impact.reset()
-                    yield_guard.reset()
-                    settle.start(done_s)
-                    settle.note_meta(
-                        source="recover",
-                        segment=segment_id,
-                        wall_t=time.time(),
-                        wait_t0=wait_t0,
-                        wait_t1=wait_t1,
-                        settled_hz=settled_hz,
-                    )
-                    since_spawn[0] = 0.0
-                    return None
-            last_error = message
-            _save_progress(done_s, done_s if target_s == float("inf") else target_s)
-            _publish(None, speed, waypoint)
-            _write_collect_crash(status_root, message, {})
-            print(f"collect stop {message}", flush=True)
-            run.stop("recover_failed", message)
-            return 2
 
         def _speed_range(kind: str, kind_range: tuple[float, float], default_src: str) -> tuple[float, ...]:
             """Clamp a range to the flags, log it, record it for this segment, and return its speed cycle."""
@@ -2700,9 +2715,16 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             ge = getattr(bng, "queue_lua_command", None)
             slots, notes = [], []
             if count and spawn_deck is not None:
+                from python.collect.spawn_mix import drop_ahead_traffic_slots
+
                 slots, notes = spawn_deck.traffic_slots(
                     picked, count, float(args.traffic_ahead_m), float(args.traffic_behind_m)
                 )
+                if route_driver is not None:
+                    kept = drop_ahead_traffic_slots(slots)
+                    if len(kept) != len(slots):
+                        notes.append("traffic ahead skipped: same-lane companions stay behind on a route clip")
+                    slots = kept
                 for note in notes:
                     print(f"collect {note}", flush=True)
                 placed = " ".join(f"{where}={along:.1f}m" for where, _p, _r, along in slots) or "none"
@@ -2721,6 +2743,18 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 flush=True,
             )
             wait_t0, wait_t1, settled_hz = _settle_after_teleport(source)
+            if route_driver is not None and route_driver.active:
+                from python.collect.long_route import route_place_z_error
+
+                deck_err = route_place_z_error(picked.pos, _settled_xyz(vehicle))
+                if deck_err:
+                    # Do not start following or send set_line. The existing
+                    # spawn_failed / resume path handles the error (a resume
+                    # already counted this attempt; never loop forever).
+                    print(f"collect spawn {segment_id} {picked.kind} failed {deck_err}", flush=True)
+                    if source in ("spawn", "segment", "recheck"):
+                        return f"{map_name}: legal spawn pose could not be placed: {deck_err}"
+                    return None
             spawn_kind = picked.kind
             spawn_cov = picked.paint_cov
             spawn_road = str(picked.road_id)
@@ -4537,6 +4571,18 @@ def _read_vehicle_ctl(
             except Exception:
                 traffic = None
     return sample, probe, traffic
+
+
+def _settled_xyz(vehicle: Any) -> tuple[float, float, float] | None:
+    """The vehicle's pose after a teleport settle poll, or None if it cannot be read."""
+    sample = _read_vehicle(vehicle)
+    pos = sample.get("pos") if isinstance(sample, dict) else None
+    if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+        try:
+            return (float(pos[0]), float(pos[1]), float(pos[2]))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _read_vehicle(vehicle: Any) -> dict[str, Any]:

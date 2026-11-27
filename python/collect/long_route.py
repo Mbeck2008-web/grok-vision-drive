@@ -17,7 +17,8 @@ within ``JOIN_M`` of another road joins it. A route is
   jitter, so each clip loops back a different way.
 
 The line is offset into the legal right-hand lane (``_offset_candidates``, the
-rule the spawn deck uses), so it can be sent to the AI as ``vehicle.ai.set_line``.
+rule the spawn deck uses), then inset so the car body plus a margin stays
+inside the dump road edge, so it can be sent to the AI as ``vehicle.ai.set_line``.
 
 ``RouteDriver`` turns a position into AI commands: it sends the next
 ``window_m`` of the route as a ``set_line`` command (the helper ``excursion.py`` already
@@ -58,6 +59,10 @@ from python.collect.spawn_mix import (
 # A road end within this of another road's centerline point joins it.
 JOIN_M = 15.0
 JOIN_DZ_M = 5.0
+# Inset the route polyline from the dump road edge so the car body stays clear
+# of barriers (EDGE_MARGIN_M 0.15 alone left the line hugging the edge).
+ROUTE_BODY_HALF_M = 1.0
+ROUTE_EDGE_MARGIN_M = 0.6
 # A junction hop costs this much extra, so the planner does not zig-zag across roads.
 LINK_COST_M = 8.0
 # Smallest highway leg worth calling "end to end".
@@ -90,6 +95,35 @@ MAX_RESUMES = 3
 
 # Highest AI speed (m/s) on each kind of road; the highway takes the clip's own speed.
 KIND_SPEED_CAP = {"highway": None, "ramp": 16.0, "city": 14.0, "dirt": 11.0}
+
+
+def route_place_z_error(
+    requested: Sequence[float] | None,
+    settled: Sequence[float] | None,
+    *,
+    limit_m: float = JOIN_DZ_M,
+) -> str | None:
+    """Return an error if the settled z is more than ``limit_m`` from the requested z.
+
+    After a route teleport the car must rest on the planned deck (plan z + 0.5),
+    not a stacked surface above or below it. ``JOIN_DZ_M`` (5 m) is the same
+    vertical join used when linking roads. A missing or short pose is also an error.
+    """
+    if requested is None or settled is None:
+        return "route place: settled pose missing z"
+    try:
+        if len(requested) < 3 or len(settled) < 3:
+            return "route place: settled pose missing z"
+        req_z = float(requested[2])
+        got_z = float(settled[2])
+    except (TypeError, ValueError):
+        return "route place: settled pose missing z"
+    if not (math.isfinite(req_z) and math.isfinite(got_z)):
+        return "route place: settled pose missing z"
+    dz = got_z - req_z
+    if abs(dz) > float(limit_m):
+        return f"route place landed {dz:+.1f} m off the planned z (limit {float(limit_m):.0f} m)"
+    return None
 
 
 def is_dirt_material(material: object) -> bool:
@@ -351,7 +385,11 @@ class RoadGraph:
         return cost
 
     def lane_offset(self, n: int) -> float:
-        """Metres right of the travel tangent for the node's road (rightmost lane, spawn-deck rule)."""
+        """Metres right of the travel tangent for the node's road.
+
+        Starts from the spawn-deck rightmost-lane rule, then clamps so
+        ``ROUTE_BODY_HALF_M + ROUTE_EDGE_MARGIN_M`` stays inside the dump edge.
+        """
         ri, pi = self.node_road[n], self.node_pi[n]
         road = self.roads[ri]
         widths = road.get("widths") or []
@@ -363,7 +401,14 @@ class RoadGraph:
             cands = _offset_candidates(road, width)
         except (KeyError, TypeError, ValueError):
             return 0.0
-        return float(cands[0]) if cands else 0.0
+        off = float(cands[0]) if cands else 0.0
+        inset = ROUTE_BODY_HALF_M + ROUTE_EDGE_MARGIN_M
+        cap = max(0.0, width / 2.0 - inset)
+        if off > cap:
+            return cap
+        if off < -cap:
+            return -cap
+        return off
 
 
 def build_graph(roads: Sequence[dict[str, Any]], pools: dict[str, list[dict[str, Any]]] | None = None) -> RoadGraph:

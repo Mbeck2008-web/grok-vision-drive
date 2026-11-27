@@ -855,8 +855,75 @@ def check_measure_route() -> None:
     print("measure: full drive 1.0 / far end / loop closed; half drive 0.5; elsewhere or teleport earn nothing; off-route counted")
 
 
+def check_route_place_rejects_wrong_deck() -> None:
+    """Settled z more than JOIN_DZ_M (5 m) from the requested plan z+0.5 is a failed place."""
+    assert lr.JOIN_DZ_M == 5.0
+    # Requested z is plan z + 0.5, the lift route_resume_pick / start_pose use.
+    req = (10.0, 20.0, 100.0 + 0.5)
+    # Smoke-c resume #1: +17 m at the same xy.
+    err = lr.route_place_z_error(req, (10.0, 20.0, req[2] + 17.0))
+    assert err, "a +17 m settle must be a failed place"
+    assert "17" in err, err
+    # Comparison is |dz|, not a one-sided check (a deck below is just as wrong).
+    err_lo = lr.route_place_z_error(req, (10.0, 20.0, req[2] - 17.0))
+    assert err_lo, "a -17 m settle must also be a failed place"
+    # Boundary: |dz| == JOIN_DZ_M is allowed; just over is not (kills threshold mutants).
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] + 5.0)) is None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] - 5.0)) is None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] + 5.01)) is not None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] - 5.01)) is not None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] + 4.99)) is None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2])) is None
+    assert lr.route_place_z_error(req, (99.0, -4.0, req[2] + 0.14)) is None  # xy may drift; z is what matters
+    assert lr.route_place_z_error(req, None) is not None
+    assert lr.route_place_z_error(req, (10.0, 20.0)) is not None
+    print("route place z: |dz| > 5 m is a failed place; |dz| == 5 m and the +17/-17 smoke-c cases are pinned")
+
+
+def check_route_polyline_is_inset_from_the_edge() -> None:
+    """Rightmost-lane offset is clamped so half-width + margin stays inside the dump edge."""
+    assert lr.ROUTE_BODY_HALF_M == 1.0
+    assert lr.ROUTE_EDGE_MARGIN_M == 0.6
+    inset = 1.0 + 0.6
+    # A 6 m two-lane one-way "narrow bridge": the spawn-deck cap (EDGE_MARGIN_M 0.15)
+    # leaves the rightmost lane 1.5 m from the edge, inside a 1.0+0.6 m body.
+    roads = [road("B1", line(0, 0, 400, 0), oneway=True, lanes=2, width=6.0)]
+    g = lr.build_graph(roads)
+    nodes = [n for n in range(len(g.xyz)) if g.roads[g.node_road[n]]["id"] == "B1"]
+    assert len(nodes) >= 3, nodes
+    # Unclamped deck offset is too close; the route clamp must pull it to width/2 - 1.6.
+    from python.collect.spawn_mix import _offset_candidates, _station_width
+
+    raw = _offset_candidates(g.roads[g.node_road[nodes[1]]], _station_width(g.roads[g.node_road[nodes[1]]].get("widths")[g.node_pi[nodes[1]]], g.roads[g.node_road[nodes[1]]]))
+    assert raw and abs(6.0 / 2.0 - abs(raw[0]) - 1.5) < 1e-9, raw
+    cap = 6.0 / 2.0 - inset
+    for n in nodes:
+        off = g.lane_offset(n)
+        dist = 6.0 / 2.0 - abs(off)
+        assert abs(off - cap) < 1e-9, (n, off, cap)
+        assert dist + 1e-9 >= inset, (n, off, dist)
+    pts, _kinds = lr._polyline(g, nodes)
+    assert pts, "polyline is not empty"
+    # Road along +x at y=0; right-hand offset is -y. Every point stays 1.6 m inside y=+/-3.
+    for x, y, _z in pts:
+        dist = 6.0 / 2.0 - abs(y)
+        assert dist + 1e-9 >= inset, (x, y, dist)
+        assert abs(abs(y) - cap) < 1e-6, (x, y, cap)
+    # A wider 8 m two-lane one-way already has 2.0 m to the edge: do not over-inset.
+    wide = lr.build_graph([road("H1", line(0, 0, 400, 0), oneway=True, lanes=2, width=8.0)])
+    wn = next(n for n in range(len(wide.xyz)))
+    assert abs(wide.lane_offset(wn) - 2.0) < 1e-9, wide.lane_offset(wn)
+    # A road narrower than half-width+margin: stay on the centerline (cap 0).
+    skinny = lr.build_graph([road("S1", line(0, 0, 200, 0), oneway=True, lanes=1, width=3.0)])
+    sn = next(n for n in range(len(skinny.xyz)))
+    assert abs(skinny.lane_offset(sn)) < 1e-9, skinny.lane_offset(sn)
+    print("route polyline: half-width 1.0 + margin 0.6 from the dump edge; 6 m bridge pinned at offset 1.4")
+
+
 def main() -> None:
     check_dirt_material_words()
+    check_route_place_rejects_wrong_deck()
+    check_route_polyline_is_inset_from_the_edge()
     check_graph_directions_and_links()
     check_route_shape_synthetic()
     check_dirt_is_used_when_present_and_omitted_when_not()

@@ -149,6 +149,13 @@ TRAFFIC_MIN_M = 8.0
 # TRAFFIC_MIN_M of a car already placed (a short road walk falls back to the
 # same farthest spot) is dropped, never stacked.
 TRAFFIC_STAGGER_M = 25.0
+
+
+def drop_ahead_traffic_slots(slots: list) -> list:
+    """Drop same-lane companions placed ahead of the ego (route / set_line clips)."""
+    return [slot for slot in slots if not str(slot[0]).startswith("ahead")]
+
+
 # Legal-lane search. The first fraction is the historical 40% station.
 LEGAL_FRACTIONS = (0.40, 0.30, 0.50, 0.22, 0.62)
 LEGAL_ATTEMPTS = 8

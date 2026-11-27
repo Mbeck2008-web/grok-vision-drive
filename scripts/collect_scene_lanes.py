@@ -3083,7 +3083,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 # A new level starts on the off-deck range; a deck spawn below replaces it.
                 speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
                 speed = speed_at(done_s, tuple(speed_span[0]))
-                spawn_err = _apply_spawn(True, "segment")
+                # Only a same-map open of the next segment, while a route is already started, is a
+                # route resume (source "segment"). The first open, and every non-route open, stay
+                # source "spawn" so the deck's type mix is unchanged.
+                spawn_src = (
+                    "segment"
+                    if route_driver is not None and route_driver.active and route_driver.spawns > 0
+                    else "spawn"
+                )
+                spawn_err = _apply_spawn(True, spawn_src)
                 if spawn_err:
                     last_error = spawn_err
                     _save_progress(done_s, done_s if target_s == float("inf") else target_s)

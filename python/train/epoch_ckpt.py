@@ -31,7 +31,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -126,6 +126,25 @@ def ensure_free_space(
             f"would leave {(free - size) / GB:.2f} GB < floor {int(min_free_bytes) / GB:.2f} GB"
         )
     return free
+
+
+def may_unlink_partial(path: Path | str, *, owned_partials: Iterable[Path | str]) -> bool:
+    """True only for a ``.partial`` file this writer owns; an existing checkpoint is never unlinked."""
+    p = Path(path)
+    try:
+        owned = {Path(x).resolve() for x in owned_partials}
+        return ".partial" in p.name and p.resolve() in owned
+    except OSError:
+        return False
+
+
+def unlink_own_partial(path: Path | str, *, owned_partials: Iterable[Path | str]) -> None:
+    """Unlink ``path`` only if :func:`may_unlink_partial` allows it; refuses (``EpochCkptRefused``) otherwise."""
+    p = Path(path)
+    if not may_unlink_partial(p, owned_partials=owned_partials):
+        raise EpochCkptRefused(f"refusing to unlink existing checkpoint {p}")
+    if p.exists():
+        p.unlink()
 
 
 def write_epoch_ckpt(
@@ -347,7 +366,8 @@ def export_epoch_onnx(ckpt: Path | str, out: Path | str, *, trace: Any = None) -
         link_or_copy_new(partial, out)
     finally:
         if partial.exists():
-            partial.unlink()
+            # Only this call's own .partial file may be unlinked (Trainer 2.0 retention rule).
+            unlink_own_partial(partial, owned_partials=(partial,))
     return {
         "onnx": str(out),
         "onnx_sha256": sha256_file(out),

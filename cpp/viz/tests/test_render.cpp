@@ -875,9 +875,11 @@ int main() {
       f.seekg(0);
       f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
       CHECK(buf.size() > 20 && u32(buf, 0) == 0x46546C67u, "ego asset is not a GLB");
-      // Pin the exact bytes the prepare script reproduces (fa1ac245…).
+      // Pin the shipped bytes (hood T already gone; rear T stripped, glass
+      // cutout filled and flattened). Re-running prepare_ego_glb.py alone
+      // would restore the rear badge and this hash.
       const char* kEgoSha =
-          "fa1ac2450f36a48356abdf2390346e8c1190ffb986e031dc430124a59e10dae8";
+          "1107241762a6fcb50c77cf565e95d8d9b60c061e01c041b88271ca2ad13afd38";
       std::string got_sha = sha256_hex(reinterpret_cast<const unsigned char*>(buf.data()), buf.size());
       CHECK(got_sha == kEgoSha, "ego GLB sha256 %s, want %s", got_sha.c_str(), kEgoSha);
       size_t off = 12, json_off = 0, json_n = 0, bin_off = 0, bin_n = 0;

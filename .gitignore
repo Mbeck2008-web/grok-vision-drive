@@ -20,3 +20,6 @@ models/*.onnx
 models/*.pt
 !models/.gitkeep
 !models/yolov8n.onnx
+
+# A test run with GVD_DATA_DIR unset on Linux writes a literal "E:\GVD_data" directory (a single name with a backslash).
+E:\\GVD_data/

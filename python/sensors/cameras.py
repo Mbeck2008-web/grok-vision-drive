@@ -1533,7 +1533,7 @@ class BeamNGPyBackend:
         """Attach and read only these rig ids. ``None`` keeps the full eight.
 
         Call before ``open`` so unused sensors are never scheduled in Tech.
-        Scene-ckpt's main-only net uses this. The default supervisor does not.
+        --scene-ckpt asks for its checkpoint's cams (all 8 for an 8-cam ckpt). The default supervisor does not.
         """
         if cams is None:
             self._needed = None

@@ -730,11 +730,14 @@ def check_recipe_off_is_bit_identical() -> None:
     pin = json.loads(DEFAULTS_PIN.read_text(encoding="utf-8"))["defaults"]
     got = json.loads(json.dumps(vars(build_parser().parse_args(["--no-ssl-pretrain"])), sort_keys=True, default=str))
     added = {k: got[k] for k in set(got) - set(pin)}
-    assert added == dict(NEW_FLAGS, no_ssl_pretrain=True), added
+    # Exact: the SSL flags plus the four PR 6 recipe flags at their off defaults, nothing else.
+    recipe_flags = {"recipe": "", "stage": "", "accum": 0, "kd": False}
+    assert added == dict(NEW_FLAGS, no_ssl_pretrain=True, **recipe_flags), added
     assert not set(pin) - set(got), set(pin) - set(got)
     changed = sorted(k for k in pin if got[k] != pin[k])
     assert not changed, f"pre-existing train_scene defaults changed: {changed}"
-    print(f"recipe off: {len(pin)} pre-existing defaults == main 8ce34d5 pin; only {sorted(NEW_FLAGS)} added OK")
+    print(f"recipe off: {len(pin)} pre-existing defaults == main 8ce34d5 pin; only {sorted(NEW_FLAGS)} + "
+          f"{sorted(recipe_flags)} added (off defaults pinned) OK")
 
 
 def main() -> int:

@@ -170,8 +170,6 @@ for n_row, row in enumerate(rows):
         evidence.append(S.CamEvidence(cp, depth, valid, sky))
         if sky.any() and cam in ("main", "wide", "narrow"):
             sky_cols.append(rgb[sky])
-        elif cam == "main" and sky_rgb is None:   # no sky seen yet (tunnel): backdrop from main's top rows, render-only
-            sky_cols.append(rgb[: max(1, rgb.shape[0] // 10)].reshape(-1, 3))
         ys, xs = np.nonzero(valid)
         pts = S.unproject(cp, depth, ys, xs); cols = rgb[ys, xs]; foot = footprint(cp, depth)[ys, xs]
         hw, y0, y1, z0, z1 = EGO_BOX

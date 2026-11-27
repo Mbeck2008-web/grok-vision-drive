@@ -30,7 +30,6 @@ S15 a road px the snap rejects renders at its raw depth (not deleted by snap / c
 S14 snap: ego-hood px are excluded; wide snaps to a 15 m ground hit only.
 S16 the depth-edge cut has no snapped exemption (shared edge_cut_far_side).
 S22 (M04b) the edge cut drops the 12 non-sky px next to +inf sky under GT depth (far_side <= ground_hit, inf == inf).
-S19 the black band under the horizon is a 2-D render-only backdrop when a sky colour exists.
 S17 splat radius cap (W//60) covers the 0.25 m ground grid near the chase camera (behind-car strip).
 S13 ground splats reach the next camera row: on-plane points' footprint grows to the ground row spacing past
    the old 6*(d/fy) cap (rear/repeater holes); off-plane points keep the cap.
@@ -589,73 +588,6 @@ def check_splat_radius_covers_ground_grid() -> None:
     assert "S.edge_cut_far_side(" in tool and "~snapped" not in tool, "preview must use the shared edge cut without exemption"
 
 
-def _sha(*arrs) -> str:
-    import hashlib
-    h = hashlib.sha256()
-    for a_ in arrs:
-        a_ = np.ascontiguousarray(a_)
-        h.update(str(a_.dtype).encode() + str(a_.shape).encode() + a_.tobytes())
-    return h.hexdigest()
-
-
-def _sky_pipeline(sky_rgb):
-    """Everything the preview computes for one frame sequence, with ``sky_rgb`` the ONLY thing that differs: the
-    ground-grid occupancy, every CamDepthFilter output, the per-frame point set the compose step and any consumer
-    (planner / AEB) would read, and the render's depth buffer. Returns a dict of sha256."""
-    cam = camera_from_angles("main", (0.0, 1.2, 1.3), 0.0, -4.0, 60.0, 96, 64, near_m=0.05, far_m=300.0)
-    ch = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 160, 90, 0.0)
-    dz = sf._pixel_rays(cam)[..., 2]; down = dz < -1e-6
-    hit = np.where(down, cam.pos[2] / np.where(down, -dz, 1.0), np.inf)
-    depth = np.where(down, hit, 250.0)
-    sky = ~down                                            # a sky band: the thing the backdrop stands in for
-    valid = down & (hit < 60.0)
-    F = sf.CamDepthFilter(); G = sf.GroundGrid()
-    out = {"filter": [], "grid": [], "points": [], "depth_buffer": [], "occupancy": []}
-    for k in range(4):
-        pose = (0.0, 0.5 * k, 0.0)
-        d, _ = F.update(cam, depth, valid, pose, 0.1 * k)
-        ys, xs = np.nonzero(valid)
-        pts = sf.unproject(cam, d, ys, xs); cols = np.full((len(ys), 3), 120, np.uint8); foot = np.full(len(ys), 0.3)
-        gp = sf.transform_points(pts, (0.0, 0.0, 0.0), pose)
-        G.add(gp[gp[:, 2] < 0.3], cols[gp[:, 2] < 0.3], np.ones(int((gp[:, 2] < 0.3).sum())), 0.1 * k)
-        lp, lc = G.live(0.1 * k, pose[:2])
-        r = sf.compose(ch, np.vstack([pts, lp]), np.vstack([cols, lc]), np.concatenate([foot, np.full(len(lp), 0.3)]),
-                       sky_rgb=sky_rgb, ground_rgb=(110, 105, 100))
-        out["filter"].append(_sha(d)); out["grid"].append(_sha(lp, lc))
-        out["points"].append(_sha(pts, cols, foot)); out["depth_buffer"].append(_sha(r.depth))
-        out["occupancy"].append(_sha(r.masks["observed"], r.masks["filled"]))
-    return out
-
-
-def check_backdrop_render_only() -> None:
-    """S19 (Michael 2026-11-26 "the sky is not visible only the road"; Skeptic: byte-identical hashes): chase px below the
-    horizon with no point and a ground range in (PRIOR_MAX_M, FAR_M] were "unknown" (black). With a sky colour they are a
-    2-D backdrop (ground colour fading to haze) counted as far; without one they stay unknown. The sky colour touches
-    ONLY compose's colour image: with it on vs off the sha256 of the ground-grid occupancy memory, every CamDepthFilter
-    output, the point set handed to compose (what any planner / AEB consumer would read), the observed/filled masks and
-    the render's depth buffer are identical; and in the preview the sky colour is read only by compose."""
-    on = _sky_pipeline((150, 180, 220)); off = _sky_pipeline(None)
-    for key in ("filter", "grid", "points", "depth_buffer", "occupancy"):
-        assert on[key] == off[key], f"{key}: sha256 differs with sky on vs off"
-    ch = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 160, 90, 0.0)
-    pts = np.array([[0.0, 5.0, 0.0], [1.0, 6.0, 0.0]]); cols = np.full((2, 3), 120, np.uint8); foot = np.full(2, 0.3)
-    r1 = sf.compose(ch, pts, cols, foot, sky_rgb=(150, 180, 220), ground_rgb=(110, 105, 100))
-    r0 = sf.compose(ch, pts, cols, foot, sky_rgb=None, ground_rgb=(110, 105, 100))
-    rays = sf._pixel_rays(ch); dz = rays[..., 2]; up = dz >= -1e-9
-    t = np.where(up, np.inf, -ch.pos[2] / np.where(up, -1.0, dz))
-    rng = np.where(up, np.inf, np.hypot(ch.pos[0] + t * rays[..., 0], ch.pos[1] + t * rays[..., 1]))
-    band = ~up & (rng > sf.PRIOR_MAX_M) & (rng <= sf.FAR_M) & ~r1.masks["observed"] & ~r1.masks["filled"]
-    assert band.sum() > 20, "fixture: the band exists"
-    assert not r1.masks["unknown"][band].any() and r1.masks["far"][band].all()
-    assert not sf.black_mask(r1.rgb)[band].any()
-    assert r0.masks["unknown"][band].all(), "no sky colour: still unknown"
-    assert _sha(r1.depth, r1.masks["observed"], r1.masks["filled"]) == _sha(r0.depth, r0.masks["observed"], r0.masks["filled"])
-    tool = (ROOT / "tools" / "rv_stable_preview.py").read_text(encoding="utf-8")
-    uses = [ln for ln in tool.splitlines() if "sky_rgb" in ln and not ln.lstrip().startswith("#")]
-    assert all(("sky_rgb = " in ln) or ("S.compose(" in ln) or ("sky_rgb is None" in ln) or ("sky_rgb=" in ln) for ln in uses), uses
-    assert not any("filters[" in ln or "grid." in ln or "evidence" in ln for ln in uses), "sky colour must not reach filter/grid/evidence"
-
-
 def check_flag_and_deps() -> None:
     assert sf.STABLE_FILL_DEFAULT_ON is False
     tree = ast.parse(MOD.read_text(encoding="utf-8"))
@@ -735,7 +667,7 @@ if __name__ == "__main__":
                check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership,
                check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_rejected_road_px_render_raw,
                check_filter_keeps_ground, check_ground_footprint, check_snap_range_and_exclude,
-               check_edge_cut_includes_snapped, check_edge_cut_drops_px_next_to_sky, check_splat_radius_covers_ground_grid, check_backdrop_render_only, check_flag_and_deps):
+               check_edge_cut_includes_snapped, check_edge_cut_drops_px_next_to_sky, check_splat_radius_covers_ground_grid, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

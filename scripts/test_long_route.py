@@ -312,6 +312,16 @@ def check_driver_speed_caps() -> None:
     node_speeds = {float(v) for c in veh.sent if c.startswith("ai.setLine(") for _a, _b, v in POS.findall(SET_LINE.match(c).group(1))}
     assert node_speeds == {25.0, 11.0}, node_speeds  # this route is highway then dirt
 
+    # A city return (no dirt): city road is capped at 14 m/s, written as a literal here, not the constant.
+    _g, city_route = route_of(loop_network(dirt=False), seed=2)
+    assert CITY in city_route.kinds and "dirt" not in city_route.kinds, set(city_route.kinds)
+    veh = FakeVehicle()
+    drive(city_route, veh, lr.RouteDriver(city_route), speed=25.0)
+    speeds = [float(c[len("ai.setSpeed("):-1]) for c in veh.sent if c.startswith("ai.setSpeed(")]
+    assert max(speeds) == 25.0 and 14.0 in speeds and set(speeds) == {25.0, 14.0}, sorted(set(speeds))
+    nodes = {float(v) for c in veh.sent if c.startswith("ai.setLine(") for _a, _b, v in POS.findall(SET_LINE.match(c).group(1))}
+    assert nodes == {25.0, 14.0}, nodes
+
     print("driver: speeds are capped by road kind (dirt 11, city 14 m/s); the highway keeps the clip speed")
 
 
@@ -380,6 +390,7 @@ def check_collector_hooks() -> None:
 
 def check_route_length_fits_the_clip() -> None:
     """total_m is bounded by the clip's driving budget (duration x 11 m/s): at most 1.25x (hard), and 0.4x or more (it prefers 0.6x, but honouring the requested direction comes first)."""
+    fills = cases = 0
     for map_name in ("west_coast_usa", "italy"):
         g = _real(map_name)
         for dur in (300.0, 600.0, 900.0):
@@ -389,6 +400,10 @@ def check_route_length_fits_the_clip() -> None:
                     assert r is not None, (map_name, dur, seed, d)
                     ratio = r.total_m / (dur * 11.0)
                     assert 0.4 <= ratio <= 1.25 + 1e-9, (map_name, dur, seed, d, round(ratio, 2))
+                    fills += ratio >= 0.6
+                    cases += 1
+    # The planner prefers a route that fills the clip (>= 0.6x): 45 of these 48 do; the lower window is what does it.
+    assert cases == 48 and fills >= 44, (fills, cases)
     # A clip too short to hold the only highway is not given an overlong route.
     _g, r = route_of(loop_network(dirt=True), seed=1)
     assert r is not None and r.total_m <= 1.25 * 750.0 * 11.0
@@ -396,6 +411,18 @@ def check_route_length_fits_the_clip() -> None:
     for dur in (60.0, 200.0):
         assert lr.plan_highway_route(g, map_name="synthetic", seed=1, direction=0, duration_s=dur) is None, dur
     print("route length: 0.4-1.25x (never over) the clip budget on both real maps; a clip too short for the highway gets no route")
+
+
+def check_short_highway_gets_no_route() -> None:
+    """A highway under 800 m is not a long highway: no route, however good the loop back is."""
+    def net(hw_m):
+        return [road("H1", line(0, 0, hw_m, 0), oneway=True, lanes=2, width=8.0),
+                road("C1", line(hw_m, 10, hw_m, 800), width=7.0), road("C2", line(hw_m, 800, 0, 800), width=7.0),
+                road("C3", line(0, 800, 0, 10), width=7.0)]
+    assert lr.plan_highway_route(lr.build_graph(net(700)), map_name="synthetic", seed=1, direction=0) is None
+    ok = lr.plan_highway_route(lr.build_graph(net(900)), map_name="synthetic", seed=1, direction=0)
+    assert ok is not None and 800.0 <= ok.highway_m <= 1000.0, ok
+    print("short highway: 700 m gets no route, 900 m does")
 
 
 def check_end_tolerance_and_constants() -> None:
@@ -559,6 +586,7 @@ def main() -> None:
     check_driver_speed_caps()
     check_collector_hooks()
     check_route_length_fits_the_clip()
+    check_short_highway_gets_no_route()
     check_end_tolerance_and_constants()
     check_return_cost_jitter_and_avoid()
     check_dirt_preferred_over_equal_city_loop()

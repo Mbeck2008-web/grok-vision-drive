@@ -973,6 +973,7 @@ def check_verdicts_follow_exit_quality_and_measure() -> None:
     none = {"far_end_reached": False, "loop_closed": False, "driven_m": MIN_DRIVEN_M - 1.0}
     cases = [
         (0, ok, full, "completed"), (0, ok, far, "far_end_only"), (0, ok, short, "partial"), (0, ok, none, "not_driven"),
+        (0, ok, {"far_end_reached": False, "loop_closed": True, "driven_m": 9000.0}, "partial"),  # both are required
         (0, ok, None, "drive_around"), (1, ok, full, "failed"), (99, ok, None, "failed"),
         (0, {"clip_class": "reject"}, full, "rejected"), (0, {"clip_class": "pretrain_only"}, full, "completed"),
     ]

@@ -62,16 +62,23 @@ class RouteCar(sf._CrashVehicle):
     def __init__(self, stop: Path, route: lr.Route | None = None, rest_polls: int = 5, leave_at_m: float | None = None,
                  tail_polls: int = 40, max_polls: int = 3000, stall_at_m: float | None = None,
                  recover_to: str | None = None, stuck_start: str | None = None,
-                 restall_after_m: float | None = None, wrong_deck_dz: float = 0.0, **_kw: object) -> None:
+                 restall_after_m: float | None = None, wrong_deck_dz: float = 0.0,
+                 wrong_deck_on_place: int | None = None, follow_deck_after_m: float | None = None,
+                 follow_deck_dz: float = 7.8, **_kw: object) -> None:
         super().__init__(stop, stop_at=10**9)
         self.wrong_deck_dz = float(wrong_deck_dz or 0.0)
+        self.wrong_deck_on_place = int(wrong_deck_on_place) if wrong_deck_on_place else None
+        self.follow_deck_after_m = None if follow_deck_after_m is None else float(follow_deck_after_m)
+        self.follow_deck_dz = float(follow_deck_dz)
         self.route = route
         self.rest_polls, self.leave_at_m, self.tail_polls, self.max_polls = rest_polls, leave_at_m, tail_polls, max_polls
         self.mode = None
         self.has_line = False
+        self.set_line_polls: list[int] = []
         self.s = 0.0
         self.placed: list[tuple[tuple, tuple]] = []
         self.s_at_teleport: list[float] = []  # where on the route the car was when each teleport came
+        self.place_polls: list[int] = []
         self.cmd_poll: list[int] = []
         self.cmd_s: list[float] = []
         self.parked = False
@@ -91,6 +98,7 @@ class RouteCar(sf._CrashVehicle):
     def teleport(self, pos, rot_quat=None, reset=False) -> None:
         self.placed.append((tuple(pos), tuple(rot_quat or ())))
         self.s_at_teleport.append(self.s)
+        self.place_polls.append(self.polls)
         if len(self.placed) == 1:  # the car is on the first pose; later teleports do not move the fake ...
             self.s = 0.0
         elif self.stuck_start is not None or self.restall_after_m is not None:
@@ -121,6 +129,7 @@ class RouteCar(sf._CrashVehicle):
         self.cmd_s.append(self.s)
         if _is_set_line(command):
             self.has_line = True
+            self.set_line_polls.append(self.polls)
             return
         if not isinstance(command, str):
             return
@@ -168,9 +177,27 @@ class RouteCar(sf._CrashVehicle):
         if self.parked:
             x += 120.0
         z = 0.5
+        if self.placed:
+            # After a teleport, report the placed z so a recover/resume settle can be checked.
+            z = float(self.placed[-1][0][2])
         if self.wrong_deck_dz and self.placed:
             # Same xy as the teleport, z = requested z + dz (smoke-c resume: +17 m on an overpass deck).
             x, y, z = self.placed[-1][0][0], self.placed[-1][0][1], self.placed[-1][0][2] + self.wrong_deck_dz
+        elif self.wrong_deck_on_place and self.placed and len(self.placed) == self.wrong_deck_on_place:
+            z = float(self.placed[-1][0][2]) + 17.0
+        if self.follow_deck_after_m is not None and self.s >= self.follow_deck_after_m and len(self.placed) == 1:
+            # Mid-drive only (still the start place). Resume teleports clear the lift.
+            plan_z = float(self.route.points[0][2]) if self.route is not None else 0.4
+            if self.route is not None:
+                _i, _s, _d = lr.project_forward(self.route, x, y, 0, back=0, ahead_m=1e9)
+                pts, cum = self.route.points, self.route.cum
+                if _i < len(pts) - 1:
+                    seg = max(1e-6, cum[_i + 1] - cum[_i])
+                    t = min(1.0, max(0.0, (_s - cum[_i]) / seg))
+                    plan_z = float(pts[_i][2] + (pts[_i + 1][2] - pts[_i][2]) * t)
+                else:
+                    plan_z = float(pts[-1][2])
+            z = plan_z + self.follow_deck_dz
         self.state = {
             "pos": [x, y, z], "dir": [dx, dy, 0.0], "up": [0.0, 0.0, 1.0],
             "electrics": {"wheelspeed": self.v, "steering_input": 0.0, "throttle_input": 0.3, "brake_input": 0.0},
@@ -184,6 +211,7 @@ def run(route: lr.Route, extra: list[str] | None = None, paint=None, **car_kw: o
     from scripts.gvd_test_env import collect_root
 
     cars: list[RouteCar] = []
+    snap_dz = float(car_kw.pop("snap_dz", 0.0) or 0.0)
 
     def factory(stop: Path, **_kw: object) -> RouteCar:
         cars.append(RouteCar(stop, route, **car_kw))
@@ -202,7 +230,7 @@ def run(route: lr.Route, extra: list[str] | None = None, paint=None, **car_kw: o
         del bng
         if near is None or len(near) < 3:
             return None
-        return (float(near[0]), float(near[1]), float(near[2])), (0.0, 0.0, 0.0, 1.0)
+        return (float(near[0]), float(near[1]), float(near[2]) + snap_dz), (0.0, 0.0, 0.0, 1.0)
 
     level_session.snap_to_road = _snap  # type: ignore[assignment]
     try:
@@ -525,6 +553,135 @@ def check_wrong_deck_start_does_not_send_set_line() -> None:
     assert car.has_line is False
     print("collector route run: a +17 m wrong-deck start is spawn_failed, no set_line")
 
+def check_wrong_deck_resume_does_not_send_set_line() -> None:
+    """The 3rd place_vehicle is the first route resume (source=segment). A +17 m
+    settle there must be spawn_failed. A mutant that drops "segment" from the
+    reject tuple swallows the error and keeps going (a later resume or set_line).
+    """
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(route, stuck_start="until_moved", wrong_deck_on_place=3)
+    assert code == 2, (code, text[-3000:])
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "spawn_failed", status
+    detail = (status.get("stop_detail") or "") + text
+    assert "could not be placed" in detail and "off the planned z" in detail, detail[-2500:]
+    assert "source=segment" in text, text[-2500:]
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["resumes"] == 1, summary  # the failed resume was counted; no second resume
+    assert len(car.place_polls) >= 3, car.place_polls
+    resume_at = car.place_polls[2]
+    line_after = [p for p in car.set_line_polls if p >= resume_at]
+    assert not line_after, f"set_line went out after a wrong-deck resume: polls {line_after}"
+    print("collector route run: a +17 m wrong-deck resume (source=segment) is spawn_failed, resumes=1, no set_line after the place")
+
+
+def check_recover_wrong_deck_compares_to_plan_z() -> None:
+    """Recover snap and settle both +17 m above plan z must fail the recover z-check.
+
+    Comparing settled z to the snap pose (moved) misses this: both are high, |dz|~0.
+    The check must use the route's plan z. End the segment (resume path), do not
+    follow on the wrong deck, and do not stop as recover_failed.
+    """
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(
+        route, stall_at_m=50.0, snap_dz=17.0, extra=["--minutes", "20"], max_polls=8000,
+    )
+    # Recover must log the z failure against the plan (not silently follow).
+    rec = [line for line in text.splitlines() if "collect recover" in line and "failed" in line and "off the planned z" in line]
+    assert rec, f"recover z-check must fire when snap and settle are both high:\n{text[-3000:]}"
+    assert "recover_failed" not in (json.loads((out / "collect.json").read_text(encoding="utf-8")).get("stop_reason") or ""), text[-2000:]
+    # After recover reject the car must not be followed on the +17 m deck: no set_line
+    # between the recover place (2nd) and a later resume place (3rd), if any.
+    assert len(car.place_polls) >= 2, car.place_polls
+    rec_at = car.place_polls[1]
+    resume_at = car.place_polls[2] if len(car.place_polls) >= 3 else 10**9
+    line_between = [p for p in getattr(car, "set_line_polls", []) if rec_at <= p < resume_at]
+    assert not line_between, f"set_line on the wrong recover deck: {line_between}"
+
+    # The recover reject itself must end the segment under the abort that was in
+    # progress (typically stationary). A swallowed reject would only be caught
+    # later as mid-drive wrong_deck.
+    lines = text.splitlines()
+    failed_i = next(
+        (i for i, line in enumerate(lines) if "collect recover" in line and "failed" in line and "off the planned z" in line),
+        None,
+    )
+    assert failed_i is not None
+    later_ends = [line for line in lines[failed_i:] if line.startswith("collect segment end")]
+    assert later_ends, "recover z-fail must end the segment"
+    assert "wrong_deck" not in later_ends[0], later_ends[0]
+    print("collector route run: recover snap+settle both +17 m vs plan z ends the segment, no set_line on that deck")
+
+
+def check_recover_wrong_deck_uses_post_settle_z() -> None:
+    """A recover whose snap (pre-settle) is on the plan but the settled z is +17 m must fail.
+
+    A mutant that compares to the pre-settle / moved z misses this and follows.
+    """
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(
+        route, stall_at_m=50.0, wrong_deck_on_place=2, extra=["--minutes", "20"], max_polls=8000,
+    )
+    rec = [line for line in text.splitlines() if "collect recover" in line and "failed" in line and "off the planned z" in line]
+    assert rec, f"recover must use post-settle z:\n{text[-3000:]}"
+    assert "recover_failed" not in (json.loads((out / "collect.json").read_text(encoding="utf-8")).get("stop_reason") or "")
+
+    # The recover reject itself must end the segment under the abort that was in
+    # progress (typically stationary). A swallowed reject would only be caught
+    # later as mid-drive wrong_deck.
+    lines = text.splitlines()
+    failed_i = next(
+        (i for i, line in enumerate(lines) if "collect recover" in line and "failed" in line and "off the planned z" in line),
+        None,
+    )
+    assert failed_i is not None
+    later_ends = [line for line in lines[failed_i:] if line.startswith("collect segment end")]
+    assert later_ends, "recover z-fail must end the segment"
+    assert "wrong_deck" not in later_ends[0], later_ends[0]
+    print("collector route run: recover on-plan snap + +17 m settle is a failed recover (post-settle z)")
+
+
+def check_mid_drive_wrong_deck_ends_the_segment() -> None:
+    """A mid-drive |car z − plan z| jump (smoke-c +7.8 m) must stop set_line and end the
+    segment so the next open is a route resume, not off_route or recover_failed.
+    """
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(
+        route, follow_deck_after_m=80.0, follow_deck_dz=7.8, extra=["--minutes", "20"], max_polls=8000,
+    )
+    assert "off the planned z" in text, text[-3000:]
+    follow_lines = [line for line in text.splitlines() if "following" in line and "off the planned z" in line]
+    assert follow_lines or "wrong_deck" in text, text[-3000:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status.get("stop_reason") != "recover_failed", status
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["state"] != "off_route", summary
+    # The lift is only on the first place; a successful resume continues on plan z.
+    assert summary["resumes"] >= 1, summary
+    print("collector route run: mid-drive +7.8 m |car z-plan z| ends the segment and resumes, not off_route")
+
+
+def check_failed_route_place_message_surfaces_low_yield_and_segment() -> None:
+    """A wrong-deck reject for source=low_yield or source=segment is an error, not None.
+
+    The collector must not swallow it while a route is active (caller would keep driving).
+    low_yield still must not teleport an on-plan car (check_low_yield_stays_off_a_route_clip).
+    """
+    import scripts.collect_scene_lanes as collect
+
+    assert "segment" in collect.ROUTE_PLACE_FAIL_SOURCES
+    assert "low_yield" in collect.ROUTE_PLACE_FAIL_SOURCES
+    err = "route place landed +17.0 m off the planned z (limit 5 m)"
+    for source in ("spawn", "segment", "recheck", "low_yield"):
+        msg = collect.failed_route_place_message(source, "west_coast_usa", err)
+        assert msg, f"{source} must surface the reject"
+        assert "could not be placed" in msg and "17" in msg, (source, msg)
+    # stall/impact mid-run still keep the current pose when they somehow fail a place
+    assert collect.failed_route_place_message("stall", "west_coast_usa", err) is None
+    assert collect.failed_route_place_message("impact", "west_coast_usa", err) is None
+    print("failed_route_place_message: spawn/segment/recheck/low_yield surface the error; stall/impact do not")
+
+
 
 def main() -> None:
     check_route_runs_through_the_collector()
@@ -540,6 +697,11 @@ def main() -> None:
     check_three_resumes_then_the_clip_stops()
     check_failed_route_resume_placement_stops_the_clip()
     check_wrong_deck_start_does_not_send_set_line()
+    check_wrong_deck_resume_does_not_send_set_line()
+    check_recover_wrong_deck_compares_to_plan_z()
+    check_recover_wrong_deck_uses_post_settle_z()
+    check_mid_drive_wrong_deck_ends_the_segment()
+    check_failed_route_place_message_surfaces_low_yield_and_segment()
     print("test_collect_route_drive: OK")
 
 

@@ -1079,6 +1079,20 @@ def decode_issues(root: Path) -> list[str]:
     return []
 
 
+ROUTE_PLACE_FAIL_SOURCES = ("spawn", "segment", "recheck", "low_yield")
+
+
+def failed_route_place_message(source: str, map_name: str, err: str) -> str | None:
+    """Error string when a route place fails, or None to keep the current pose.
+
+    ``low_yield`` and ``segment`` must not be swallowed: the caller would keep
+    driving. stall/impact mid-run still keep the current pose.
+    """
+    if source in ROUTE_PLACE_FAIL_SOURCES:
+        return f"{map_name}: legal spawn pose could not be placed: {err}"
+    return None
+
+
 def start_freeroam(bng: Any, level: str) -> bool:
     """Ask the running session to load ``level``. Does not close BeamNGpy.
 
@@ -2416,7 +2430,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
             stall_s = max(0.0, float(live.slow_s)) if reason in ("stationary", "impact") else 0.0
-            end_segment = segment_aborts >= 2 and reason in HARD_SEGMENT_REASONS
+            end_segment = (segment_aborts >= 2 and reason in HARD_SEGMENT_REASONS) or reason == "wrong_deck"
             if not end_segment:
                 from python.collect.level_session import place_vehicle, recover_points, snap_to_road
 
@@ -2448,9 +2462,16 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         )
                         wait_t0, wait_t1, settled_hz = _settle_after_teleport("recover")
                         if route_driver is not None and route_driver.active:
-                            from python.collect.long_route import route_place_z_error
+                            from python.collect.long_route import route_place_z_error, route_plan_z
 
-                            deck_err = route_place_z_error(moved, _settled_xyz(vehicle))
+                            plan_z = route_plan_z(
+                                route_driver.route, float(moved[0]), float(moved[1]), route_driver.index
+                            )
+                            # Compare settled z to the route plan z, not the snap pose
+                            # (snap and settle can both land on a stacked deck).
+                            deck_err = route_place_z_error(
+                                (moved[0], moved[1], plan_z), _settled_xyz(vehicle)
+                            )
                             if deck_err:
                                 # Do not start following or send set_line. End the
                                 # segment so the next open is a route resume (the
@@ -2708,23 +2729,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 # "segment" is a route resume: resume() already advanced the driver, so swallowing
                 # this would burn a resume and keep driving from the stall. "recheck" callers also
                 # honour the error return; stall/impact mid-run still keep the current pose.
-                if source in ("spawn", "segment", "recheck"):
-                    return f"{map_name}: legal spawn pose could not be placed: {shift}"
-                return None
+                return failed_route_place_message(source, map_name, shift)
             count = traffic_count(args.traffic, map_name)
             ge = getattr(bng, "queue_lua_command", None)
             slots, notes = [], []
             if count and spawn_deck is not None:
-                from python.collect.spawn_mix import drop_ahead_traffic_slots
-
                 slots, notes = spawn_deck.traffic_slots(
                     picked, count, float(args.traffic_ahead_m), float(args.traffic_behind_m)
                 )
-                if route_driver is not None:
-                    kept = drop_ahead_traffic_slots(slots)
-                    if len(kept) != len(slots):
-                        notes.append("traffic ahead skipped: same-lane companions stay behind on a route clip")
-                    slots = kept
                 for note in notes:
                     print(f"collect {note}", flush=True)
                 placed = " ".join(f"{where}={along:.1f}m" for where, _p, _r, along in slots) or "none"
@@ -2744,17 +2756,20 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             )
             wait_t0, wait_t1, settled_hz = _settle_after_teleport(source)
             if route_driver is not None and route_driver.active:
-                from python.collect.long_route import route_place_z_error
+                from python.collect.long_route import route_place_z_error, route_plan_z
 
-                deck_err = route_place_z_error(picked.pos, _settled_xyz(vehicle))
+                plan_z = route_plan_z(
+                    route_driver.route, float(picked.pos[0]), float(picked.pos[1]), route_driver.index
+                )
+                deck_err = route_place_z_error(
+                    (picked.pos[0], picked.pos[1], plan_z), _settled_xyz(vehicle)
+                )
                 if deck_err:
                     # Do not start following or send set_line. The existing
                     # spawn_failed / resume path handles the error (a resume
                     # already counted this attempt; never loop forever).
                     print(f"collect spawn {segment_id} {picked.kind} failed {deck_err}", flush=True)
-                    if source in ("spawn", "segment", "recheck"):
-                        return f"{map_name}: legal spawn pose could not be placed: {deck_err}"
-                    return None
+                    return failed_route_place_message(source, map_name, deck_err)
             spawn_kind = picked.kind
             spawn_cov = picked.paint_cov
             spawn_road = str(picked.road_id)
@@ -3375,6 +3390,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         if not route_driver.active:
                             last_ai = None  # finished or abandoned at rest: the plain span send runs from the next tick
                             print(f"collect route {segment_id} driver {route_driver.summary()}", flush=True)
+                        if route_driver.deck_error:
+                            last_error = f"{segment_id} {route_driver.deck_error}"
+                            print(f"collect route {segment_id} following {route_driver.deck_error}", flush=True)
+                            code = _abort("wrong_deck")
+                            if code is not None:
+                                return code
+                            _tick_sleep(tick_mark)
+                            tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                            continue
                     elif last_ai is None:
                         for command in ai_commands(speed, waypoint, traffic=False):
                             try:
@@ -3713,6 +3737,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if was_active and not route_driver.active:
                     last_ai = None  # route finished or abandoned: the normal AI send resumes next tick
                     print(f"collect route {segment_id} driver {route_driver.summary()}", flush=True)
+                if route_driver.deck_error:
+                    last_error = f"{segment_id} {route_driver.deck_error}"
+                    print(f"collect route {segment_id} following {route_driver.deck_error}", flush=True)
+                    cam_sched.undo()
+                    code = _abort("wrong_deck")
+                    if code is not None:
+                        return code
+                    tick_dt = 0.1
+                    continue
             if send_ai:
                 commands = (
                     excursion_commands(

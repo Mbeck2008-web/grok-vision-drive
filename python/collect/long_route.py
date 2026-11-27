@@ -17,8 +17,7 @@ within ``JOIN_M`` of another road joins it. A route is
   jitter, so each clip loops back a different way.
 
 The line is offset into the legal right-hand lane (``_offset_candidates``, the
-rule the spawn deck uses), then inset so the car body plus a margin stays
-inside the dump road edge, so it can be sent to the AI as ``vehicle.ai.set_line``.
+rule the spawn deck uses), so it can be sent to the AI as ``vehicle.ai.set_line``.
 
 ``RouteDriver`` turns a position into AI commands: it sends the next
 ``window_m`` of the route as a ``set_line`` command (the helper ``excursion.py`` already
@@ -59,10 +58,6 @@ from python.collect.spawn_mix import (
 # A road end within this of another road's centerline point joins it.
 JOIN_M = 15.0
 JOIN_DZ_M = 5.0
-# Inset the route polyline from the dump road edge so the car body stays clear
-# of barriers (EDGE_MARGIN_M 0.15 alone left the line hugging the edge).
-ROUTE_BODY_HALF_M = 1.0
-ROUTE_EDGE_MARGIN_M = 0.6
 # A junction hop costs this much extra, so the planner does not zig-zag across roads.
 LINK_COST_M = 8.0
 # Smallest highway leg worth calling "end to end".
@@ -103,9 +98,10 @@ def route_place_z_error(
     *,
     limit_m: float = JOIN_DZ_M,
 ) -> str | None:
-    """Return an error if the settled z is more than ``limit_m`` from the requested z.
+    """Return an error if the settled z is more than ``limit_m`` from the reference z.
 
-    After a route teleport the car must rest on the planned deck (plan z + 0.5),
+    The first pose is the route plan z (or any reference z the caller chooses).
+    After a route teleport, and mid-drive, the car must rest on the planned deck,
     not a stacked surface above or below it. ``JOIN_DZ_M`` (5 m) is the same
     vertical join used when linking roads. A missing or short pose is also an error.
     """
@@ -124,6 +120,22 @@ def route_place_z_error(
     if abs(dz) > float(limit_m):
         return f"route place landed {dz:+.1f} m off the planned z (limit {float(limit_m):.0f} m)"
     return None
+
+
+def _interp_plan_z(route: "Route", i: int, s: float) -> float:
+    """Plan z at arc length ``s`` on segment ``i``."""
+    pts, cum = route.points, route.cum
+    if i >= len(pts) - 1:
+        return float(pts[-1][2])
+    seg = max(1e-6, cum[i + 1] - cum[i])
+    t = min(1.0, max(0.0, (s - cum[i]) / seg))
+    return float(pts[i][2] + (pts[i + 1][2] - pts[i][2]) * t)
+
+
+def route_plan_z(route: "Route", x: float, y: float, start_index: int = 0) -> float:
+    """The planned route height at the projection of ``(x, y)``."""
+    i, s, _d = project_forward(route, x, y, start_index, ahead_m=1e9)
+    return _interp_plan_z(route, i, s)
 
 
 def is_dirt_material(material: object) -> bool:
@@ -385,11 +397,7 @@ class RoadGraph:
         return cost
 
     def lane_offset(self, n: int) -> float:
-        """Metres right of the travel tangent for the node's road.
-
-        Starts from the spawn-deck rightmost-lane rule, then clamps so
-        ``ROUTE_BODY_HALF_M + ROUTE_EDGE_MARGIN_M`` stays inside the dump edge.
-        """
+        """Metres right of the travel tangent for the node's road (rightmost lane, spawn-deck rule)."""
         ri, pi = self.node_road[n], self.node_pi[n]
         road = self.roads[ri]
         widths = road.get("widths") or []
@@ -401,14 +409,7 @@ class RoadGraph:
             cands = _offset_candidates(road, width)
         except (KeyError, TypeError, ValueError):
             return 0.0
-        off = float(cands[0]) if cands else 0.0
-        inset = ROUTE_BODY_HALF_M + ROUTE_EDGE_MARGIN_M
-        cap = max(0.0, width / 2.0 - inset)
-        if off > cap:
-            return cap
-        if off < -cap:
-            return -cap
-        return off
+        return float(cands[0]) if cands else 0.0
 
 
 def build_graph(roads: Sequence[dict[str, Any]], pools: dict[str, list[dict[str, Any]]] | None = None) -> RoadGraph:
@@ -653,6 +654,7 @@ class RouteDriver:
         self._off = 0
         self._sent_at: float | None = None
         self._sent_speed: float | None = None
+        self.deck_error: str | None = None
 
     @property
     def active(self) -> bool:
@@ -661,7 +663,7 @@ class RouteDriver:
     def _project(self, x: float, y: float) -> tuple[int, float, float]:
         return project_forward(self.route, x, y, self.index)
 
-    def commands(self, x: float, y: float, speed_mps: float) -> list[object]:
+    def commands(self, x: float, y: float, speed_mps: float, z: float | None = None) -> list[object]:
         if not self.active:
             return []
         i, s, d = self._project(x, y)
@@ -675,6 +677,12 @@ class RouteDriver:
         self._off = 0
         self.index = i
         self.progress_m = max(self.progress_m, s)
+        if z is not None:
+            err = route_place_z_error((x, y, _interp_plan_z(self.route, i, s)), (x, y, z))
+            if err:
+                # Stay active so resume() still works; the collector ends the segment.
+                self.deck_error = err
+                return []
         if self.progress_m >= self.route.far_end_m - FAR_END_TOL_M:
             self.far_end_reached = True
         if self.progress_m >= self.route.total_m - self.end_tol_m:
@@ -718,6 +726,7 @@ class RouteDriver:
     def note_start(self) -> None:
         """The collector took the route's own start pose."""
         self.spawns += 1
+        self.deck_error = None
 
     def resume(self) -> tuple[SpawnPick | None, str]:
         """A respawn on the route itself, ``RESUME_NUDGE_M`` past the farthest point the car reached.
@@ -744,6 +753,7 @@ class RouteDriver:
         self.resumes += 1
         self.spawns += 1
         self._off = 0
+        self.deck_error = None
         self.reset_send()
         return pick, ""
 
@@ -845,7 +855,16 @@ def drive_tick(driver: RouteDriver, pos: Sequence[float] | None, speed_mps: floa
         return False
     if pos is None or len(pos) < 2:
         return True
-    for cmd in driver.commands(float(pos[0]), float(pos[1]), float(speed_mps)):
+    z: float | None = None
+    if len(pos) >= 3:
+        try:
+            z_val = float(pos[2])
+        except (TypeError, ValueError):
+            z_val = None
+        else:
+            if math.isfinite(z_val):
+                z = z_val
+    for cmd in driver.commands(float(pos[0]), float(pos[1]), float(speed_mps), z=z):
         queue(cmd)
     return True
 

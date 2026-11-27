@@ -880,50 +880,73 @@ def check_route_place_rejects_wrong_deck() -> None:
     print("route place z: |dz| > 5 m is a failed place; |dz| == 5 m and the +17/-17 smoke-c cases are pinned")
 
 
-def check_route_polyline_is_inset_from_the_edge() -> None:
-    """Rightmost-lane offset is clamped so half-width + margin stays inside the dump edge."""
-    assert lr.ROUTE_BODY_HALF_M == 1.0
-    assert lr.ROUTE_EDGE_MARGIN_M == 0.6
-    inset = 1.0 + 0.6
-    # A 6 m two-lane one-way "narrow bridge": the spawn-deck cap (EDGE_MARGIN_M 0.15)
-    # leaves the rightmost lane 1.5 m from the edge, inside a 1.0+0.6 m body.
-    roads = [road("B1", line(0, 0, 400, 0), oneway=True, lanes=2, width=6.0)]
-    g = lr.build_graph(roads)
-    nodes = [n for n in range(len(g.xyz)) if g.roads[g.node_road[n]]["id"] == "B1"]
-    assert len(nodes) >= 3, nodes
-    # Unclamped deck offset is too close; the route clamp must pull it to width/2 - 1.6.
-    from python.collect.spawn_mix import _offset_candidates, _station_width
+def check_following_z_guard_stops_the_line() -> None:
+    """Mid-drive |car z − plan z| > JOIN_DZ_M must not send set_line; the driver stays active for resume."""
+    _g, route = route_of(loop_network(dirt=False), seed=2)
+    drv = lr.RouteDriver(route)
+    x, y, z0 = route.points[0]
+    # On-plan first tick still sends the window.
+    cmds = drv.commands(x, y, 20.0, z=z0)
+    assert any(is_set_line_cmd(c) for c in cmds), cmds
+    assert drv.deck_error is None
+    assert drv.active
+    # Smoke-c row 343: +7.8 m mid-drive. No new line; stay following so resume() still works.
+    high = lr.RouteDriver(route)
+    cmds = high.commands(x, y, 20.0, z=z0 + 7.8)
+    assert cmds == [], cmds
+    assert high.deck_error and "off the planned z" in high.deck_error, high.deck_error
+    assert "7.8" in high.deck_error or "7." in high.deck_error, high.deck_error
+    assert high.active and high.state != "off_route", high.summary()
+    # Smoke-c row 1179: -12.5 m.
+    low = lr.RouteDriver(route)
+    cmds = low.commands(x, y, 20.0, z=z0 - 12.5)
+    assert cmds == [], cmds
+    assert low.deck_error and "off the planned z" in low.deck_error, low.deck_error
+    assert low.active
+    # |dz| == 5 m is allowed; 5.01 is not. drive_tick must pass z through.
+    ok = lr.RouteDriver(route)
+    queued: list[object] = []
+    assert lr.drive_tick(ok, [x, y, z0 + 5.0], 20.0, queued.append)
+    assert any(is_set_line_cmd(c) for c in queued), queued
+    assert ok.deck_error is None
+    bad = lr.RouteDriver(route)
+    queued = []
+    assert lr.drive_tick(bad, [x, y, z0 + 5.01], 20.0, queued.append)
+    assert queued == [], queued
+    assert bad.deck_error
+    # plan z helper matches the start point.
+    assert abs(lr.route_plan_z(route, x, y, 0) - z0) < 1e-6
+    print("following z: +7.8 / -12.5 stop the line; |dz|==5 allowed; drive_tick passes z; driver stays active")
 
-    raw = _offset_candidates(g.roads[g.node_road[nodes[1]]], _station_width(g.roads[g.node_road[nodes[1]]].get("widths")[g.node_pi[nodes[1]]], g.roads[g.node_road[nodes[1]]]))
-    assert raw and abs(6.0 / 2.0 - abs(raw[0]) - 1.5) < 1e-9, raw
-    cap = 6.0 / 2.0 - inset
-    for n in nodes:
-        off = g.lane_offset(n)
-        dist = 6.0 / 2.0 - abs(off)
-        assert abs(off - cap) < 1e-9, (n, off, cap)
-        assert dist + 1e-9 >= inset, (n, off, dist)
-    pts, _kinds = lr._polyline(g, nodes)
-    assert pts, "polyline is not empty"
-    # Road along +x at y=0; right-hand offset is -y. Every point stays 1.6 m inside y=+/-3.
-    for x, y, _z in pts:
-        dist = 6.0 / 2.0 - abs(y)
-        assert dist + 1e-9 >= inset, (x, y, dist)
-        assert abs(abs(y) - cap) < 1e-6, (x, y, cap)
-    # A wider 8 m two-lane one-way already has 2.0 m to the edge: do not over-inset.
-    wide = lr.build_graph([road("H1", line(0, 0, 400, 0), oneway=True, lanes=2, width=8.0)])
-    wn = next(n for n in range(len(wide.xyz)))
-    assert abs(wide.lane_offset(wn) - 2.0) < 1e-9, wide.lane_offset(wn)
-    # A road narrower than half-width+margin: stay on the centerline (cap 0).
-    skinny = lr.build_graph([road("S1", line(0, 0, 200, 0), oneway=True, lanes=1, width=3.0)])
-    sn = next(n for n in range(len(skinny.xyz)))
-    assert abs(skinny.lane_offset(sn)) < 1e-9, skinny.lane_offset(sn)
-    print("route polyline: half-width 1.0 + margin 0.6 from the dump edge; 6 m bridge pinned at offset 1.4")
+
+def check_two_way_offsets_stay_outside_the_centre_deadzone() -> None:
+    """Nothing in the route/spawn offset path enters the 0.83 m two-way centre deadzone."""
+    from python.collect.spawn_mix import EDGE_MARGIN_M, LANE_CLEAR_M, _offset_candidates
+    from python.train.frame_quality import CENTER_DEADZONE_M
+
+    clear = CENTER_DEADZONE_M + LANE_CLEAR_M
+    assert abs(clear - 0.83) < 1e-9, clear
+    # 8 m two-way, two lanes: right-hand legal centres must stay past the deadzone.
+    spec = {"id": "C1", "oneWay": False, "lanes": 2, "width": 8.0, "drivability": 1.0}
+    cands = _offset_candidates(spec, 8.0)
+    assert cands, cands
+    for off in cands:
+        assert abs(off) + 1e-9 >= clear, (off, clear)
+        assert abs(off) <= 8.0 / 2.0 - EDGE_MARGIN_M + 1e-9, off
+    # Route lane_offset uses the same first candidate (no extra inset).
+    g = lr.build_graph([road("C1", line(0, 0, 400, 0), oneway=False, lanes=2, width=8.0)])
+    n = next(n for n in range(len(g.xyz)) if g.roads[g.node_road[n]]["id"] == "C1")
+    off = g.lane_offset(n)
+    assert abs(off) + 1e-9 >= clear, (off, clear)
+    assert abs(off - cands[0]) < 1e-9, (off, cands)
+    print("two-way offsets stay outside the 0.83 m centre deadzone; route lane_offset is the first candidate")
 
 
 def main() -> None:
     check_dirt_material_words()
     check_route_place_rejects_wrong_deck()
-    check_route_polyline_is_inset_from_the_edge()
+    check_following_z_guard_stops_the_line()
+    check_two_way_offsets_stay_outside_the_centre_deadzone()
     check_graph_directions_and_links()
     check_route_shape_synthetic()
     check_dirt_is_used_when_present_and_omitted_when_not()

@@ -29,6 +29,7 @@ from python.collect import long_route as lr  # noqa: E402
 from python.collect.spawn_mix import CITY, HIGHWAY  # noqa: E402
 
 SPEED = 25.0
+CRAWL_M, CRAWL_V = 6.0, 0.95
 MAP = "west_coast_usa"
 
 
@@ -105,7 +106,10 @@ class RouteCar(sf._CrashVehicle):
         if self.leave_at_m is not None and self.s >= self.leave_at_m:
             self.parked = True  # off the route, and stopped there (a stuck car is a car at rest)
         if driven and not self.parked:
-            self.v = SPEED
+            # The last metres before the route's end tolerance are a crawl (< 1 m/s): the car is not "driving" when
+            # it is handed back, which is when the collector's own span send must still take over.
+            crawl = self.s >= self.route.total_m - lr.END_TOL_M - CRAWL_M
+            self.v = CRAWL_V if crawl else SPEED
             self.s = min(self.route.total_m, self.s + self.v * 0.1)
         else:
             self.v = max(0.0, self.v - 0.5)  # 5 m/s2: a stop, not an impact
@@ -175,6 +179,7 @@ def check_route_runs_through_the_collector() -> None:
     # no deck respawn of any kind (impact, stall) during the clip
     assert len(car.placed) == 1, car.placed
     assert "stall_respawn" not in text and "impact_respawn" not in text, text[-1500:]
+    assert "collect abort" not in text and "collect recover" not in text, "the route ends by hand-back, not by a stall abort"
     # the route commands reached the car, while the car was at rest at the start
     lines = [i for i, c in enumerate(car.commands) if "setLine" in c]
     assert len(lines) >= 20, len(lines)

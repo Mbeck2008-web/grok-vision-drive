@@ -1126,6 +1126,7 @@ def load_nav_roads(path: Path | str) -> list[dict[str, Any]]:
                 "flip": _flag(road.get("flipDirection")),
                 "auto_lanes": _flag(road.get("autoLanes")),
                 "width": _median_width(widths),
+                "material": str(road.get("material") or ""),
             }
         )
     return roads

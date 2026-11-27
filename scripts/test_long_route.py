@@ -296,7 +296,7 @@ def check_driver_resend_rules() -> None:
     print("driver: re-sends on 80 m of progress or a 0.5 m/s speed change, never re-sets the mode")
 
 
-def check_driver_speed_caps_and_resume() -> None:
+def check_driver_speed_caps() -> None:
     _g, route = route_of(loop_network(dirt=True), seed=2)
     # Dirt and city take less than the highway's 25 m/s; the highway keeps it.
     drv = lr.RouteDriver(route)
@@ -310,28 +310,70 @@ def check_driver_speed_caps_and_resume() -> None:
     node_speeds = {float(v) for c in veh.sent if c.startswith("ai.setLine(") for _a, _b, v in POS.findall(SET_LINE.match(c).group(1))}
     assert node_speeds == {25.0, 11.0}, node_speeds  # this route is highway then dirt
 
-    # A respawn that has to stay on the route: 25 m past the last progress, facing along it, then a fresh window.
+    print("driver: speeds are capped by road kind (dirt 11, city 14 m/s); the highway keeps the clip speed")
+
+
+def check_collector_hooks() -> None:
+    import json
+    import tempfile
+
+    _g, route = route_of(loop_network(dirt=True), seed=2)
+    with tempfile.TemporaryDirectory() as td:
+        good = Path(td) / "route.json"
+        good.write_text(json.dumps(route.to_json()), encoding="utf-8")
+        again = lr.load_route_plan(good, ["synthetic"])
+        assert len(again.points) == len(route.points) and max(abs(a - b) for p, q in zip(again.points, route.points) for a, b in zip(p, q)) < 0.01 and again.far_end_index == route.far_end_index and again.map == "synthetic"
+        for maps, why in ((["west_coast_usa"], "other map"), (["synthetic", "italy"], "two maps"), ([], "no map")):
+            try:
+                lr.load_route_plan(good, maps)
+            except ValueError as exc:
+                assert "route plan is for map synthetic" in str(exc), exc
+            else:
+                raise AssertionError(f"accepted {why}")
+        for name, text in (("missing.json", None), ("junk.json", "{not json"), ("empty.json", "{}")):
+            path = Path(td) / name
+            if text is not None:
+                path.write_text(text, encoding="utf-8")
+            try:
+                lr.load_route_plan(path, ["synthetic"])
+            except ValueError as exc:
+                assert "unreadable" in str(exc), exc
+            else:
+                raise AssertionError(f"accepted {name}")
+        # The driver summary file is replaced in place and parses.
+        drv = lr.RouteDriver(route)
+        drv.commands(route.points[0][0], route.points[0][1], 20.0)
+        f = lr.write_driver_summary(td, drv)
+        assert f.name == "route_driver.json" and json.loads(f.read_text(encoding="utf-8")) == drv.summary()
+        drv.commands(route.points[0][0], route.points[0][1], 25.0)
+        lr.write_driver_summary(td, drv)
+        assert json.loads(f.read_text(encoding="utf-8"))["lines_sent"] == 2 and not list(Path(td).glob("*.tmp"))
+
+    # First spawn: the route's own start pose on its highway road, a highway pick.
+    pick = lr.route_spawn_pick(route)
+    pos, rot = route.start_pose()
+    assert pick.kind == HIGHWAY and pick.pos == pos and pick.rot == rot and pick.road_id == route.start_road
+    assert pick.speed == (20.0, 30.0) and lr.route_spawn_pick(route, (8.0, 14.0)).speed == (8.0, 14.0)
+
+    # One tick of driving: the driver owns the AI while active, the route's end hands back, a spawn reset re-sends.
     drv = lr.RouteDriver(route)
-    i0 = next(i for i, c in enumerate(route.cum) if c > 1000.0)
-    x, y, _ = route.points[i0]
-    drv.commands(x, y, 20.0)
-    before = drv.progress_m
-    pos, rot = drv.resume_pose()
-    j, s, d = lr.project_forward(route, pos[0], pos[1], 0, ahead_m=1e9)
-    assert d < 1.0 and abs(s - (before + lr.RESUME_AHEAD_M)) < 1.0, (s, before)
-    assert pos[2] >= route.points[j][2] + 0.4
-    yaw = math.atan2(2 * rot[3] * rot[2], 1 - 2 * rot[2] ** 2)
-    a, b = route.points[j], route.points[j + 1]
-    assert abs(math.cos(yaw) * (b[0] - a[0]) + math.sin(yaw) * (b[1] - a[1])) > 0.99 * math.hypot(b[0] - a[0], b[1] - a[1]), "faces along the route"
-    assert drv.resumes == 1 and drv.summary()["resumes"] == 1
-    again = drv.commands(pos[0], pos[1], 20.0)
-    assert any(c.startswith("ai.setLine(") for c in again) and 'ai.setMode("manual")' in again, again[:3]
-    # The end of the route is not run past.
-    end = lr.RouteDriver(route)
-    end.progress_m = route.total_m
-    p2, _r = end.resume_pose()
-    assert lr.project_forward(route, p2[0], p2[1], 0, ahead_m=1e9)[1] <= route.total_m
-    print("driver: kind speed caps (dirt 11, city 14); resume_pose re-places 25 m ahead on the route and re-sends")
+    sent: list[str] = []
+    x, y = route.points[0][0], route.points[0][1]
+    assert lr.drive_tick(drv, [x, y, 0.0], 20.0, sent.append) is True
+    assert sent[0] == 'ai.setMode("manual")' and any(c.startswith("ai.setLine(") for c in sent), sent[:2]
+    n = len(sent)
+    assert lr.drive_tick(drv, [x, y, 0.0], 20.0, sent.append) is True and len(sent) == n, "nothing re-sent for the same place"
+    assert lr.drive_tick(drv, None, 20.0, sent.append) is True and len(sent) == n, "no position: wait"
+    drv.reset_send()
+    assert lr.drive_tick(drv, [x, y, 0.0], 20.0, sent.append) is True and sent[n] == 'ai.setMode("manual")', "after a reset the mode and window are sent again"
+    ex, ey = route.points[-1][0], route.points[-1][1]
+    drv2 = lr.RouteDriver(route)
+    drv2.progress_m = route.total_m
+    drv2.index = len(route.points) - 2
+    tail: list[str] = []
+    assert lr.drive_tick(drv2, [ex, ey, 0.0], 20.0, tail.append) is True and tail == lr.span_commands(20.0)
+    assert not drv2.active and lr.drive_tick(drv2, [ex, ey, 0.0], 20.0, tail.append) is False and tail == lr.span_commands(20.0)
+    print("collector hooks: plan loads only for its one map, first spawn is the route start, tick sends/hands back/re-sends")
 
 
 def check_driver_off_route_and_far_end() -> None:
@@ -415,7 +457,8 @@ def main() -> None:
     check_json_roundtrip_and_determinism()
     check_driver_sends_the_route_in_order()
     check_driver_resend_rules()
-    check_driver_speed_caps_and_resume()
+    check_driver_speed_caps()
+    check_collector_hooks()
     check_driver_off_route_and_far_end()
     check_measure_route()
     check_real_maps_routes()

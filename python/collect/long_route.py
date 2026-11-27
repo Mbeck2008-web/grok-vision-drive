@@ -36,6 +36,7 @@ from functools import lru_cache
 import json
 import math
 import random
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
@@ -45,6 +46,8 @@ from python.collect.spawn_mix import (
     CITY,
     HIGHWAY,
     RAMP,
+    SPEED,
+    SpawnPick,
     _effective_oneway,
     _offset_candidates,
     _station_width,
@@ -78,7 +81,6 @@ FAR_END_TOL_M = 60.0
 SEND_SPEED_DELTA = 0.5
 # Highest AI speed (m/s) on each kind of road; the highway takes the clip's own speed.
 KIND_SPEED_CAP = {"highway": None, "ramp": 16.0, "city": 14.0, "dirt": 11.0}
-RESUME_AHEAD_M = 25.0
 
 
 def is_dirt_material(material: object) -> bool:
@@ -589,7 +591,6 @@ class RouteDriver:
         self.lines_sent = 0
         self.max_off_route_m = 0.0
         self.far_end_reached = False
-        self.resumes = 0
         self._off = 0
         self._sent_at: float | None = None
         self._sent_speed: float | None = None
@@ -655,30 +656,16 @@ class RouteDriver:
             out.append(pts[j])
         return out
 
-    def resume_pose(self, ahead_m: float = RESUME_AHEAD_M) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
-        """Pose ``ahead_m`` past the car's last place on the route, facing along it (for a respawn that must stay on the route).
-
-        The next ``commands`` call sends a fresh window, the mode included.
-        """
-        pts, cum = self.route.points, self.route.cum
-        s = min(self.route.total_m - 1.0, self.progress_m + float(ahead_m))
-        k = max(0, min(len(pts) - 2, max(j for j in range(len(cum)) if cum[j] <= max(0.0, s))))
-        t = min(1.0, max(0.0, (s - cum[k]) / max(1e-6, cum[k + 1] - cum[k])))
-        a, b = pts[k], pts[k + 1]
-        pos = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t + 0.5)
-        self.index = k
-        self.resumes += 1
-        self.progress_m = max(self.progress_m, s)
+    def reset_send(self) -> None:
+        """Forget what was sent (the AI was reset by a spawn or recover): the next tick sends the window again, mode included."""
         self._sent_at = None
         self._sent_speed = None
-        self._off = 0
-        return pos, _yaw_quat(b[0] - a[0], b[1] - a[1])
 
     def summary(self) -> dict[str, Any]:
         return {
             "state": self.state, "progress_m": round(self.progress_m, 1), "total_m": round(self.route.total_m, 1),
             "far_end_reached": bool(self.far_end_reached), "lines_sent": int(self.lines_sent),
-            "max_off_route_m": round(self.max_off_route_m, 1), "resumes": int(self.resumes),
+            "max_off_route_m": round(self.max_off_route_m, 1)
         }
 
 
@@ -704,6 +691,60 @@ def project_forward(route: Route, x: float, y: float, start_index: int, *, back:
             best = (j, cum[j] + t * math.sqrt(seg2), d)
         j += 1
     return best
+
+
+# --------------------------------------------------------------------------- collector hooks
+
+
+DRIVER_FILE = "route_driver.json"
+ROUTE_AI_KEY = ("route-plan",)  # the collector's last_ai while the driver owns the AI
+
+
+def load_route_plan(path: str | Path, map_names: Sequence[str]) -> Route:
+    """Read the route the clip runner wrote. It must be for the one map this collector run loads."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        route = Route.from_json(data)
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+        raise ValueError(f"route plan {path} unreadable: {type(exc).__name__}: {exc}") from exc
+    maps = [str(m) for m in map_names if str(m)]
+    if maps != [route.map]:
+        raise ValueError(f"route plan is for map {route.map}; this run loads {maps or 'no map'} (--maps must be exactly that map)")
+    if len(route.points) < 2 or not (0 < route.far_end_index < len(route.points)):
+        raise ValueError(f"route plan {path} has no usable route")
+    return route
+
+
+def route_spawn_pick(route: Route, speed: tuple[float, float] | None = None) -> SpawnPick:
+    """The collector's first spawn: the highway end the route starts at, facing along it."""
+    pos, rot = route.start_pose()
+    return SpawnPick(kind=HIGHWAY, road_id=str(route.start_road), pos=pos, rot=rot,
+                     speed=tuple(speed) if speed is not None else SPEED[HIGHWAY])
+
+
+def drive_tick(driver: RouteDriver, pos: Sequence[float] | None, speed_mps: float, queue: Callable[[str], None]) -> bool:
+    """One collector tick of route driving. True when the route driver owns the AI this tick.
+
+    ``queue`` is the collector's ``_queue(vehicle, command)``. The tick that finishes or abandons
+    the route sends the span commands itself and returns True; after that the collector's own AI
+    logic runs as before.
+    """
+    if not driver.active:
+        return False
+    if pos is None or len(pos) < 2:
+        return True
+    for cmd in driver.commands(float(pos[0]), float(pos[1]), float(speed_mps)):
+        queue(cmd)
+    return True
+
+
+def write_driver_summary(out: str | Path, driver: RouteDriver) -> Path:
+    """``route_driver.json`` in the clip folder (replaced each save; the run clip_tags.json embeds the last one)."""
+    path = Path(out) / DRIVER_FILE
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(driver.summary()), encoding="utf-8")
+    tmp.replace(path)
+    return path
 
 
 # --------------------------------------------------------------------------- measure

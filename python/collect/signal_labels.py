@@ -143,6 +143,12 @@ def _as_signal_list(raw: Any) -> list[Any]:
     return []
 
 
+def sign_id(cls: str, world_xy: tuple[float, float]) -> str:
+    """``<cls>@<x>,<y>`` from the world position (0.1 m grid): the same sign has the same id on every tick."""
+    # ``+ 0.0`` turns a rounded -0.0 into 0.0: -0.04 and 0.04 are the same place, so the same id
+    return f"{cls}@{round(float(world_xy[0]), 1) + 0.0:.1f},{round(float(world_xy[1]), 1) + 0.0:.1f}"
+
+
 def labels_from_signals(raw: Any, ego_pos: Any, ego_dir: Any) -> list[dict[str, Any]]:
     """Ego-frame signs. Unknown class or pose is dropped, not guessed."""
     out: list[dict[str, Any]] = []
@@ -166,6 +172,9 @@ def labels_from_signals(raw: Any, ego_pos: Any, ego_dir: Any) -> list[dict[str, 
             continue
         out.append(
             {
+                # Stable across ticks: the world position, not the ego-frame one. Stage 2b scores one event
+                # per id (python/train/stop_events.py); a sign without an id cannot be tracked.
+                "id": sign_id(cls, pos),
                 "cls": cls,
                 "x": float(ego[0]),
                 "y": float(ego[1]),

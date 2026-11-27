@@ -1374,11 +1374,18 @@ class LaneGtCoverage:
 
 
 def head_names(heads: tuple[str, ...] | list[str] | None) -> frozenset[str]:
-    """Which scene heads contribute loss. Empty means every head."""
+    """Which scene heads contribute loss. ``None`` means every default head.
+
+    An empty tuple or list trains none of the named scene heads (``aux_depth`` /
+    ``aux_sem`` still pull when their weights are > 0). Used by ``--recipe trainer2``
+    stage 1 (depth/sem only).
+    """
     from python.train.cam_strip import parse_heads
 
-    if not heads:
+    if heads is None:
         return frozenset(HEAD_NAMES)
+    if len(tuple(heads)) == 0:
+        return frozenset()
     return frozenset(parse_heads(",".join(str(name) for name in heads)))
 
 

@@ -108,7 +108,7 @@ def check_collector_argv() -> None:
 def _fake_recording(out: Path, *, rows: int = 40, speed: float = 10.0, yaw_rate: float = 0.0,
                     jpg: bool = False, drop_depth: str | None = None, damage: float = 0.0,
                     traffic_n: int = 2, luma: int = 120, spawn_type: str = "city",
-                    traffic_at=None, speed_at=None, impact_at=()) -> None:
+                    traffic_at=None, speed_at=None, impact_at=(), pos_at=None) -> None:
     import cv2
 
     from python.data.raw_frames import RawFrameWriter, camera_sidecar
@@ -140,7 +140,7 @@ def _fake_recording(out: Path, *, rows: int = 40, speed: float = 10.0, yaw_rate:
             tags["impact"] = {"kind": "contact", "speed_mps": v}
         w.write(
             frames, t=1000.0 + i * 0.1, timestamps=stamps,
-            ego={"speed_mps": v, "yaw_rate": yaw_rate, "pos": [0.0, i * 1.0, 0.0], "dir": [0, 1, 0], "damage": damage},
+            ego={"speed_mps": v, "yaw_rate": yaw_rate, "pos": ([0.0, i * 1.0, 0.0] if pos_at is None else list(pos_at(i))), "dir": [0, 1, 0], "damage": damage},
             tech={"lane_gt_valid": [1.0, 1.0, 0.0]},
             tags=tags,
         )

@@ -481,6 +481,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-excursions", action="store_true", help="Stay centered. Default weaves and lane changes.")
     parser.add_argument(
+        "--route-plan",
+        default="",
+        metavar="FILE",
+        help=(
+            "JSON route from python/collect/long_route.py (collect_clips.py writes one per long highway clip). "
+            "The first spawn is the route's highway end, facing along it, and the AI is driven along the route "
+            "(highway to the far end, then the return loop) with rolling ai.setLine windows; span roaming takes over "
+            "at the end or when the car leaves the route. Needs --maps to be exactly the route's map. Turns excursions "
+            "off and the stall/impact deck respawns off (the stationary abort and recover stays)."
+        ),
+    )
+    parser.add_argument(
         "--excursion-gap-min-s",
         type=float,
         default=CRUISE_S,
@@ -1830,6 +1842,16 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         map_names = tuple(DEFAULT_MAPS)
     segment_s = max(60.0, float(args.segment_min) * 60.0)
     excursions_on = not bool(args.no_excursions)
+    route_driver = None
+    if args.route_plan:
+        from python.collect.long_route import RouteDriver, load_route_plan
+
+        try:
+            route_driver = RouteDriver(load_route_plan(args.route_plan, map_names))
+        except ValueError as exc:
+            print(f"collect {exc}", file=sys.stderr)
+            return 2
+        excursions_on = False
     vary_env = bool(map_names) and not bool(args.no_vary_env)
     # Off the spawn deck (other maps) the range is 8-17, clamped to the flags like a spawn type.
     flags_set = args.speed_min is not None or args.speed_max is not None
@@ -2122,7 +2144,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # Seconds the painted lane at the car has been missing during a weave.
         paint_lost_s = 0.0
         PAINT_LOST_S = 0.5
-        impact_respawn_on = not bool(getattr(args, "no_impact_respawn", False))
+        # A route run keeps the car on its route: a deck respawn would teleport it off the route.
+        impact_respawn_on = not bool(getattr(args, "no_impact_respawn", False)) and route_driver is None
         impact_respawn_due = False
         impact_respawns: dict[str, int] = {"impacts": 0, "deck": 0, "recover": 0, "abort_same_tick": 0}
         loaded_map = ""
@@ -2147,7 +2170,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         recheck_min = max(0.0, float(getattr(args, "recheck_cov_min", 0.0) or 0.0))
         recheck_s = recheck_min * 60.0
         recheck_mark = 0.0
-        stall_respawn_s = max(0.0, float(getattr(args, "stall_respawn_s", 0.0) or 0.0))
+        stall_respawn_s = 0.0 if route_driver is not None else max(0.0, float(getattr(args, "stall_respawn_s", 0.0) or 0.0))
         # Loop seconds since the last spawn, recover or level load (the
         # driving clock stops while the car stands, so settle cannot be used).
         since_spawn = [0.0]
@@ -2595,7 +2618,19 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if spawn_deck.summary()["picks"] == 0:
                     return f"{map_name}: no legal on-road spawn (correct side of the road)"
                 return None
-            picked = spawn_deck.take(source)
+            if route_driver is not None and route_driver.state == "idle" and route_driver.lines_sent == 0:
+                # The route's own start (a highway end, facing along it), not a deck draw.
+                from python.collect.long_route import route_spawn_pick
+
+                picked = route_spawn_pick(route_driver.route)
+                print(
+                    f"collect route start {segment_id} road={route_driver.route.start_road} "
+                    f"direction={route_driver.route.direction} highway={route_driver.route.highway_m:.0f}m "
+                    f"return={route_driver.route.return_m:.0f}m",
+                    flush=True,
+                )
+            else:
+                picked = spawn_deck.take(source)
             if picked is None:
                 mix = spawn_deck.summary()
                 deck_exhausted.update(
@@ -2779,6 +2814,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if yield_guard.enabled:
                 extra["live_yield"] = yield_guard.summary()
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
+            if route_driver is not None:
+                extra["route_driver"] = route_driver.summary()
             windows = settle.summary()
             if windows:
                 extra["settle_windows"] = windows
@@ -2807,6 +2844,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
 
         def _save_progress(done: float, target: float) -> None:
             save_progress(progress_path, done, target, _spawn_extra())
+            if route_driver is not None:
+                from python.collect.long_route import write_driver_summary
+
+                write_driver_summary(out, route_driver)
 
         def _say_repeats() -> None:
             if spawn_deck is not None:
@@ -3242,7 +3283,25 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     held_tag = None
                     print(f"collect driving {segment_id}", flush=True)
                 else:
-                    if last_ai is None:
+                    if route_driver is not None and not waypoint and route_driver.active:
+                        # A spawn or recover leaves the car at rest: the route's window goes out now, not the plain span.
+                        from python.collect.long_route import ROUTE_AI_KEY, drive_tick
+
+                        if last_ai is None and route_driver.lines_sent:
+                            route_driver.reset_send()
+                        pre_cmds: list[str] = []
+                        if drive_tick(route_driver, pos, speed, pre_cmds.append):
+                            last_ai = ROUTE_AI_KEY
+                        for command in pre_cmds:
+                            try:
+                                _queue(vehicle, command)
+                                ai_cmd = control_log.ai_cmd_state(ai_cmd, command)
+                            except Exception as exc:
+                                last_error = f"{type(exc).__name__}: {exc}"
+                        if not route_driver.active:
+                            last_ai = None  # finished or abandoned at rest: the plain span send runs from the next tick
+                            print(f"collect route {segment_id} driver {route_driver.summary()}", flush=True)
+                    elif last_ai is None:
                         for command in ai_commands(speed, waypoint, traffic=False):
                             try:
                                 _queue(vehicle, command)
@@ -3560,6 +3619,26 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             send_ai = last_ai != ai_key
             if not driving and not waypoint and last_ai is not None:
                 send_ai = False
+            if route_driver is not None and not waypoint:  # not gated on "driving": a car at rest (after a spawn or recover) must get its window
+                from python.collect.long_route import ROUTE_AI_KEY, drive_tick
+
+                was_active = route_driver.active
+                if was_active and last_ai is None:
+                    route_driver.reset_send()  # a spawn or recover cleared the AI: send the window again
+                route_cmds: list[str] = []
+                # While the route is active the driver owns the AI: the plain span/excursion send stays off.
+                if drive_tick(route_driver, pos, speed, route_cmds.append):
+                    send_ai = False
+                    last_ai = ROUTE_AI_KEY
+                for command in route_cmds:
+                    try:
+                        _queue(vehicle, command)
+                        ai_cmd = control_log.ai_cmd_state(ai_cmd, command)
+                    except Exception as exc:
+                        last_error = f"{type(exc).__name__}: {exc}"
+                if was_active and not route_driver.active:
+                    last_ai = None  # route finished or abandoned: the normal AI send resumes next tick
+                    print(f"collect route {segment_id} driver {route_driver.summary()}", flush=True)
             if send_ai:
                 commands = (
                     excursion_commands(

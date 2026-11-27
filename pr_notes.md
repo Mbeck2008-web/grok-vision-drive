@@ -26,13 +26,13 @@ Three lines carry the rejection. Two are byte-identical: `ROAD_SNAP_MAX_ABOVE_M:
 ## M04b and M07
 
 - M04b is pinned by `check_edge_cut_drops_px_next_to_sky` (S22), commit 98a7bc6, with no render change (`<=` kept in `edge_cut_far_side`). With GT depth, the non-sky px next to +inf sky is cut to +inf and is not drawn; the test asserts the 12 border px and fails on a `<` mutant.
-- M07: `edge_cut_far_side` is equivalent to the old inline cut on depth, but the clamp mask differs on ties (px exactly at the ground hit).
+- M07: `ground_clamp` `d > zmax` mutated to `>=` (`python/viz/rv_stable_fill.py:357`). Depth output is identical; only the clamp mask differs on exact ties (px exactly at the ground hit), and that mask feeds `clamp_frac` only. Equivalent mutant on depth, not pinned.
 
 ## Known issues until Trainer 2.0 (do not regress in this PR)
 
 - Wide rings remain. With wide snap off (Michael 2026-11-26) the wide cam's net depth sits too high on the road; this branch does not fix the ripple (see `check_clip015_ripple_wide_dz`, `check_wide_snap_off_no_plane_pull_0_5m`, KNOWN_FAILING).
 - pillarR / repeatR gate (b) is a known failure: pillar 0-15 m band, clip015 f40/f160, `check_clip015_snap_misplace`: pillarR 9.48% (3055/32213) and repeatR 2.56% (985/38413) drawn snapped px with GT z > 0.3 m (max 1%). `ROAD_SNAP_CAMS` and the 0.30 m rejection are as described above.
-- Fixed 0.3 m splat sites in `scripts/test_rv_side_rear_props.py` (Breaker's file; not the renderer's own `point_footprint` and cap), at f59b7b2: line 579 (`hole_fraction` paint), 2070, 2165, 2366 (all `np.full(..., 0.3)` footprints); line 771 is the check that counts them and 2984 is a fallback when no footprint exists. (The brief listed :579, :1773, :1974, :2592; at this head those latter three lines are unrelated, so the sites above are the ones found by grep.)
+- Fixed 0.3 m splat sites in `scripts/test_rv_side_rear_props.py` (Breaker's file; not the renderer's own `point_footprint` and cap), at f59b7b2: line 579 (`hole_fraction` paint), 2070, 2165, 2366 (all `np.full(..., 0.3)` footprints); line 771 is the check that counts them and 2984 is a fallback when no footprint exists. (The brief listed :579, :1773, :1974, :2592. :1773/:1974/:2592 are the same footprint lines as 2165/2366/2984 on this head, shifted down by the props insert above them; the site lines are byte-identical to the aeed334 parent.)
 
 ## rear_holes evidence (Skeptic ruling b)
 

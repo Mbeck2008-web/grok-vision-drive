@@ -15,13 +15,13 @@ Michael 2026-11-25:
   Anything short ships as 1.x.
 
 Intervention = takeover, collision, missed stop sign, missed red light, curb
-strike, **and** any AEB or hand-coded stop-rule activation. The last part is a
-**PROPOSAL pending Michael** (GVD call 2026-11-25, not his words): it is the
-named config ``BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS`` (and the
-``count_backstop`` argument), default True. With False, ``aeb`` / ``hand_rule``
-are still tallied and reported under ``backstop`` but do not count toward
-``total``. The drive records come from the IQU45 harness (spec Dependencies
-6-8); without them the name is never 2.0.
+strike. AEB and hand-coded stop-rule activations do **not** count:
+**DECIDED (Michael 2026-11-26)**. It is the named config
+``BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS`` (and the ``count_backstop``
+argument), default False: ``aeb`` / ``hand_rule`` are still tallied and reported
+under ``backstop`` but do not count toward ``total``. True counts them. The
+drive records come from the IQU45 harness (spec Dependencies 6-8); without
+them the name is never 2.0.
 
 Scenario slices
 ---------------
@@ -71,9 +71,9 @@ TIMES_OF_DAY = ("day", "night")
 CORE_INTERVENTION_KINDS = ("takeover", "collision", "missed_stop_sign", "missed_red_light", "curb_strike")
 BACKSTOP_KINDS = ("aeb", "hand_rule")
 INTERVENTION_KINDS = CORE_INTERVENTION_KINDS + BACKSTOP_KINDS
-# PROPOSAL pending Michael (GVD call 2026-11-25, interpreting "zero interventions"): an AEB or hand-coded
-# stop-rule activation during the 2.0 drive counts as an intervention. False = tallied and reported only.
-BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS = True
+# DECIDED (Michael 2026-11-26): AEB and hand-coded stop-rule activations during the 2.0 drive do NOT
+# count as interventions; they are tallied and reported under ``backstop`` only. True would count them.
+BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS = False
 HIGHER = "higher_is_better"
 LOWER = "lower_is_better"
 DIRECTIONS = (HIGHER, LOWER)
@@ -269,8 +269,8 @@ def tally_interventions(
 
     An event with a missing or unknown ``kind`` raises (a typo such as
     ``"Takeover"`` must not read as a clean drive). ``total`` counts the core
-    kinds, and ``aeb`` / ``hand_rule`` only when ``count_backstop`` (PROPOSAL
-    pending Michael); ``backstop`` is their count either way.
+    kinds, and ``aeb`` / ``hand_rule`` only when ``count_backstop`` (default
+    False, DECIDED Michael 2026-11-26); ``backstop`` is their count either way.
     """
     out = {kind: 0 for kind in INTERVENTION_KINDS}
     for ev in events:

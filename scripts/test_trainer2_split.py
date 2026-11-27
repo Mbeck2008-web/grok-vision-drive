@@ -150,7 +150,7 @@ class HeldoutMapExcluded(unittest.TestCase):
             {"kind": "train", "rows": a[:150] + u[:150]},
             {"kind": "holdout", "rows": a[190:] + u[190:]},
         ]
-        man = ts.build_split_manifest(plan, source_maps=MAPS, heldout_map="utah")
+        man = ts.build_split_manifest(plan, source_maps=MAPS, heldout_map="utah", bar_heldout_from_holdout=True)
         self.assertEqual(man["heldout_map"], "utah")
         for split in ("train", "holdout"):
             self.assertFalse([k for k in man[split] if k[0] == "recU"], split)
@@ -594,10 +594,10 @@ class SortedUniqueGuard(unittest.TestCase):
 
 
 class HeldoutMapBarFlag(unittest.TestCase):
-    """OPEN QUESTION 2, PROPOSAL pending Michael: is the held-out map barred from the matched holdout too?
+    """DECIDED (Michael 2026-11-26, "for now"): the held-out map is NOT barred from the matched holdout.
 
-    The default (True) is GVD's 2026-11-25 call, not Michael's ruling. This pins both settings
-    so his answer is a one-line change of BAR_HELDOUT_MAP_FROM_HOLDOUT, not a rewrite.
+    Held-out-map rows stay out of train only; the held-out-map test comes later. Both settings
+    stay pinned (``bar_heldout_from_holdout=True`` still bars it from the holdout).
     """
 
     def _plan(self):
@@ -608,12 +608,21 @@ class HeldoutMapBarFlag(unittest.TestCase):
             {"kind": "holdout", "rows": a[190:] + u[190:]},
         ], u
 
-    def test_current_default_is_the_proposal(self) -> None:
+    def test_current_default_is_decided(self) -> None:
         from python.train import trainer2_split as ts
 
-        self.assertIs(ts.BAR_HELDOUT_MAP_FROM_HOLDOUT, True)  # PROPOSAL pending Michael
+        self.assertIs(ts.BAR_HELDOUT_MAP_FROM_HOLDOUT, False)  # DECIDED (Michael 2026-11-26)
         plan, _u = self._plan()
         man = ts.build_split_manifest(plan, source_maps=MAPS, heldout_map="utah")
+        self.assertIs(man["heldout_map_bars_holdout"], False)
+        self.assertFalse([k for k in man["train"] if k[3] == "utah"])
+        self.assertEqual(len([k for k in man["holdout"] if k[3] == "utah"]), 10)
+
+    def test_barring_keeps_heldout_map_out_of_both(self) -> None:
+        from python.train import trainer2_split as ts
+
+        plan, _u = self._plan()
+        man = ts.build_split_manifest(plan, source_maps=MAPS, heldout_map="utah", bar_heldout_from_holdout=True)
         self.assertIs(man["heldout_map_bars_holdout"], True)
         self.assertFalse([k for k in man["holdout"] if k[3] == "utah"])
 

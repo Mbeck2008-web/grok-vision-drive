@@ -68,6 +68,7 @@ class RouteCar(sf._CrashVehicle):
         self.has_line = False
         self.s = 0.0
         self.placed: list[tuple[tuple, tuple]] = []
+        self.s_at_teleport: list[float] = []  # where on the route the car was when each teleport came
         self.cmd_poll: list[int] = []
         self.cmd_s: list[float] = []
         self.parked = False
@@ -85,6 +86,7 @@ class RouteCar(sf._CrashVehicle):
 
     def teleport(self, pos, rot_quat=None, reset=False) -> None:
         self.placed.append((tuple(pos), tuple(rot_quat or ())))
+        self.s_at_teleport.append(self.s)
         if len(self.placed) == 1:  # the car is on the first pose; later teleports do not move the fake ...
             self.s = 0.0
         elif self.stuck_start is not None:  # ... except in the stuck-start run: it follows the teleport
@@ -343,14 +345,17 @@ def check_unresumable_route_ends_the_clip_honestly() -> None:
 
 
 def check_timed_respawn_stays_off_a_route_clip() -> None:
-    """--respawn-min teleports to a new deck spawn on its own clock. On a route clip that would leave the route mid-drive."""
+    """--respawn-min teleports to a new deck spawn on its own clock. While the route is being driven that would
+    leave it mid-drive; after the route is finished the clip roams and the clock applies again, as before."""
     route = make_route()
     code, text, out, car = _no_excursions_flag_run(route, extra=["--respawn-min", "0.2"])
     assert code == 0, (code, text[-2500:])
-    assert len(car.placed) == 1, f"a timed respawn moved the car off the route: {car.placed}"
+    assert len(car.placed) >= 2, "the clock never fired after the route: this check would not see a mid-route teleport"
+    early = [round(s_) for s_ in car.s_at_teleport[1:] if s_ < route.total_m - lr.END_TOL_M - 10.0]
+    assert not early, f"a timed respawn moved the car off the route mid-drive (at route metres {early}): {car.placed}"
     summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
     assert summary["state"] == "done" and summary["resumes"] == 0 and summary["max_off_route_m"] < 1.0, summary
-    print("collector route run: a --respawn-min clock does not teleport a route clip")
+    print("collector route run: a --respawn-min clock does not teleport a route clip while the route is driven")
 
 
 def main() -> None:

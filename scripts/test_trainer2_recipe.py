@@ -439,18 +439,23 @@ def check_exit_criteria_pinned_in_manifest() -> None:
 
 
 def check_proposal_defaults_unchanged() -> None:
-    """Cross-module PROPOSAL defaults this PR must not decide or edit."""
+    """Cross-module defaults the recipe must not silently drift.
+
+    #275 (Michael 2026-11-26) set BAR_HELDOUT_MAP_FROM_HOLDOUT and
+    BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS to False. The other pins
+    remain PROPOSAL and unchanged.
+    """
     from python.train.trainer2_balance import WEIGHT_LR
     from python.train.trainer2_split import BAR_HELDOUT_MAP_FROM_HOLDOUT
     from python.train.stop_events import RED_TO_GREEN_PROCEED_IS_MISS
     from python.train.trainer2_bar import BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS, REQUIRE_UNLABELABLE_SLICES_FOR_2_0
 
     assert WEIGHT_LR == 0.025
-    assert BAR_HELDOUT_MAP_FROM_HOLDOUT is True
+    assert BAR_HELDOUT_MAP_FROM_HOLDOUT is False  # DECIDED (Michael 2026-11-26)
     assert RED_TO_GREEN_PROCEED_IS_MISS is True
-    assert BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS is True
+    assert BACKSTOP_ACTIVATIONS_COUNT_AS_INTERVENTIONS is False  # DECIDED (Michael 2026-11-26)
     assert REQUIRE_UNLABELABLE_SLICES_FOR_2_0 is True
-    print("cross-PR PROPOSAL defaults unchanged OK")
+    print("cross-PR defaults pinned (two DECIDED False; remaining PROPOSAL unchanged) OK")
 
 
 def check_recipe_off_is_bit_identical() -> None:

@@ -3,7 +3,7 @@
 
 ``collect.main`` runs on the fake-BeamNG harness of test_collect_spawn_fix (fake clock, fake vehicle,
 no game, never a live BeamNG). The fake car obeys the AI commands it is sent: it drives the planned route
-at 25 m/s once it has been told ``ai.setMode("manual")`` and given an ``ai.setLine`` window, and stops
+at 25 m/s once it has been told ``ai.setMode("manual")`` and given a set_line window, and stops
 when it is handed back to ``span``. This tests what the unit tests of long_route.py cannot reach: the
 collector loop's use of the driver.
 
@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import test_collect_spawn_fix as sf  # noqa: E402
 from python.collect import long_route as lr  # noqa: E402
 from python.collect.spawn_mix import CITY, HIGHWAY  # noqa: E402
+from python.collect.excursion import is_set_line as _is_set_line  # noqa: E402
 
 SPEED = 25.0
 CRAWL_M, CRAWL_V = 4.0, 0.95
@@ -113,10 +114,15 @@ class RouteCar(sf._CrashVehicle):
         elif self.recover_to == "off":  # or off the route
             self.parked = True
 
-    def queue_lua_command(self, command: str, *args: object) -> None:
+    def queue_lua_command(self, command: object, *args: object) -> None:
         super().queue_lua_command(command, *args)
         self.cmd_poll.append(self.polls)
         self.cmd_s.append(self.s)
+        if _is_set_line(command):
+            self.has_line = True
+            return
+        if not isinstance(command, str):
+            return
         if 'ai.setMode("manual")' in command:
             self.mode = "manual"
             if self.stall == "stalled":
@@ -125,8 +131,6 @@ class RouteCar(sf._CrashVehicle):
             if self.mode == "manual":  # a hand-back after the route; the first span is the collector's own start-up send
                 self.span_poll = self.span_poll or self.polls
             self.mode = "span"
-        if "setLine" in command:
-            self.has_line = True
 
     def _at(self, s: float) -> tuple[float, float, float, float]:
         r, cum = self.route, self.route.cum
@@ -238,19 +242,19 @@ def check_route_runs_through_the_collector() -> None:
     assert "stall_respawn" not in text and "impact_respawn" not in text, text[-1500:]
     assert "collect abort" not in text and "collect recover" not in text, "the route ends by hand-back, not by a stall abort"
     # the route commands reached the car, while the car was at rest at the start
-    lines = [i for i, c in enumerate(car.commands) if "setLine" in c]
+    lines = [i for i, c in enumerate(car.commands) if _is_set_line(c)]
     assert len(lines) >= 20, len(lines)
     assert car.max_s >= total - lr.END_TOL_M - 3.0, (car.max_s, total)
     assert car.cmd_s[lines[0]] == 0.0, car.cmd_s[lines[0]]  # the first window went out while the car was still at rest
     # the AI mode is re-sent once the car is driving (the segment opens and clears the AI state), well before 80 m
-    manual = [i for i, c in enumerate(car.commands) if 'ai.setMode("manual")' in c]
+    manual = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("manual")' in c]
     assert len(manual) == 2, [car.commands[i] for i in manual]
     assert car.cmd_poll[manual[1]] - car.cmd_poll[manual[0]] <= 12, [car.cmd_poll[i] for i in manual]
     # the plain span send stays off while the route is active, and takes over once it ends
-    spans = [i for i, c in enumerate(car.commands) if 'ai.setMode("span")' in c and i > lines[0]]
+    spans = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("span")' in c and i > lines[0]]
     assert spans and min(spans) > max(lines), (spans[:3], lines[-3:])
     assert len(spans) >= 2, "the collector's own span send resumes after the driver's hand-off, even with the car at rest"
-    assert not any("setLine" in c for c in car.commands[spans[0]:]), "no route line after the hand-off"
+    assert not any(_is_set_line(c) for c in car.commands[spans[0]:]), "no route line after the hand-off"
     # no excursions on a route clip (its lane/weave logic would fight the route)
     assert car.bbox_calls == 0, car.bbox_calls
     assert "collect excursion" not in text and "excursion=weave" not in text
@@ -272,8 +276,8 @@ def check_leaving_the_route_hands_back_to_span() -> None:
     summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
     assert summary["state"] == "off_route" and summary["far_end_reached"] is False, summary
     assert summary["max_off_route_m"] > 100.0, summary
-    lines = [i for i, c in enumerate(car.commands) if "setLine" in c]
-    spans = [i for i, c in enumerate(car.commands) if 'ai.setMode("span")' in c and i > lines[0]]
+    lines = [i for i, c in enumerate(car.commands) if _is_set_line(c)]
+    spans = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("span")' in c and i > lines[0]]
     assert spans and min(spans) > max(lines), "span only after the last route line"
     assert "'state': 'off_route'" in text and len(car.placed) == 1, text[-1500:]
     # the car is parked off the route (at rest): the hand-back comes from the route driver within a second or two,
@@ -284,7 +288,7 @@ def check_leaving_the_route_hands_back_to_span() -> None:
 
 
 def _spans_after(car: RouteCar) -> list[int]:
-    return [i for i, c in enumerate(car.commands) if 'ai.setMode("span")' in c and car.cmd_poll[i] > car.stall_poll]
+    return [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("span")' in c and car.cmd_poll[i] > car.stall_poll]
 
 
 def check_recover_to_rest_resends_the_window() -> None:
@@ -295,8 +299,8 @@ def check_recover_to_rest_resends_the_window() -> None:
     assert "collect abort stationary" in text and "collect recover" in text, text[-2500:]
     assert len(car.placed) == 2, car.placed  # the route start, then the recover
     # mode + window re-sent from where the car stopped, after the recover
-    again = [i for i, c in enumerate(car.commands) if 'ai.setMode("manual")' in c and car.cmd_s[i] >= 499.0]
-    assert again, [(c[:30], s_) for c, s_ in zip(car.commands, car.cmd_s) if "setMode" in c]
+    again = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("manual")' in c and car.cmd_s[i] >= 499.0]
+    assert again, [(c[:30], s_) for c, s_ in zip(car.commands, car.cmd_s) if isinstance(c, str) and "setMode" in c]
     assert car.stall == "resumed" and car.max_s >= route.total_m - lr.END_TOL_M - 3.0, (car.stall, car.max_s)
     summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
     assert summary["state"] == "done" and summary["far_end_reached"] is True, summary

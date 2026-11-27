@@ -387,7 +387,7 @@ class _CrashVehicle:
         self.damage_at = damage_at
         self.stop_at = int(stop_at)
         self.polls = 0
-        self.commands: list[str] = []
+        self.commands: list[object] = []
         self.state: dict = {}
         self._set(10.0)
 
@@ -421,9 +421,9 @@ class _CrashVehicle:
         if self.polls >= self.stop_at:
             self.stop.write_text("stop", encoding="utf-8")
 
-    def queue_lua_command(self, command: str, *args: object) -> None:
+    def queue_lua_command(self, command: object, *args: object) -> None:
         del args
-        self.commands.append(str(command))
+        self.commands.append(command)
 
     def connect(self, bng: object) -> None:
         del bng
@@ -446,11 +446,11 @@ class _Api:
 class _Bng:
     def __init__(self, vehicle) -> None:
         self.vehicles = _Api(vehicle)
-        self.commands: list[str] = []
+        self.commands: list[object] = []
 
-    def queue_lua_command(self, command: str, *args: object) -> None:
+    def queue_lua_command(self, command: object, *args: object) -> None:
         del args
-        self.commands.append(str(command))
+        self.commands.append(command)
 
     def get_road_network(self, **kwargs: object):
         del kwargs

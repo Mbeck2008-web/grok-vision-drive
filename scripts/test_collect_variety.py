@@ -232,17 +232,42 @@ def check_paths_stay_on_the_road() -> None:
     )
     assert missing is None
 
+    def _is_set_line(cmd: object) -> bool:
+        return (
+            isinstance(cmd, tuple)
+            and len(cmd) == 3
+            and cmd[0] == "set_line"
+            and isinstance(cmd[1], list)
+            and cmd[2] is True
+        )
+
+    def _no_ai_setline(cmds: list[object]) -> None:
+        for cmd in cmds:
+            text = cmd if isinstance(cmd, str) else repr(cmd)
+            assert "ai.setLine(" not in text, cmd
+
     cruise = excursion_commands(10.0, "cruise", 1)
-    assert any('setMode("span")' in line for line in cruise)
-    assert any('driveInLane("on")' in line for line in cruise)
-    assert all("setLine" not in line for line in cruise)
+    assert any(isinstance(line, str) and 'setMode("span")' in line for line in cruise)
+    assert any(isinstance(line, str) and 'driveInLane("on")' in line for line in cruise)
+    _no_ai_setline(cruise)
+    assert not any(_is_set_line(line) for line in cruise)
     lined = excursion_commands(10.0, "weave", 1, path=points)
-    assert any('setMode("manual")' in line for line in lined)
-    assert any('driveInLane("off")' in line for line in lined)
-    assert any(line.startswith("ai.setLine(") and line.endswith(", true)") for line in lined)
+    _no_ai_setline(lined)
+    assert any(isinstance(line, str) and 'setMode("manual")' in line for line in lined)
+    assert any(isinstance(line, str) and 'driveInLane("off")' in line for line in lined)
+    set_lines = [c for c in lined if _is_set_line(c)]
+    assert len(set_lines) == 1, lined
+    line, cling = set_lines[0][1], set_lines[0][2]
+    assert cling is True
+    assert line, "weave set_line window is not empty"
+    for node in line:
+        pos = node["pos"]
+        assert isinstance(pos, tuple) and len(pos) == 3, pos
+        assert node["speed"] == 10.0, node
     abort = excursion_commands(10.0, "abort", 1)
-    assert any('driveInLane("on")' in line for line in abort)
-    assert all("setLine" not in line for line in abort)
+    assert any(isinstance(line, str) and 'driveInLane("on")' in line for line in abort)
+    _no_ai_setline(abort)
+    assert not any(_is_set_line(line) for line in abort)
 
 
 def _segment_rows(names: list[str], count: int = 30) -> list[dict[str, object]]:

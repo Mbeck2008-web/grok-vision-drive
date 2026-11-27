@@ -240,10 +240,15 @@ def actor_dims(box: Any) -> tuple[float | None, float | None, float | None]:
 _SET = re.compile(r'^\s*ai\.(setMode|setSpeedMode|setSpeed|setLine)\((.*)\)\s*$', re.S)
 
 
-def ai_cmd_state(state: Mapping[str, Any] | None = None, command: str | None = None) -> dict[str, Any]:
-    """The collector's last AI commands, updated by one vehicle-Lua line it sent."""
+def ai_cmd_state(state: Mapping[str, Any] | None = None, command: object = None) -> dict[str, Any]:
+    """The collector's last AI commands, updated by one command it sent."""
+    from python.collect.excursion import is_set_line
+
     out = dict(state) if state else {"mode": None, "set_speed_mps": None, "speed_mode": None, "line_active": False}
-    match = _SET.match(str(command or ""))
+    if is_set_line(command):
+        out["line_active"] = True
+        return out
+    match = _SET.match(command if isinstance(command, str) else "")
     if not match:
         return out
     name, arg = match.group(1), match.group(2).strip()

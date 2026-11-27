@@ -101,7 +101,11 @@ def check_schema() -> None:
     for line in collect.ai_commands(12.0, None):
         state = cl.ai_cmd_state(state, line)
     assert state == {"mode": "span", "set_speed_mps": 12.0, "speed_mode": "limit", "line_active": False}, state
-    for line in ('ai.setMode("manual")', "ai.setSpeed(9.5)", "ai.setLine({{pos={1,2,3}}}, true)"):
+    for line in (
+        'ai.setMode("manual")',
+        "ai.setSpeed(9.5)",
+        ("set_line", [{"pos": (1.0, 2.0, 3.0), "speed": 9.5}], True),
+    ):
         state = cl.ai_cmd_state(state, line)
     assert state == {"mode": "manual", "set_speed_mps": 9.5, "speed_mode": "limit", "line_active": True}, state
     state = cl.ai_cmd_state(state, 'ai.setMode("span")')

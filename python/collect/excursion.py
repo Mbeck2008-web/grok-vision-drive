@@ -809,9 +809,9 @@ def excursion_commands(
     direction: int,
     *,
     traffic: bool = False,
-    path: list[tuple[float, float]] | None = None,
-) -> list[str]:
-    """AI lines for this phase. A path leaves lane-keeping; cruise puts it back."""
+    path: list[tuple[float, float]] | list[tuple[float, float, float]] | None = None,
+) -> list[object]:
+    """AI commands for this phase. A path leaves lane-keeping; cruise puts it back."""
     speed = float(speed_mps)
     if phase in ACTIVE and path:
         return [
@@ -819,7 +819,7 @@ def excursion_commands(
             'ai.driveInLane("off")',
             'ai.setSpeedMode("limit")',
             f"ai.setSpeed({speed})",
-            lua_set_line(path, speed),
+            set_line_command(path, speed, cling=True),
         ]
     mode = "traffic" if traffic else "span"
     lines = [
@@ -836,13 +836,37 @@ def excursion_commands(
     return lines
 
 
-def lua_set_line(points: list[tuple[float, float]], speed_mps: float) -> str:
-    """One ``ai.setLine`` call. ``cling`` keeps the line on the road surface."""
-    speed = float(speed_mps)
-    body = ",".join(
-        f"{{pos={{{x:.2f},{y:.2f},0}},speed={speed:.2f}}}" for x, y in points
+def is_set_line(cmd: object) -> bool:
+    """True for the structured command dispatched to ``vehicle.ai.set_line``."""
+    return (
+        isinstance(cmd, tuple)
+        and len(cmd) == 3
+        and cmd[0] == "set_line"
+        and isinstance(cmd[1], list)
+        and isinstance(cmd[2], bool)
     )
-    return f"ai.setLine({{{body}}}, true)"
+
+
+def set_line_command(
+    points: list[tuple[float, float]] | list[tuple[float, float, float]] | list,
+    speed_mps: float,
+    *,
+    cling: bool = True,
+) -> tuple[str, list[dict[str, object]], bool]:
+    """A ``vehicle.ai.set_line(line, cling=True)`` command: pos is an (x, y, z) 3-tuple.
+
+    Route windows pass the route's own z. A 2-D excursion path uses z=0 and
+    relies on cling to snap the polyline to the ground (Tech 0.39 techCore).
+    """
+    speed = float(speed_mps)
+    line: list[dict[str, object]] = []
+    for p in points:
+        if len(p) < 2:
+            raise ValueError(f"set_line point needs x, y: {p!r}")
+        x, y = float(p[0]), float(p[1])
+        z = float(p[2]) if len(p) > 2 else 0.0
+        line.append({"pos": (x, y, z), "speed": speed})
+    return ("set_line", line, bool(cling))
 
 
 def near_junction(
@@ -1375,7 +1399,7 @@ def excursion_path(
     half_width_m: float | None = None,
     info: dict | None = None,
 ) -> tuple[list[tuple[float, float]] | None, int]:
-    """World points for ``ai.setLine``, and the direction that stays on the road.
+    """World points for ``set_line``, and the direction that stays on the road.
 
     The second value flips when the requested lane change would leave the
     pavement and the other side would not. ``(None, direction)`` means do

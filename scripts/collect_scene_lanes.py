@@ -55,7 +55,7 @@ and ``sem_classes.json``. LiDAR and radar stay off.
 West-coast spawns skip roads whose next 300 m has painted lanes on less than
 ``--min-paint-cov`` of the probes (default 0.5, 0 disables). The weave guard
 (on; ``--no-weave-guard`` turns it off) keeps weaves off unpainted stretches
-and junctions, and ends an excursion when its 60 m ``ai.setLine`` runs out.
+and junctions, and ends an excursion when its 60 m set_line window runs out.
 Excursions start after a cruise gap (``--excursion-gap-min-s`` and
 ``--excursion-gap-max-s``, both default ``CRUISE_S`` = 60 s). Each gap is
 one uniform draw from ``--excursion-seed`` (default 0), taken again only
@@ -487,7 +487,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "JSON route from python/collect/long_route.py (collect_clips.py writes one per long highway clip). "
             "The first spawn is the route's highway end, facing along it, and the AI is driven along the route "
-            "(highway to the far end, then the return loop) with rolling ai.setLine windows; span roaming takes over "
+            "(highway to the far end, then the return loop) with rolling set_line windows; span roaming takes over "
             "at the end or when the car leaves the route. Needs --maps to be exactly the route's map. Turns excursions "
             "off and the stall/impact deck respawns off (the stationary abort and recover stays). When a stop is not fixed by the "
             "recover and the segment ends, the respawn is on the route (RESUME_NUDGE_M past the farthest point reached, at "
@@ -1172,7 +1172,26 @@ def road_lanes(roads: list[Any], hit: object) -> int | None:
         return None
 
 
-def _queue(vehicle: Any, command: str) -> None:
+def _queue(vehicle: Any, command: object) -> None:
+    from python.collect.excursion import is_set_line
+
+    if is_set_line(command):
+        _tag, line, cling = command  # type: ignore[misc]
+        fn = getattr(getattr(vehicle, "ai", None), "set_line", None)
+        if callable(fn):
+            fn(line, cling=cling)
+            return
+        # Tests / fakes without beamngpy still record the structured command.
+        rec = getattr(vehicle, "queue_lua_command", None)
+        if callable(rec):
+            try:
+                rec(command)
+            except TypeError:
+                rec(command, False)
+            return
+        raise RuntimeError("vehicle has no ai.set_line")
+    if not isinstance(command, str):
+        raise TypeError(f"unsupported AI command: {command!r}")
     fn = getattr(vehicle, "queue_lua_command", None)
     if callable(fn):
         try:

@@ -455,9 +455,15 @@ def check_length_cap_and_window_pinned() -> None:
     # The window: a candidate at 0.7x is taken in the first tier, ahead of a later 1.0x one.
     r, _ = plan([0.7, 1.0])
     assert r is not None and abs(r.total_m / budget - 0.7) < 1e-6, r and r.total_m / budget
+    # Just above 0.6x (0.62x) must also take the first tier: pins the window against a 0.65x compare.
+    r, _ = plan([0.62, 1.0])
+    assert r is not None and abs(r.total_m / budget - 0.62) < 1e-6, r and r.total_m / budget
     # Under 0.6x the window refuses it, the second tier takes it (a route shorter than the clip is allowed).
     r, calls = plan([0.55])
     assert r is not None and abs(r.total_m / budget - 0.55) < 1e-6 and len(calls) >= 2
+    # Just under 0.6x (0.58x) must also miss the first tier.
+    r, calls = plan([0.58])
+    assert r is not None and abs(r.total_m / budget - 0.58) < 1e-6 and len(calls) >= 2
     r, _ = plan([0.55, 0.65])
     assert r is not None and abs(r.total_m / budget - 0.65) < 1e-6, r and r.total_m / budget  # the window's pick wins
     # The last tier: a map whose only loop back is short (< 1500 m) still gets a route (honestly short), not None.

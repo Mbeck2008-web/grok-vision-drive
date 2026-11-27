@@ -15,7 +15,6 @@ Against `main` (a56f514) `python/viz/rv_stable_fill.py` and `tools/rv_stable_pre
 - New `edge_cut_far_side` replaces the preview's inline `cv2.dilate` cut: no snapped exemption, and a px keeps its own depth where the far side would be past its ground hit (never under the road). The cut now runs before `ground_clamp` (clamp after the cut).
 - `point_footprint`: on-plane points' splat footprint grows to the ground row spacing (rear/side holes).
 - `splat_max_radius_px(width) = max(2, W//40)` (was `max(2, W//120)`).
-- `yield_mask`: see the diff (`git diff 783fedd..HEAD -- python/viz/rv_stable_fill.py`).
 - `tools/rv_stable_preview.py` calls the above (`snap_road_for_cam` with an ego mask, `edge_cut_far_side`, `point_footprint`, `splat_max_radius_px`).
 
 Part B commits (side/rear snap work on top of ca70e02): 434a654 (ground splats reach the next camera row, rear snapped, snapped px go through the edge cut), 64d4c03 (ego-hood px not snapped, wide capped at 15 m, shared edge cut with no snapped exemption, splat cap W//40), 68281e7 (wide road snap OFF by default; main/pillars/repeaters/rear snap with the 0.30 m rejection; all cams switchable).

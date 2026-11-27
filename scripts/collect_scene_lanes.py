@@ -3283,7 +3283,25 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     held_tag = None
                     print(f"collect driving {segment_id}", flush=True)
                 else:
-                    if last_ai is None:
+                    if route_driver is not None and not waypoint and route_driver.active:
+                        # A spawn or recover leaves the car at rest: the route's window goes out now, not the plain span.
+                        from python.collect.long_route import ROUTE_AI_KEY, drive_tick
+
+                        if last_ai is None and route_driver.lines_sent:
+                            route_driver.reset_send()
+                        pre_cmds: list[str] = []
+                        if drive_tick(route_driver, pos, speed, pre_cmds.append):
+                            last_ai = ROUTE_AI_KEY
+                        for command in pre_cmds:
+                            try:
+                                _queue(vehicle, command)
+                                ai_cmd = control_log.ai_cmd_state(ai_cmd, command)
+                            except Exception as exc:
+                                last_error = f"{type(exc).__name__}: {exc}"
+                        if not route_driver.active:
+                            last_ai = None  # finished or abandoned at rest: the plain span send runs from the next tick
+                            print(f"collect route {segment_id} driver {route_driver.summary()}", flush=True)
+                    elif last_ai is None:
                         for command in ai_commands(speed, waypoint, traffic=False):
                             try:
                                 _queue(vehicle, command)
@@ -3601,7 +3619,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             send_ai = last_ai != ai_key
             if not driving and not waypoint and last_ai is not None:
                 send_ai = False
-            if route_driver is not None and not waypoint:  # not gated on "driving": the car starts at rest
+            if route_driver is not None and not waypoint:  # not gated on "driving": a car at rest (after a spawn or recover) must get its window
                 from python.collect.long_route import ROUTE_AI_KEY, drive_tick
 
                 was_active = route_driver.active

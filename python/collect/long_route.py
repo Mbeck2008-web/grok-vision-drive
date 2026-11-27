@@ -76,6 +76,9 @@ OFF_TICKS = 8
 END_TOL_M = 25.0
 FAR_END_TOL_M = 60.0
 SEND_SPEED_DELTA = 0.5
+# Highest AI speed (m/s) on each kind of road; the highway takes the clip's own speed.
+KIND_SPEED_CAP = {"highway": None, "ramp": 16.0, "city": 14.0, "dirt": 11.0}
+RESUME_AHEAD_M = 25.0
 
 
 def is_dirt_material(material: object) -> bool:
@@ -586,6 +589,7 @@ class RouteDriver:
         self.lines_sent = 0
         self.max_off_route_m = 0.0
         self.far_end_reached = False
+        self.resumes = 0
         self._off = 0
         self._sent_at: float | None = None
         self._sent_speed: float | None = None
@@ -616,17 +620,20 @@ class RouteDriver:
         if self.progress_m >= self.route.total_m - self.end_tol_m:
             self.state = "done"
             return span_commands(speed_mps)
+        v = float(speed_mps)
+        cap = KIND_SPEED_CAP.get(self.route.kinds[min(len(self.route.kinds) - 1, i + 1)])
+        if cap is not None:
+            v = min(v, float(cap))
         stale = self._sent_at is None or (self.progress_m - self._sent_at) >= self.resend_m
-        faster = self._sent_speed is None or abs(float(speed_mps) - self._sent_speed) >= SEND_SPEED_DELTA
+        faster = self._sent_speed is None or abs(v - self._sent_speed) >= SEND_SPEED_DELTA
         if not (stale or faster):
             return []
         first = self._sent_at is None
         line = self._window(i, s)
         self._sent_at = self.progress_m
-        self._sent_speed = float(speed_mps)
+        self._sent_speed = v
         self.lines_sent += 1
         self.state = "following"
-        v = float(speed_mps)
         cmds = ['ai.setMode("manual")', 'ai.driveInLane("off")', 'ai.setSpeedMode("limit")'] if first else []
         cmds += [f"ai.setSpeed({v})", lua_set_line([(p[0], p[1]) for p in line], v)]
         return cmds
@@ -648,11 +655,30 @@ class RouteDriver:
             out.append(pts[j])
         return out
 
+    def resume_pose(self, ahead_m: float = RESUME_AHEAD_M) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+        """Pose ``ahead_m`` past the car's last place on the route, facing along it (for a respawn that must stay on the route).
+
+        The next ``commands`` call sends a fresh window, the mode included.
+        """
+        pts, cum = self.route.points, self.route.cum
+        s = min(self.route.total_m - 1.0, self.progress_m + float(ahead_m))
+        k = max(0, min(len(pts) - 2, max(j for j in range(len(cum)) if cum[j] <= max(0.0, s))))
+        t = min(1.0, max(0.0, (s - cum[k]) / max(1e-6, cum[k + 1] - cum[k])))
+        a, b = pts[k], pts[k + 1]
+        pos = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t + 0.5)
+        self.index = k
+        self.resumes += 1
+        self.progress_m = max(self.progress_m, s)
+        self._sent_at = None
+        self._sent_speed = None
+        self._off = 0
+        return pos, _yaw_quat(b[0] - a[0], b[1] - a[1])
+
     def summary(self) -> dict[str, Any]:
         return {
             "state": self.state, "progress_m": round(self.progress_m, 1), "total_m": round(self.route.total_m, 1),
             "far_end_reached": bool(self.far_end_reached), "lines_sent": int(self.lines_sent),
-            "max_off_route_m": round(self.max_off_route_m, 1),
+            "max_off_route_m": round(self.max_off_route_m, 1), "resumes": int(self.resumes),
         }
 
 

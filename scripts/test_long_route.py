@@ -296,6 +296,44 @@ def check_driver_resend_rules() -> None:
     print("driver: re-sends on 80 m of progress or a 0.5 m/s speed change, never re-sets the mode")
 
 
+def check_driver_speed_caps_and_resume() -> None:
+    _g, route = route_of(loop_network(dirt=True), seed=2)
+    # Dirt and city take less than the highway's 25 m/s; the highway keeps it.
+    drv = lr.RouteDriver(route)
+    veh = FakeVehicle()
+    drive(route, veh, drv, speed=25.0)
+    speeds = [float(c[len("ai.setSpeed("):-1]) for c in veh.sent if c.startswith("ai.setSpeed(")]
+    assert speeds[0] == 25.0 and max(speeds) == 25.0, speeds
+    assert 11.0 in speeds and min(speeds) == 11.0, speeds
+    assert all(sp in (25.0, 14.0, 11.0) for sp in speeds), sorted(set(speeds))
+    # The setLine nodes carry the capped speed too.
+    node_speeds = {float(v) for c in veh.sent if c.startswith("ai.setLine(") for _a, _b, v in POS.findall(SET_LINE.match(c).group(1))}
+    assert node_speeds == {25.0, 11.0}, node_speeds  # this route is highway then dirt
+
+    # A respawn that has to stay on the route: 25 m past the last progress, facing along it, then a fresh window.
+    drv = lr.RouteDriver(route)
+    i0 = next(i for i, c in enumerate(route.cum) if c > 1000.0)
+    x, y, _ = route.points[i0]
+    drv.commands(x, y, 20.0)
+    before = drv.progress_m
+    pos, rot = drv.resume_pose()
+    j, s, d = lr.project_forward(route, pos[0], pos[1], 0, ahead_m=1e9)
+    assert d < 1.0 and abs(s - (before + lr.RESUME_AHEAD_M)) < 1.0, (s, before)
+    assert pos[2] >= route.points[j][2] + 0.4
+    yaw = math.atan2(2 * rot[3] * rot[2], 1 - 2 * rot[2] ** 2)
+    a, b = route.points[j], route.points[j + 1]
+    assert abs(math.cos(yaw) * (b[0] - a[0]) + math.sin(yaw) * (b[1] - a[1])) > 0.99 * math.hypot(b[0] - a[0], b[1] - a[1]), "faces along the route"
+    assert drv.resumes == 1 and drv.summary()["resumes"] == 1
+    again = drv.commands(pos[0], pos[1], 20.0)
+    assert any(c.startswith("ai.setLine(") for c in again) and 'ai.setMode("manual")' in again, again[:3]
+    # The end of the route is not run past.
+    end = lr.RouteDriver(route)
+    end.progress_m = route.total_m
+    p2, _r = end.resume_pose()
+    assert lr.project_forward(route, p2[0], p2[1], 0, ahead_m=1e9)[1] <= route.total_m
+    print("driver: kind speed caps (dirt 11, city 14); resume_pose re-places 25 m ahead on the route and re-sends")
+
+
 def check_driver_off_route_and_far_end() -> None:
     _g, route = route_of(loop_network(dirt=False), seed=2)
     drv = lr.RouteDriver(route)
@@ -377,6 +415,7 @@ def main() -> None:
     check_json_roundtrip_and_determinism()
     check_driver_sends_the_route_in_order()
     check_driver_resend_rules()
+    check_driver_speed_caps_and_resume()
     check_driver_off_route_and_far_end()
     check_measure_route()
     check_real_maps_routes()

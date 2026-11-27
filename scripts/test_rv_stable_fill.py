@@ -29,6 +29,7 @@ S3b CamDepthFilter does not push on/above-road input below the road plane.
 S15 a road px the snap rejects renders at its raw depth (not deleted by snap / clamp / cap).
 S14 snap: ego-hood px are excluded; wide snaps to a 15 m ground hit only.
 S16 the depth-edge cut has no snapped exemption (shared edge_cut_far_side).
+S22 (M04b) the edge cut drops the 12 non-sky px next to +inf sky under GT depth (far_side <= ground_hit, inf == inf).
 S19 the black band under the horizon is a 2-D render-only backdrop when a sky colour exists.
 S21 no module under python/ imports tools.rv_*, rv_stable_fill, or tools.rv_stable_fill (import isolation: AEB/planner cannot see the preview).
 S17 splat radius cap (W//60) covers the 0.25 m ground grid near the chase camera (behind-car strip).
@@ -536,6 +537,26 @@ def check_edge_cut_includes_snapped() -> None:
     assert np.array_equal(out2[down & (xs < 80)], d[down & (xs < 80)])
 
 
+def check_edge_cut_drops_px_next_to_sky() -> None:
+    """S22 (M04b pin, current behaviour; no render change): with GT depth a sky px is +inf and the ground hit of an
+    upward ray is +inf, so ``far_side <= ground_hit`` holds as +inf == +inf: the non-sky px next to sky is cut to +inf
+    and is then not drawn (valid needs a finite depth). Pins the actual pixels: the 12-px border column is cut, nothing
+    else changes. A strict ``<`` would keep those 12 px at their own depth, so this fails on ``<``."""
+    H, W, X = 12, 16, 8                                           # finite surface in cols 0..7, sky in cols 8..15
+    d = np.full((H, W), 30.0)
+    sky = np.zeros((H, W), bool); sky[:, X:] = True
+    d[sky] = np.inf                                               # GT no-hit px
+    ghit = np.full((H, W), np.inf)                                # upward rays: no ground hit
+    out = sf.edge_cut_far_side(d, sky, ghit)
+    border = np.zeros((H, W), bool); border[:, X - 1] = True      # the 12 non-sky px touching the sky
+    assert border.sum() == 12
+    assert np.all(np.isposinf(out[border])), "the 12 border px next to sky are cut to +inf"
+    rest = ~border
+    assert np.array_equal(out[rest], d[rest]), "no other px changes"
+    valid = ~sky & np.isfinite(out) & (out > 0.3)
+    assert not valid[border].any() and valid[~sky & ~border].all(), "cut border px are dropped, the rest stays drawn"
+
+
 def check_splat_radius_covers_ground_grid() -> None:
     """S17 (Skeptic, behind-car strip): the ground grid keeps one point per 0.25 m cell; at ~3 m from the pose A chase
     camera that is ~39 px apart, so a splat radius capped at 8 px (W//120 at 960) leaves a third of the road cells just
@@ -792,7 +813,7 @@ if __name__ == "__main__":
                check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership,
                check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_rejected_road_px_render_raw,
                check_filter_keeps_ground, check_ground_footprint, check_snap_range_and_exclude,
-               check_edge_cut_includes_snapped, check_splat_radius_covers_ground_grid, check_backdrop_render_only,
+               check_edge_cut_includes_snapped, check_edge_cut_drops_px_next_to_sky, check_splat_radius_covers_ground_grid, check_backdrop_render_only,
                check_python_import_isolation, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)

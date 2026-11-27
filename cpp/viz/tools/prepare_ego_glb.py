@@ -6,6 +6,17 @@ Source (do not ship model3_scene.glb): the car-only extract of
 Removes the embossed hood T badge, converts to the visualizer ego frame
 (X right, Y forward, Z up, length-centered, wheels on the ground), and
 writes vertex colours (body / glass / wheels / lamps) for the flat mesh shader.
+
+This tool's output still has the rear T badge (trunk lid at the base of
+the glass). The committed cpp/viz/assets/tesla_model3_ego.glb is the
+source of truth for the ego mesh (SHA-256
+1107241762a6fcb50c77cf565e95d8d9b60c061e01c041b88271ca2ad13afd38).
+A one-off post-pass on this tool's output (then SHA-256 fa1ac2450f36…)
+stripped that rear badge, filled the T-shaped glass cutout, and flattened
+the hole-rim vertices; that post-pass is not in the repository and cannot
+be re-run to the same bytes. Re-running this tool on the car-only source
+would restore the rear badge; do not overwrite the committed asset with
+that output. See cpp/viz/assets/ATTRIBUTION.txt.
 """
 from __future__ import annotations
 

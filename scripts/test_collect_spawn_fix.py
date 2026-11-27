@@ -373,6 +373,20 @@ def check_damage_and_up_are_read() -> None:
 
 
 # ------------------------------------------------------ collector, end to end
+class FakeAiApi:
+    """beamngpy 1.36 ``Vehicle.ai.set_line(line, cling=True)`` stand-in."""
+
+    def __init__(self, on_set_line=None) -> None:
+        self._on_set_line = on_set_line
+        self.calls: list[tuple[object, bool]] = []
+
+    def set_line(self, line, cling=True):
+        cling_b = bool(cling)
+        self.calls.append((line, cling_b))
+        if self._on_set_line is not None:
+            self._on_set_line(line, cling=cling_b)
+
+
 class _CrashVehicle:
     """10 m/s, a crash to 0.2 m/s, stopped, then driving again, then the stop file."""
 
@@ -388,7 +402,10 @@ class _CrashVehicle:
         self.stop_at = int(stop_at)
         self.polls = 0
         self.commands: list[object] = []
+        self.lua_commands: list[str] = []
+        self.set_line_calls: list[tuple[object, bool]] = []
         self.state: dict = {}
+        self.ai = FakeAiApi(self.record_ai_set_line)
         self._set(10.0)
 
     def get_bbox(self) -> dict:
@@ -421,9 +438,20 @@ class _CrashVehicle:
         if self.polls >= self.stop_at:
             self.stop.write_text("stop", encoding="utf-8")
 
+    def record_ai_set_line(self, line, cling=True) -> None:
+        cling_b = bool(cling)
+        self.set_line_calls.append((line, cling_b))
+        self._note_command(("set_line", line, cling_b))
+
+    def _note_command(self, command: object) -> None:
+        self.commands.append(command)
+
     def queue_lua_command(self, command: object, *args: object) -> None:
         del args
-        self.commands.append(command)
+        if not isinstance(command, str):
+            raise TypeError(f"queue_lua_command never receives a non-string: {command!r}")
+        self.lua_commands.append(command)
+        self._note_command(command)
 
     def connect(self, bng: object) -> None:
         del bng
@@ -1295,6 +1323,43 @@ def check_recheck_placement_error_stops() -> None:
     print("recheck: a failed placement stops the clip (exit 2, spawn_failed)")
 
 
+def check_queue_dispatches_set_line() -> None:
+    """The collector's _queue calls vehicle.ai.set_line; lua never sees the structured command."""
+    import tempfile
+
+    import scripts.collect_scene_lanes as collect
+    from python.collect.excursion import set_line_command
+
+    with tempfile.TemporaryDirectory() as td:
+        car = _CrashVehicle(Path(td) / "stop")
+    cmd = set_line_command([(0.0, 10.0, 78.74), (20.0, 10.0, 78.80)], 12.5, cling=True)
+    collect._queue(car, cmd)
+    collect._queue(car, 'ai.setSpeed(12.5)')
+    assert car.set_line_calls, "vehicle.ai.set_line was not called"
+    line, cling = car.set_line_calls[0]
+    assert cling is True, cling
+    assert len(line) == 2
+    for node, z in zip(line, (78.74, 78.80)):
+        pos = node["pos"]
+        assert isinstance(pos, tuple) and len(pos) == 3, pos
+        assert pos[2] == z, pos
+        assert node["speed"] == 12.5, node
+    assert car.lua_commands == ["ai.setSpeed(12.5)"]
+    assert all(isinstance(c, str) for c in car.lua_commands)
+    # Missing ai.set_line must fail loudly, not fall back to queue_lua_command.
+    class _NoAi:
+        def queue_lua_command(self, command: object, *args: object) -> None:
+            raise AssertionError(f"fallback must not send {command!r} to queue_lua_command")
+
+    try:
+        collect._queue(_NoAi(), cmd)
+    except RuntimeError as exc:
+        assert "ai.set_line" in str(exc), exc
+    else:
+        raise AssertionError("expected RuntimeError when vehicle has no ai.set_line")
+    print("collector _queue: set_line goes to vehicle.ai.set_line with 3-tuple pos, speed, cling=True; lua stays strings")
+
+
 def main() -> None:
     check_coverage_walks_ahead()
     check_short_probe_is_not_full_coverage()
@@ -1331,6 +1396,7 @@ def main() -> None:
     check_non_route_low_yield_counts_as_spawn()
     check_low_yield_placement_error_stops()
     check_recheck_placement_error_stops()
+    check_queue_dispatches_set_line()
     print("collect spawn fix ok")
 
 

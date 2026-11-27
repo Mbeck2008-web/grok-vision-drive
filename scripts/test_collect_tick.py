@@ -48,6 +48,11 @@ OLD_TOP = ["i", "t", "dt_s", "driver", "ego", "wheel", "pedals", "capture", "cam
 NEW_TOP = ["veh", "imu", "ai_in_src", "ai_cmd", "road", "traffic"]
 
 
+class _TickAi:
+    def set_line(self, line, cling=True) -> None:
+        del line, cling
+
+
 class _Vehicle:
     model = "etk800"  # no get_bbox: the collector logs the etk800 width
 
@@ -57,6 +62,7 @@ class _Vehicle:
         self.commands: list[str] = []
         self.probes = 0
         self.polls = 0
+        self.ai = _TickAi()
         self.state = {
             "pos": [0.4, 12.0, 0.5],
             "dir": [0.0, 1.0, 0.0],

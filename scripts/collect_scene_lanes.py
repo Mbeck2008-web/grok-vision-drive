@@ -1178,18 +1178,10 @@ def _queue(vehicle: Any, command: object) -> None:
     if is_set_line(command):
         _tag, line, cling = command  # type: ignore[misc]
         fn = getattr(getattr(vehicle, "ai", None), "set_line", None)
-        if callable(fn):
-            fn(line, cling=cling)
-            return
-        # Tests / fakes without beamngpy still record the structured command.
-        rec = getattr(vehicle, "queue_lua_command", None)
-        if callable(rec):
-            try:
-                rec(command)
-            except TypeError:
-                rec(command, False)
-            return
-        raise RuntimeError("vehicle has no ai.set_line")
+        if not callable(fn):
+            raise RuntimeError("vehicle has no ai.set_line")
+        fn(line, cling=cling)
+        return
     if not isinstance(command, str):
         raise TypeError(f"unsupported AI command: {command!r}")
     fn = getattr(vehicle, "queue_lua_command", None)

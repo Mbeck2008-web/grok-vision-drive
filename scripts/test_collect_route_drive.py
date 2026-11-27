@@ -114,8 +114,8 @@ class RouteCar(sf._CrashVehicle):
         elif self.recover_to == "off":  # or off the route
             self.parked = True
 
-    def queue_lua_command(self, command: object, *args: object) -> None:
-        super().queue_lua_command(command, *args)
+    def _note_command(self, command: object) -> None:
+        super()._note_command(command)
         self.cmd_poll.append(self.polls)
         self.cmd_s.append(self.s)
         if _is_set_line(command):
@@ -228,6 +228,23 @@ def _no_excursions_flag_run(route: lr.Route, **kw: object):
         collect.main = orig  # type: ignore[assignment]
 
 
+
+def _assert_set_line_dispatched(car, *, z: float) -> None:
+    """The real _queue called vehicle.ai.set_line with beamngpy 1.36's signature."""
+    assert car.set_line_calls, "vehicle.ai.set_line was not called"
+    for line, cling in car.set_line_calls:
+        assert cling is True, cling
+        assert line, "set_line window is not empty"
+        for node in line:
+            pos = node["pos"]
+            assert isinstance(pos, tuple) and len(pos) == 3, pos
+            assert pos[2] == z, f"pos z must be the route height, not hardcoded 0: {pos}"
+            assert "speed" in node, node
+    assert car.lua_commands, "expected Lua setMode/setSpeed strings"
+    assert all(isinstance(c, str) for c in car.lua_commands)
+    assert not any(_is_set_line(c) for c in car.lua_commands)
+
+
 def check_route_runs_through_the_collector() -> None:
     route = make_route()
     code, text, out, car = _no_excursions_flag_run(route)
@@ -266,6 +283,7 @@ def check_route_runs_through_the_collector() -> None:
     assert status["route_driver"] == summary, (status["route_driver"], summary)
     assert status["impact_respawn"]["on"] is False, status["impact_respawn"]
     assert "collect route west_coast_usa#0 driver" in text and "'state': 'done'" in text, text[-1500:]
+    _assert_set_line_dispatched(car, z=0.4)
     print(f"collector route run: {len(lines)} route lines over {total:.0f} m, start pose from the route, one respawn-free segment, hand-off to span, route_driver.json written")
 
 

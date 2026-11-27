@@ -237,7 +237,7 @@ def actor_dims(box: Any) -> tuple[float | None, float | None, float | None]:
     return round(rest[0], 6), round(rest[1], 6), round(2.0 * half[up_i], 6)
 
 
-_SET = re.compile(r'^\s*ai\.(setMode|setSpeedMode|setSpeed|setLine)\((.*)\)\s*$', re.S)
+_SET = re.compile(r'^\s*ai\.(setMode|setSpeedMode|setSpeed)\((.*)\)\s*$', re.S)
 
 
 def ai_cmd_state(state: Mapping[str, Any] | None = None, command: object = None) -> dict[str, Any]:
@@ -259,8 +259,6 @@ def ai_cmd_state(state: Mapping[str, Any] | None = None, command: object = None)
         out["speed_mode"] = arg.strip("\"'")
     elif name == "setSpeed":
         out["set_speed_mps"] = _num(arg)
-    else:
-        out["line_active"] = True
     return out
 
 

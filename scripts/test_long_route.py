@@ -247,23 +247,46 @@ def assert_no_ai_setline(cmds: list[object]) -> None:
 
 
 class FakeVehicle:
-    """Records the commands the driver sends, like the collector's ``_queue(vehicle, cmd)``."""
+    """Records through the collector's real ``_queue``: Lua strings and ``ai.set_line``."""
 
     def __init__(self):
         self.sent: list[object] = []
+        self.lua_commands: list[str] = []
+        self.set_line_calls: list[tuple[object, bool]] = []
         self.mode = "span"
         self.line: list[tuple[float, float, float]] = []
+        self.ai = _FakeAi(self)
 
-    def queue(self, cmd: object) -> None:
+    def record_set_line(self, line, cling=True) -> None:
+        cling_b = bool(cling)
+        self.set_line_calls.append((line, cling_b))
+        cmd = ("set_line", line, cling_b)
         self.sent.append(cmd)
-        if isinstance(cmd, str) and cmd.startswith("ai.setMode("):
-            self.mode = cmd.split('"')[1]
-        if is_set_line_cmd(cmd):
-            self.line = set_line_points(cmd)
+        self.line = set_line_points(cmd)
+
+    def queue_lua_command(self, command: object, *args: object) -> None:
+        del args
+        assert isinstance(command, str), f"queue_lua_command never receives a non-string: {command!r}"
+        self.lua_commands.append(command)
+        self.sent.append(command)
+        if command.startswith("ai.setMode("):
+            self.mode = command.split('"')[1]
+
+
+class _FakeAi:
+    """beamngpy 1.36 ``Vehicle.ai.set_line(line, cling=True)`` stand-in."""
+
+    def __init__(self, vehicle: FakeVehicle) -> None:
+        self._vehicle = vehicle
+
+    def set_line(self, line, cling=True):
+        self._vehicle.record_set_line(line, cling=cling)
 
 
 def drive(route, vehicle, driver, *, step_m=6.0, speed=14.0, start_s=0.0, stop_s=None, jitter=0.0):
-    """Move a car along ``route`` and call the driver each tick."""
+    """Move a car along ``route`` and dispatch each command through the collector's ``_queue``."""
+    import scripts.collect_scene_lanes as collect
+
     s = start_s
     end = route.total_m if stop_s is None else stop_s
     ticks = 0
@@ -273,7 +296,7 @@ def drive(route, vehicle, driver, *, step_m=6.0, speed=14.0, start_s=0.0, stop_s
         x = route.points[i][0] + t * (route.points[i + 1][0] - route.points[i][0]) + jitter
         y = route.points[i][1] + t * (route.points[i + 1][1] - route.points[i][1])
         for cmd in driver.commands(x, y, speed):
-            vehicle.queue(cmd)
+            collect._queue(vehicle, cmd)
         s += step_m
         ticks += 1
     return ticks
@@ -307,6 +330,27 @@ def check_driver_uses_set_line_api() -> None:
         assert node["speed"] == 20.0, node
     assert abs(line[0]["pos"][0] - x) < 1e-6 and abs(line[0]["pos"][1] - y) < 1e-6
     assert abs(line[0]["pos"][2] - z0) < 1e-6, (line[0]["pos"], z0)
+    import scripts.collect_scene_lanes as collect
+
+    veh = FakeVehicle()
+    for cmd in cmds:
+        collect._queue(veh, cmd)
+    assert veh.set_line_calls, "vehicle.ai.set_line was not called"
+    got, got_cling = veh.set_line_calls[0]
+    assert got_cling is True, got_cling
+    assert got == line
+    for node in got:
+        pos = node["pos"]
+        assert isinstance(pos, tuple) and len(pos) == 3, pos
+        assert pos[2] != 0.0, f"pos z must be the route height, not hardcoded 0: {pos}"
+        assert "speed" in node and node["speed"] == 20.0, node
+    assert veh.lua_commands == [
+        'ai.setMode("manual")',
+        'ai.driveInLane("off")',
+        'ai.setSpeedMode("limit")',
+        "ai.setSpeed(20.0)",
+    ]
+    assert all(isinstance(c, str) for c in veh.lua_commands)
     print("driver: set_line uses 3-tuple pos with real z, speed, cling=True; no ai.setLine Lua")
 
 

@@ -257,6 +257,8 @@ def check_paths_stay_on_the_road() -> None:
     assert any(isinstance(line, str) and 'driveInLane("off")' in line for line in lined)
     set_lines = [c for c in lined if _is_set_line(c)]
     assert len(set_lines) == 1, lined
+    assert "ai.setSpeed(10.0)" in lined
+    assert lined.index("ai.setSpeed(10.0)") < lined.index(set_lines[0])
     line, cling = set_lines[0][1], set_lines[0][2]
     assert cling is True
     assert line, "weave set_line window is not empty"
@@ -530,8 +532,16 @@ class _NoVehicle(Exception):
 _NoVehicle.__name__ = "BNGError"
 
 
+class _EgoAi:
+    def set_line(self, line, cling=True) -> None:
+        del line, cling
+
+
 class _Ego:
     model = "etk800"  # no get_bbox: the collector logs the etk800 width
+
+    def __init__(self) -> None:
+        self.ai = _EgoAi()
 
     def connect(self, bng: object) -> None:
         del bng

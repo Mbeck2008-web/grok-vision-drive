@@ -279,7 +279,7 @@ def apply_long_highway(
         raise ValueError(f"long_highway_frac must be in [0, 1], not {highway_frac}")
     pool = tuple(str(m) for m in (maps if maps is not None else (plan.map,)) if str(m))
     if not pool:
-        return plan
+        raise ValueError("a long clip needs at least one map")
     rng = random.Random(f"gvd-long-clip:{int(plan.seed)}:{int(plan.index)}")
     duration = round(rng.uniform(float(min_s), float(max_s)), 3)
     hwy = highway_maps(pool)
@@ -886,11 +886,8 @@ def run_clips(
                 plan, min_s=long_min_s, max_s=long_max_s, maps=maps,
                 highway_frac=long_highway_frac, ordinal=long_order.index(index),
             )
-            if plan.long:
-                key = plan.long_route if plan.long_route in long_delivered else VARIED
-                long_delivered[key] += 1
-            else:
-                log(f"long clips: index {index} was not applied")
+            # apply_long_highway always returns a long plan (it raises on an empty pool); count it by its route.
+            long_delivered[plan.long_route] += 1
         clip = new_clip_dir(session, plan)
         route = plan_route(plan)
         route_file = write_route_plan(session, clip, route) if route is not None else None

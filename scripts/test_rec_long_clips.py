@@ -773,6 +773,128 @@ def check_requested_direction_alternates_by_long_clip_order() -> None:
     print("direction alternates in long-clip order, seed differs per clip, failed plan falls back to varied span")
 
 
+def check_long_plan_guards_and_provenance() -> None:
+    """Empty pool and a bad fraction are refused; notes/tags carry 'long'; the spawn seed is re-rolled; argv gets exact segment minutes."""
+    import math
+
+    from python.collect.clip_mode import apply_long_highway, clip_argv, plan_clip
+
+    base = plan_clip(2, seed=5, maps=("west_coast_usa",), max_traffic=1)
+    for bad_maps in ((), ("",)):
+        try:
+            apply_long_highway(base, min_s=600.0, max_s=900.0, maps=bad_maps)
+        except ValueError as exc:
+            assert "at least one map" in str(exc), exc
+        else:
+            raise AssertionError(f"a long clip was made from an empty pool {bad_maps!r}")
+    for bad in (-0.01, 1.01, 7.0):
+        try:
+            apply_long_highway(base, min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=bad)
+        except ValueError as exc:
+            assert "long_highway_frac" in str(exc), exc
+        else:
+            raise AssertionError(f"accepted highway_frac {bad}")
+    for ok in (0.0, 1.0):
+        apply_long_highway(base, min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=ok)
+
+    # 'long' is in both the notes and the tags, loop or varied; 'long_highway' only on the loop.
+    loop = apply_long_highway(base, min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=1.0)
+    varied = apply_long_highway(base, min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=0.0)
+    assert loop.long_route == "highway_loop" and varied.long_route == "varied"
+    for p in (loop, varied):
+        assert "long" in p.notes and "long" in p.tags, p
+    assert "long_highway" in loop.notes and "long_highway" in loop.tags
+    assert "long_highway" not in varied.notes and "long_highway" not in varied.tags
+    # The spawn seed is a fresh draw for the long clip, not the short plan's.
+    seeds = [(plan_clip(i, seed=5, maps=("west_coast_usa",), max_traffic=1), i) for i in range(6)]
+    moved = [apply_long_highway(b, min_s=600.0, max_s=900.0, maps=("west_coast_usa",), highway_frac=0.0).spawn_seed != b.spawn_seed for b, _ in seeds]
+    assert all(moved), moved
+
+    # --segment-min is the clip's whole minutes, rounded up (a 15 min clip is not cut at 12).
+    for secs, minutes in ((200.0, 4.0), (840.0, 14.0), (900.0, 15.0), (901.0, 16.0), (600.0, 10.0)):
+        for frac in (0.0, 1.0):
+            plan = apply_long_highway(base, min_s=secs, max_s=secs, maps=("west_coast_usa",), highway_frac=frac)
+            argv = clip_argv(plan, Path("/tmp/x/clip"), route_plan="/tmp/r.json")
+            assert float(argv[argv.index("--segment-min") + 1]) == minutes, (secs, frac, argv)
+            assert float(argv[argv.index("--segment-min") + 1]) == math.ceil(plan.duration_s / 60.0)
+    print("long plan: empty pool and bad fraction refused, 'long' in notes/tags, spawn seed re-rolled, segment-min is ceil(minutes)")
+
+
+def check_varied_spawn_kind_and_qc_skip() -> None:
+    """A varied long clip spawns on a city road, else a highway, else anywhere; QC does not fail it for an unobserved edge case."""
+    from python.collect import clip_mode
+    from python.collect.clip_mode import apply_long_highway, plan_clip, quality_check
+    from scripts.gvd_test_env import collect_root
+
+    base = plan_clip(0, seed=3, maps=("small_island",), max_traffic=0)
+    cases = (
+        (True, True, "city"),
+        (True, False, "city"),
+        (False, True, "highway"),
+        (False, False, None),
+    )
+    city0, hwy0 = clip_mode.map_has_city_pool, clip_mode.map_has_highway_pool
+    try:
+        for city, hwy, kind in cases:
+            clip_mode.map_has_city_pool = lambda m, _c=city: _c
+            clip_mode.map_has_highway_pool = lambda m, _h=hwy: _h
+            plan = apply_long_highway(base, min_s=600.0, max_s=900.0, maps=("small_island",), highway_frac=0.0)
+            assert plan.long_route == "varied" and plan.spawn_kind == kind, (city, hwy, plan.spawn_kind)
+    finally:
+        clip_mode.map_has_city_pool, clip_mode.map_has_highway_pool = city0, hwy0
+
+    # QC: a varied long clip (not long_highway) that inherited a cut_in recipe is not failed for the cut-in.
+    cut = plan_clip(0, seed=1, maps=("west_coast_usa",), max_traffic=4, edge_cases=("cut_in",), min_s=4.0, max_s=4.0)
+    plan = apply_long_highway(cut, min_s=4.0, max_s=4.0, maps=("west_coast_usa",), highway_frac=0.0)
+    assert plan.long and not plan.long_highway
+    with collect_root() as root:
+        d = root / "clip"
+        _fake_recording(d, rows=50, spawn_type="city")
+        qc = quality_check(d, plan, exit_code=0)
+        assert qc["quality"] == "train" and qc["edge_case_observed"] is None, qc
+        assert qc["edge_case_note"].startswith("long"), qc
+        # Same recording against the short cut_in plan is judged on the cut-in (so the skip above is doing the work).
+        short = quality_check(d, cut, exit_code=0)
+        assert short["edge_case_observed"] is False, short
+    print("varied long clip: spawn kind city > highway > none; QC does not judge an inherited edge case")
+
+
+def check_manifest_frac_warning_and_forwarding() -> None:
+    from python.collect.clip_mode import run_clips
+    from scripts.gvd_test_env import collect_root
+
+    def runner(argv: list[str]) -> int:
+        _fake_recording(Path(argv[argv.index("--out") + 1]), rows=50)
+        return 0
+
+    seen = {}
+    for frac in (0.0, 1.0):
+        logs: list[str] = []
+        with collect_root() as root:
+            session = run_clips(
+                root, clips=8, seed=6, maps=("west_coast_usa", "east_coast_usa"), max_traffic=1, runner=runner,
+                min_s=30.0, max_s=60.0, long_clips=4, long_min_s=600.0, long_max_s=900.0,
+                long_highway_frac=frac, log=logs.append,
+            )
+            manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["long_highway_frac"] == frac, manifest["long_highway_frac"]
+        seen[frac] = manifest["long_clips_by_route"]
+        assert not any("no highway map" in x for x in logs), logs  # the pool has a highway map
+    assert seen[0.0] == {"highway_loop": 0, "varied": 4}, seen
+    assert seen[1.0] == {"highway_loop": 4, "varied": 0}, seen
+
+    # The no-highway warning only fires when long clips were asked for.
+    for n, want in ((0, False), (2, True)):
+        logs = []
+        with collect_root() as root:
+            run_clips(
+                root, clips=4, seed=6, maps=("east_coast_usa",), max_traffic=1, runner=runner,
+                min_s=30.0, max_s=60.0, long_clips=n, long_min_s=600.0, long_max_s=900.0, log=logs.append,
+            )
+        assert any("no highway map" in x for x in logs) == want, (n, logs)
+    print("session.json keeps long_highway_frac, run_clips forwards it, the no-highway warning only fires when long clips were asked for")
+
+
 def check_disk_guards_unchanged_for_long_clips() -> None:
     """20 GiB free-space floor and 3.5 GiB per-file cap are unchanged at the 43 GiB/900 s ceiling."""
     from python.collect.clip_mode import LONG_CLIP_DISK_GIB_PER_900S
@@ -958,6 +1080,9 @@ def _checks() -> None:
     check_long_clip_highway_frac_mix()
     check_highway_loop_clips_are_driven_and_measured()
     check_requested_direction_alternates_by_long_clip_order()
+    check_long_plan_guards_and_provenance()
+    check_varied_spawn_kind_and_qc_skip()
+    check_manifest_frac_warning_and_forwarding()
     check_disk_guards_unchanged_for_long_clips()
     check_no_highway_pool_delivers_drive_around_long_clips()
     check_keep_planned_highway_map_and_remap_varies()

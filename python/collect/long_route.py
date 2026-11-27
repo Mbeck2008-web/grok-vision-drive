@@ -32,6 +32,7 @@ against a live BeamNG; the collector wiring is described in
 from __future__ import annotations
 
 import heapq
+from functools import lru_cache
 import json
 import math
 import random
@@ -94,6 +95,7 @@ def _hash01(seed: int, tag: str, a: int, b: int) -> float:
     return h / 4294967296.0
 
 
+@lru_cache(maxsize=256)
 def hash_tag(tag: str) -> int:
     return sum((i + 1) * ord(c) for i, c in enumerate(tag)) & 0xFFFF
 
@@ -528,15 +530,33 @@ def _plan_return(
     return None
 
 
-def route_for_map(map_name: str, *, seed: int, direction: int, duration_s: float = 750.0) -> Route | None:
-    """Plan from the map's road dump. None when there is no dump or no highway."""
+@lru_cache(maxsize=8)
+def graph_for_map(map_name: str) -> RoadGraph | None:
+    """The map's road graph from its dump (cached). None when there is no dump."""
     from python.collect.spawn_mix import load_nav_roads, spawn_roads_path
 
     path = spawn_roads_path(str(map_name))
     if path is None or not path.is_file():
         return None
-    roads = load_nav_roads(path)
-    return plan_highway_route(build_graph(roads), map_name=map_name, seed=seed, direction=direction, duration_s=duration_s)
+    return build_graph(load_nav_roads(path))
+
+
+def map_unpaved_m(map_name: str) -> float:
+    """Total length of the map's unpaved roads (dirt, mud, gravel, tire tracks) in its dump; 0 with no dump."""
+    graph = graph_for_map(map_name)
+    if graph is None:
+        return 0.0
+    return float(sum(
+        _cumulative(r["pts"])[-1] for ri, r in enumerate(graph.roads) if graph.is_dirt[ri]
+    ))
+
+
+def route_for_map(map_name: str, *, seed: int, direction: int, duration_s: float = 750.0) -> Route | None:
+    """Plan from the map's road dump. None when there is no dump or no highway."""
+    graph = graph_for_map(map_name)
+    if graph is None:
+        return None
+    return plan_highway_route(graph, map_name=map_name, seed=seed, direction=direction, duration_s=duration_s)
 
 
 # --------------------------------------------------------------------------- driver

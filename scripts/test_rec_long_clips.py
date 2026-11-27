@@ -7,6 +7,7 @@ Offline. Plans, argv, tags, and scheduling only; no BeamNG.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import sys
@@ -17,6 +18,48 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from test_clip_mode import MAPS, _fake_recording  # noqa: E402
+from python.collect import clip_mode as _clip_mode  # noqa: E402
+
+_REAL_ROUTE_PLANNER = _clip_mode._route_cached
+
+
+@contextlib.contextmanager
+def fast_routes(fail: bool = False):
+    """Plan routes on a small synthetic network instead of the real road dump (about 1 s a route).
+
+    Same planner, tiny map: the clip-mode logic around it is what these checks are about. The real
+    dumps are exercised by ``check_long_clip_routes_direction_and_maps`` and ``test_long_route``.
+    ``fail`` makes every plan fail, as on a map where no route can be found.
+    """
+    from python.collect import clip_mode, long_route as lr
+    from test_long_route import loop_network
+
+    graphs = {d: lr.build_graph(loop_network(dirt=True, mirror=bool(d))) for d in (0, 1)}
+    orig = clip_mode._route_cached
+
+    def fake(map_name, seed, direction, duration_s):
+        if fail:
+            return None
+        return lr.plan_highway_route(graphs[int(direction) % 2], map_name=map_name, seed=int(seed),
+                                     direction=int(direction), duration_s=900.0)
+
+    clip_mode._route_cached = fake
+    try:
+        yield
+    finally:
+        clip_mode._route_cached = orig
+
+
+@contextlib.contextmanager
+def real_routes():
+    from python.collect import clip_mode
+
+    cur = clip_mode._route_cached
+    clip_mode._route_cached = _REAL_ROUTE_PLANNER
+    try:
+        yield
+    finally:
+        clip_mode._route_cached = cur
 
 
 def _cli():
@@ -117,7 +160,15 @@ def check_long_plan_duration_spawn_speed_and_tags() -> None:
     assert plan.spawn_kind == "highway"
     assert plan.speed_min == 8.0 and plan.speed_max == 30.0
     assert "long_highway" in plan.tags
-    argv = clip_argv(plan, Path("/tmp/x/clip"))
+    try:
+        clip_argv(plan, Path("/tmp/x/clip"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a highway-loop clip got an argv with no route plan (it would roam freely)")
+    argv = clip_argv(plan, Path("/tmp/x/clip"), route_plan=Path("/tmp/x/_routes/clip.json"))
+    assert argv[argv.index("--route-plan") + 1] == str(Path("/tmp/x/_routes/clip.json"))
+    assert "--no-excursions" in argv and "--route" not in argv
     assert float(argv[argv.index("--clip-s") + 1]) == plan.duration_s
     assert argv[argv.index("--spawn-kind") + 1] == "highway"
     assert float(argv[argv.index("--speed-min") + 1]) == 8.0
@@ -126,6 +177,7 @@ def check_long_plan_duration_spawn_speed_and_tags() -> None:
     # A normal plan does not pick up the highway speed clamp.
     normal_argv = clip_argv(base, Path("/tmp/x/clip"))
     assert "--speed-min" not in normal_argv and "--speed-max" not in normal_argv
+    assert "--route-plan" not in normal_argv and "--no-excursions" not in normal_argv
     assert 30.0 <= base.duration_s <= 60.0
 
     with collect_root() as root:
@@ -518,9 +570,9 @@ def check_long_clip_routes_direction_and_maps() -> None:
     with neither is still a long clip, on a varied seeded route.
     """
     from python.collect.clip_mode import (
-        DIRT_MAPS,
         apply_long_highway,
         clip_argv,
+        map_has_dirt_roads,
         map_has_highway_pool,
         plan_clip,
     )
@@ -532,38 +584,42 @@ def check_long_clip_routes_direction_and_maps() -> None:
             min_s=600.0, max_s=900.0, maps=maps, highway_frac=kw.get("highway_frac", 1.0),
         )
 
-    # italy has highway, city, and is listed as a dirt map.
-    italy = [apply(i, 11, ("italy",)) for i in range(16)]
+    # italy: highway + city; its road dump has no unpaved material, so no dirt leg is claimed.
+    italy = [apply(i, 11, ("italy",)) for i in range(6)]
     assert all(p.long_highway and p.long_route == "highway_loop" for p in italy)
     assert all(p.route_legs[0] == "highway" and p.route_legs[-1] == "highway" for p in italy)
     assert all("city" in p.route_legs for p in italy)
-    assert all("dirt" in p.route_legs for p in italy)
-    dirs = [p.long_direction for p in italy]
-    assert set(dirs) == {0, 1}, dirs
-    assert dirs == [i % 2 for i in range(16)], dirs
+    assert all("dirt" not in p.route_legs and p.route_summary["dirt_m"] == 0.0 for p in italy)
+    assert not map_has_dirt_roads("italy")
+    # The requested direction alternates; the route's own direction is what its start bearing is.
+    assert [p.route_summary["requested_direction"] for p in italy] == [i % 2 for i in range(6)]
+    assert set(p.long_direction for p in italy) == {0, 1}, [p.long_direction for p in italy]
+    assert all(p.long_direction == p.route_summary["direction"] for p in italy)
     # Route / spawn variety across clips; same index is stable.
     seeds = [p.spawn_seed for p in italy]
     assert len(set(seeds)) > 1, seeds
     assert italy[0].spawn_seed == apply(0, 11, ("italy",)).spawn_seed
-    argv = clip_argv(italy[0], _P("/tmp/x/clip"))
+    argv = clip_argv(italy[0], _P("/tmp/x/clip"), route_plan="/tmp/r.json")
     assert argv[argv.index("--spawn-kind") + 1] == "highway"
     seg = float(argv[argv.index("--segment-min") + 1])
     assert seg * 60.0 >= italy[0].duration_s, (seg, italy[0].duration_s)
 
-    # west_coast_usa has highway+city, not a DIRT_MAPS entry: no faked dirt leg.
-    assert "west_coast_usa" not in DIRT_MAPS
-    wc = apply(0, 2, ("west_coast_usa",))
-    assert wc.long_route == "highway_loop" and "city" in wc.route_legs
-    assert "dirt" not in wc.route_legs
+    # west_coast_usa: its dump has gravel/dirt road material, so the dirt leg is real when the return uses it.
+    assert map_has_dirt_roads("west_coast_usa")
+    wcs = [apply(i, 2, ("west_coast_usa",)) for i in range(6)]
+    assert all(p.long_route == "highway_loop" and "city" in p.route_legs for p in wcs)
+    assert all(("dirt" in p.route_legs) == (p.route_summary["dirt_m"] > 0.0) for p in wcs)
+    assert any("dirt" in p.route_legs for p in wcs)
 
-    # east_coast_usa: no highway, is a dirt map. Still a long clip, varied route, no long_highway.
+    # east_coast_usa: no highway (so span roaming), dirt by road material. Still a long clip, no long_highway.
     assert not map_has_highway_pool("east_coast_usa")
-    assert "east_coast_usa" in DIRT_MAPS
+    assert map_has_dirt_roads("east_coast_usa")
     ec = [apply(i, 5, ("east_coast_usa",), highway_frac=1.0) for i in range(12)]
     assert all(p.long and not p.long_highway and p.long_route == "varied" and p.map == "east_coast_usa" for p in ec)
-    assert all("highway" not in p.route_legs for p in ec)
-    assert all("dirt" in p.route_legs or "city" in p.route_legs for p in ec)
-    assert len({(p.spawn_seed, p.long_direction, tuple(p.route_legs)) for p in ec}) > 1
+    assert all(p.route_legs == ["varied"] and p.route_summary is None and p.long_direction is None for p in ec)
+    assert len({p.spawn_seed for p in ec}) > 1
+    argv = clip_argv(ec[0], _P("/tmp/x/clip"))
+    assert argv[argv.index("--route") + 1] == "span" and "--route-plan" not in argv
     # Default pool: some long clips can land on east_coast_usa under frac < 1.
     default = ("west_coast_usa", "italy", "east_coast_usa")
     landed = {
@@ -573,6 +629,148 @@ def check_long_clip_routes_direction_and_maps() -> None:
     }
     assert "east_coast_usa" in landed, landed
     print("routes: direction alternates, spawn/route vary, no-highway maps still counted")
+
+
+def check_real_map_plan_resolves_to_its_route() -> None:
+    """On a real dump a highway-loop plan resolves to the same route the collector is given."""
+    from python.collect.clip_mode import apply_long_highway, plan_clip, plan_route
+
+    base = plan_clip(1, seed=3, maps=("west_coast_usa",), max_traffic=0)
+    plan = apply_long_highway(base, min_s=800.0, max_s=800.0, maps=("west_coast_usa",), highway_frac=1.0)
+    route = plan_route(plan)
+    assert plan.long_route == "highway_loop" and route is not None
+    assert route.map == "west_coast_usa" and route.direction == plan.long_direction
+    assert round(route.highway_m, 1) == plan.route_summary["highway_m"] and list(route.legs) == plan.route_legs
+    assert plan_route(base) is None
+    print("real map: the plan resolves to its own route")
+
+
+def _pos_along(route, frac):
+    """pos_at(i) for a recording of 100 rows that drives the first ``frac`` of the route, then stops."""
+    def pos_at(i):
+        s = route.total_m * min(1.0, frac) * min(1.0, i / 99.0)
+        k = max(j for j in range(len(route.cum)) if route.cum[j] <= s)
+        k = min(k, len(route.points) - 2)
+        t = (s - route.cum[k]) / max(1e-9, route.cum[k + 1] - route.cum[k])
+        a, b = route.points[k], route.points[k + 1]
+        return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, 0.0)
+    return pos_at
+
+
+def check_highway_loop_clips_are_driven_and_measured() -> None:
+    """The route is written, handed to the collector, and scored from the recorded GT pose."""
+    from python.collect import long_route as lr
+    from python.collect.clip_mode import long_clip_indices, plan_route, run_clips
+    from scripts.gvd_test_env import collect_root
+
+    drives = [1.0, 0.2, 0.6]  # one full loop, one stopped early on the highway, one past the far end
+    seen: list[dict] = []
+
+    def runner(argv: list[str]) -> int:
+        out = Path(argv[argv.index("--out") + 1])
+        if "--route-plan" not in argv:
+            _fake_recording(out, rows=50)
+            return 0
+        path = Path(argv[argv.index("--route-plan") + 1])
+        route = lr.Route.from_json(json.loads(path.read_text(encoding="utf-8")))
+        frac = drives[len([x for x in seen if x["route"]])]
+        seen.append({"route": True, "path": path, "argv": argv, "total": route.total_m})
+        _fake_recording(out, rows=100, pos_at=_pos_along(route, frac))
+        (out / "route_driver.json").write_text(json.dumps({"state": "following", "lines_sent": 7}), encoding="utf-8")
+        return 0
+
+    with collect_root() as root:
+        session = run_clips(
+            root, clips=9, seed=4, maps=("west_coast_usa", "italy"), max_traffic=2, runner=runner,
+            min_s=30.0, max_s=60.0, long_clips=3, long_min_s=600.0, long_max_s=900.0, long_highway_frac=1.0,
+        )
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        want = long_clip_indices(9, 3, seed=4)
+        assert len(seen) == 3, seen
+        assert manifest["long_clips_by_route"] == {"highway_loop": 3, "varied": 0}, manifest["long_clips_by_route"]
+        measured = []
+        for i, row in enumerate(manifest["results"]):
+            tags = json.loads((session / row["dir"] / "clip_tags.json").read_text(encoding="utf-8"))
+            if i not in want:
+                assert "route_measure" not in tags and "route_measure" not in row, (i, tags.keys())
+                assert "--route-plan" not in tags["argv"]
+                continue
+            k = len(measured)
+            m = tags["route_measure"]
+            measured.append(m)
+            assert row["route_measure"] == m and row["long_route"] == "highway_loop"
+            path = Path(tags["route_plan_file"])
+            assert path.parent == session / "_routes" and path.name == f"{row['dir']}.json" and path.is_file()
+            assert tags["argv"][tags["argv"].index("--route-plan") + 1] == str(path)
+            assert "--no-excursions" in tags["argv"] and "--route" not in tags["argv"]
+            assert tags["route_driver"] == {"state": "following", "lines_sent": 7}
+            # What the plan said and what the car did are separate numbers.
+            assert tags["route_summary"]["highway_m"] == m["highway_m"] and tags["route_summary"]["total_m"] == m["planned_m"]
+            if drives[k] == 1.0:
+                assert m["far_end_reached"] and m["loop_closed"] and m["highway_fraction"] >= 0.99, m
+                assert m["return_fraction"] >= 0.95 and m["driven_m"] >= 0.97 * m["planned_m"], m
+            elif drives[k] == 0.2:
+                assert not m["far_end_reached"] and not m["loop_closed"], m
+                assert 0.2 * m["planned_m"] - 60 <= m["driven_m"] <= 0.2 * m["planned_m"] + 60, m
+                assert 0.0 < m["highway_fraction"] < 1.0 and m["return_fraction"] == 0.0, m
+            else:
+                assert m["far_end_reached"] and not m["loop_closed"], m
+                assert 0.0 < m["return_fraction"] < 1.0, m
+        tot = manifest["long_route_totals"]
+        assert tot["route_clips"] == 3 and tot["far_end_reached"] == 2 and tot["loop_closed"] == 1, tot
+        assert abs(tot["driven_m"] - sum(m["driven_m"] for m in measured)) < 0.2, (tot, measured)
+        assert abs(tot["mean_highway_fraction"] - sum(m["highway_fraction"] for m in measured) / 3) < 1e-3, tot
+        assert tot["dirt_driven_m"] == round(sum(m["dirt_driven_m"] for m in measured), 1)
+        # The route file is the route the plan resolves to (same plan, same route).
+        plans_dirs = [r["dir"] for i, r in enumerate(manifest["results"]) if i in want]
+        for d in plans_dirs:
+            rt = lr.Route.from_json(json.loads((session / "_routes" / f"{d}.json").read_text(encoding="utf-8")))
+            assert rt.points[0] and rt.far_end_index > 0 and rt.highway_m >= lr.MIN_HIGHWAY_M
+    print("highway loop: route file + --route-plan, GT-pose measure per clip and in session.json (full / early stop / far end only)")
+
+
+def check_requested_direction_alternates_by_long_clip_order() -> None:
+    """Direction alternates in long-clip order (not by raw clip index); the seed differs per clip; a failed plan falls back."""
+    from python.collect.clip_mode import long_clip_indices, run_clips
+    from scripts.gvd_test_env import collect_root
+
+    def runner(argv: list[str]) -> int:
+        _fake_recording(Path(argv[argv.index("--out") + 1]), rows=50)
+        return 0
+
+    want = long_clip_indices(24, 6, seed=2)
+    assert [i % 2 for i in want] != [k % 2 for k in range(6)], want  # raw index parity is not the alternation
+    with collect_root() as root:
+        session = run_clips(
+            root, clips=24, seed=2, maps=("west_coast_usa",), max_traffic=1, runner=runner,
+            min_s=30.0, max_s=60.0, long_clips=6, long_min_s=600.0, long_max_s=900.0, long_highway_frac=1.0,
+        )
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        tags = [json.loads((session / manifest["results"][i]["dir"] / "clip_tags.json").read_text(encoding="utf-8")) for i in want]
+    assert [t["route_summary"]["requested_direction"] for t in tags] == [k % 2 for k in range(6)], tags
+    assert [t["long_direction"] for t in tags] == [k % 2 for k in range(6)]  # the stub network honours the request
+    assert len({t["spawn_seed"] for t in tags}) == 6, [t["spawn_seed"] for t in tags]
+    assert all(t["long_route"] == "highway_loop" and t["route_legs"][0] == "highway" for t in tags)
+
+    # No route can be planned (here forced): the clip is a varied span clip, says so, and is counted as varied.
+    logs: list[str] = []
+    with fast_routes(fail=True), collect_root() as root:
+        session = run_clips(
+            root, clips=6, seed=2, maps=("west_coast_usa",), max_traffic=1, runner=runner,
+            min_s=30.0, max_s=60.0, long_clips=2, long_min_s=600.0, long_max_s=900.0, long_highway_frac=1.0,
+            log=logs.append,
+        )
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["long_clips_by_route"] == {"highway_loop": 0, "varied": 2}, manifest["long_clips_by_route"]
+        assert manifest["long_route_totals"]["route_clips"] == 0
+        for i in long_clip_indices(6, 2, seed=2):
+            t = json.loads((session / manifest["results"][i]["dir"] / "clip_tags.json").read_text(encoding="utf-8"))
+            assert t["long"] is True and t["long_highway"] is False and t["long_route"] == "varied"
+            assert t["route_legs"] == ["varied"] and t["route_summary"] is None and t["long_direction"] is None
+            assert "--route" in t["argv"] and "--route-plan" not in t["argv"] and "route_measure" not in t
+            assert any("no highway end-to-end route" in n for n in t["plan_notes"]), t["plan_notes"]
+        assert not (session / "_routes").exists()
+    print("direction alternates in long-clip order, seed differs per clip, failed plan falls back to varied span")
 
 
 def check_disk_guards_unchanged_for_long_clips() -> None:
@@ -737,7 +935,15 @@ def check_session_id_names_this_launch() -> None:
 
 
 def main() -> None:
+    with fast_routes():
+        _checks()
+    with real_routes():
+        check_long_clip_routes_direction_and_maps()
+        check_real_map_plan_resolves_to_its_route()
+    print("test_rec_long_clips: OK")
 
+
+def _checks() -> None:
     check_default_off_unchanged()
     check_cli_long_clip_flags()
     check_long_clip_indices_spread_and_seeded()
@@ -750,13 +956,13 @@ def main() -> None:
     check_collect_clips_main_passes_long_clip_kwargs()
     check_long_clip_default_duration_bounds()
     check_long_clip_highway_frac_mix()
-    check_long_clip_routes_direction_and_maps()
+    check_highway_loop_clips_are_driven_and_measured()
+    check_requested_direction_alternates_by_long_clip_order()
     check_disk_guards_unchanged_for_long_clips()
     check_no_highway_pool_delivers_drive_around_long_clips()
     check_keep_planned_highway_map_and_remap_varies()
     check_unreadable_road_dump_is_not_a_highway_map()
     check_session_id_names_this_launch()
-    print("test_rec_long_clips: OK")
 
 
 if __name__ == "__main__":

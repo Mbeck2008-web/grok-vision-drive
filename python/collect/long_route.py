@@ -19,9 +19,11 @@ within ``JOIN_M`` of another road joins it. A route is
 The line is offset into the legal right-hand lane (``_offset_candidates``, the
 rule the spawn deck uses), so it can be sent to the AI as ``vehicle.ai.set_line``.
 
-``RouteDriver`` turns a position into AI commands: it sends the next
-``window_m`` of the route as a ``set_line`` command (the helper ``excursion.py`` already
+``RouteDriver`` turns a position into AI commands: it sends the remaining
+route once as a ``set_line`` command (the helper ``excursion.py`` already
 makes) and hands the car back to ``span`` at the end or when it is off the route.
+Mid-drive speed changes go out as ``ai.setSpeed`` only: re-issuing ``set_line``
+makes Tech ``driveUsingPath({script=...})`` teleport to the first script point.
 ``measure_route`` scores a recording against the route from the ego positions.
 
 No BeamNG here, so everything runs offline. Nothing in this module was run
@@ -75,7 +77,12 @@ JITTER_LO, JITTER_HI = 0.85, 1.7
 DIRT_WORDS = ("dirt", "mud", "gravel", "tiretracks")
 
 # Driver and measure tolerances.
-WINDOW_M = 300.0
+# The first set_line of a segment is the remaining route (no mid-drive window
+# slice). Re-issuing set_line mid-drive teleports: Tech driveUsingPath({script})
+# always places the car at script[1].
+WINDOW_M = float("inf")
+# Historical mid-drive re-issue distance (80 m). Kept so tests can pin that we
+# no longer re-send set_line at this gap. Not used to trigger a new line.
 RESEND_M = 80.0
 OFF_ROUTE_M = 45.0
 OFF_TICKS = 8
@@ -692,22 +699,29 @@ class RouteDriver:
         cap = KIND_SPEED_CAP.get(self.route.kinds[min(len(self.route.kinds) - 1, i + 1)])
         if cap is not None:
             v = min(v, float(cap))
-        stale = self._sent_at is None or (self.progress_m - self._sent_at) >= self.resend_m
-        faster = self._sent_speed is None or abs(v - self._sent_speed) >= SEND_SPEED_DELTA
-        if not (stale or faster):
-            return []
         first = self._sent_at is None
+        faster = self._sent_speed is None or abs(v - self._sent_speed) >= SEND_SPEED_DELTA
+        if not first and not faster:
+            return []
+        if not first:
+            # Mid-drive: speed only. A new set_line would teleport to script[1].
+            self._sent_speed = v
+            return [f"ai.setSpeed({v})"]
         line = self._window(i, s)
         self._sent_at = self.progress_m
         self._sent_speed = v
         self.lines_sent += 1
         self.state = "following"
-        cmds = ['ai.setMode("manual")', 'ai.driveInLane("off")', 'ai.setSpeedMode("limit")'] if first else []
-        cmds += [f"ai.setSpeed({v})", set_line_command(line, v, cling=True)]
-        return cmds
+        return [
+            'ai.setMode("manual")',
+            'ai.driveInLane("off")',
+            'ai.setSpeedMode("limit")',
+            f"ai.setSpeed({v})",
+            set_line_command(line, v, cling=True),
+        ]
 
     def _window(self, i: int, s: float) -> list[tuple[float, float, float]]:
-        """The car's own place on the route, then the route ahead up to ``window_m`` (plus the next point)."""
+        """The car's place on the route, then the remaining route (capped by window_m if finite)."""
         pts = self.route.points
         cum = self.route.cum
         seg = max(1e-6, cum[i + 1] - cum[i])
@@ -715,7 +729,8 @@ class RouteDriver:
         a, b = pts[i], pts[i + 1]
         out = [(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t)]
         j = i + 1
-        while j < len(pts) and cum[j] - s <= self.window_m:
+        ahead = self.window_m if math.isfinite(self.window_m) else float("inf")
+        while j < len(pts) and cum[j] - s <= ahead:
             if math.hypot(pts[j][0] - out[-1][0], pts[j][1] - out[-1][1]) >= 0.5:
                 out.append(pts[j])
             j += 1

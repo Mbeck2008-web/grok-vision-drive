@@ -293,13 +293,12 @@ def check_route_runs_through_the_collector() -> None:
     assert "collect abort" not in text and "collect recover" not in text, "the route ends by hand-back, not by a stall abort"
     # the route commands reached the car, while the car was at rest at the start
     lines = [i for i, c in enumerate(car.commands) if _is_set_line(c)]
-    assert len(lines) >= 20, len(lines)
+    assert len(lines) == 1, f"one set_line per segment, got {len(lines)}"
     assert car.max_s >= total - lr.END_TOL_M - 3.0, (car.max_s, total)
-    assert car.cmd_s[lines[0]] == 0.0, car.cmd_s[lines[0]]  # the first window went out while the car was still at rest
-    # the AI mode is re-sent once the car is driving (the segment opens and clears the AI state), well before 80 m
+    assert car.cmd_s[lines[0]] == 0.0, car.cmd_s[lines[0]]  # the line went out while the car was still at rest
+    # Opening the segment must not re-issue set_line (that would teleport).
     manual = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("manual")' in c]
-    assert len(manual) == 2, [car.commands[i] for i in manual]
-    assert car.cmd_poll[manual[1]] - car.cmd_poll[manual[0]] <= 12, [car.cmd_poll[i] for i in manual]
+    assert len(manual) == 1, [car.commands[i] for i in manual]
     # the plain span send stays off while the route is active, and takes over once it ends
     spans = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("span")' in c and i > lines[0]]
     assert spans and min(spans) > max(lines), (spans[:3], lines[-3:])
@@ -317,7 +316,7 @@ def check_route_runs_through_the_collector() -> None:
     assert status["impact_respawn"]["on"] is False, status["impact_respawn"]
     assert "collect route west_coast_usa#0 driver" in text and "'state': 'done'" in text, text[-1500:]
     _assert_set_line_dispatched(car, z=0.4)
-    print(f"collector route run: {len(lines)} route lines over {total:.0f} m, start pose from the route, one respawn-free segment, hand-off to span, route_driver.json written")
+    print(f"collector route run: {len(lines)} set_line over {total:.0f} m, start pose from the route, one respawn-free segment, hand-off to span, route_driver.json written")
 
 
 def check_leaving_the_route_hands_back_to_span() -> None:

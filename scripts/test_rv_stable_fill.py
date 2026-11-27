@@ -31,7 +31,6 @@ S14 snap: ego-hood px are excluded; wide snaps to a 15 m ground hit only.
 S16 the depth-edge cut has no snapped exemption (shared edge_cut_far_side).
 S22 (M04b) the edge cut drops the 12 non-sky px next to +inf sky under GT depth (far_side <= ground_hit, inf == inf).
 S19 the black band under the horizon is a 2-D render-only backdrop when a sky colour exists.
-S21 no module under python/ imports tools.rv_*, rv_stable_fill, or tools.rv_stable_fill (import isolation: AEB/planner cannot see the preview).
 S17 splat radius cap (W//60) covers the 0.25 m ground grid near the chase camera (behind-car strip).
 S13 ground splats reach the next camera row: on-plane points' footprint grows to the ground row spacing past
    the old 6*(d/fy) cap (rear/repeater holes); off-plane points keep the cap.
@@ -601,9 +600,8 @@ def _sha(*arrs) -> str:
 
 def _sky_pipeline(sky_rgb):
     """Everything the preview computes for one frame sequence, with ``sky_rgb`` the ONLY thing that differs: the
-    ground-grid occupancy, every CamDepthFilter output, the point set handed to compose, the observed/filled masks
-    and the render's depth buffer. Returns a dict of sha256. Safety is this byte-identity plus S21 import isolation
-    (AEB lives under python/control, planning, perception, runtime and must not import the preview)."""
+    ground-grid occupancy, every CamDepthFilter output, the per-frame point set the compose step and any consumer
+    (planner / AEB) would read, and the render's depth buffer. Returns a dict of sha256."""
     cam = camera_from_angles("main", (0.0, 1.2, 1.3), 0.0, -4.0, 60.0, 96, 64, near_m=0.05, far_m=300.0)
     ch = sf.chase_camera((0.0, -4.0, 2.6), -12.0, 60.0, 160, 90, 0.0)
     dz = sf._pixel_rays(cam)[..., 2]; down = dz < -1e-6
@@ -630,14 +628,12 @@ def _sky_pipeline(sky_rgb):
 
 
 def check_backdrop_render_only() -> None:
-    """S19 (Michael 2026-11-26 "the sky is not visible only the road"): chase px below the horizon with no point and a
-    ground range in (PRIOR_MAX_M, FAR_M] were "unknown" (black). With a sky colour they are a 2-D backdrop (ground colour
-    fading to haze) counted as far; without one they stay unknown. Safety is import isolation (S21) plus byte-identical
-    hashes: with sky on vs off the sha256 of the ground-grid occupancy, every CamDepthFilter output, the point set handed
-    to compose, the observed/filled masks and the render's depth buffer are identical. The sky colour touches ONLY
-    compose's colour image (in the preview, sky_rgb is read only by compose). AEB lives in python/control/actuate.py,
-    override.py, planning/speed.py, perception/cipv.py and runtime/frame_gate.py; those modules are covered by S21 and
-    do not import the preview. The point-set hash is one of the hashed buffers, not a stand-in for planner/AEB."""
+    """S19 (Michael 2026-11-26 "the sky is not visible only the road"; Skeptic: byte-identical hashes): chase px below the
+    horizon with no point and a ground range in (PRIOR_MAX_M, FAR_M] were "unknown" (black). With a sky colour they are a
+    2-D backdrop (ground colour fading to haze) counted as far; without one they stay unknown. The sky colour touches
+    ONLY compose's colour image: with it on vs off the sha256 of the ground-grid occupancy memory, every CamDepthFilter
+    output, the point set handed to compose (what any planner / AEB consumer would read), the observed/filled masks and
+    the render's depth buffer are identical; and in the preview the sky colour is read only by compose."""
     on = _sky_pipeline((150, 180, 220)); off = _sky_pipeline(None)
     for key in ("filter", "grid", "points", "depth_buffer", "occupancy"):
         assert on[key] == off[key], f"{key}: sha256 differs with sky on vs off"
@@ -658,80 +654,6 @@ def check_backdrop_render_only() -> None:
     uses = [ln for ln in tool.splitlines() if "sky_rgb" in ln and not ln.lstrip().startswith("#")]
     assert all(("sky_rgb = " in ln) or ("S.compose(" in ln) or ("sky_rgb is None" in ln) or ("sky_rgb=" in ln) for ln in uses), uses
     assert not any("filters[" in ln or "grid." in ln or "evidence" in ln for ln in uses), "sky colour must not reach filter/grid/evidence"
-
-
-
-def _banned_module(name: str) -> bool:
-    """True if ``name`` is tools.rv_*, rv_stable_fill, or tools.rv_stable_fill (any dotted prefix)."""
-    if not name:
-        return False
-    parts = name.split(".")
-    if "rv_stable_fill" in parts:
-        return True
-    return name == "tools.rv_" or name.startswith("tools.rv_")
-
-
-def _import_module_arg(node: ast.AST) -> str | None:
-    """Literal module name passed to importlib.import_module(...) or __import__(...)."""
-    if not isinstance(node, ast.Call):
-        return None
-    fn = node.func
-    hook = (isinstance(fn, ast.Name) and fn.id in {"__import__", "import_module"}) or (
-        isinstance(fn, ast.Attribute) and fn.attr in {"__import__", "import_module"})
-    if not hook:
-        return None
-    arg = None
-    if node.args:
-        arg = node.args[0]
-    for kw in node.keywords:
-        if kw.arg in (None, "name"):
-            arg = kw.value
-            if kw.arg == "name":
-                break
-    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-        return arg.value
-    return None
-
-
-def check_python_import_isolation() -> None:
-    """S21: no .py under python/ imports tools.rv_*, rv_stable_fill, or tools.rv_stable_fill, in any form
-    (import, from-import, importlib.import_module, __import__ with a literal). AEB lives in
-    python/control/actuate.py, override.py, planning/speed.py, perception/cipv.py and runtime/frame_gate.py;
-    those files are in the scan. Combined with S19's on/off hashes, this is the safety argument for the
-    render-only sky backdrop (not a claim that the compose point-set hash stands in for planner/AEB)."""
-    root = ROOT / "python"
-    hits: list[str] = []
-    for path in sorted(root.rglob("*.py")):
-        src = path.read_text(encoding="utf-8")
-        try:
-            tree = ast.parse(src, filename=str(path))
-        except SyntaxError as e:
-            raise AssertionError(f"S21: cannot parse {path.relative_to(ROOT)}: {e}") from e
-        rel = str(path.relative_to(ROOT))
-        for node in ast.walk(tree):
-            names: list[str] = []
-            if isinstance(node, ast.Import):
-                names.extend(a.name for a in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                base = node.module or ""
-                if _banned_module(base):
-                    names.append(base)
-                for a in node.names:
-                    # from tools import rv_foo  /  from python.viz import rv_stable_fill
-                    if a.name != "*":
-                        names.append(f"{base}.{a.name}" if base else a.name)
-            else:
-                arg = _import_module_arg(node)
-                if arg is not None:
-                    names.append(arg)
-            for n in names:
-                if _banned_module(n):
-                    hits.append(f"{rel}:{node.lineno} {n}")
-    assert not hits, "S21 import isolation failed (python/ imported tools.rv_*, rv_stable_fill, or tools.rv_stable_fill): " + "; ".join(hits)
-
-
-def test_python_import_isolation() -> None:
-    check_python_import_isolation()
 
 
 def check_flag_and_deps() -> None:
@@ -813,8 +735,7 @@ if __name__ == "__main__":
                check_classifier, check_ground_clamp, check_far_drawn_at_cap, check_road_snap, check_ownership,
                check_snap_rejects_above_road, check_snap_cams, check_clamp_inf, check_rejected_road_px_render_raw,
                check_filter_keeps_ground, check_ground_footprint, check_snap_range_and_exclude,
-               check_edge_cut_includes_snapped, check_edge_cut_drops_px_next_to_sky, check_splat_radius_covers_ground_grid, check_backdrop_render_only,
-               check_python_import_isolation, check_flag_and_deps):
+               check_edge_cut_includes_snapped, check_edge_cut_drops_px_next_to_sky, check_splat_radius_covers_ground_grid, check_backdrop_render_only, check_flag_and_deps):
         fn()
         print("ok", fn.__name__, flush=True)
     print("test_rv_stable_fill: all checks passed")

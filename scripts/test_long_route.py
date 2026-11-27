@@ -413,6 +413,62 @@ def check_route_length_fits_the_clip() -> None:
     print("route length: 0.4-1.25x (never over) the clip budget on both real maps; a clip too short for the highway gets no route")
 
 
+def check_length_cap_and_window_pinned() -> None:
+    """The cap (1.25x the budget) and the preferred window (>= 0.6x) as literals, and as behaviour at their edges.
+
+    The synthetic network's planner cannot reach 1.25x on its own, so ``_assemble`` is wrapped to hand the planner
+    candidates of an exact length ratio to the budget (duration x 11 m/s).
+    """
+    import dataclasses
+
+    assert (lr.BUDGET_MAX_FRAC, lr.BUDGET_MIN_FRAC, lr.AVG_SPEED_MPS) == (1.25, 0.6, 11.0)
+    g = lr.build_graph(loop_network(dirt=False))
+    dur = 750.0
+    budget = dur * 11.0
+    real = lr._assemble
+
+    def plan(ratios):
+        calls = []
+
+        def fake(*a, **k):
+            r = real(*a, **k)
+            ratio = ratios[min(len(calls), len(ratios) - 1)]
+            calls.append(ratio)
+            kk = ratio * budget / r.total_m
+            return dataclasses.replace(r, cum=tuple(c * kk for c in r.cum))
+
+        lr._assemble = fake  # type: ignore[assignment]
+        try:
+            out = lr.plan_highway_route(g, map_name="synthetic", seed=1, direction=0, duration_s=dur)
+        finally:
+            lr._assemble = real  # type: ignore[assignment]
+        return out, calls
+
+    r, _ = plan([1.2])
+    assert r is not None and abs(r.total_m / budget - 1.2) < 1e-6
+    r, _ = plan([1.245])
+    assert r is not None and abs(r.total_m / budget - 1.245) < 1e-6
+    r, calls = plan([1.255])  # just over the cap: refused in every tier, however many candidates are tried
+    assert r is None and len(calls) >= 3, (r, calls)
+    r, _ = plan([1.27])
+    assert r is None
+    # The window: a candidate at 0.7x is taken in the first tier, ahead of a later 1.0x one.
+    r, _ = plan([0.7, 1.0])
+    assert r is not None and abs(r.total_m / budget - 0.7) < 1e-6, r and r.total_m / budget
+    # Under 0.6x the window refuses it, the second tier takes it (a route shorter than the clip is allowed).
+    r, calls = plan([0.55])
+    assert r is not None and abs(r.total_m / budget - 0.55) < 1e-6 and len(calls) >= 2
+    r, _ = plan([0.55, 0.65])
+    assert r is not None and abs(r.total_m / budget - 0.65) < 1e-6, r and r.total_m / budget  # the window's pick wins
+    # The last tier: a map whose only loop back is short (< 1500 m) still gets a route (honestly short), not None.
+    short = lr.build_graph([road("H1", line(0, 0, 900, 0), oneway=True, lanes=2, width=8.0),
+                            road("C1", line(900, 10, 900, 200), width=7.0), road("C2", line(900, 200, 0, 200), width=7.0),
+                            road("C3", line(0, 200, 0, 10), width=7.0)])
+    r = lr.plan_highway_route(short, map_name="synthetic", seed=1, direction=0)
+    assert r is not None and 1000.0 < r.return_m < lr.MIN_RETURN_M and r.highway_m >= 800.0, r
+    print("length cap 1.25x and window 0.6x pinned (literals, edge candidates, last tier for short loops)")
+
+
 def check_short_highway_gets_no_route() -> None:
     """A highway under 800 m is not a long highway: no route, however good the loop back is."""
     def net(hw_m):
@@ -586,6 +642,7 @@ def main() -> None:
     check_driver_speed_caps()
     check_collector_hooks()
     check_route_length_fits_the_clip()
+    check_length_cap_and_window_pinned()
     check_short_highway_gets_no_route()
     check_end_tolerance_and_constants()
     check_return_cost_jitter_and_avoid()

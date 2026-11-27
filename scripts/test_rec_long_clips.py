@@ -966,11 +966,12 @@ def check_verdicts_follow_exit_quality_and_measure() -> None:
     from python.collect import long_route as lr
     from python.collect.clip_mode import MIN_DRIVEN_M, VERDICT_DELIVERED, route_verdict
 
+    assert MIN_DRIVEN_M == 100.0  # literal: the partial / not_driven line
     ok = {"clip_class": "train"}
     full = {"far_end_reached": True, "loop_closed": True, "driven_m": 9000.0}
     far = {"far_end_reached": True, "loop_closed": False, "driven_m": 5000.0}
-    short = {"far_end_reached": False, "loop_closed": False, "driven_m": MIN_DRIVEN_M}
-    none = {"far_end_reached": False, "loop_closed": False, "driven_m": MIN_DRIVEN_M - 1.0}
+    short = {"far_end_reached": False, "loop_closed": False, "driven_m": 100.0}
+    none = {"far_end_reached": False, "loop_closed": False, "driven_m": 99.0}
     cases = [
         (0, ok, full, "completed"), (0, ok, far, "far_end_only"), (0, ok, short, "partial"), (0, ok, none, "not_driven"),
         (0, ok, {"far_end_reached": False, "loop_closed": True, "driven_m": 9000.0}, "partial"),  # both are required

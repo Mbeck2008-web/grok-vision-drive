@@ -59,7 +59,8 @@ class RouteCar(sf._CrashVehicle):
     """Starts at rest. Drives the route at SPEED once manual mode and a line were sent; span stops it."""
 
     def __init__(self, stop: Path, route: lr.Route | None = None, rest_polls: int = 5, leave_at_m: float | None = None,
-                 tail_polls: int = 40, max_polls: int = 3000, **_kw: object) -> None:
+                 tail_polls: int = 40, max_polls: int = 3000, stall_at_m: float | None = None,
+                 recover_to: str | None = None, **_kw: object) -> None:
         super().__init__(stop, stop_at=10**9)
         self.route = route
         self.rest_polls, self.leave_at_m, self.tail_polls, self.max_polls = rest_polls, leave_at_m, tail_polls, max_polls
@@ -71,13 +72,20 @@ class RouteCar(sf._CrashVehicle):
         self.cmd_s: list[float] = []
         self.parked = False
         self.v = 0.0
+        self.stall_at_m, self.recover_to = stall_at_m, recover_to
+        self.stall = None  # None -> 'stalled' (stops at stall_at_m) -> 'resumed' (a fresh manual mode arrived)
+        self.stall_poll: int | None = None
         self.span_poll: int | None = None
         self.max_s = 0.0
 
     def teleport(self, pos, rot_quat=None, reset=False) -> None:
         self.placed.append((tuple(pos), tuple(rot_quat or ())))
-        if len(self.placed) == 1:  # the car is on the first pose; later teleports do not move the fake
+        if len(self.placed) == 1:  # the car is on the first pose; later teleports do not move the fake ...
             self.s = 0.0
+        elif self.recover_to == "end":  # ... unless the recover is asked to land it at the route's end
+            self.s = self.route.total_m - 10.0
+        elif self.recover_to == "off":  # or off the route
+            self.parked = True
 
     def queue_lua_command(self, command: str, *args: object) -> None:
         super().queue_lua_command(command, *args)
@@ -85,6 +93,8 @@ class RouteCar(sf._CrashVehicle):
         self.cmd_s.append(self.s)
         if 'ai.setMode("manual")' in command:
             self.mode = "manual"
+            if self.stall == "stalled":
+                self.stall = "resumed"  # the AI was told to drive again after the recover
         elif "ai.setMode(" in command and '"span"' in command:
             if self.mode == "manual":  # a hand-back after the route; the first span is the collector's own start-up send
                 self.span_poll = self.span_poll or self.polls
@@ -103,6 +113,10 @@ class RouteCar(sf._CrashVehicle):
     def poll_sensors(self) -> None:
         self.polls += 1
         driven = self.polls > self.rest_polls and self.mode == "manual" and self.has_line
+        if self.stall_at_m is not None and self.stall is None and self.s >= self.stall_at_m:
+            self.stall, self.stall_poll = "stalled", self.polls  # the AI is reset: only a fresh manual mode restarts it
+        if self.stall == "stalled":
+            driven = False
         if self.leave_at_m is not None and self.s >= self.leave_at_m:
             self.parked = True  # off the route, and stopped there (a stuck car is a car at rest)
         if driven and not self.parked:
@@ -226,9 +240,47 @@ def check_leaving_the_route_hands_back_to_span() -> None:
     print(f"collector route run: leaving the route (max {summary['max_off_route_m']} m off) hands the car back to span")
 
 
+def _spans_after(car: RouteCar) -> list[int]:
+    return [i for i, c in enumerate(car.commands) if 'ai.setMode("span")' in c and car.cmd_poll[i] > car.stall_poll]
+
+
+def check_recover_to_rest_resends_the_window() -> None:
+    """The AI stalls mid-route and the collector recovers the car: at rest, the route window must go out again."""
+    route = make_route()
+    code, text, out, car = _no_excursions_flag_run(route, stall_at_m=500.0)
+    assert code == 0, (code, text[-1500:])
+    assert "collect abort stationary" in text and "collect recover" in text, text[-2500:]
+    assert len(car.placed) == 2, car.placed  # the route start, then the recover
+    # mode + window re-sent from where the car stopped, after the recover
+    again = [i for i, c in enumerate(car.commands) if 'ai.setMode("manual")' in c and car.cmd_s[i] >= 499.0]
+    assert again, [(c[:30], s_) for c, s_ in zip(car.commands, car.cmd_s) if "setMode" in c]
+    assert car.stall == "resumed" and car.max_s >= route.total_m - lr.END_TOL_M - 3.0, (car.stall, car.max_s)
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["state"] == "done" and summary["far_end_reached"] is True, summary
+    print("collector route run: a recover to rest mid-route re-sends mode + window and the route finishes")
+
+
+def check_finish_or_abandon_at_rest_hands_back_to_span() -> None:
+    """The recover leaves the car at rest where the route is already finished (or abandoned): span must be sent."""
+    for where, state, stall_m in (("end", "done", 2300.0), ("off", "off_route", 500.0)):
+        route = make_route()
+        code, text, out, car = _no_excursions_flag_run(route, stall_at_m=stall_m, recover_to=where)
+        assert code == 0, (where, code, text[-1500:])
+        assert "collect recover" in text and f"'state': '{state}'" in text, (where, text[-2500:])
+        summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+        assert summary["state"] == state, (where, summary)
+        # the driver's own span commands plus the collector's plain send, which only runs if last_ai was cleared
+        spans = _spans_after(car)
+        assert len(spans) >= 2, (where, spans)
+        assert "collect ai speed=" in text.split("collect recover", 1)[1], (where, text[-1500:])
+    print("collector route run: a route finished or abandoned while the car is at rest after a recover gets span, then the plain AI send")
+
+
 def main() -> None:
     check_route_runs_through_the_collector()
     check_leaving_the_route_hands_back_to_span()
+    check_recover_to_rest_resends_the_window()
+    check_finish_or_abandon_at_rest_hands_back_to_span()
     print("test_collect_route_drive: OK")
 
 

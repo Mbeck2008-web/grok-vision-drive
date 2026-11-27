@@ -9,6 +9,7 @@ so BeamNG keeps the GPU.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,7 @@ SHADOW_BGR = (48, 32, 220)  # warm red, BGR
 
 
 class SceneCkptInputError(ValueError):
-    """Main-camera shape/channel mismatch, or a checkpoint this runtime refuses."""
+    """A camera picture with the wrong shape/channels, or a checkpoint this runtime refuses."""
 
 
 def overlay_bgr(kind: str) -> tuple[int, int, int]:
@@ -81,6 +82,9 @@ def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float 
         return "shadow"
     from python.train.scene_lane_runtime import scene_lane_decision, straight_lane_path
 
+    # A camera the model needs is absent this tick: its sector is black, so no steering from it.
+    if pred is not None and getattr(pred, "missing_cams", ()):
+        pred = None
     lane_x = None if pred is None else getattr(pred, "lane_x", None)
     try:
         conf = 0.0 if pred is None else float(getattr(pred, "confidence", 0.0) or 0.0)
@@ -369,7 +373,7 @@ def scene_ckpt_as_state(
     if pred is not None and hasattr(pred, "as_state"):
         out = dict(pred.as_state())
     else:
-        out = {"lane_x": None, "confidence": 0.0, "canvas": None}
+        out = {"lane_x": None, "confidence": 0.0, "canvas": None, "missing_cams": []}
     out["source"] = "scene_ckpt"
     out["shadow"] = not bool(drive)
     out["drive"] = bool(drive)
@@ -387,6 +391,10 @@ class SceneCkptPred:
     confidence: float = 0.0
     heading_err_rad: float | None = None
     canvas_shape: tuple[int, ...] | None = None
+    # Cameras the checkpoint needs that this tick's frame dict lacks (absent or 0-size). compose_strip
+    # paints them black; the prediction is still computed (shadow draws it) but it is flagged, and
+    # --scene-ckpt-drive treats a flagged tick as no prediction.
+    missing_cams: tuple[str, ...] = ()
 
     @classmethod
     def empty(cls) -> "SceneCkptPred":
@@ -402,6 +410,7 @@ class SceneCkptPred:
             "centers": centers,
             "caption": scene_ckpt_caption(self.confidence),
             "canvas": list(self.canvas_shape) if self.canvas_shape else None,
+            "missing_cams": list(self.missing_cams),
         }
         if self.heading_err_rad is not None:
             out["heading_err_rad"] = float(self.heading_err_rad)
@@ -542,26 +551,28 @@ class SceneCkptRuntime:
             if param.device.type != "cpu":
                 raise SceneCkptInputError("scene-ckpt shadow must stay on CPU")
         self.cams = tuple(getattr(self.net, "cams", ()) or ())
-        names = self.cams or ("main",)
-        if names != ("main",):
-            raise SceneCkptInputError(
-                f"{self.path.name}: this shadow runtime only has the main camera; "
-                f"refusing cams={list(names)} (missing sectors would be black)"
-            )
         self.canvas_h = int(getattr(self.net, "canvas_h", 192))
         self.canvas_w = int(getattr(self.net, "canvas_w", 256))
         self.aux_sensors = bool(getattr(self.net, "aux_sensors", False))
         self.state = self.net.initial_state(device="cpu")
+        self._last_missing: tuple[str, ...] = ()
 
     @property
     def wants_route(self) -> bool:
         return bool(getattr(self.net, "route_cond", False))
 
-    def observe(self, frame: Any, dt_s: float | None, route: Any = None) -> SceneCkptPred:
-        arr = _require_main(frame)
-        if arr is None:
-            return SceneCkptPred.empty()
-        canvas = _main_canvas(arr, self.cams, self.canvas_h, self.canvas_w, float(getattr(self.net, "scale", 1.0) or 1.0))
+    def observe(self, frames: Any, dt_s: float | None, route: Any = None) -> SceneCkptPred:
+        """One tick. ``frames`` is the live camera frame dict (``CameraFrameBundle.frames``).
+
+        The strip is ``compose_strip`` of that whole dict, the same call the live lane path
+        makes, so every camera in the dict (wide included) lands in its sector.
+        """
+        pics = _require_frames(frames)
+        missing = _missing_cams(frames if isinstance(frames, Mapping) else None, self.cams)
+        self._note_missing(missing)
+        if pics is None:
+            return SceneCkptPred(missing_cams=missing)
+        canvas = _main_canvas(pics, self.cams, self.canvas_h, self.canvas_w, float(getattr(self.net, "scale", 1.0) or 1.0))
         import torch
 
         with torch.inference_mode():
@@ -573,7 +584,7 @@ class SceneCkptRuntime:
                 pred, self.state = self.net.forward(canvas, 0.0 if dt_s is None else float(dt_s), self.state)
         raw = getattr(pred, "lane_gt", None)
         if raw is None:
-            return SceneCkptPred(canvas_shape=tuple(int(x) for x in canvas.shape))
+            return SceneCkptPred(canvas_shape=tuple(int(x) for x in canvas.shape), missing_cams=missing)
         vec = raw.detach().float().cpu().numpy().reshape(-1).astype(np.float32)
         heading = None
         if vec.size >= 2:
@@ -586,33 +597,86 @@ class SceneCkptRuntime:
             confidence=confidence_from_vector(vec),
             heading_err_rad=heading,
             canvas_shape=tuple(int(x) for x in canvas.shape),
+            missing_cams=missing,
         )
 
+    def _note_missing(self, missing: tuple[str, ...]) -> None:
+        """Print the set of missing cameras once each time it changes (not every tick)."""
+        if missing == self._last_missing:
+            return
+        self._last_missing = missing
+        if missing:
+            print(
+                f"[GVD] scene-ckpt cams missing: {','.join(missing)} "
+                "(black sector this tick; --scene-ckpt-drive treats it as no prediction)",
+                flush=True,
+            )
+        else:
+            print("[GVD] scene-ckpt cams missing: none (all cameras present)", flush=True)
 
-def _require_main(frame: Any) -> np.ndarray | None:
-    if frame is None:
+
+def _missing_cams(frames: Mapping[str, Any] | None, cams: tuple[str, ...]) -> tuple[str, ...]:
+    """The checkpoint's cameras (strip order) that are absent or 0-size in ``frames``.
+
+    ``cam_main`` counts as ``main`` (compose_strip accepts either). ``None`` means nothing was grabbed.
+    """
+    out = []
+    for cam in (cams or ("main",)):
+        img = None if frames is None else frames.get(cam)
+        if img is None and cam == "main" and frames is not None:
+            img = frames.get("cam_main")
+        if img is None or np.asarray(img).size == 0:
+            out.append(cam)
+    return tuple(out)
+
+
+def _require_frames(frames: Any) -> Mapping[str, Any] | None:
+    """The live frame dict, checked. None (nothing grabbed, or no main picture) gives no prediction.
+
+    A bare main image is the old main-only input and is refused, not composed on its own.
+    """
+    if frames is None:
         return None
-    arr = np.asarray(frame)
-    if arr.ndim != 3 or int(arr.shape[-1]) != 3:
+    if not isinstance(frames, Mapping):
         raise SceneCkptInputError(
-            f"main camera must be HxWx3 (live long side ~640), got shape {tuple(arr.shape)} "
-            "(channel/shape check)"
+            f"scene-ckpt takes the live camera frame dict (cam name -> HxWx3 image), got {type(frames).__name__}; "
+            "a bare main frame is the old main-only input"
         )
-    return arr
+    from python.data.strip_writer import STRIP_ORDER
+
+    for cam in (*STRIP_ORDER, "cam_main"):
+        img = frames.get(cam)
+        if img is None:
+            continue
+        arr = np.asarray(img)
+        if arr.size == 0:
+            continue
+        if arr.ndim != 3 or int(arr.shape[-1]) != 3:
+            raise SceneCkptInputError(
+                f"{cam} camera must be HxWx3 (live long side ~640), got shape {tuple(arr.shape)} "
+                "(channel/shape check)"
+            )
+    main = frames.get("main")
+    if main is None:
+        main = frames.get("cam_main")
+    if main is None or np.asarray(main).size == 0:
+        return None
+    return frames
 
 
 def _main_canvas(
-    frame: np.ndarray,
+    frames: Mapping[str, Any],
     cams: tuple[str, ...],
     canvas_h: int,
     canvas_w: int,
     scale: float,
 ) -> np.ndarray:
+    """The model canvas from the live 8-camera frame dict: ``compose_strip(frames)``, cut to ``cams``."""
     from python.data.strip_writer import compose_strip
     from python.train.cam_strip import extract_cams, scale_canvas
 
     names = cams or ("main",)
-    strip = compose_strip({"main": frame})
+    strip = compose_strip(frames)
     packed = extract_cams(strip, names)
     if float(scale) < 0.999:
         packed = scale_canvas(packed, scale, names)

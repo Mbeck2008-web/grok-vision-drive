@@ -446,6 +446,42 @@ def check_three_resumes_then_the_clip_stops() -> None:
     print("collector route run: three on-route resumes, then the fourth is refused (exit 2, spawn_failed), never off-route")
 
 
+def check_failed_route_resume_placement_stops_the_clip() -> None:
+    """The 3rd place_vehicle is the first route resume (start, recover, then resume). If it
+    fails, the clip must stop (spawn_failed): resume() already counted that resume, and
+    swallowing the error used to let the clip continue and burn another. The first open
+    must still settle as source=spawn (not segment)."""
+    import python.collect.level_session as level_session
+
+    orig = level_session.place_vehicle
+    n = [0]
+
+    def pv(bng, vehicle, pos, rot):
+        n[0] += 1
+        if n[0] == 3:
+            return "session lost: simulated placement failure"
+        return orig(bng, vehicle, pos, rot)
+
+    level_session.place_vehicle = pv  # type: ignore[assignment]
+    try:
+        route = make_route()
+        code, text, out, car = _no_excursions_flag_run(route, stuck_start="until_moved")
+    finally:
+        level_session.place_vehicle = orig  # type: ignore[assignment]
+    assert code == 2, (code, text[-3000:])
+    assert "legal spawn pose could not be placed" in text and "session lost" in text, text[-2500:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "spawn_failed" and "session lost" in (status.get("stop_detail") or ""), status
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["resumes"] == 1, summary  # the failed resume was counted; no second resume
+    assert "resumes=2" not in text, text[-2500:]
+    # First open is source=spawn: N6 (drop spawns>0 from spawn_src) would settle #0 as segment.
+    first_settle = [line for line in text.splitlines() if "teleport_settle west_coast_usa#0" in line]
+    assert first_settle and any("source=spawn" in line for line in first_settle), first_settle
+    assert not any("source=segment" in line for line in first_settle), first_settle
+    print("collector route run: a failed resume placement stops the clip (exit 2, spawn_failed), resumes=1, first settle is source=spawn")
+
+
 def main() -> None:
     check_route_runs_through_the_collector()
     check_leaving_the_route_hands_back_to_span()
@@ -458,6 +494,7 @@ def main() -> None:
     check_low_yield_stays_off_a_route_clip()
     check_recheck_stays_off_a_route_clip()
     check_three_resumes_then_the_clip_stops()
+    check_failed_route_resume_placement_stops_the_clip()
     print("test_collect_route_drive: OK")
 
 

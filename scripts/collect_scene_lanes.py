@@ -2679,7 +2679,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             shift = place_vehicle(bng, vehicle, picked.pos, picked.rot)
             if shift:
                 print(f"collect spawn {segment_id} {picked.kind} failed {shift}", flush=True)
-                if source == "spawn":
+                # "segment" is a route resume: resume() already advanced the driver, so swallowing
+                # this would burn a resume and keep driving from the stall. "recheck" callers also
+                # honour the error return; stall/impact mid-run still keep the current pose.
+                if source in ("spawn", "segment", "recheck"):
                     return f"{map_name}: legal spawn pose could not be placed: {shift}"
                 return None
             count = traffic_count(args.traffic, map_name)
@@ -3916,7 +3919,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 plan, new_cut = low_yield_plan(can_respawn, boundary, done_s, schedule_cut)
                 if plan == "respawn":
                     mark = spawn_mark
-                    spawn_err = _apply_spawn(True, "low_yield")
+                    # Off a route the pick must stay in the "spawn" type column (and settle as
+                    # source=spawn). Pass "low_yield" only while a route is active, so the
+                    # route guard can refuse it without treating it as a resume.
+                    low_yield_src = "low_yield" if route_driver is not None and route_driver.active else "spawn"
+                    spawn_err = _apply_spawn(True, low_yield_src)
                     if spawn_err:
                         last_error = spawn_err
                         _save_progress(done_s, done_s if target_s == float("inf") else target_s)

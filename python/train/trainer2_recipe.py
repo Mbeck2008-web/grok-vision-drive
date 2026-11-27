@@ -205,6 +205,11 @@ def validate_recipe_args(args: Any) -> None:
     )
     if recipe and recipe not in ("off", "false", "0"):
         parse_stage_filter(getattr(args, "stage", "") or "")
+        if bool(getattr(args, "ctl_cond", False)):
+            # --ctl-cond feeds the ctl head the previous row's recorded speed and pedals, so the stage-2b speed profile
+            # (integrated from that head) would read recorded speed after t0; the export refuses such a checkpoint too.
+            raise RecipeRefused("--ctl-cond is refused under --recipe trainer2: its ctl input is the recorded speed and "
+                                "pedals (stage 2b would score a profile that reads them, and the export drops it)")
 
 
 def parse_stage_filter(text: str | None) -> tuple[str, ...] | None:
@@ -1021,7 +1026,60 @@ def _tag_source(rows: Iterable[Mapping[str, Any]], source: str) -> list[dict[str
 
 
 def legacy_split_rows(strip_roots: Iterable[Path | str], holdout_root: Path | str, *, holdout_blocks: int) -> tuple[list, list]:
-    """``(train, holdout)`` rows of the #187 split ``train_directory`` uses, tagged with ``source``."""
+    """``(train, holdout)`` rows of the #187 split ``train_directory`` uses, tagged with ``source``.
+
+    The train rows are the manifest's: those within the 4 s purge of a holdout row (``trainer2_split.build_split_manifest``)
+    are not in it, and ``train_directory`` drops them from its recipe windows too (``plan_train_keys``).
+    """
+    from python.train.trainer2_split import filter_rows
+
+    train, hold = _unpurged_split_rows(strip_roots, holdout_root, holdout_blocks=holdout_blocks)
+    manifest = _manifest_of(train, hold)
+    return filter_rows(train, manifest, "train"), hold
+
+
+def _manifest_of(train: list, hold: list, *, heldout_map: str | None = None) -> dict[str, Any]:
+    from python.train.trainer2_split import build_split_manifest
+
+    return build_split_manifest([{"kind": "train", "rows": train}, {"kind": "holdout", "rows": hold}],
+                                heldout_map=heldout_map)
+
+
+def plan_train_keys(plan: Iterable[Mapping[str, Any]]) -> frozenset[tuple[str, int]]:
+    """The manifest's train ``(source, i)`` keys of a ``train_directory`` pass plan (the 4 s purge applied)."""
+    manifest = _manifest_of(*_plan_rows(plan))
+    return frozenset((str(k[0]), int(k[1])) for k in manifest["train"])
+
+
+def _plan_rows(plan: Iterable[Mapping[str, Any]]) -> tuple[list, list]:
+    train: list = []
+    hold: list = []
+    for item in plan:
+        kind = str(item.get("kind") or "")
+        if kind in ("train", "holdout"):
+            (train if kind == "train" else hold).extend(item.get("rows") or [])
+    return train, hold
+
+
+def restrict_train_windows(steps: list[dict[str, Any]], keys: frozenset[tuple[str, int]]) -> tuple[list[dict[str, Any]], int]:
+    """``steps`` with every train row outside ``keys`` removed (a window left empty is dropped); holdout windows are kept
+    as they are. Returns ``(steps, n_distinct_rows_removed)`` (windows overlap: a row counts once)."""
+    out: list[dict[str, Any]] = []
+    removed: set[tuple[str, int]] = set()
+    for item in steps:
+        if str(item.get("kind") or "") == "holdout":
+            out.append(item)
+            continue
+        rows = list(item.get("rows") or [])
+        ids = [(str(r.get("source") or ""), int(r["i"])) for r in rows]
+        kept = [r for r, key in zip(rows, ids) if key in keys]
+        removed.update(key for key in ids if key not in keys)
+        if kept:
+            out.append(dict(item, rows=kept))
+    return out, len(removed)
+
+
+def _unpurged_split_rows(strip_roots: Iterable[Path | str], holdout_root: Path | str, *, holdout_blocks: int) -> tuple[list, list]:
     from python.train.exp_distill import split_tagged_rows
     from python.train.strip_sources import load_multi_source_rows
 
@@ -1035,11 +1093,8 @@ def legacy_split_rows(strip_roots: Iterable[Path | str], holdout_root: Path | st
 def build_recipe_split(strip_roots: Iterable[Path | str], holdout_root: Path | str, *, holdout_blocks: int,
                        heldout_map: str | None = None) -> dict[str, Any]:
     """Split manifest from the same #187 split the trainer uses (``trainer2_split.build_split_manifest``)."""
-    from python.train.trainer2_split import build_split_manifest
-
-    train, hold = legacy_split_rows(strip_roots, holdout_root, holdout_blocks=holdout_blocks)
-    return build_split_manifest([{"kind": "train", "rows": train}, {"kind": "holdout", "rows": hold}],
-                                heldout_map=heldout_map)
+    train, hold = _unpurged_split_rows(strip_roots, holdout_root, holdout_blocks=holdout_blocks)
+    return _manifest_of(train, hold, heldout_map=heldout_map)
 
 
 def preregister_recipe_run(out_dir: Path | str, *, split_path: Path | str, git_sha: str, seed: int,

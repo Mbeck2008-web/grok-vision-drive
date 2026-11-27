@@ -117,6 +117,23 @@ def check_recipe_refuses_augment() -> None:
     print("recipe refuses --augment (default-on is refused; --no-augment required) OK")
 
 
+def check_ctl_cond_refused_under_the_recipe() -> None:
+    """--ctl-cond feeds the ctl head the previous row's recorded speed and pedals; stage 2b integrates its profile from that
+    head, so under --recipe trainer2 the flag is refused up front (and still legal with the recipe off)."""
+    rec = _recipe()
+    base = ["--recipe", "trainer2", "--no-augment"]
+    rec.validate_recipe_args(_parser().parse_args(base))  # the same run without the flag is fine
+    for extra in (["--ctl-cond"], ["--ctl-cond", "--stage", "2b"], ["--stage", "7", "--ctl-cond"]):
+        try:
+            rec.validate_recipe_args(_parser().parse_args(base + extra))
+        except rec.RecipeRefused as exc:
+            assert "--ctl-cond" in str(exc) and "recorded speed" in str(exc), exc
+        else:
+            raise AssertionError(f"{extra} must be refused under --recipe trainer2")
+    rec.validate_recipe_args(_parser().parse_args(["--ctl-cond"]))  # recipe off: unchanged
+    print("--ctl-cond refused under --recipe trainer2 (its input is the recorded speed and pedals), legal with the recipe off OK")
+
+
 def check_kd_refused_in_pr6() -> None:
     rec = _recipe()
     args = _parser().parse_args(["--recipe", "trainer2", "--no-augment", "--kd"])
@@ -2018,6 +2035,7 @@ def main() -> int:
         check_recipe_refuses_scale_lt_1,
         check_recipe_refuses_augment,
         check_kd_refused_in_pr6,
+        check_ctl_cond_refused_under_the_recipe,
         check_unknown_recipe_refused,
         check_curriculum_order_and_gates,
         check_student_export_fits_deploy,

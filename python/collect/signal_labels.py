@@ -145,7 +145,8 @@ def _as_signal_list(raw: Any) -> list[Any]:
 
 def sign_id(cls: str, world_xy: tuple[float, float]) -> str:
     """``<cls>@<x>,<y>`` from the world position (0.1 m grid): the same sign has the same id on every tick."""
-    return f"{cls}@{float(world_xy[0]):.1f},{float(world_xy[1]):.1f}"
+    # ``+ 0.0`` turns a rounded -0.0 into 0.0: -0.04 and 0.04 are the same place, so the same id
+    return f"{cls}@{round(float(world_xy[0]), 1) + 0.0:.1f},{round(float(world_xy[1]), 1) + 0.0:.1f}"
 
 
 def labels_from_signals(raw: Any, ego_pos: Any, ego_dir: Any) -> list[dict[str, Any]]:

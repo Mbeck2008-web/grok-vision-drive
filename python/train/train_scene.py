@@ -2631,6 +2631,12 @@ def ssl_empty_split_refusal(record: Mapping[str, Any], plan: Any) -> str | None:
     )
 
 
+def recipe_sidecar_root(recipe: str | None, root: Path) -> Path | None:
+    """The strip root a single-root run joins ``signs.jsonl`` / ``stoplines.jsonl`` from: its own under the trainer2 recipe
+    (rows carry no ``source_root`` there), none otherwise (a non-recipe run keeps its rows unjoined, as before)."""
+    return root if str(recipe or "") == "trainer2" else None
+
+
 def train_directory(
     root: Path,
     *,
@@ -2978,6 +2984,13 @@ def train_directory(
     else:
         startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
     mix = holdout_mix(startup_plan)
+    recipe_train_keys: frozenset[tuple[str, int]] | None = None
+    if str(recipe or "") == "trainer2":
+        # The recipe trains and fits on the run manifest's train rows: the 4 s purge before / after a holdout row applies
+        # to the trainer too (the same build_split_manifest rule), not only to the manifest file.
+        from python.train.trainer2_recipe import plan_train_keys
+
+        recipe_train_keys = plan_train_keys(startup_plan)
     ssl_record = ssl_record_for(ssl_meta, init_stem)
     refusal = ssl_empty_split_refusal(ssl_record, startup_plan)
     if refusal:
@@ -3024,7 +3037,7 @@ def train_directory(
 
     # The recipe's single-root run has no source_root on its rows: join the sidecars in its strip root (stage 2b trains
     # the sign / stop-line heads and scores the stop events on the sign GT). Other runs keep the old behaviour.
-    sidecar_root = root if str(recipe or "") == "trainer2" else None
+    sidecar_root = recipe_sidecar_root(recipe, root)
     print(sign_counts_line(attach_sign_labels(rows, default_root=sidecar_root)), flush=True)
     if use_stop_line:
         print(stop_counts_line(attach_stop_lines(rows, default_root=sidecar_root)), flush=True)
@@ -3523,18 +3536,28 @@ def train_directory(
             # Log what --min-valid removed (first epoch, or whenever a whole
             # recording goes); a recording with no train window left raises.
             report_valid_filter(filter_stats, epoch=int(epoch), quiet=filter_logged)
+            if recipe_train_keys is not None:
+                from python.train.trainer2_recipe import restrict_train_windows
+
+                plan_steps, purged_rows = restrict_train_windows(plan_steps, recipe_train_keys)
+                if not filter_logged:
+                    print(f"[GVD] recipe trainer2: manifest purge removed {purged_rows} train rows within the holdout gap", flush=True)
             filter_logged = True
             if stop_stage and "stop_motion" not in holder:
                 # Once, before any epoch trains and before the metric runs: (1) the longitudinal map is fitted on the
                 # manifest's TRAIN rows only (a holdout id in the fit set is refused), (2) stage 2b needs events.
-                from python.train.stop_pred import StopNotMeasured, fit_motion, recorded_events
+                from python.train.stop_pred import StopNotMeasured, fit_motions, recorded_events, row_key
 
-                held_ids = {r.get("i") for it in plan_steps if it.get("kind") == "holdout" for r in it["rows"]}
+                held_rows = [r for it in plan_steps if it.get("kind") == "holdout" for r in it["rows"]]
+                held_keys = {row_key(r) for r in held_rows}
+                fit_keys = {(src, str(i)) for src, i in (recipe_train_keys or ())}
                 try:
-                    holder["stop_motion"] = fit_motion([r for r in state_rows if r.get("i") in train_ids], holdout_ids=held_ids)
-                    m0 = holder["stop_motion"]
-                    print(f"[GVD] stop motion fitted on {m0.n_rows} train row pairs ({m0.n_brake_rows} braking): "
-                          f"k_thr={m0.k_thr:.4f} k_brk={m0.k_brk:.4f} k_drag={m0.k_drag:.4f} (holdout ids in fit set: 0)", flush=True)
+                    # one map per holdout recording, on that recording's manifest train rows (keyed (source, i))
+                    holder["stop_motion"] = fit_motions([r for r in state_rows if row_key(r) in fit_keys], holdout_keys=held_keys,
+                                                        sources={k[0] for k in held_keys})
+                    for src, m0 in holder["stop_motion"].items():
+                        print(f"[GVD] stop motion fitted on {m0.n_rows} train row pairs ({m0.n_brake_rows} braking): "
+                              f"k_thr={m0.k_thr:.4f} k_brk={m0.k_brk:.4f} k_drag={m0.k_drag:.4f} (holdout ids in fit set: 0)", flush=True)
                 except StopNotMeasured as exc:
                     if stop_stage == "2b":
                         raise
@@ -4695,7 +4718,7 @@ def _run_trainer2_recipe(
         except StopNotMeasured as exc:
             raise RecipeRefused(f"{exc}. Nothing was trained; drop 2b with --stage to run the other stages") from exc
         print(f"[GVD] recipe trainer2: stage 2b preflight OK: holdout events {pre['events']}, motion fitted on "
-              f"{pre['motion'].n_rows} train row pairs", flush=True)
+              f"{sum(m.n_rows for m in pre['motions'].values())} train row pairs ({len(pre['motions'])} holdout recording(s), one map each)", flush=True)
     wrote = ensure_recipe_manifest(
         getattr(args, "ckpt_dir", None), strip_roots=strip_roots, holdout_root=holdout_root,
         holdout_blocks=resolve_holdout_blocks(args.holdout_blocks), seed=int(args.seed), ssl_pretrain=ssl_on,

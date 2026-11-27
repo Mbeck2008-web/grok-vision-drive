@@ -123,6 +123,20 @@ def check_stage_2b_trains_end_to_end() -> None:
         # the recipe turns it into the stage result the runner gates on
         res = rec.stage_result_from_stats("2b", stats)
         assert all(res.metrics[k] == e[k] for k in rec.STOP_METRICS), (res.metrics, e)
+        # a segment gap under the manifest's 4 s purge: the train rows next to the holdout are out of the training windows
+        # and out of the fit (they used to be in both), and the run says so
+        fx.SEGMENT_GAP_S = 1.0
+        try:
+            tight = fx.build(base / "tight", fx.N_ROWS, fx.intersections(fx.N_ROWS))
+        finally:
+            fx.SEGMENT_GAP_S = 60.0
+        tstats, err, tout = _train_2b(torch, train_scene, rec, tight, base, "tight")
+        assert err is None, f"stage 2b with a purge crashed: {type(err).__name__}: {err}\n{tout[-2500:]}"
+        assert "manifest purge removed 14 train rows within the holdout gap" in tout, tout[-2500:]
+        assert "manifest purge removed 0 train rows" in out, "no purge when the segments are far apart"
+        tfit = re.search(r"stop motion fitted on (\d+) train row pairs", tout)
+        assert tfit and int(tfit.group(1)) <= n_pairs - 10, (tfit and tfit.group(0), n_pairs)  # 14 purged rows leave the fit
+        assert tstats["holdout_evals"][0]["stop_events"] == 1, tstats["holdout_evals"]
         # stage 7 on the same recording measures them again (a 2b ran before it)
         stats7, err, out7 = _train_2b(torch, train_scene, rec, strips, base, "ok7", stage="7")
         assert err is None, f"stage 7 crashed: {type(err).__name__}: {err}\n{out7[-2500:]}"
@@ -131,8 +145,43 @@ def check_stage_2b_trains_end_to_end() -> None:
           "holdout pass, refused (not a vacuous 0) without sign ids or without braking OK")
 
 
+def check_sidecar_join_scope() -> None:
+    """The single-root sign / stop-line join is the trainer2 recipe's; a run without the recipe keeps its rows unjoined."""
+    torch = _torch()
+    if torch is None:
+        skip_check("check_sidecar_join_scope", "torch not installed")
+        return
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        skip_check("check_sidecar_join_scope", "cv2 not installed")
+        return
+    import stage2b_fixture as fx
+    from python.train.intersection_labels import attach_sign_labels, attach_stop_lines
+    from python.train.strip_sources import load_multi_source_rows
+    from python.train.train_scene import recipe_sidecar_root
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = fx.build(Path(raw) / "r", fx.N_ROWS, fx.intersections(fx.N_ROWS))
+        (root / "stoplines.jsonl").write_text('{"t": 0.0, "bars": []}\n', encoding="utf-8")
+        assert recipe_sidecar_root("trainer2", root) == root
+        for off in (None, "", "off"):
+            assert recipe_sidecar_root(off, root) is None, off
+        rows, _ = load_multi_source_rows((root,), holdout_source=root)
+        plain = [dict(r) for r in rows]
+        counts = attach_sign_labels(plain, default_root=recipe_sidecar_root(None, root))
+        attach_stop_lines(plain, default_root=recipe_sidecar_root(None, root))
+        assert counts["parsed"] == 0 and counts["absent"] == len(plain), counts
+        assert not any("signs" in r or "signs" in (r.get("tech") or {}) for r in plain), "a non-recipe run must not join signs"
+        assert all(float(r["stop_line_valid"][0]) == 0.0 for r in plain)
+        joined = [dict(r) for r in rows]
+        counts = attach_sign_labels(joined, default_root=recipe_sidecar_root("trainer2", root))
+        assert counts["parsed"] > 0 and any((r.get("tech") or {}).get("signs") or r.get("signs") for r in joined), counts
+    print("sidecar join scope: the recipe joins its single root, a non-recipe run stays unjoined OK")
+
+
 def main() -> int:
-    checks = (check_stage_2b_trains_end_to_end,)
+    checks = (check_sidecar_join_scope, check_stage_2b_trains_end_to_end,)
     for fn in checks:
         fn()
     print(f"{len(checks)}/{len(checks)} checks passed")

@@ -597,6 +597,10 @@ def check_driver_off_route_and_far_end() -> None:
 
 def check_driver_resume_on_the_route() -> None:
     """A respawn on the route itself: past the farthest point reached, on the line, facing along it; refused when it cannot be."""
+    # Pin the literals, not just the names: a mutant that changes 40, 3 or 150 must fail here.
+    assert lr.RESUME_NUDGE_M == 40.0
+    assert lr.MAX_RESUMES == 3
+    assert lr.RESUME_MIN_LEFT_M == 150.0
     _g, route = route_of(loop_network(dirt=True), seed=3)
     drv = lr.RouteDriver(route)
     drv.note_start()
@@ -627,7 +631,28 @@ def check_driver_resume_on_the_route() -> None:
     pick2, why2 = drv.resume()
     assert pick2 is not None, why2
     _i, s2, d2 = lr.project_forward(route, pick2.pos[0], pick2.pos[1], 0, back=0, ahead_m=1e9)
-    assert d2 < 0.5 and abs(s2 - (reached + lr.RESUME_NUDGE_M)) < 0.5, (s2, reached)
+    assert d2 < 0.5 and abs(s2 - (reached + 40.0)) < 0.5, (s2, reached)
+    # Progress can go backwards: project_forward searches 3 segments back. The resume must still
+    # land 40 m past the farthest point reached, not past the later (smaller) projection.
+    drv3 = lr.RouteDriver(route)
+    drv3.note_start()
+    for k, c in enumerate(route.cum):
+        if lr.RESUME_NUDGE_M < c <= 700.0:
+            drv3.commands(route.points[k][0], route.points[k][1], 14.0)
+    farthest = drv3.progress_m
+    assert 600.0 <= farthest <= 700.0 and drv3.state == "following", drv3.summary()
+    behind_i = max(0, drv3.index - 2)
+    bx, by = route.points[behind_i][0], route.points[behind_i][1]
+    _bi, back_s, back_d = lr.project_forward(route, bx, by, drv3.index)
+    assert back_d < 1.0 and back_s < farthest - 10.0, (back_s, back_d, farthest, behind_i, drv3.index)
+    drv3.commands(bx, by, 14.0)
+    assert drv3.state == "following" and abs(drv3.progress_m - farthest) < 1e-9, (
+        f"progress rolled back from {farthest} to {drv3.progress_m} (projected {back_s})"
+    )
+    pick_b, why_b = drv3.resume()
+    assert pick_b is not None, why_b
+    _i, s_b, d_b = lr.project_forward(route, pick_b.pos[0], pick_b.pos[1], 0, back=0, ahead_m=1e9)
+    assert d_b < 0.5 and abs(s_b - (farthest + 40.0)) < 0.5, (s_b, farthest, back_s)
     # The cap: MAX_RESUMES then None, with the reason, and the driver untouched by the refusal.
     while drv.resumes < lr.MAX_RESUMES:
         assert drv.resume()[0] is not None
@@ -637,13 +662,19 @@ def check_driver_resume_on_the_route() -> None:
     # Too little route left: None, with the reason.
     late = lr.RouteDriver(route)
     late.note_start()
-    late.progress_m = route.total_m - lr.RESUME_MIN_LEFT_M - lr.RESUME_NUDGE_M + 1.0
+    late.progress_m = route.total_m - 150.0 - 40.0 + 1.0
     nope, why4 = late.resume()
     assert nope is None and "of the route are left" in why4 and late.resumes == 0, why4
     edge = lr.RouteDriver(route)
     edge.note_start()
-    edge.progress_m = route.total_m - lr.RESUME_MIN_LEFT_M - lr.RESUME_NUDGE_M - 1.0
+    edge.progress_m = route.total_m - 150.0 - 40.0 - 1.0
     assert edge.resume()[0] is not None, "just inside the margin still resumes"
+    # Exact boundary: left == 150 m after the nudge must still resume (`<`, not `<=`).
+    exact = lr.RouteDriver(route)
+    exact.note_start()
+    exact.progress_m = route.total_m - 150.0 - 40.0
+    got_exact, why_exact = exact.resume()
+    assert got_exact is not None and exact.resumes == 1, (why_exact, route.total_m - (exact.progress_m if got_exact is None else 0.0))
     # A finished or abandoned driver is never resumed (the collector's deck takes over, as before).
     for state in ("done", "off_route"):
         dead = lr.RouteDriver(route)
@@ -656,6 +687,19 @@ def check_driver_resume_on_the_route() -> None:
     assert dirt_s is not None
     _i, dpick = lr.route_resume_pick(route, dirt_s + 1.0)
     assert dpick.kind == "city" and dpick.speed == lr.SPEED["city"], dpick
+    # At a kind-change segment, the pick must use kinds[i+1], not kinds[i].
+    change = next((k for k in range(len(route.kinds) - 2)
+                   if route.kinds[k] != route.kinds[k + 1] and (route.cum[k + 1] - route.cum[k]) > 1.0), None)
+    assert change is not None, "loop_network(dirt=True) has no kind-change segment"
+    s_change = route.cum[change] + min(1.0, 0.5 * (route.cum[change + 1] - route.cum[change]))
+    i_change, cpick = lr.route_resume_pick(route, s_change)
+    assert i_change == change, (i_change, change, s_change, route.cum[change], route.cum[change + 1])
+    assert route.kinds[i_change] != route.kinds[i_change + 1], (route.kinds[i_change], route.kinds[i_change + 1])
+    upcoming = route.kinds[i_change + 1]
+    expected = "city" if upcoming == "dirt" else upcoming
+    assert cpick.kind == expected and (upcoming != "dirt" or cpick.speed == lr.SPEED["city"]), (
+        cpick.kind, upcoming, route.kinds[i_change], cpick.speed
+    )
     print("driver resume: on the route line, facing along it, past the farthest point, capped, refused near the end / when done")
 
 

@@ -60,7 +60,8 @@ class RouteCar(sf._CrashVehicle):
 
     def __init__(self, stop: Path, route: lr.Route | None = None, rest_polls: int = 5, leave_at_m: float | None = None,
                  tail_polls: int = 40, max_polls: int = 3000, stall_at_m: float | None = None,
-                 recover_to: str | None = None, stuck_start: str | None = None, **_kw: object) -> None:
+                 recover_to: str | None = None, stuck_start: str | None = None,
+                 restall_after_m: float | None = None, **_kw: object) -> None:
         super().__init__(stop, stop_at=10**9)
         self.route = route
         self.rest_polls, self.leave_at_m, self.tail_polls, self.max_polls = rest_polls, leave_at_m, tail_polls, max_polls
@@ -82,6 +83,7 @@ class RouteCar(sf._CrashVehicle):
         # again). "until_moved": it drives once a teleport puts it on the route 10+ m past the start; "always": never.
         self.stuck_start = stuck_start
         self.stuck = stuck_start is not None
+        self.restall_after_m = restall_after_m
         self.teleports_on_route: list[tuple[float, float]] = []  # (arc length, distance off the route) of each later teleport
 
     def teleport(self, pos, rot_quat=None, reset=False) -> None:
@@ -89,15 +91,23 @@ class RouteCar(sf._CrashVehicle):
         self.s_at_teleport.append(self.s)
         if len(self.placed) == 1:  # the car is on the first pose; later teleports do not move the fake ...
             self.s = 0.0
-        elif self.stuck_start is not None:  # ... except in the stuck-start run: it follows the teleport
+        elif self.stuck_start is not None or self.restall_after_m is not None:
+            # Follow a later on-route teleport (stuck-start or a mid-route resume). A recover in place
+            # (same arc, restall) leaves the car stalled so the second abort can end the segment.
             _i, s, d = lr.project_forward(self.route, pos[0], pos[1], 0, back=0, ahead_m=1e9)
             self.teleports_on_route.append((s, d))
             if d > lr.OFF_ROUTE_M:
                 self.parked = True  # a deck pose km away: the car is off the route and at rest
+            elif self.restall_after_m is not None and s <= self.s + 5.0:
+                pass  # recover in place: stay stalled at the same arc
             else:
                 self.s = s
                 if self.stuck_start == "until_moved" and s >= 10.0:
                     self.stuck = False
+                if self.restall_after_m is not None:
+                    self.stall = None
+                    self.has_line = False
+                    self.stall_at_m = s + self.restall_after_m
         elif self.recover_to == "end":  # ... unless the recover is asked to land it at the route's end
             self.s = self.route.total_m - 10.0
         elif self.recover_to == "off":  # or off the route
@@ -129,8 +139,13 @@ class RouteCar(sf._CrashVehicle):
     def poll_sensors(self) -> None:
         self.polls += 1
         driven = self.polls > self.rest_polls and self.mode == "manual" and self.has_line
-        if self.stall_at_m is not None and self.stall is None and self.s >= self.stall_at_m:
-            self.stall, self.stall_poll = "stalled", self.polls  # the AI is reset: only a fresh manual mode restarts it
+        if self.stall_at_m is not None and self.s >= self.stall_at_m:
+            if self.restall_after_m is not None:
+                # Stay stalled through a recover in place; only a resume teleport re-arms stall_at_m.
+                if self.stall != "stalled":
+                    self.stall, self.stall_poll = "stalled", self.polls
+            elif self.stall is None:
+                self.stall, self.stall_poll = "stalled", self.polls  # the AI is reset: only a fresh manual mode restarts it
         if self.stall == "stalled" or self.stuck:
             driven = False
         if self.leave_at_m is not None and self.s >= self.leave_at_m:
@@ -156,7 +171,7 @@ class RouteCar(sf._CrashVehicle):
             self.stop.write_text("stop", encoding="utf-8")
 
 
-def run(route: lr.Route, extra: list[str] | None = None, **car_kw: object):
+def run(route: lr.Route, extra: list[str] | None = None, paint=None, **car_kw: object):
     from scripts.gvd_test_env import collect_root
 
     cars: list[RouteCar] = []
@@ -170,14 +185,26 @@ def run(route: lr.Route, extra: list[str] | None = None, **car_kw: object):
     plan.write_text(json.dumps(route.to_json()), encoding="utf-8")
     previous = sf._CrashVehicle
     sf._CrashVehicle = factory  # type: ignore[assignment]
+    import python.collect.level_session as level_session
+    prev_snap = level_session.snap_to_road
+
+    def _snap(bng, near):
+        # The harness BeamNG road only runs to y=80; a real recover stays at the car.
+        del bng
+        if near is None or len(near) < 3:
+            return None
+        return (float(near[0]), float(near[1]), float(near[2])), (0.0, 0.0, 0.0, 1.0)
+
+    level_session.snap_to_road = _snap  # type: ignore[assignment]
     try:
         # No --no-excursions, --no-impact-respawn or stall setting of its own: the route clip must turn those off itself.
         code, text, out = sf._run_west_coast(
-            sf._Paint(lambda x, y: True), sf._west_pools(),
+            paint if paint is not None else sf._Paint(lambda x, y: True), sf._west_pools(),
             ["--route-plan", str(plan), "--min-paint-cov", "0", "--stall-respawn-s", "5"] + list(extra or []), 10**9, root=root,
         )
     finally:
         sf._CrashVehicle = previous  # type: ignore[assignment]
+        level_session.snap_to_road = prev_snap  # type: ignore[assignment]
     return code, text, out, cars[0]
 
 
@@ -358,6 +385,67 @@ def check_timed_respawn_stays_off_a_route_clip() -> None:
     print("collector route run: a --respawn-min clock does not teleport a route clip while the route is driven")
 
 
+def check_low_yield_stays_off_a_route_clip() -> None:
+    """A low-yield cut uses force=True and would have called _apply_spawn with source=="spawn", which the
+    old guard treated as a route resume: a moving car would be teleported 40 m ahead. The cut must keep
+    the car on the route (plan=keep), with no resume."""
+    route = make_route()
+    # Unpainted labels are invalid, so YieldGuard fires after its 60 s moving window.
+    paint = sf._Paint(lambda x, y: False)
+    code, text, out, car = _no_excursions_flag_run(route, extra=["--min-live-yield", "0.99"], paint=paint)
+    assert code == 0, (code, text[-2500:])
+    assert "collect low_yield" in text, text[-3000:]
+    mid_route_resumes = [line for line in text.splitlines() if "collect route resume" in line]
+    assert not mid_route_resumes, f"low-yield teleported the car on the route: {mid_route_resumes}\n{text[-2500:]}"
+    assert "-> keep" in text, text[-2500:]
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["state"] == "done" and summary["resumes"] == 0 and summary["max_off_route_m"] < 1.0, summary
+    assert all(d < 1.0 for _s, d in car.teleports_on_route), car.teleports_on_route
+    print("collector route run: a low-yield cut does not teleport a route clip; the route finishes")
+
+
+def check_recheck_stays_off_a_route_clip() -> None:
+    """--recheck-cov-min would teleport to a painted deck road. While the route is driven the recheck
+    must keep the car on the (unpainted) route, with no resume."""
+    route = make_route()
+    # The route is at x=0..250; east deck roads (x>1000) are painted, so a rogue deck pick would leave the route.
+    paint = sf._Paint(lambda x, y: x > 1000.0)
+    code, text, out, car = _no_excursions_flag_run(
+        route, extra=["--min-paint-cov", "0.5", "--recheck-cov-min", "0.2"], paint=paint,
+    )
+    assert code == 0, (code, text[-2500:])
+    assert "collect recheck_cov" in text, text[-3000:]
+    mid_route_resumes = [line for line in text.splitlines() if "collect route resume" in line]
+    assert not mid_route_resumes, f"recheck teleported the car on the route: {mid_route_resumes}\n{text[-2500:]}"
+    assert "-> keep" in text, text[-2500:]
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["state"] == "done" and summary["resumes"] == 0 and summary["max_off_route_m"] < 1.0, summary
+    assert all(d < 1.0 for _s, d in car.teleports_on_route), car.teleports_on_route
+    early = [round(s_) for s_ in car.s_at_teleport[1:] if s_ < route.total_m - lr.END_TOL_M - 10.0]
+    assert not early, f"a recheck teleport moved the car mid-drive (at route metres {early}): {car.placed}"
+    print("collector route run: a paint-coverage recheck does not teleport a route clip; the route finishes")
+
+
+def check_three_resumes_then_the_clip_stops() -> None:
+    """MAX_RESUMES is 3 and must be reachable through the collector: the car records rows (so segment_fail
+    does not fire after two empty segments), stalls three times, is put back on the route each time, and
+    the fourth resume is refused with spawn_failed."""
+    route = make_route()
+    # A longer plan so four ~20 s stall losses stay under the 20% recover-lost exit.
+    code, text, out, car = _no_excursions_flag_run(
+        route, extra=["--minutes", "20"], stall_at_m=50.0, restall_after_m=50.0, max_polls=20000,
+    )
+    assert code == 2, (code, text[-3000:])
+    summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
+    assert summary["resumes"] == 3, summary
+    assert summary["state"] != "off_route", summary
+    assert "route respawn impossible" in text and "already put back on the route" in text, text[-2500:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "spawn_failed" and "route respawn impossible" in (status.get("stop_detail") or ""), status
+    assert all(d < 1.0 for _s, d in car.teleports_on_route), f"a respawn left the route: {car.teleports_on_route}"
+    print("collector route run: three on-route resumes, then the fourth is refused (exit 2, spawn_failed), never off-route")
+
+
 def main() -> None:
     check_route_runs_through_the_collector()
     check_leaving_the_route_hands_back_to_span()
@@ -367,6 +455,9 @@ def main() -> None:
     check_stuck_route_ends_the_clip_honestly()
     check_unresumable_route_ends_the_clip_honestly()
     check_timed_respawn_stays_off_a_route_clip()
+    check_low_yield_stays_off_a_route_clip()
+    check_recheck_stays_off_a_route_clip()
+    check_three_resumes_then_the_clip_stops()
     print("test_collect_route_drive: OK")
 
 

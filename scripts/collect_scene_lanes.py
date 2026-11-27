@@ -2620,9 +2620,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if spawn_deck.summary()["picks"] == 0:
                     return f"{map_name}: no legal on-road spawn (correct side of the road)"
                 return None
-            if route_driver is not None and route_driver.active and route_driver.spawns > 0 and (not force or source != "spawn"):
-                return None  # a timed, stall, impact or recheck respawn would draw a deck road far off the route: keep the car on it
             if route_driver is not None and route_driver.active and route_driver.spawns > 0:
+                if source != "segment":
+                    return None  # timed, stall, impact, recheck or low-yield: a deck road would put the car far off the route
                 # The segment ended (the car stopped and a recover did not move it) with the route still being driven. The
                 # deck would draw a road anywhere on the map: the smoke put the car 2 km off the route and the driver never
                 # got it back. Respawn on the route itself, a nudge past where it got to, or end the clip.
@@ -3083,7 +3083,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 # A new level starts on the off-deck range; a deck spawn below replaces it.
                 speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
                 speed = speed_at(done_s, tuple(speed_span[0]))
-                spawn_err = _apply_spawn(True)
+                spawn_err = _apply_spawn(True, "segment")
                 if spawn_err:
                     last_error = spawn_err
                     _save_progress(done_s, done_s if target_s == float("inf") else target_s)
@@ -3908,7 +3908,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 plan, new_cut = low_yield_plan(can_respawn, boundary, done_s, schedule_cut)
                 if plan == "respawn":
                     mark = spawn_mark
-                    _apply_spawn(True)
+                    spawn_err = _apply_spawn(True, "low_yield")
+                    if spawn_err:
+                        last_error = spawn_err
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                        _publish(None, speed, waypoint)
+                        _write_collect_crash(status_root, last_error, {})
+                        print(f"collect stop {last_error}", flush=True)
+                        run.stop("spawn_failed", last_error)
+                        return 2
                     if spawn_mark == mark:
                         plan = "keep"
                 elif plan == "segment_end":
@@ -3970,7 +3978,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 new_road = new_type = None
                 if plan == "respawn":
                     mark = spawn_mark
-                    _apply_spawn(True, "recheck")
+                    spawn_err = _apply_spawn(True, "recheck")
+                    if spawn_err:
+                        last_error = spawn_err
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                        _publish(None, speed, waypoint)
+                        _write_collect_crash(status_root, last_error, {})
+                        print(f"collect stop {last_error}", flush=True)
+                        run.stop("spawn_failed", last_error)
+                        return 2
                     if spawn_mark == mark:
                         plan = "keep"
                     else:

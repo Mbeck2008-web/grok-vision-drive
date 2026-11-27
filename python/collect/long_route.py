@@ -82,13 +82,13 @@ OFF_TICKS = 8
 END_TOL_M = 25.0
 FAR_END_TOL_M = 60.0
 SEND_SPEED_DELTA = 0.5
-# Highest AI speed (m/s) on each kind of road; the highway takes the clip's own speed.
 # A respawn on the route (see ``RouteDriver.resume``): past where the car was, so a spot that stalled it is not
 # the spawn again; at most MAX_RESUMES per clip; and not within RESUME_MIN_LEFT_M of the end.
 RESUME_NUDGE_M = 40.0
 RESUME_MIN_LEFT_M = 150.0
 MAX_RESUMES = 3
 
+# Highest AI speed (m/s) on each kind of road; the highway takes the clip's own speed.
 KIND_SPEED_CAP = {"highway": None, "ramp": 16.0, "city": 14.0, "dirt": 11.0}
 
 

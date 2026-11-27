@@ -1221,6 +1221,80 @@ def check_lane_edge_straddle_run() -> None:
     print(f"lane_edge run: x=0.4 straddling -> abort lane_edge after {len(weave)} weave row; x=1.75 -> {len(weave_in)} weave rows; {sent[0]}")
 
 
+def check_non_route_low_yield_counts_as_spawn() -> None:
+    """Off a route, a low-yield respawn is a spawn-column pick (and settles as source=spawn).
+    Passing source=low_yield would open a new spawn_types column and change the settle label."""
+    east_paint = _Paint(lambda x, y: x > 1000.0)
+    code, text, out = _run_west_coast(
+        east_paint, _west_pools(), ["--min-live-yield", "0.99"], 2000,
+    )
+    assert code == 0, (code, text[-2500:])
+    assert "collect low_yield" in text and "-> respawn" in text, text[-2500:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    types = status.get("spawn_types") or {}
+    assert "low_yield" not in types, types
+    assert sum((types.get("spawn") or {}).values()) >= 2, types
+    assert "source=low_yield" not in text, text[-2500:]
+    assert any("teleport_settle" in line and "source=spawn" in line for line in text.splitlines()), text[-2000:]
+    print(f"non-route low-yield: counted under spawn_types spawn n={sum((types.get('spawn') or {}).values())}, no low_yield column")
+
+
+def check_low_yield_placement_error_stops() -> None:
+    """A failed place_vehicle on a non-route low-yield respawn (source=spawn) must stop the clip."""
+    import python.collect.level_session as level_session
+
+    orig = level_session.place_vehicle
+    n = [0]
+
+    def pv(bng, vehicle, pos, rot):
+        n[0] += 1
+        if n[0] >= 2:
+            return "session lost: simulated placement failure"
+        return orig(bng, vehicle, pos, rot)
+
+    east_paint = _Paint(lambda x, y: x > 1000.0)
+    level_session.place_vehicle = pv  # type: ignore[assignment]
+    try:
+        code, text, out = _run_west_coast(
+            east_paint, _west_pools(), ["--min-live-yield", "0.99"], 2000,
+        )
+    finally:
+        level_session.place_vehicle = orig  # type: ignore[assignment]
+    assert code == 2, (code, text[-2500:])
+    assert "legal spawn pose could not be placed" in text and "session lost" in text, text[-2500:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "spawn_failed" and "session lost" in (status.get("stop_detail") or ""), status
+    print("non-route low-yield: a failed placement stops the clip (exit 2, spawn_failed)")
+
+
+def check_recheck_placement_error_stops() -> None:
+    """A failed place_vehicle on a recheck respawn must stop the clip (the error return is honoured)."""
+    import python.collect.level_session as level_session
+
+    orig = level_session.place_vehicle
+    n = [0]
+
+    def pv(bng, vehicle, pos, rot):
+        n[0] += 1
+        if n[0] >= 2:
+            return "session lost: simulated placement failure"
+        return orig(bng, vehicle, pos, rot)
+
+    east_paint = _Paint(lambda x, y: x > 1000.0)
+    level_session.place_vehicle = pv  # type: ignore[assignment]
+    try:
+        code, text, out = _run_west_coast(
+            east_paint, _west_pools(), ["--min-paint-cov", "0.5", "--recheck-cov-min", "0.2"], 1000,
+        )
+    finally:
+        level_session.place_vehicle = orig  # type: ignore[assignment]
+    assert code == 2, (code, text[-2500:])
+    assert "legal spawn pose could not be placed" in text and "session lost" in text, text[-2500:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "spawn_failed" and "session lost" in (status.get("stop_detail") or ""), status
+    print("recheck: a failed placement stops the clip (exit 2, spawn_failed)")
+
+
 def main() -> None:
     check_coverage_walks_ahead()
     check_short_probe_is_not_full_coverage()
@@ -1254,6 +1328,9 @@ def main() -> None:
     check_impact_respawn_run()
     check_vehicle_width_runs()
     check_lane_edge_straddle_run()
+    check_non_route_low_yield_counts_as_spawn()
+    check_low_yield_placement_error_stops()
+    check_recheck_placement_error_stops()
     print("collect spawn fix ok")
 
 

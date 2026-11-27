@@ -489,7 +489,9 @@ def build_parser() -> argparse.ArgumentParser:
             "The first spawn is the route's highway end, facing along it, and the AI is driven along the route "
             "(highway to the far end, then the return loop) with rolling ai.setLine windows; span roaming takes over "
             "at the end or when the car leaves the route. Needs --maps to be exactly the route's map. Turns excursions "
-            "off and the stall/impact deck respawns off (the stationary abort and recover stays)."
+            "off and the stall/impact deck respawns off (the stationary abort and recover stays). When a stop is not fixed by the "
+            "recover and the segment ends, the respawn is on the route (RESUME_NUDGE_M past the farthest point reached, at "
+            "most MAX_RESUMES times), never a deck draw; with none left the clip stops (spawn_failed). --respawn-min is ignored."
         ),
     )
     parser.add_argument(
@@ -2618,11 +2620,27 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if spawn_deck.summary()["picks"] == 0:
                     return f"{map_name}: no legal on-road spawn (correct side of the road)"
                 return None
-            if route_driver is not None and route_driver.state == "idle" and route_driver.lines_sent == 0:
+            if route_driver is not None and route_driver.active and route_driver.spawns > 0:
+                if source != "segment":
+                    return None  # timed, stall, impact, recheck or low-yield: a deck road would put the car far off the route
+                # The segment ended (the car stopped and a recover did not move it) with the route still being driven. The
+                # deck would draw a road anywhere on the map: the smoke put the car 2 km off the route and the driver never
+                # got it back. Respawn on the route itself, a nudge past where it got to, or end the clip.
+                picked, why = route_driver.resume()
+                if picked is None:
+                    return f"{map_name}: route respawn impossible: {why}"
+                print(
+                    f"collect route resume {segment_id} s={route_driver.progress_m:.0f}m of {route_driver.route.total_m:.0f}m "
+                    f"nudge={route_driver.skipped_m / max(1, route_driver.resumes):.0f}m resumes={route_driver.resumes} "
+                    f"kind={picked.kind}",
+                    flush=True,
+                )
+            elif route_driver is not None and route_driver.active and route_driver.state == "idle" and route_driver.lines_sent == 0:
                 # The route's own start (a highway end, facing along it), not a deck draw.
                 from python.collect.long_route import route_spawn_pick
 
                 picked = route_spawn_pick(route_driver.route)
+                route_driver.note_start()
                 print(
                     f"collect route start {segment_id} road={route_driver.route.start_road} "
                     f"direction={route_driver.route.direction} highway={route_driver.route.highway_m:.0f}m "
@@ -2661,7 +2679,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             shift = place_vehicle(bng, vehicle, picked.pos, picked.rot)
             if shift:
                 print(f"collect spawn {segment_id} {picked.kind} failed {shift}", flush=True)
-                if source == "spawn":
+                # "segment" is a route resume: resume() already advanced the driver, so swallowing
+                # this would burn a resume and keep driving from the stall. "recheck" callers also
+                # honour the error return; stall/impact mid-run still keep the current pose.
+                if source in ("spawn", "segment", "recheck"):
                     return f"{map_name}: legal spawn pose could not be placed: {shift}"
                 return None
             count = traffic_count(args.traffic, map_name)
@@ -3065,7 +3086,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 # A new level starts on the off-deck range; a deck spawn below replaces it.
                 speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
                 speed = speed_at(done_s, tuple(speed_span[0]))
-                spawn_err = _apply_spawn(True)
+                # Only a same-map open of the next segment, while a route is already started, is a
+                # route resume (source "segment"). The first open, and every non-route open, stay
+                # source "spawn" so the deck's type mix is unchanged.
+                spawn_src = (
+                    "segment"
+                    if route_driver is not None and route_driver.active and route_driver.spawns > 0
+                    else "spawn"
+                )
+                spawn_err = _apply_spawn(True, spawn_src)
                 if spawn_err:
                     last_error = spawn_err
                     _save_progress(done_s, done_s if target_s == float("inf") else target_s)
@@ -3890,7 +3919,19 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 plan, new_cut = low_yield_plan(can_respawn, boundary, done_s, schedule_cut)
                 if plan == "respawn":
                     mark = spawn_mark
-                    _apply_spawn(True)
+                    # Off a route the pick must stay in the "spawn" type column (and settle as
+                    # source=spawn). Pass "low_yield" only while a route is active, so the
+                    # route guard can refuse it without treating it as a resume.
+                    low_yield_src = "low_yield" if route_driver is not None and route_driver.active else "spawn"
+                    spawn_err = _apply_spawn(True, low_yield_src)
+                    if spawn_err:
+                        last_error = spawn_err
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                        _publish(None, speed, waypoint)
+                        _write_collect_crash(status_root, last_error, {})
+                        print(f"collect stop {last_error}", flush=True)
+                        run.stop("spawn_failed", last_error)
+                        return 2
                     if spawn_mark == mark:
                         plan = "keep"
                 elif plan == "segment_end":
@@ -3952,7 +3993,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 new_road = new_type = None
                 if plan == "respawn":
                     mark = spawn_mark
-                    _apply_spawn(True, "recheck")
+                    spawn_err = _apply_spawn(True, "recheck")
+                    if spawn_err:
+                        last_error = spawn_err
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                        _publish(None, speed, waypoint)
+                        _write_collect_crash(status_root, last_error, {})
+                        print(f"collect stop {last_error}", flush=True)
+                        run.stop("spawn_failed", last_error)
+                        return 2
                     if spawn_mark == mark:
                         plan = "keep"
                     else:

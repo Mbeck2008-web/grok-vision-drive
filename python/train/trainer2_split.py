@@ -41,11 +41,11 @@ RUN_MANIFEST = "run_manifest.json"
 SPLITS = ("train", "holdout")
 DECISION_TIERS = ("iteration", "2.0")
 KEY_FIELDS = ("source", "i", "t", "map", "session")
-# PROPOSAL pending Michael (GVD call 2026-11-25, interpreting "held out of all
-# training"): the held-out map is also barred from the matched holdout used for
-# stage exit, model selection and the 25% RMS gate. False keeps held-out-map
-# rows out of train only. The choice is recorded in the manifest and hashed.
-BAR_HELDOUT_MAP_FROM_HOLDOUT = True
+# DECIDED (Michael 2026-11-26, "for now"): the held-out map is NOT barred from the
+# matched holdout; held-out-map rows stay out of train only, and the held-out-map
+# test comes later. True would also bar it from the holdout used for stage exit,
+# model selection and the 25% RMS gate. The choice is recorded in the manifest and hashed.
+BAR_HELDOUT_MAP_FROM_HOLDOUT = False
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 __all__ = [
@@ -158,9 +158,9 @@ def build_split_manifest(
     A recording that has holdout rows needs a finite ``t`` on every one of its
     rows, train and holdout: without it the purge cannot be proven, so the build
     is refused (never silently kept).
-    Rows on ``heldout_map`` go to no split (counted in ``heldout_map_rows``).
-    With ``bar_heldout_from_holdout=False`` (PROPOSAL pending Michael) they are
-    barred from train only and stay in the holdout.
+    With ``bar_heldout_from_holdout=True`` rows on ``heldout_map`` go to no split
+    (counted in ``heldout_map_rows``). With False (the default, DECIDED Michael
+    2026-11-26 "for now") they are barred from train only and stay in the holdout.
     When ``heldout_map`` is set, a row whose map is unknown is refused: the
     manifest cannot prove it is not on the held-out map.
     ``cells`` (a ``continual.choose_holdout_cells`` spec, ``--holdout-cells``)

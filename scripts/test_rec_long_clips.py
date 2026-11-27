@@ -620,7 +620,13 @@ def check_long_clip_routes_direction_and_maps() -> None:
     assert len({p.spawn_seed for p in ec}) > 1
     argv = clip_argv(ec[0], _P("/tmp/x/clip"))
     assert argv[argv.index("--route") + 1] == "span" and "--route-plan" not in argv
-    # Default pool: some long clips can land on east_coast_usa under frac < 1.
+    print("routes: direction alternates, spawn/route vary, no-highway maps still counted")
+
+
+def check_default_pool_lands_on_the_no_highway_map() -> None:
+    """With frac < 1 some long clips land on east_coast_usa (varied, free roaming)."""
+    from python.collect.clip_mode import apply_long_highway, plan_clip
+
     default = ("west_coast_usa", "italy", "east_coast_usa")
     landed = {
         apply_long_highway(plan_clip(i, seed=s, maps=default, max_traffic=0),
@@ -628,7 +634,7 @@ def check_long_clip_routes_direction_and_maps() -> None:
         for s in range(20) for i in range(8)
     }
     assert "east_coast_usa" in landed, landed
-    print("routes: direction alternates, spawn/route vary, no-highway maps still counted")
+    print("default pool: long clips do land on east_coast_usa when frac < 1")
 
 
 def check_real_map_plan_resolves_to_its_route() -> None:
@@ -1078,6 +1084,7 @@ def _checks() -> None:
     check_collect_clips_main_passes_long_clip_kwargs()
     check_long_clip_default_duration_bounds()
     check_long_clip_highway_frac_mix()
+    check_default_pool_lands_on_the_no_highway_map()
     check_highway_loop_clips_are_driven_and_measured()
     check_requested_direction_alternates_by_long_clip_order()
     check_long_plan_guards_and_provenance()

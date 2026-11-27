@@ -117,6 +117,23 @@ def check_recipe_refuses_augment() -> None:
     print("recipe refuses --augment (default-on is refused; --no-augment required) OK")
 
 
+def check_ctl_cond_refused_under_the_recipe() -> None:
+    """--ctl-cond feeds the ctl head the previous row's recorded speed and pedals; stage 2b integrates its profile from that
+    head, so under --recipe trainer2 the flag is refused up front (and still legal with the recipe off)."""
+    rec = _recipe()
+    base = ["--recipe", "trainer2", "--no-augment"]
+    rec.validate_recipe_args(_parser().parse_args(base))  # the same run without the flag is fine
+    for extra in (["--ctl-cond"], ["--ctl-cond", "--stage", "2b"], ["--stage", "7", "--ctl-cond"]):
+        try:
+            rec.validate_recipe_args(_parser().parse_args(base + extra))
+        except rec.RecipeRefused as exc:
+            assert "--ctl-cond" in str(exc) and "recorded speed" in str(exc), exc
+        else:
+            raise AssertionError(f"{extra} must be refused under --recipe trainer2")
+    rec.validate_recipe_args(_parser().parse_args(["--ctl-cond"]))  # recipe off: unchanged
+    print("--ctl-cond refused under --recipe trainer2 (its input is the recorded speed and pedals), legal with the recipe off OK")
+
+
 def check_kd_refused_in_pr6() -> None:
     rec = _recipe()
     args = _parser().parse_args(["--recipe", "trainer2", "--no-augment", "--kd"])
@@ -215,6 +232,27 @@ def check_curriculum_order_and_gates() -> None:
         pass
     else:
         raise AssertionError("lane_r drop just over 5% must reject")
+
+    # A zero baseline (a stage that missed nothing) that gets worse is rejected whatever its size: the 5% rule is
+    # relative to |old| and would divide by zero; improving or holding at zero is fine.
+    rec.check_non_regression({"missed_stop": 0.0, "false_brake": 0.0}, {"missed_stop": 0.0, "false_brake": 0.0})
+    rec.check_non_regression({"missed_stop": 2.0}, {"missed_stop": 1.0})
+    rec.check_non_regression({"missed_stop": 1.0}, {"missed_stop": 1.04})  # 4% worse, inside the 5%
+    for earlier, now, what in (({"missed_stop": 0.0}, {"missed_stop": 1.0}, "zero baseline"),
+                               ({"false_brake": 0.0}, {"false_brake": 0.001}, "zero baseline"),
+                               ({"lane_r": 0.0}, {"lane_r": -0.1}, "zero baseline"),  # higher is better: below zero is worse
+                               ({"missed_stop": 1.0}, {"missed_stop": 1.06}, "6")):
+        try:
+            rec.check_non_regression(earlier, now)
+        except rec.CheckpointRejected as exc:
+            assert what in str(exc), (earlier, now, exc)
+        else:
+            raise AssertionError(f"{earlier} -> {now} must be rejected")
+    rec.check_non_regression({"lane_r": 0.0}, {"lane_r": 0.3})  # higher-is-better metric rising from zero is not worse
+    assert rec._worse_frac(0.0, 2.0, metric="missed_stop") == float("inf")
+    assert rec._worse_frac(0.0, 0.0, metric="missed_stop") == 0.0
+    assert rec._worse_frac(0.0, 2.0, metric="lane_r") < 0.0 and rec._worse_frac(0.0, -2.0, metric="lane_r") == float("inf")
+    assert abs(rec._worse_frac(2.0, 3.0, metric="missed_stop") - 0.5) < 1e-12
 
     # Orchestrator: skip-logs 3-6, rejects a regressing ckpt, does not call train on skipped stages.
     trained: list[str] = []
@@ -631,13 +669,51 @@ def check_stage_result_from_stats_is_real() -> None:
             assert "not claiming exit" in str(exc), exc
         else:
             raise AssertionError(f"{bad} must not yield a stage-1 result")
-    # stage 2b: refused with the precise reason, never a made-up number
+    # stage 2b: the three stop metrics from the holdout pass (python/train/stop_pred.py), every one finite on every eval
+    ok2b = {"lane_rms": 0.5, "lane_r": 0.9, "depth_absrel": 0.4, "sem_miou": 0.3, "missed_stop": 2.0, "missed_light": 1.0,
+            "false_brake": 0.75}
+    res = rec.stage_result_from_stats("2b", _stats([dict(ok2b, missed_stop=4.0, missed_light=3.0, false_brake=2.0),
+                                                    dict(ok2b, missed_stop=3.0, missed_light=2.0, false_brake=1.0), ok2b]))
+    assert res.metrics == ok2b, res.metrics  # the LAST eval, with the lane and aux metrics it keeps measuring
+    assert res.evals_by == {"missed_stop": [4.0, 3.0, 2.0], "missed_light": [3.0, 2.0, 1.0], "false_brake": [2.0, 1.0, 0.75]}, res.evals_by
+    assert res.evals == [4.0, 3.0, 2.0] and res.epochs == 3
+    for key in ("missed_stop", "missed_light", "false_brake"):
+        for bad in (None, nan, float("inf")):
+            try:
+                rec.stage_result_from_stats("2b", _stats([ok2b, dict(ok2b, **{key: bad})]))
+            except rec.MetricNotMeasured as exc:
+                assert key in str(exc) and "not claiming exit" in str(exc), exc
+            else:
+                raise AssertionError(f"2b with {key}={bad} must not yield a result")
+        gone = dict(ok2b)
+        del gone[key]
+        try:
+            rec.stage_result_from_stats("2b", _stats([ok2b, gone]))
+        except rec.MetricNotMeasured:
+            pass
+        else:
+            raise AssertionError(f"2b without {key} must not yield a result")
+    # stage 7 re-measures the stop metrics when the pass produced them (a 2b ran before) and does not need them otherwise
+    r7 = rec.stage_result_from_stats("7", _stats([ok2b]))
+    assert r7.metrics == ok2b, r7.metrics
+    r7 = rec.stage_result_from_stats("7", _stats([{k: v for k, v in ok2b.items() if k not in rec.STOP_METRICS}]))
+    assert set(r7.metrics) == {"lane_rms", "lane_r", "depth_absrel", "sem_miou"}, r7.metrics
+    # the guard for a stage that cannot be measured is still there (nothing is in it today)
+    assert rec.UNMEASURABLE_STAGES == {}
+    saved = dict(rec.UNMEASURABLE_STAGES)
+    rec.UNMEASURABLE_STAGES["2b"] = "because"
     try:
-        rec.stage_result_from_stats("2b", _stats([{"lane_rms": 1.0}] * 4))
-    except rec.MetricNotMeasured as exc:
-        assert "PR 6b" in str(exc) and "stop ids" in str(exc) and "pred_v" in str(exc), exc
-    else:
-        raise AssertionError("stage 2b has no offline exit metric; must not pass")
+        for fn, args in ((rec.stage_result_from_stats, ("2b", _stats([ok2b]))), (rec.require_measurable_stages, (["0", "2b"],))):
+            try:
+                fn(*args)
+            except rec.MetricNotMeasured as exc:
+                assert "because" in str(exc), exc
+            else:
+                raise AssertionError("an unmeasurable stage must be refused")
+        rec.require_measurable_stages(["0", "1", "2"])
+    finally:
+        rec.UNMEASURABLE_STAGES.clear()
+        rec.UNMEASURABLE_STAGES.update(saved)
     # stages 2 and 7: the 8 m lane score, plus the re-measured aux metrics when the net kept its aux heads
     for sid in ("2", "7"):
         for bad in ({}, {"holdout_evals": []}, {"holdout_evals": [{"lane_rms": None}]},
@@ -723,7 +799,7 @@ def check_stage_result_from_stats_is_real() -> None:
         assert "did not exit" in str(exc), exc
     else:
         raise AssertionError("sem mIoU still improving: stage 1 must not exit")
-    print("stage results come from real measurements (0 SSL loss, 1 AbsRel/mIoU, 2/7 lane + re-measured aux); 2b refused with its reason; chain gates 5% / 2% / re-measure OK")
+    print("stage results come from real measurements (0 SSL loss, 1 AbsRel/mIoU, 2/7 lane + re-measured aux); 2b result from the three stop metrics; chain gates 5% / 2% / re-measure OK")
 
 
 def check_deploy_real_export() -> None:
@@ -1026,7 +1102,7 @@ def check_recipe_stages_train_on_fixture() -> None:
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
         strips = _fixture(base)
-        for sid in ("1", "2", "2b", "7"):
+        for sid in ("1", "2", "7"):  # 2b needs sign ids + stop events: check_stage_2b_trains_end_to_end
             kw = rec.stage_train_kwargs(sid)
             seen, real, spy, wrap = _grad_spy(torch, train_scene, ("aux_depth_head", "lane_gt_head"))
             torch.nn.utils.clip_grad_norm_ = spy
@@ -1061,7 +1137,11 @@ def check_recipe_stages_train_on_fixture() -> None:
                 assert any(g.get("lane_gt_head.weight", 0.0) > 0.0 for g in seen), (sid, seen)
             if sid == "1":
                 assert all(g.get("lane_gt_head.weight", 0.0) == 0.0 for g in seen), "stage 1 heads=() must not train lane_gt"
-    print("recipe on: stages 1 / 2 / 2b / 7 train on the fixture; aux_depth and lane_gt heads get gradient; stage 1 trains no lane head OK")
+            if sid == "7":
+                # no ego speed / pedals in this recording: the stop metrics are not measured, softly, outside stage 2b
+                assert "stop events not measured in stage 7" in buf.getvalue(), buf.getvalue()[-1500:]
+                assert all("missed_stop" not in e for e in evals), evals
+    print("recipe on: stages 1 / 2 / 7 train on the fixture; aux_depth and lane_gt heads get gradient; stage 1 trains no lane head OK")
 
 
 def _prereg(rec, ck, strips, *, seed=0, ssl=False):
@@ -1635,7 +1715,10 @@ def _fake_env(base):
 
     table = {"1": {"depth_absrel": 0.8, "sem_miou": 0.3},
              "2": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3},
+             "2b": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3, "missed_stop": 1.0,
+                    "missed_light": 1.0, "false_brake": 1.0},
              "7": {"lane_rms": 1.0, "lane_r": 0.9, "depth_absrel": 0.82, "sem_miou": 0.3}}
+    stop_part = {"missed_stop": 1.0, "missed_light": 1.0, "false_brake": 1.0}
 
     def fake_train(root, **kw):
         sid = kw["recipe_stage"]
@@ -1648,9 +1731,13 @@ def _fake_env(base):
         net = SceneNet(cams=("main",), ctl="ctl" in kw["heads"], aux_sensors=True, **scene_net_kwargs("small"))
         path = Path(kw["ckpt_dir"]) / f"scene_x.run20260101T00000{env.n}Z.ckpt_ep{env.n}_step{env.n}.npz"
         _ckpt_of(net, path, epoch=env.n, step=env.n, ctl="ctl" in kw["heads"], heads=list(kw["heads"]), preset="small")
-        return {"holdout_evals": [dict(table[sid])] * 4, "epoch_ckpts": [str(path)], "epochs_run": 4}
+        ev = dict(table[sid])
+        if sid == "7" and any(c[0] == "train" and c[1] == "2b" for c in calls):
+            ev.update(stop_part)  # stage 7 re-measures the stop metrics a 2b baseline holds
+        return {"holdout_evals": [ev] * 4, "epoch_ckpts": [str(path)], "epochs_run": 4}
 
-    def run(*, stage="0,1,2,7", export=None, preset="small", extra=(), ck_name="ck"):
+    def run(*, stage="0,1,2,7", export=None, preset="small", extra=(), ck_name="ck", strips_root=None):
+        use = strips_root or strips
         ck = base / ck_name
         ck.mkdir(exist_ok=True)
         argv = ["--recipe", "trainer2", "--no-augment", "--cams", "main", "--ckpt-dir", str(ck), "--min-valid", "0",
@@ -1660,7 +1747,7 @@ def _fake_env(base):
         train_scene.train_directory, train_scene._default_ssl_stage, rec._repo_git_sha = fake_train, fake_ssl, lambda: "0" * 40
         try:
             res = train_scene._run_trainer2_recipe(
-                args, strip_roots=(strips,), holdout_root=strips, cam_names=("main",), net_kw=scene_net_kwargs(preset),
+                args, strip_roots=(use,), holdout_root=use, cam_names=("main",), net_kw=scene_net_kwargs(preset),
                 preset_name=preset, train_precision="auto", plan_precision=None, frame_cache=None, aux_cache=None,
                 export_path=export, pause_dir=None, start_now=True, open_panel=False)
             return res, None, ck
@@ -1703,7 +1790,6 @@ def check_runner_refuses_before_training() -> None:
             ("--no-ssl-pretrain with stage 0", dict(extra=("--no-ssl-pretrain",)), rec.RecipeRefused, "--no-ssl-pretrain"),
             ("--init-stem with stage 0", dict(extra=("--init-stem", str(env.base / "x.npz"))), rec.RecipeRefused, "--init-stem"),
             ("--holdout-cells with stage 0", dict(extra=("--holdout-cells",)), rec.RecipeRefused, "cell"),
-            ("default plan (stage 2b)", dict(stage=""), rec.MetricNotMeasured, "PR 6b"),
         )
         for k, (label, kw, kind, word) in enumerate(cases):
             res, err, ck = env.run(ck_name=f"ck{k}", **kw)
@@ -1711,14 +1797,35 @@ def check_runner_refuses_before_training() -> None:
             assert env.calls == [], (label, env.calls)
             assert not (ck / "run_manifest.json").exists() and not (ck / "split_manifest.json").exists(), label
         assert existing.read_bytes() == b"a model that must survive"
-        # 2b says exactly what is missing
-        _r, err, _c = env.run(stage="", ck_name="ck_2b")
-        for word in ("stop ids", "stops", "pred_v", "Nothing was trained", "--stage"):
+        # the default plan (2b in it) on a recording with no sign ids: refused before SSL / any stage / any manifest
+        _r, err, ck2b = env.run(stage="", ck_name="ck_2b")
+        assert isinstance(err, rec.RecipeRefused), err
+        for word in ("sim_t", "Nothing was trained", "--stage"):  # the plain fixture rows carry no ego speed / time at all
             assert word in str(err), (word, err)
+        assert env.calls == [] and not (ck2b / "run_manifest.json").exists(), env.calls
         # dropping 2b from --stage is the supported way to run the rest
         res, err, ck = env.run(stage="0,1,2,7", ck_name="ck_ok")
         assert err is None and res.trained == ["0", "1", "2", "7"], err
-    print("runner: existing export / SSL-only export / medium+xl preset / --no-ssl-pretrain / --init-stem / stage 2b refuse before anything trains or is written OK")
+        # a recording that has the stop events in its holdout: the default plan runs 2b, in order
+        import stage2b_fixture as fx
+
+        stops = fx.build(env.base / "with_stops", fx.N_ROWS, fx.intersections(fx.N_ROWS))
+        env.calls.clear()
+        res, err, ck = env.run(stage="", ck_name="ck_all", strips_root=stops)
+        assert err is None and res.trained == ["0", "1", "2", "2b", "7"], err
+        order = [c[1] for c in env.calls if c[0] == "train"]
+        assert order == ["1", "2", "2b", "7"], env.calls
+        heads_2b = [c[4] for c in env.calls if c[0] == "train" and c[1] == "2b"][0]
+        assert "signs" in heads_2b and "stop_line" in heads_2b and "ctl" in heads_2b, heads_2b
+        # the same recording with its signs.jsonl removed is refused again (the join has nothing to find)
+        bare = fx.build(env.base / "bare", fx.N_ROWS, fx.intersections(fx.N_ROWS), with_signs=False)
+        env.calls.clear()
+        _r, err, ck_bare = env.run(stage="", ck_name="ck_bare", strips_root=bare)
+        assert isinstance(err, rec.RecipeRefused) and env.calls == [], (err, env.calls)
+        for word in ("stage 2b", "0 stop-sign/line", "0 red/yellow-light", "vacuous", "Nothing was trained", "--stage"):
+            assert word in str(err), (word, err)
+        assert not (ck_bare / "run_manifest.json").exists()
+    print("runner: existing export / SSL-only export / medium+xl preset / --no-ssl-pretrain / --init-stem / stage 2b without events refuse before anything trains or is written; with events the default plan reaches 2b OK")
 
 
 def check_runner_exports_once_after_the_last_stage() -> None:
@@ -1928,6 +2035,7 @@ def main() -> int:
         check_recipe_refuses_scale_lt_1,
         check_recipe_refuses_augment,
         check_kd_refused_in_pr6,
+        check_ctl_cond_refused_under_the_recipe,
         check_unknown_recipe_refused,
         check_curriculum_order_and_gates,
         check_student_export_fits_deploy,

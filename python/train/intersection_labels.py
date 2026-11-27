@@ -101,18 +101,20 @@ def _write_signs(row: dict[str, Any], signs: list[Any] | None) -> None:
         row["signs"] = signs
 
 
-def attach_sign_labels(rows: list[dict[str, Any]]) -> dict[str, int]:
+def attach_sign_labels(rows: list[dict[str, Any]], *, default_root: Path | str | None = None) -> dict[str, int]:
     """Copy ``signs.jsonl`` onto rows. ``err`` and a missing ``t`` clear signs.
 
     A recording with no sidecar is left alone: there is nothing to join and
-    nothing is invented. Join stays inside ``source_root``.
+    nothing is invented. Join stays inside ``source_root`` (or ``default_root`` for a single-root run).
     """
     caches: dict[str, dict[str, dict[str, Any]] | None] = {}
     counts = {"parsed": 0, "masked": 0, "absent": 0}
     for name in SIGN_CLASSES:
         counts[name] = 0
     for row in rows:
-        root = str(row.get("source_root") or "")
+        # A single-root run has no ``source_root`` on its rows; ``default_root`` (the recipe passes its strip root) is the
+        # recording the sidecar lives in. Without either there is nothing to join.
+        root = str(row.get("source_root") or default_root or "")
         if not root:
             counts["absent"] += 1
             continue
@@ -144,12 +146,14 @@ def _write_stop(row: dict[str, Any], values: np.ndarray, mask: np.ndarray) -> No
     row["stop_line_valid"] = np.asarray(mask, dtype=np.float32).reshape(STOP_LINE_DIM).copy()
 
 
-def attach_stop_lines(rows: list[dict[str, Any]]) -> dict[str, int]:
+def attach_stop_lines(rows: list[dict[str, Any]], *, default_root: Path | str | None = None) -> dict[str, int]:
     """Join ``stoplines.jsonl``. Missing file or tick: mask 0, not a guessed bar."""
     caches: dict[str, dict[str, dict[str, Any]] | None] = {}
     counts = {"valid": 0, "masked": 0, "absent": 0}
     for row in rows:
-        root = str(row.get("source_root") or "")
+        # A single-root run has no ``source_root`` on its rows; ``default_root`` (the recipe passes its strip root) is the
+        # recording the sidecar lives in. Without either there is nothing to join.
+        root = str(row.get("source_root") or default_root or "")
         if not root:
             _write_stop(row, *stop_line_target(None))
             counts["masked"] += 1

@@ -205,6 +205,11 @@ def validate_recipe_args(args: Any) -> None:
     )
     if recipe and recipe not in ("off", "false", "0"):
         parse_stage_filter(getattr(args, "stage", "") or "")
+        if bool(getattr(args, "ctl_cond", False)):
+            # --ctl-cond feeds the ctl head the previous row's recorded speed and pedals, so the stage-2b speed profile
+            # (integrated from that head) would read recorded speed after t0; the export refuses such a checkpoint too.
+            raise RecipeRefused("--ctl-cond is refused under --recipe trainer2: its ctl input is the recorded speed and "
+                                "pedals (stage 2b would score a profile that reads them, and the export drops it)")
 
 
 def parse_stage_filter(text: str | None) -> tuple[str, ...] | None:
@@ -356,7 +361,13 @@ def metric_gain(old: float, new: float, *, metric: str) -> float:
 
 
 def _worse_frac(old: float, new: float, *, metric: str) -> float:
-    """Positive means worse, relative to ``|old|``."""
+    """Positive means worse, relative to ``|old|``. A zero baseline that gets worse is infinitely worse (a 0-miss
+    stage must stay 0-miss); ``metric_gain`` alone would call it "no worse"."""
+    old_f, new_f = float(old), float(new)
+    if math.isfinite(old_f) and math.isfinite(new_f) and old_f == 0.0 and new_f != old_f:
+        worse = new_f < old_f if METRIC_HIGHER_IS_BETTER.get(metric, False) else new_f > old_f
+        if worse:
+            return float("inf")
     return -metric_gain(old, new, metric=metric)
 
 
@@ -403,6 +414,10 @@ def check_non_regression(
                 f"stage checkpoint rejected: earlier-stage metric {name} was not measured by this stage"
             )
         worse = _worse_frac(float(old), float(current[name]), metric=name)
+        if worse == float("inf") and math.isfinite(float(old)) and math.isfinite(float(current[name])):
+            raise CheckpointRejected(
+                f"stage checkpoint rejected: {name} got worse from a zero baseline ({old} -> {current[name]})"
+            )
         if not math.isfinite(worse):
             raise CheckpointRejected(
                 f"stage checkpoint rejected: {name} is not finite ({old} -> {current[name]})"
@@ -787,18 +802,15 @@ def recipe_run_config(**extra: Any) -> dict[str, Any]:
 NOT_REMEASURABLE_METRICS = ("ssl_pretext",)
 
 # Stages whose exit metric cannot be measured offline yet, and exactly why. A run that includes one is refused
-# before it trains anything (``require_measurable_stages``), not after hours of SSL and stage 1.
-UNMEASURABLE_STAGES: dict[str, str] = {
-    "2b": (
-        "stage 2b's exit metric (missed / false brakes on signs and lights) needs three inputs that exist nowhere "
-        "in the repo before PR 6b: per-event stop ids on the holdout rows (signs.jsonl entries carry no id and no "
-        "producer writes the `stops` rows that stop_events.score reads), the held-stop speed key, and a predicted "
-        "speed profile (pred_v) from the ctl brake output. Inventing them would be a fake metric"
-    ),
-}
+# before it trains anything (``require_measurable_stages``), not after hours of SSL and stage 1. Empty since stage 2b's
+# metric exists (``python/train/stop_pred.py``); the guard stays for any stage that loses its measurement again.
+UNMEASURABLE_STAGES: dict[str, str] = {}
 
 # holdout_evals keys the recipe scores each pass, by stage metric name (train_directory records them).
-_EVAL_KEY = {"lane_rms": "lane_rms", "lane_r": "lane_r", "depth_absrel": "depth_absrel", "sem_miou": "sem_miou"}
+_EVAL_KEY = {"lane_rms": "lane_rms", "lane_r": "lane_r", "depth_absrel": "depth_absrel", "sem_miou": "sem_miou",
+             "missed_stop": "missed_stop", "missed_light": "missed_light", "false_brake": "false_brake"}
+# Stage 2b owns these; stage 7 re-measures them (when the run had a 2b) for the non-regression gate.
+STOP_METRICS = ("missed_stop", "missed_light", "false_brake")
 
 
 def require_measurable_stages(stage_ids: Iterable[str]) -> None:
@@ -836,7 +848,9 @@ def stage_result_from_stats(stage_id: str, stats: Mapping[str, Any]) -> StageRes
     * stages 1 / 2 / 7: ``stats["holdout_evals"]``, the holdout pass ``train_directory`` scores every eval:
       depth AbsRel and sem mIoU (stage 1), the 8 m lane ``rms`` / ``r`` (stages 2 and 7). A later stage's net
       keeps the earlier aux heads (at weight 0) so it re-measures AbsRel / mIoU for the non-regression gate.
-    * stage 2b: see ``UNMEASURABLE_STAGES``.
+    * stage 2b: ``missed_stop`` / ``missed_light`` / ``false_brake`` from ``python/train/stop_pred.py`` (per-event stop ids
+      on the holdout rows, the predicted speed profile as the held-stop speed key), plus the lane and aux metrics it
+      keeps measuring. Stage 7 re-measures the stop metrics when it can (``train_directory`` records them).
     """
     if stage_id in UNMEASURABLE_STAGES:
         raise MetricNotMeasured(f"stage {stage_id} cannot exit: {UNMEASURABLE_STAGES[stage_id]}")
@@ -855,7 +869,7 @@ def stage_result_from_stats(stage_id: str, stats: Mapping[str, Any]) -> StageRes
             ckpt=None, metrics={"ssl_pretext": float(series[-1])}, evals=[float(v) for v in series],
             epochs=len(series), evals_by={"ssl_pretext": [float(v) for v in series]},
         )
-    if stage_id not in ("1", "2", "7"):
+    if stage_id not in ("1", "2", "2b", "7"):
         raise MetricNotMeasured(f"stage {stage_id}: no exit metric is defined for it in this PR; not claiming exit")
     evals_raw = list(stats.get("holdout_evals") or [])
     by = eval_series(stage_id, evals_raw)
@@ -867,7 +881,10 @@ def stage_result_from_stats(stage_id: str, stats: Mapping[str, Any]) -> StageRes
     last = evals_raw[-1]
     metrics: dict[str, float] = {}
     # Stage 1 trains no lane head: its (untrained) lane score is not a metric it owns, so it is not a baseline.
-    for name in (("depth_absrel", "sem_miou") if stage_id == "1" else ("lane_rms", "lane_r", "depth_absrel", "sem_miou")):
+    names = ("depth_absrel", "sem_miou") if stage_id == "1" else ("lane_rms", "lane_r", "depth_absrel", "sem_miou")
+    if stage_id in ("2b", "7"):
+        names = names + STOP_METRICS
+    for name in names:
         value = _finite_or_none(last.get(_EVAL_KEY[name]))
         if value is not None:
             metrics[name] = value
@@ -1009,7 +1026,60 @@ def _tag_source(rows: Iterable[Mapping[str, Any]], source: str) -> list[dict[str
 
 
 def legacy_split_rows(strip_roots: Iterable[Path | str], holdout_root: Path | str, *, holdout_blocks: int) -> tuple[list, list]:
-    """``(train, holdout)`` rows of the #187 split ``train_directory`` uses, tagged with ``source``."""
+    """``(train, holdout)`` rows of the #187 split ``train_directory`` uses, tagged with ``source``.
+
+    The train rows are the manifest's: those within the 4 s purge of a holdout row (``trainer2_split.build_split_manifest``)
+    are not in it, and ``train_directory`` drops them from its recipe windows too (``plan_train_keys``).
+    """
+    from python.train.trainer2_split import filter_rows
+
+    train, hold = _unpurged_split_rows(strip_roots, holdout_root, holdout_blocks=holdout_blocks)
+    manifest = _manifest_of(train, hold)
+    return filter_rows(train, manifest, "train"), hold
+
+
+def _manifest_of(train: list, hold: list, *, heldout_map: str | None = None) -> dict[str, Any]:
+    from python.train.trainer2_split import build_split_manifest
+
+    return build_split_manifest([{"kind": "train", "rows": train}, {"kind": "holdout", "rows": hold}],
+                                heldout_map=heldout_map)
+
+
+def plan_train_keys(plan: Iterable[Mapping[str, Any]]) -> frozenset[tuple[str, int]]:
+    """The manifest's train ``(source, i)`` keys of a ``train_directory`` pass plan (the 4 s purge applied)."""
+    manifest = _manifest_of(*_plan_rows(plan))
+    return frozenset((str(k[0]), int(k[1])) for k in manifest["train"])
+
+
+def _plan_rows(plan: Iterable[Mapping[str, Any]]) -> tuple[list, list]:
+    train: list = []
+    hold: list = []
+    for item in plan:
+        kind = str(item.get("kind") or "")
+        if kind in ("train", "holdout"):
+            (train if kind == "train" else hold).extend(item.get("rows") or [])
+    return train, hold
+
+
+def restrict_train_windows(steps: list[dict[str, Any]], keys: frozenset[tuple[str, int]]) -> tuple[list[dict[str, Any]], int]:
+    """``steps`` with every train row outside ``keys`` removed (a window left empty is dropped); holdout windows are kept
+    as they are. Returns ``(steps, n_distinct_rows_removed)`` (windows overlap: a row counts once)."""
+    out: list[dict[str, Any]] = []
+    removed: set[tuple[str, int]] = set()
+    for item in steps:
+        if str(item.get("kind") or "") == "holdout":
+            out.append(item)
+            continue
+        rows = list(item.get("rows") or [])
+        ids = [(str(r.get("source") or ""), int(r["i"])) for r in rows]
+        kept = [r for r, key in zip(rows, ids) if key in keys]
+        removed.update(key for key in ids if key not in keys)
+        if kept:
+            out.append(dict(item, rows=kept))
+    return out, len(removed)
+
+
+def _unpurged_split_rows(strip_roots: Iterable[Path | str], holdout_root: Path | str, *, holdout_blocks: int) -> tuple[list, list]:
     from python.train.exp_distill import split_tagged_rows
     from python.train.strip_sources import load_multi_source_rows
 
@@ -1023,11 +1093,8 @@ def legacy_split_rows(strip_roots: Iterable[Path | str], holdout_root: Path | st
 def build_recipe_split(strip_roots: Iterable[Path | str], holdout_root: Path | str, *, holdout_blocks: int,
                        heldout_map: str | None = None) -> dict[str, Any]:
     """Split manifest from the same #187 split the trainer uses (``trainer2_split.build_split_manifest``)."""
-    from python.train.trainer2_split import build_split_manifest
-
-    train, hold = legacy_split_rows(strip_roots, holdout_root, holdout_blocks=holdout_blocks)
-    return build_split_manifest([{"kind": "train", "rows": train}, {"kind": "holdout", "rows": hold}],
-                                heldout_map=heldout_map)
+    train, hold = _unpurged_split_rows(strip_roots, holdout_root, holdout_blocks=holdout_blocks)
+    return _manifest_of(train, hold, heldout_map=heldout_map)
 
 
 def preregister_recipe_run(out_dir: Path | str, *, split_path: Path | str, git_sha: str, seed: int,

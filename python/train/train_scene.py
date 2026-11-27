@@ -2631,6 +2631,12 @@ def ssl_empty_split_refusal(record: Mapping[str, Any], plan: Any) -> str | None:
     )
 
 
+def recipe_sidecar_root(recipe: str | None, root: Path) -> Path | None:
+    """The strip root a single-root run joins ``signs.jsonl`` / ``stoplines.jsonl`` from: its own under the trainer2 recipe
+    (rows carry no ``source_root`` there), none otherwise (a non-recipe run keeps its rows unjoined, as before)."""
+    return root if str(recipe or "") == "trainer2" else None
+
+
 def train_directory(
     root: Path,
     *,
@@ -2738,6 +2744,11 @@ def train_directory(
     use_stop_line = bool(train_heads) and "stop_line" in train_heads
     use_depth_hires = bool(train_heads) and "depth_hires" in train_heads
     use_aux_sensors = bool(aux_depth) or bool(aux_sem) or bool(aux_measure)
+    # Stage 2b scores missed / false brakes on the holdout every pass (python/train/stop_pred.py); stage 7 re-measures
+    # them for the non-regression gate when it can. Needs the ctl head (its h=0 throttle / brake) and the sign GT.
+    stop_stage = str(recipe_stage or "") if str(recipe or "") == "trainer2" and str(recipe_stage or "") in ("2b", "7") else ""
+    if stop_stage and not (use_ctl and "signs" in train_heads):
+        raise ValueError(f"recipe stage {stop_stage} scores stop events: it needs --heads with ctl and signs")
     aux_ev = None
     if use_aux_sensors and str(recipe or "") == "trainer2":
         from python.train.aux_eval import AuxEval
@@ -2973,6 +2984,13 @@ def train_directory(
     else:
         startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
     mix = holdout_mix(startup_plan)
+    recipe_train_keys: frozenset[tuple[str, int]] | None = None
+    if str(recipe or "") == "trainer2":
+        # The recipe trains and fits on the run manifest's train rows: the 4 s purge before / after a holdout row applies
+        # to the trainer too (the same build_split_manifest rule), not only to the manifest file.
+        from python.train.trainer2_recipe import plan_train_keys
+
+        recipe_train_keys = plan_train_keys(startup_plan)
     ssl_record = ssl_record_for(ssl_meta, init_stem)
     refusal = ssl_empty_split_refusal(ssl_record, startup_plan)
     if refusal:
@@ -3017,9 +3035,12 @@ def train_directory(
         stop_counts_line,
     )
 
-    print(sign_counts_line(attach_sign_labels(rows)), flush=True)
+    # The recipe's single-root run has no source_root on its rows: join the sidecars in its strip root (stage 2b trains
+    # the sign / stop-line heads and scores the stop events on the sign GT). Other runs keep the old behaviour.
+    sidecar_root = recipe_sidecar_root(recipe, root)
+    print(sign_counts_line(attach_sign_labels(rows, default_root=sidecar_root)), flush=True)
     if use_stop_line:
-        print(stop_counts_line(attach_stop_lines(rows)), flush=True)
+        print(stop_counts_line(attach_stop_lines(rows, default_root=sidecar_root)), flush=True)
     if route_cond:
         from python.train.route_cond import attach_route_cmds, route_counts_line
 
@@ -3515,7 +3536,46 @@ def train_directory(
             # Log what --min-valid removed (first epoch, or whenever a whole
             # recording goes); a recording with no train window left raises.
             report_valid_filter(filter_stats, epoch=int(epoch), quiet=filter_logged)
+            if recipe_train_keys is not None:
+                from python.train.trainer2_recipe import restrict_train_windows
+
+                plan_steps, purged_rows = restrict_train_windows(plan_steps, recipe_train_keys)
+                if not filter_logged:
+                    print(f"[GVD] recipe trainer2: manifest purge removed {purged_rows} train rows within the holdout gap", flush=True)
             filter_logged = True
+            if stop_stage and "stop_motion" not in holder:
+                # Once, before any epoch trains and before the metric runs: (1) the longitudinal map is fitted on the
+                # manifest's TRAIN rows only (a holdout id in the fit set is refused), (2) stage 2b needs events.
+                from python.train.stop_pred import StopNotMeasured, fit_motions, recorded_events, row_key
+
+                held_rows = [r for it in plan_steps if it.get("kind") == "holdout" for r in it["rows"]]
+                held_keys = {row_key(r) for r in held_rows}
+                fit_keys = {(src, str(i)) for src, i in (recipe_train_keys or ())}
+                try:
+                    # one map per holdout recording, on that recording's manifest train rows (keyed (source, i))
+                    holder["stop_motion"] = fit_motions([r for r in state_rows if row_key(r) in fit_keys], holdout_keys=held_keys,
+                                                        sources={k[0] for k in held_keys})
+                    for src, m0 in holder["stop_motion"].items():
+                        print(f"[GVD] stop motion fitted on {m0.n_rows} train row pairs ({m0.n_brake_rows} braking): "
+                              f"k_thr={m0.k_thr:.4f} k_brk={m0.k_brk:.4f} k_drag={m0.k_drag:.4f} (holdout ids in fit set: 0)", flush=True)
+                except StopNotMeasured as exc:
+                    if stop_stage == "2b":
+                        raise
+                    holder["stop_motion"] = None
+                    print(f"[GVD] stop events not measured in stage 7: {exc}", flush=True)
+                if stop_stage == "2b":
+                    # Before any epoch trains: does this holdout hold the events stage 2b is scored on?
+                    held = [(r, np.zeros((3, 1))) for it in plan_steps if it.get("kind") == "holdout"
+                            for r in it["rows"] if "ctl_valid" in r and loss_mask(r)]
+                    found = recorded_events(held) if held else {"stop": 0, "light": 0, "rows": 0}
+                    print(f"[GVD] stage 2b holdout events: stop-sign/line={found['stop']} red-yellow-light={found['light']} "
+                          f"rows={found['rows']}", flush=True)
+                    if not found["stop"] or not found["light"]:
+                        raise StopNotMeasured(
+                            f"stage 2b cannot be scored on this holdout: {found['stop']} stop-sign/line and {found['light']} "
+                            "red/yellow-light events (needs >= 1 of each: a miss count with no events would be a vacuous 0). "
+                            "Record more intersections with signals.jsonl + export_signal_labels.py, or move the holdout"
+                        )
             if exp_active_subset:
                 from python.train.exp_active_subset import select_active_subset
 
@@ -3980,6 +4040,22 @@ def train_directory(
                 fallback = float(val_parts["lane_reg"]) / int(val_parts["n"])
             if fallback is None:
                 fallback = mean
+            stop_m: dict[str, Any] = {}
+            if stop_stage and holder.get("stop_motion") is not None:
+                from python.train.stop_pred import StopNotMeasured, measure as measure_stops
+
+                try:
+                    stop_m = measure_stops(val_ctl, holder["stop_motion"])
+                except StopNotMeasured as exc:
+                    if stop_stage == "2b":
+                        raise
+                    print(f"[GVD] stop events not measured this pass: {exc}", flush=True)
+                if stop_m:
+                    print(
+                        f"[GVD] val stop: missed_stop={stop_m['missed_stop']} missed_light={stop_m['missed_light']} "
+                        f"false_brake_per_km={stop_m['false_brake']} events(stop/light)={stop_m['stop_events']}/"
+                        f"{stop_m['light_events']} km={stop_m['stop_km']:.3f} side_angle={stop_m['stop_side_angle_events']}"
+                        f"(missed {stop_m['stop_side_angle_missed']})", flush=True)
             holder.setdefault("holdout_evals", []).append(
                 {
                     "epoch": int(epoch),
@@ -3987,6 +4063,11 @@ def train_directory(
                     "lane_rms": None if scored.get("rms") is None else float(scored["rms"]),
                     "lane_r": None if scored.get("r") is None else float(scored["r"]),
                     "holdout_loss": float(mean),
+                    **({} if not stop_m else {k: stop_m[k] for k in (
+                        "missed_stop", "missed_light", "false_brake", "stop_events", "light_events", "stop_km",
+                        "stop_side_angle_events", "stop_side_angle_missed")}),
+                    # the train-row map this pass's profile was integrated with
+                    **({} if not stop_m else {"stop_motion": dict(stop_m["motion"])}),
                     **({} if aux_ev is None else {
                         "depth_absrel": aux_ev.absrel(), "sem_miou": aux_ev.miou(),
                         "depth_cells": int(aux_ev.rel_n), "sem_cells": int(aux_ev.sem_n),
@@ -4628,6 +4709,16 @@ def _run_trainer2_recipe(
     train_rows, hold_rows = legacy_split_rows(
         strip_roots, holdout_root, holdout_blocks=resolve_holdout_blocks(args.holdout_blocks)
     )
+    if "2b" in live:
+        # Before SSL / stage 1 / stage 2 train for hours: can this split's holdout score stage 2b at all?
+        from python.train.stop_pred import StopNotMeasured, preflight
+
+        try:
+            pre = preflight(train_rows, hold_rows, default_root=holdout_root)
+        except StopNotMeasured as exc:
+            raise RecipeRefused(f"{exc}. Nothing was trained; drop 2b with --stage to run the other stages") from exc
+        print(f"[GVD] recipe trainer2: stage 2b preflight OK: holdout events {pre['events']}, motion fitted on "
+              f"{sum(m.n_rows for m in pre['motions'].values())} train row pairs ({len(pre['motions'])} holdout recording(s), one map each)", flush=True)
     wrote = ensure_recipe_manifest(
         getattr(args, "ckpt_dir", None), strip_roots=strip_roots, holdout_root=holdout_root,
         holdout_blocks=resolve_holdout_blocks(args.holdout_blocks), seed=int(args.seed), ssl_pretrain=ssl_on,
@@ -4981,6 +5072,7 @@ def main(argv: list[str] | None = None) -> None:
         drop_wrong_way, require_road_dump, max_road_clip, road_dump = frame_quality_from_args(args)
         if str(getattr(args, "recipe", "") or "") == "trainer2":
             from python.train.exp_ssl import SslError as _RecipeSslError
+            from python.train.stop_pred import StopNotMeasured as _StopNotMeasured
             from python.train.trainer2_recipe import CheckpointRejected, RecipeRefused
             from python.train.trainer2_split import SplitError
 
@@ -5002,7 +5094,7 @@ def main(argv: list[str] | None = None) -> None:
                     open_panel=open_panel,
                 )
             except (RecipeRefused, CheckpointRejected, SplitError, _RecipeSslError, LossyFramesError, ExactEpochsMismatch,
-                    TrainFitError, MaskFileError, CtlDataError) as exc:
+                    TrainFitError, MaskFileError, CtlDataError, _StopNotMeasured) as exc:
                 print(f"[GVD] scene train: {exc}", flush=True)
                 sys.exit(2)
             return

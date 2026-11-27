@@ -19,6 +19,34 @@ GVD enters **beta** when a trained model drives the car in BeamNG. The next proo
 
 Trainer collapse fixes and event masking (`--mask-events`, `python/train/event_mask.py`) merged to main in PR #87 on 2026-10-20. That is trainer code; it is not evidence that a model drives.
 
+## What's on main, and what isn't
+
+This list matches `main` as of the commit that last updated this README. Features below are in the tree (code and/or specs). Live BeamNG gates stay largely unproven; see [What is proven](#what-is-proven).
+
+**On main**
+
+- Eight-camera BeamNG.tech capture and the 2272×192 stitch, including the wide-camera near-range lane-point gate (9 m ahead, 5 m to the side).
+- Recorder v2 (`scripts/collect_clips.py`): many 30–60 s lossless clips, all eight cameras with training-only depth and semantics, optional chase camera, a stop file, and a Tech watchdog. Clip QC is `scripts/qc_clips.py`.
+- Labels v4 pieces: the recorder (`python/collect/recorder_v4.py`) writes signals and traffic brake lights; offline `scripts/label_route_intent.py` writes `intent.jsonl` (route-hindsight) and `scripts/label_stoplines.py` writes the stop-line sidecar; `road_edge` is an opt-in trainer head, not a recorder output. Spec: [docs/specs/labels_v4.md](docs/specs/labels_v4.md).
+- Scene net with optional aux depth/semantics, an opt-in `depth_hires` head (48×64), and opt-in `--route-cond`. SSL stem pretraining is default-on for real scratch-backbone `train_scene` runs (`--no-ssl-pretrain` skips it; it is off for `--init-stem`, `--dry-run`, `--sanity`, a non-scratch `--backbone`, and resume). `--holdout-cells` exits 2 unless `--no-ssl-pretrain` (or an `--init-stem` built without the held-out cells) is also passed.
+- Trainer 2.0 spec ([docs/specs/trainer_2.md](docs/specs/trainer_2.md)) plus library modules and offline tests for split manifests, GradNorm, warmup+cosine LR, stop-event metrics, and merge/naming bars. The `--recipe trainer2` curriculum runner is not on main yet.
+- Reality View contract, a default-off `--reality-view` child-process boundary, an offline CPU option C prototype, an A-generator for SH0 Gaussians, and a bench-only radix splat sort. The live GVD VISION pane is still the placeholder from PR #242 until a live predicted-depth source and a renderer graduate. Spec: [docs/specs/reality_view_3dgs.md](docs/specs/reality_view_3dgs.md).
+- Display-only GPS route intent on the LIVE tab ([docs/SPEC_route_conditioning.md](docs/SPEC_route_conditioning.md)), and an opt-in drive log (`--drive-log`, [docs/DRIVE_LOG.md](docs/DRIVE_LOG.md)).
+- Learned lanes behind `--learned-lanes` (default off; no held-out win versus Hough yet).
+- Sparse occupancy net (camera-only, [docs/specs/occ_sparse.md](docs/specs/occ_sparse.md)): on main as a module and tests, not the live occupancy display (that tab still uses tracks).
+- C++ visualizer `gvd_viz` as a disabled option (`--enable-viz-cpp`).
+
+**Not on main / still in progress** — do not treat these as shipped:
+
+- Reality View side and rear geometry (road-snap can lay walls, curbs, and cars on the ground and throw them outward).
+- Multi-camera Reality View fusion, and wiring the Model 3 ego mesh into that chase render.
+- A mean-flow (or other) fill model that paints over holes in the Reality View image.
+- Turn-by-turn directions and a map-pin destination.
+- Trainer 2.0 `--recipe trainer2` curriculum runner (PR #269).
+- A BEV LSS head (PR #241).
+- Optional long highway clips in the recorder (PR #276).
+- A license change to PolyForm Noncommercial (PR #192). `LICENSE` on main is still MIT.
+
 ## Quick start
 
 Windows. You do not need an administrator account. The full agent procedure (Tech launch flags, data disk, collect, validate, train) is [AGENTS.md](AGENTS.md). Shell debugging is [DEBUGGING.md](DEBUGGING.md).
@@ -37,11 +65,11 @@ Windows. You do not need an administrator account. The full agent procedure (Tec
 
 ### GVD VISION window (supervisor)
 
-`python/run_vision.py --viz` opens one OpenCV window named **GVD VISION**. The left part is Reality View, the default main view (a placeholder until the splat renderer exists). The old classic stage view is a disabled option, unlocked with `--view classic --enable-classic-view` (or `viz.classic_view_enabled: true`). The right part is the nerd panel with tabs.
+`python/run_vision.py --viz` opens one OpenCV window named **GVD VISION**. The left part is Reality View, the default main view. Today that live pane is still a placeholder (PR #242) until a live predicted-depth source and a renderer graduate; see [Reality View](#reality-view). The old classic stage view (ice-blue ribbon) is a disabled option, unlocked with `--view classic --enable-classic-view` (or `viz.classic_view_enabled: true`). The right part is the nerd panel with tabs.
 
-![GVD VISION supervisor ribbon, offline render](docs/img/viz-ribbon.png)
+![Classic stage view (disabled option)](docs/img/viz-ribbon.png)
 
-*Offline render of the GVD VISION stage (chase 3/4). The blue ribbon is as wide as the ego box and has no dashed center line. It shows camera and model detections only, not BeamNG ground truth. This frame is shadow mode: the model is watching. Low confidence dims the ribbon instead of printing overlay text such as `LOW conf=0.12`; gating, engage, and AEB are unchanged. Live driving is unproven. Not a live capture.*
+*Classic stage view (disabled option). Offline render of the old GVD VISION stage (chase 3/4). The blue ribbon is as wide as the ego box and has no dashed center line. It shows camera and model detections only, not BeamNG ground truth. This frame is shadow mode: the model is watching. Low confidence dims the ribbon instead of printing overlay text such as `LOW conf=0.12`; gating, engage, and AEB are unchanged. Live driving is unproven. Not a live capture.*
 
 ![GVD VISION at an intersection, offline render](docs/media/gvd_viz_intersection_stage.png)
 
@@ -61,7 +89,7 @@ Windows. You do not need an administrator account. The full agent procedure (Tec
 | `cam_main` PIP | Small main-camera picture, top left, with a center cross. | on (VIZ `cam_main PIP`) | Offline smoke only |
 | View mode | Chase 3/4 bird view just behind the car, or a top-down BEV. Key `T` switches. | chase | Offline smoke only |
 
-GVD has no map widget in the supervisor. The "map" is the stage view above. The LIVE tab prints a `nav` GPS line on Tech; it is a hint only and does not route.
+GVD has no map widget in the supervisor. The "map" is the stage view above. The LIVE tab can print a `nav` GPS route-intent line on Tech (`python/sensors/route_intent.py`); it is display only and is not a steering, stopping, or lane-choice command. A map-pin destination and turn-by-turn routing are not on main.
 
 #### Nerd panel tabs
 
@@ -152,7 +180,7 @@ Automatic Mode records while BeamNG's own AI drives. BeamNG's AI steers. Every s
 | Start | Starts the collector process | | Offline smoke only |
 | Stop | Writes a `STOP` file and ends the collector. BeamNG stays open. | | Offline smoke only |
 | map | Cycles current / west_coast_usa / italy / east_coast_usa / utah / jungle_rock_island | current | Offline smoke only |
-| maps | Toggles a rotation over all five maps | current | Offline smoke only |
+| maps | Toggles a rotation over the three default maps (west_coast_usa, italy, east_coast_usa). utah and jungle_rock_island stay on the `map` cycle but have no bundled road dump and will `spawn_failed` until one exists. | current | Offline smoke only |
 | route | Cycles span / waypoints / random | span | Offline smoke only |
 | excursion | Toggles weaves and lane changes | on | Offline smoke only |
 | speed | Raises the top of the speed range by 1 m/s, up to 30 | 8-17 m/s | Offline smoke only |
@@ -257,13 +285,17 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 
 | Command | Key flags (default) | Status |
 | --- | --- | --- |
-| `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--view` (reality|classic, default from config else reality), `--enable-classic-view` (off), `--viz-cpp` (off), `--enable-viz-cpp` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off), `--no-engage` / `GVD_NO_ENGAGE=1` (hard engage disable, off), `--cam-age-baseline` (cam-age capture baseline: cam-age model / hold off), `--run-seconds` (0 = until stopped) | Unproven |
+| `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--view` (reality|classic, default from config else reality), `--enable-classic-view` (off), `--reality-view` (off), `--viz-cpp` (off), `--enable-viz-cpp` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--learned-lanes` (off), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--drive-log` (off), `--drive-log-gt` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off), `--no-engage` / `GVD_NO_ENGAGE=1` (hard engage disable, off), `--cam-age-baseline` (cam-age capture baseline: cam-age model / hold off), `--run-seconds` (0 = until stopped) | Unproven |
 | `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (unset), `--speed-max` (unset; when set, each clamps every spawn type's range: city 8-14, highway 20-30, ramp 10-18 m/s; off the deck 8-17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--no-impact-respawn` (impact respawn is on by default), `--time-of-day`, `--weather`, `--no-excursions`, `--weave-guard` (on; `--no-weave-guard` turns it off), `--ego-model` (sbr, the Hirochi eSBR electric), `--ego-config` (`vehicles/sbr/electric_800.pc`, the stock eSBR 800), `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Proven live: recording only (`GVD_data\logs\rec3_20261019.txt`, `GVD_data\scene_lanes_rec3\collect.json`) |
+| `py -3 scripts\collect_clips.py` (recorder v2) | `--out` (required), `--clips` (20), `--seed` (0), `--maps` (west_coast_usa,italy,east_coast_usa), `--max-traffic` (6), `--min-s` / `--max-s` (30–60), `--edge-cases`, `--chase-cam` (off), `--gfx` (vk), `--stop-file` (`<out>/STOP`; empty string disables), `--tech-fail-relaunch`, `--tech-relaunch-cap`. Extra collector args go after `--`. Each clip is one `collect_scene_lanes.py` process: lossless PNG, all eight cameras with training-only depth/sem, Hirochi eSBR, Vulkan. | Offline smoke only in this repo. Offline Reality View stills below were rendered from a rec_v2 clip on the dev PC (`GVD_data\rec_v2_8h_20261124\clips_20261124_223309\clip_015_heavy_traffic_west_coast_usa`); that is recording evidence, not a driving proof. |
+| `py -3 scripts\qc_clips.py <clip-or-session>` | `--write` (off, read-only), `--roads-dir`, `--road-dump`, `--skip-images` | Offline smoke only |
 | `py -3 -m python.train.train_scene` (trainer) | see Technical details | Offline smoke only |
 | `py -3 scripts\gvd_status.py` | none | Offline smoke only |
 | `py -3 scripts\bot_engage.py on\|off` | none | Offline smoke only |
 | `py -3 scripts\validate_scene_lanes.py` | `--strips` (required), `--out`, `--montage` (4) | Offline smoke only |
 | `py -3 scripts\eval_scene_lanes.py` | `--strips` (required), `--checkpoint`, `--check-targets`, `--out`, `--worst` (8) | Unproven |
+| `py -3 -m python.debug.drive_log_report <log.jsonl>` | none (see [docs/DRIVE_LOG.md](docs/DRIVE_LOG.md)) | Offline smoke only |
+| `py -3 scripts\eval_learned_lanes.py` | `--npz-dir` (required), `--onnx`, `--json`. Held-out learned-vs-Hough eval; no winning checkpoint is claimed | Unproven |
 | `py -3 scripts\migrate_ckpt_classes.py OLD.npz [NEW.npz]` | `--min-free-gb` (8; low-disk floor, same as the trainer's; 0 disables the floor; non-finite or negative values are an error). Output is create-only: any existing path is refused (exit 2), there is no overwrite flag. Opt-in: maps a 96-output (pre-v2, six classes) epoch checkpoint onto the 80-output head, dropping the removed people class; main's refusal stays the default. See `docs/CKPT_MIGRATE_CLASSES.md` | Offline smoke only |
 | `py -3 scripts\relabel_painted.py <root>` | `--zip MAP=PATH`, `--out` (`gt_painted.jsonl`) | Offline smoke only |
 | `py -3 scripts\live_lane_test.py` | `--seconds` (30), `--min-in-lane` (80), `--host`, `--port` | Unproven |
@@ -315,18 +347,40 @@ The wide camera's lane points feed the planner only in the near field: at most `
 
 ![rear](docs/cams/rear.jpg)
 
+## Reality View
+
+The left pane of **GVD VISION** is named Reality View and is the default main view (`config/cameras.yaml` `viz.main_view: reality`). Today that live pane is still a placeholder (PR #242). The old ice-blue ribbon stage is a disabled option (`--view classic --enable-classic-view`).
+
+On main, behind a default-off flag (`--reality-view` or `viz.reality_view_enabled: true`), there is a separate-process contract and stub (`python/viz/rv_contract.py`), an offline CPU option C prototype (`python/viz/reality_view_c.py`), an A-generator that builds SH0 Gaussians from predicted depth, RGB and camera `K` (`python/viz/rv_a_gen.py`; hard cap 300,000 points; unknown never surfaces as free space), and a bench-only radix depth sort (`python/viz/rv_splat_sort.py`). None of that is a live, proven renderer in the supervisor, and there is still no live predicted-depth tensor on the exported net (aux depth is training-only; a BEV depth head is not on main). Reality View must not feed AEB, engage, the heartbeat, or the planner.
+
+The stills below are offline CPU previews from a recorded rec_v2 clip (`clip_015_heavy_traffic_west_coast_usa`, 2026-11-24, on the dev PC). They are not live gameplay. No simulator ground truth is drawn. Sources: [docs/img/SOURCE.md](docs/img/SOURCE.md).
+
+![Offline Reality View C prototype, frame 110](docs/img/rv_offline_c_prototype_frame110.jpg)
+
+*Offline preview, not live. Option C prototype already on main (`python/viz/reality_view_c.py`), flag default off. Left: recorded main camera and the scene-net `aux_depth` head (12×16, upsampled). Right: chase-camera reconstruction. The still itself is labelled "OFFLINE PREVIEW, not live".*
+
+![Offline 8-camera Reality View preview, frame 180](docs/img/rv_offline_preview_frame180.jpg)
+
+*Offline preview, not live, same clip, frame 180. An experimental 8-camera fusion with a Model 3 ego overlay (mesh already in `cpp/viz/assets`, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) by David_Holiday; hood badge removed). Multi-camera fusion and this ego overlay are not the live GVD VISION path on main. The right-hand inset is a main-camera-only comparison, not simulator ground truth. Side and rear geometry is still being fixed; a fill model for the holes has not been built.*
+
+![Offline 8-camera Reality View preview, tunnel, frame 40](docs/img/rv_offline_preview_frame040.jpg)
+
+*Offline preview, not live, same clip, frame 40 (tunnel). Same caveats as the frame above.*
+
 ## Training-only depth and semantic ground truth
 
-`main` and `wide` record it (`train_gt: true`). The other six cameras stay RGB-only. Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
+Recorder v2 records training-only depth and semantics on **all eight** cameras (`train_gt: true` in `config/cameras.yaml`). The live attach forces `train_gt` off (`python/sensors/cameras.py`). Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
 
-- **Per camera:** `train_gt: true` in `config/cameras.yaml` renders depth and annotation for that camera only. A camera without the key stays colour.
-- **Outputs** (one file per tick, beside the colour folder):
-  - `raw/<cam>_depth/NNNNNN.png`: uint16 depth in **centimetres**, saturating at 65535 (655.35 m). `main` and `wide`.
+- **Per camera:** `train_gt: true` renders depth and annotation for that camera. A camera without the key stays colour.
+- **Outputs** (one file per tick, beside the colour folder), for each of the eight cameras:
+  - `raw/<cam>_depth/NNNNNN.png`: uint16 depth in **centimetres**, saturating at 65535 (655.35 m).
   - `raw/<cam>_sem/NNNNNN.png`: uint8 semantic class id (0 = unknown); `sem_classes.json` maps id to the simulator's annotation class name and colour.
+- **Optional chase camera:** `scripts/collect_clips.py --chase-cam` also records a recording-only chase (drone) camera, RGB + depth + sem. It is not in `CAM_IDS`, the strip, the live attach, or the model.
 - **Tagging and isolation:** these entries carry `"train_only": true` in `state.jsonl`. Raw-image listings, per-row camera lists and the frame cache's camera list exclude `*_depth` / `*_sem`, so the driving cameras and training strips are unchanged.
 - **Depth scale is an assumption:** distance is taken as raw depth (0..1) x the camera far plane. This is unverified until a short live smoke run spot-checks a known distance; treat depth values as provisional until then.
-- **Training aux (opt-in):** `--aux-depth` / `--aux-sem` add masked losses from those PNGs onto the main-camera stem features (fixed `12×16` grid). They are never ONNX inputs or default export outputs. Weights (`--aux-depth-weight`, `--aux-sem-weight`) are experimental.
-- **Road-edge (opt-in, separate from paint):** `--heads lane_gt,road_edge` trains a separately named `road_edge` vector (mapped-road left/right at the paint lookaheads). It does **not** fill painted `lane_gt` slots. Absent paint stays masked. Default ONNX stays RGB-only without `road_edge` outputs (training-only in this change). Dirt-road generalization is UNPROVEN.
+- **Training aux (opt-in):** `--aux-depth` / `--aux-sem` add masked losses from those PNGs onto the main-camera stem features (default `12×16` grid). They are never ONNX inputs or default export outputs. Weights (`--aux-depth-weight`, `--aux-sem-weight`) are experimental.
+- **Higher-res depth (opt-in):** `--heads ...,depth_hires` with `--aux-depth` replaces the 12×16 aux depth grid with a 48×64 Reality View depth head plus a far/sky class. It is not a live export default.
+- **Road-edge (opt-in, separate from paint):** `--heads lane_gt,road_edge` trains a separately named `road_edge` vector (mapped-road left/right at the paint lookaheads). It does **not** fill painted `lane_gt` slots. Absent paint stays masked. Default ONNX stays RGB-only without `road_edge` outputs. Dirt-road generalization is UNPROVEN.
 
 ## Renderer: Vulkan (`-gfx vk`)
 
@@ -396,6 +450,9 @@ Every number in this section is a code default or a code constant on this branch
 | Backbones | `--backbone scratch\|imagenet-resnet18\|mobilenetv3` (default `scratch`, merged in PR #87). `scratch` is the GRU scene net above. The two ImageNet choices are a single-frame baseline (`python/train/pretrained_net.py`): a torchvision backbone per frame, no GRU. | Unproven |
 | Heads | Linear heads on the GRU output: lanes (6 x 16 points), lane valid, curbs (2 x 16), curb valid, objects (16 x 8 with class and valid), signs (8 x 4 with class, lamp state and valid), and `lane_gt` (14 values). Optional ctl head (offline only): `--heads lane_gt,ctl` adds steer, throttle and brake targets at 0-5 s horizons for offline evaluation; nothing drives from it. `--ctl-cond` (off by default) also feeds that head the previous row's speed, controls and yaw rate; the live runtime refuses such a model. `--ctl-loss l1` (default `huber`) trains its steer and throttle on L1 instead of smooth-L1. The path planner turns the scene into the path. | Offline smoke only |
 | Export | `--export` writes an FP32 ONNX graph, `models/e2e_scene.onnx`. | Offline smoke only |
+| Aux / route / depth_hires | Opt-in training-only heads and `--route-cond` (above). They are not default ONNX outputs. | Offline smoke only |
+| Learned lanes | `--learned-lanes` can feed the planner the SceneNet lane head, with Hough as a reported fallback and a paint gate. Default off; no held-out win versus Hough is claimed. | Offline smoke only |
+| Sparse occupancy | `python/perception/occ_sparse.py` is a camera-only sparse occupancy net (no depth/sem/box input, no dense volume). On main as a module and tests, not wired as the live occupancy display. | Offline smoke only |
 
 **Label vector (`lane_gt`, 14 values)**, from `python/debug/lane_targets.py`:
 
@@ -418,18 +475,20 @@ Labels come from the painted line decals the camera actually sees: every `DecalR
 | Step | What happens | Status |
 | --- | --- | --- |
 | Collector | `scripts/collect_scene_lanes.py` attaches to a running BeamNG.tech on port 25252, never launches or closes it, and lets BeamNG's AI drive (`span` mode, lane keeping, speed limit changing every 3 minutes). Each tick writes one lossless file per camera (PNG for uint8), `state.jsonl` (timestamps, `dt_s`, camera pose and intrinsics) and `gt.jsonl` (lane targets). The first 60 s is a PNG decode smoke check. | Proven live: recording only (`GVD_data\logs\rec3_20261019.txt`, `GVD_data\scene_lanes_rec3\collect.json`) |
+| Recorder v2 | `scripts/collect_clips.py` runs many short clips, each as one collector process in a new folder (`clips_<stamp>/clip_*`). All eight cameras write training-only depth and semantics. Optional `--chase-cam`. A stop file (default `<out>/STOP`) finishes the current clip and pauses the batch. After consecutive attach/load failures a Tech watchdog can kill a hung Tech and relaunch (capped). | Offline smoke only in this repo; see the CLI table for the rec_v2 clip used in the Reality View stills |
+| Clip QC | `scripts/qc_clips.py` writes a report; `--write` also writes `clip_qc.json` / `clip_qc_mask.jsonl`. The trainer flag is `--mask-clip-qc` (optional `--clip-qc-drop` drops masked rows before holdout). Masks include post-teleport, map warmup, and the event reasons listed in the flag help. | Offline smoke only |
 | Raw vs lossy | Training data comes only from the collector's lossless PNG files under `raw/`. The supervisor's Start recording JPEG strips and the review captures are for viewing, not training. The trainer and `eval_scene_lanes.py` can still read `strips/*.jpg` from a folder that has no `raw/`, so never point `--strips` at a Start recording folder. The frame cache reads `raw/` only. | Offline smoke only |
 | Steering nudges | Weaves and lane changes are planned at the higher of the measured and the target speed, capped by lateral acceleration, and aborted on overspeed. Their first live recording started on 2026-10-20 and has not been reviewed yet. | Offline smoke only |
 | Impact respawn | After a logged impact the car respawns from the spawn deck (`--no-impact-respawn` keeps driving). | Offline smoke only |
-| Spawn deck | On west_coast_usa, `--respawn-min N` teleports to a new stratified spawn every N minutes: about 40% city, 35% highway, 25% ramps, each road used once per run (`python/collect/spawn_mix.py`). | Offline smoke only |
+| Spawn deck | The Automatic Mode / `collect_clips` default map pool is west_coast_usa, italy, and east_coast_usa. The stratified spawn deck (`SpawnDeck` in `python/collect/spawn_mix.py`, about 40% city, 35% highway, 25% ramps when those pools are non-empty, each road once per run) is used at every new level or segment on any map that has a road dump (`scripts/collect_scene_lanes.py` `_apply_spawn(True)`; that is how `collect_clips` places each clip). Mid-run teleports are west_coast_usa only: impact respawn and `--respawn-min`. The default traffic count is 2 on west_coast_usa and 0 on other maps. east_coast_usa's bundled dump has an empty highway/ramp pool, so its deck is city-only. utah and jungle_rock_island have no bundled dump and fail spawn until one exists. | Offline smoke only |
 | Data disk | Data lives in `GVD_data` on a data drive (`GVD_DATA_DIR` overrides it). The C and D drives are refused as the data root. Runs stop under 20 GB free. The dev PC's data drive is FAT32, so no file may exceed 4 GB. | Offline smoke only |
 | Frame cache | `--build-cache <dir>` decodes the chosen cameras into `.npy` chunks under 3.5 GB each (FAT32-safe), then exits. Single-root writes format `gvd-frame-cache-2`; multi-root writes `gvd-frame-cache-3` with namespaced source keys. `--cache <dir>` memory-maps them. Aggregate size may be many GiB; each file stays under 4 GB. | Offline smoke only |
 | Combined recordings | Pass multiple `--strips` roots (same basename OK). Frame/`session` ids are namespaced by source. Holdout stays on `--holdout-source` (default: first root); other roots are train-only. No physical merge folder. | Offline smoke only |
 | Validate | `scripts/validate_scene_lanes.py` checks a recording and writes a report and montage PNGs. | Offline smoke only |
 | Time holdout | By default the last 20% of each long segment is held out, with a 4 s gap on both sides. `--holdout-blocks K` (or `GVD_HOLDOUT_BLOCKS`) spreads that over K equal time blocks. Default 1. | Offline smoke only |
-| Spatial holdout | `--holdout-cells` scores a seeded set of 250 m map cells holding about 20% of rows, and drops training rows within 50 m of them. `--holdout-cells-file` (default `<status dir>/holdout_cells.json`) saves and reuses the list. `--holdout-seed` (default 0). | Offline smoke only |
+| Spatial holdout | `--holdout-cells` scores a seeded set of 250 m map cells holding about 20% of rows, and drops training rows within 50 m of them. `--holdout-cells-file` (default `<status dir>/holdout_cells.json`) saves and reuses the list. `--holdout-seed` (default 0). Incompatible with default SSL: the SSL split is time-based, not cell-aware, so `--holdout-cells` needs `--no-ssl-pretrain` (or an `--init-stem` built without the held-out cells) or the trainer exits 2. | Offline smoke only |
 
-Close BeamNG before training. The trainer does not start or stop it. A typical sequence (build the cache, dry-run, sanity, then the real run):
+Close BeamNG before training. The trainer does not start or stop it. SSL stem pretraining is **default-on for real scratch-backbone runs**. It is off for `--init-stem`, `--dry-run`, `--sanity`, a non-scratch `--backbone`, and resume. `--holdout-cells` exits 2 unless you also pass `--no-ssl-pretrain` (or an `--init-stem` built without the held-out cells). A typical sequence (build the cache, dry-run, sanity, then the real run — only the last of these turns SSL on):
 
 ```
 py -3 -m python.train.train_scene --strips <data drive>\GVD_data\scene_lanes --cams main --build-cache <cache dir>
@@ -473,13 +532,22 @@ Combined main-only cache estimate ≈ 19.15 GiB aggregate on E: (many ≤ 3.5 GB
 | `--scale` | 1.0 | Downscale the canvas before the cache and the net |
 | `--workers` | 4 on Windows, 0 elsewhere | DataLoader workers |
 | `--cache`, `--build-cache` | none | Frame cache (above) |
-| `--holdout-blocks`, `--holdout-cells`, `--holdout-cells-file`, `--holdout-seed` | 1, off, status dir, 0 | Holdouts (above) |
+| `--holdout-blocks`, `--holdout-cells`, `--holdout-cells-file`, `--holdout-seed` | 1, off, status dir, 0 | Holdouts (above). `--holdout-cells` requires `--no-ssl-pretrain` (or a safe `--init-stem`) or the trainer exits 2. |
 | `--resume` / `--no-resume` | resume | Load the pause checkpoint when it exists |
 | `--sanity` | off | Overfit 8 strips; exit 1 unless the lane loss falls below 0.05 |
 | `--dry-run` | off | Two steps, print tensor shapes |
 | `--export [path]` | off | Write the ONNX graph |
 | `--metrics-every` | 10 | Steps between metrics lines |
 | `--no-panel`, `--autostart` | off | Training window control |
+| `--no-ssl-pretrain` | default-on for real scratch-backbone runs | Skip the default SSL stem pretraining (A/B baselines, and required with `--holdout-cells`). Off already for `--init-stem`, `--dry-run`, `--sanity`, a non-scratch `--backbone`, and resume. When it runs: train frames only, EMA target, collapse guard; the stem is cached and reused. `--ssl-epochs` (1), `--ssl-max-rows` (4000; 0 = all). |
+| `--route-cond` | off | Feed the scene net a 5-float navigation command (one-hot follow/left/right/straight plus `next_jct_m/150`) from `intent.jsonl`. This is not `--ctl-cond`. Old checkpoints load unchanged. |
+| `--aux-depth`, `--aux-sem` | off | Training-only aux losses from `raw/<cam>_depth` and `raw/<cam>_sem`. Not inference inputs. |
+| `--heads ...,depth_hires` | off | Replaces the 12×16 aux depth grid with a 48×64 Reality View depth head plus a far/sky class. Requires `--aux-depth`. |
+| `--mask-clip-qc` | off | Apply automatic clip-QC driving-target masks (post-teleport, map warmup, and the event reasons in the flag help). `--clip-qc-drop` drops those rows before holdout instead of target-level masking. |
+
+### Trainer 2.0
+
+The Trainer 2.0 spec is [docs/specs/trainer_2.md](docs/specs/trainer_2.md). On main today: SSL default-on for real scratch-backbone runs (above), the opt-in `depth_hires` head, and library modules with offline tests for split manifests (`python/train/trainer2_split.py`), GradNorm and head ramps (`trainer2_balance.py`), warmup+cosine LR (`lr_schedule.py`), stop-sign / traffic-light event metrics (`stop_events.py`), wide-gate parity (`trainer2_wide.py`), and merge/naming bars (`trainer2_bar.py`). Those modules are not yet composed by a `train_scene --recipe trainer2` flag; that runner is still in progress (PR #269). Do not read the presence of the modules as a finished 2.0 training recipe, and do not quote a training score.
 
 Before the first step the trainer measures free VRAM and shrinks the batch until a step fits. It falls back to the CPU only when the card cannot hold one step, and marks that path not recommended.
 
@@ -512,6 +580,7 @@ Before the first step the trainer measures free VRAM and shrinks the batch until
 - `scripts/validate_scene_lanes.py`, `python/debug/dataset_check.py`: check a recording.
 - `scripts/eval_scene_lanes.py`: score lane centers on the time holdout.
 - `--gt-log` or `GVD_GT_LOG=1`: per-tick ground truth under `logs/gt_<stamp>.jsonl`; `scripts/gt_report.py` summarizes it.
+- `--drive-log PATH` (and optional `--drive-log-gt`): per-tick scene-ckpt drive log; `python -m python.debug.drive_log_report` scores it. Does not change the command. See [docs/DRIVE_LOG.md](docs/DRIVE_LOG.md).
 - `--lane-source gt`: drive on road-network lanes to test the controller alone.
 - Live camera frames are the raw buffers the recorder saves (no tone curve).
 - `scripts/live_lane_test.py`: headless lane-keep check against a running BeamNG.tech.
@@ -523,8 +592,9 @@ Before the first step the trainer measures free VRAM and shrinks the batch until
 - **Live BeamNG.tech gates are largely unproven.** Alt+G, the in-game ribbon, the eight-camera drive, force feedback and Quick Sync have no live proof on file.
 - **The car does not yet drive from a trained model.** No scene-net checkpoint has been shown to keep a lane live.
 - **Unpainted roads are not handled.** Labels need DecalRoad paint. Paint baked into the terrain texture gets no labels, so those roads are invalid slots.
-- **Lane keeping only.** There is no intersection handling, no turns at junctions and no routing.
-- **Trained on west_coast_usa only.** Treat any model as a west_coast_usa model. The labelled data so far is mostly from that map, and the spawn deck covers only that map.
+- **Lane keeping only, for the live driver.** Intersection labels and route-hindsight sidecars exist for training. Route intent on the LIVE tab is display only. `--route-cond` is an opt-in training input. There is no live turn-at-junction controller, and no map-pin or turn-by-turn router on main.
+- **Do not treat a model as proven off west_coast_usa.** Collection can use a map pool (default west_coast_usa, italy, east_coast_usa). The spawn deck runs on every map with a road dump at each new level or segment; only impact respawn, `--respawn-min`, and the default traffic count are west_coast_usa only. east_coast_usa has no highway/ramp pool. No holdout on file shows a model working off west_coast_usa.
+- **Reality View is not a finished live view.** The live pane is still a placeholder. Offline previews have holes, and side/rear geometry is still being fixed. A fill model has not been built. Reality View is viz only; it is not on the control path (AEB, engage, heartbeat, or the planner).
 - **Vision-only toy, not a driver aid.** LiDAR, radar and IMU extras are for display and are ignored by the planner.
 - **Not every collision is caught.** The collector writes `impacts.jsonl` and respawns after a logged impact, but it does not catch every collision. The supervisor infers crashes from vehicle damage jumps and stuck detection, which miss light contacts.
 - Retail BeamNG.drive is one window capture, not eight cameras.
@@ -552,7 +622,7 @@ GVD uses these outside projects. Each one is its authors' work.
 - [mss](https://github.com/BoboTiG/python-mss). Window capture uses mss when BetterCam is unavailable.
 - [pywin32](https://github.com/mhammond/pywin32). Windows matches the BeamNG window title with pywin32.
 - [FFmpeg](https://ffmpeg.org/). Review clips are encoded with FFmpeg when it is on PATH.
-- "Tesla Model 3" by David_Holiday, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), https://sketchfab.com/3d-models/tesla-model-3-123c10f376ec4f18b93c73afc382808b — ego mesh in the C++ visualizer (`cpp/viz/assets/`, hood T badge removed).
+- "Tesla Model 3" by David_Holiday, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), https://sketchfab.com/3d-models/tesla-model-3-123c10f376ec4f18b93c73afc382808b — ego mesh in the C++ visualizer (`cpp/viz/assets/`, hood T badge removed; the rear T is still in the mesh on main until PR #273 lands).
 
 ## License
 

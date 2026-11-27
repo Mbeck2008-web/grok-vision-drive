@@ -17,10 +17,10 @@ within ``JOIN_M`` of another road joins it. A route is
   jitter, so each clip loops back a different way.
 
 The line is offset into the legal right-hand lane (``_offset_candidates``, the
-rule the spawn deck uses), so it can be sent to the AI as ``ai.setLine``.
+rule the spawn deck uses), so it can be sent to the AI as ``vehicle.ai.set_line``.
 
 ``RouteDriver`` turns a position into AI commands: it sends the next
-``window_m`` of the route as an ``ai.setLine`` (the call ``excursion.py`` already
+``window_m`` of the route as a ``set_line`` command (the helper ``excursion.py`` already
 makes) and hands the car back to ``span`` at the end or when it is off the route.
 ``measure_route`` scores a recording against the route from the ego positions.
 
@@ -41,7 +41,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
-from python.collect.excursion import lua_set_line
+from python.collect.excursion import set_line_command
 from python.collect.spawn_mix import (
     CITY,
     HIGHWAY,
@@ -616,7 +616,7 @@ class RouteDriver:
     def _project(self, x: float, y: float) -> tuple[int, float, float]:
         return project_forward(self.route, x, y, self.index)
 
-    def commands(self, x: float, y: float, speed_mps: float) -> list[str]:
+    def commands(self, x: float, y: float, speed_mps: float) -> list[object]:
         if not self.active:
             return []
         i, s, d = self._project(x, y)
@@ -650,7 +650,7 @@ class RouteDriver:
         self.lines_sent += 1
         self.state = "following"
         cmds = ['ai.setMode("manual")', 'ai.driveInLane("off")', 'ai.setSpeedMode("limit")'] if first else []
-        cmds += [f"ai.setSpeed({v})", lua_set_line([(p[0], p[1]) for p in line], v)]
+        cmds += [f"ai.setSpeed({v})", set_line_command(line, v, cling=True)]
         return cmds
 
     def _window(self, i: int, s: float) -> list[tuple[float, float, float]]:

@@ -535,6 +535,7 @@ class _Vehicle:
         self.polls = 0
         self.sensors = _Sensors()
         self.commands: list[str] = []
+        self.ai = type("AI", (), {"set_line": staticmethod(lambda line, cling=True: None)})()
         self.state = {
             "pos": [0.4, 12.0, 0.5],
             "dir": [0.0, 1.0, 0.0],

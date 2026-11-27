@@ -4,7 +4,7 @@ Short clips are the edge-case batch (30-60 s). Optional ``--long-clips N`` mixes
 N 10-15 minute regular-driving clips through the batch (default 0, so current
 behaviour is unchanged). A highway-loop long clip is planned from the map's road
 dump (python/collect/long_route.py): the AI spawns at one end of a highway facing
-along it, is driven to the far end (rolling ai.setLine windows), then loops back
+along it, is driven to the far end (rolling set_line windows), then loops back
 over non-highway roads (dirt where the dump's road material says unpaved) to a
 different route each time, the direction alternating through the batch. The
 route goes to the collector as ``--route-plan``; afterwards the recorded ego pose

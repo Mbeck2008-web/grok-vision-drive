@@ -34,8 +34,8 @@ from python.collect.excursion import ABORT_AGGRESSION, ABORT_S, AI_DEFAULT_AGGRE
 from scripts import abort_aggression_tag as tagger  # noqa: E402
 
 
-def _aggr(lines: list[str]) -> list[str]:
-    return [ln for ln in lines if ln.startswith("ai.setAggression(")]
+def _aggr(lines: list[object]) -> list[str]:
+    return [ln for ln in lines if isinstance(ln, str) and ln.startswith("ai.setAggression(")]
 
 
 def check_commands() -> None:

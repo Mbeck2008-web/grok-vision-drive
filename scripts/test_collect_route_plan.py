@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """collect_scene_lanes.py --route-plan: the flag and its refusals. Offline; BeamNG is never started.
 
-The route driving itself (rolling ai.setLine windows, first spawn on the route) is tested through
+The route driving itself (rolling set_line windows, first spawn on the route) is tested through
 python/collect/long_route.py with a fake vehicle in test_long_route.py. The collector's loop that calls
 it needs a live BeamNG and has not been run live.
 """

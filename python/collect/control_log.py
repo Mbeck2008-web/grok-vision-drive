@@ -237,13 +237,18 @@ def actor_dims(box: Any) -> tuple[float | None, float | None, float | None]:
     return round(rest[0], 6), round(rest[1], 6), round(2.0 * half[up_i], 6)
 
 
-_SET = re.compile(r'^\s*ai\.(setMode|setSpeedMode|setSpeed|setLine)\((.*)\)\s*$', re.S)
+_SET = re.compile(r'^\s*ai\.(setMode|setSpeedMode|setSpeed)\((.*)\)\s*$', re.S)
 
 
-def ai_cmd_state(state: Mapping[str, Any] | None = None, command: str | None = None) -> dict[str, Any]:
-    """The collector's last AI commands, updated by one vehicle-Lua line it sent."""
+def ai_cmd_state(state: Mapping[str, Any] | None = None, command: object = None) -> dict[str, Any]:
+    """The collector's last AI commands, updated by one command it sent."""
+    from python.collect.excursion import is_set_line
+
     out = dict(state) if state else {"mode": None, "set_speed_mps": None, "speed_mode": None, "line_active": False}
-    match = _SET.match(str(command or ""))
+    if is_set_line(command):
+        out["line_active"] = True
+        return out
+    match = _SET.match(command if isinstance(command, str) else "")
     if not match:
         return out
     name, arg = match.group(1), match.group(2).strip()
@@ -254,8 +259,6 @@ def ai_cmd_state(state: Mapping[str, Any] | None = None, command: str | None = N
         out["speed_mode"] = arg.strip("\"'")
     elif name == "setSpeed":
         out["set_speed_mps"] = _num(arg)
-    else:
-        out["line_active"] = True
     return out
 
 

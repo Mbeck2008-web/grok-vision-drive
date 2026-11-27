@@ -136,6 +136,11 @@ def check_validator_drops_parked_span() -> None:
     print("parked span excluded")
 
 
+class _LiveAi:
+    def set_line(self, line, cling=True) -> None:
+        del line, cling
+
+
 class _Vehicle:
     model = "etk800"  # no get_bbox: the collector logs the etk800 width
 
@@ -145,6 +150,7 @@ class _Vehicle:
         self.stop_on = stop_on
         self.polls = 0
         self.commands: list[str] = []
+        self.ai = _LiveAi()
 
     def poll_sensors(self) -> None:
         self.polls += 1

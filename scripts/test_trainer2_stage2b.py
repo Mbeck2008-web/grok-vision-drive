@@ -662,9 +662,9 @@ def check_one_event_per_approach_not_per_sign_id() -> None:
     """The sign id is the world position, so a second lap past the same sign shares it: each approach is its own event."""
     from python.train import stop_pred
 
-    stops = lambda k: 1.0 if 2 <= k < 30 else 0.0  # noqa: E731
+    stops = lambda k: 1.0 if k < 45 else 0.0  # noqa: E731  (full brake from 12 m/s: at 0 by row 27, held to the window's end)
     never = lambda k: 0.0  # noqa: E731
-    filler = _approach("A", n=60, v=lambda k: 12.0, brake=never, target=None)
+    filler = _approach("F", n=60, v=lambda k: 12.0, brake=never, target=None)  # a second source: its km, no signs
     for name, first, second, want_missed in (("lap 1 stops, lap 2 runs the sign", stops, never, 1.0),
                                               ("lap 1 runs the sign, lap 2 stops", never, stops, 1.0),
                                               ("both laps stop", stops, stops, 0.0), ("both laps run it", never, never, 2.0)):
@@ -679,9 +679,10 @@ def check_one_event_per_approach_not_per_sign_id() -> None:
     cut = _lap("A", 0.0, never, n=25)
     got = stop_pred.measure(cut + _lap("A", 120.0, stops) + filler, _motion())
     assert got["stop_events"] == 2 and got["missed_stop"] == 1.0, got
-    # a label dropout inside ONE approach (target gone for 1.4 s, then back closer to the line) stays one event
+    # a label dropout inside ONE approach (target gone for 1.3 s, over the 1 s hole limit, then back closer to the line with
+    # the sign still ahead: y 28 -> 12) stays one event: a gap alone does not make a new approach, the sign has to be farther
     one = _lap("A", 0.0, stops, n=60)
-    for row, _c in one[20:34]:
+    for row, _c in one[10:23]:
         row["signs"] = []
     rows, _ = stop_pred.stop_rows(one)
     assert {s["id"] for r in rows for s in r["stops"]} == {"stop_sign@10.0,50.0"}, "a dropout is not a second approach"
@@ -693,6 +694,14 @@ def check_one_event_per_approach_not_per_sign_id() -> None:
         row["i"] = 1000 + k
     rows, _ = stop_pred.stop_rows(turn + again)
     assert len({s["id"] for r in rows for s in r["stops"]}) == 2, "re-approach after passing the sign"
+    # the line tolerance: y = -0.5 is still at the line (not passed, > -1 m), so a hop back to y = +5 on the next tick (jitter,
+    # a creep back) is the same approach; y = -1.5 is passed, and the same hop is a new one
+    def hop(y_last):
+        ys = [30.0, 15.0, 5.0, y_last, 5.0, 4.0]
+        pairs = [({"i": k, "ego": {"sim_t": 100.0 + 0.1 * k, "speed_mps": 3.0}, "source": "A",
+                   "signs": [{"id": "z", "cls": "stop_sign", "x": 0.5, "y": y, "state": None}]}, _ctl(0.0, 0.0)) for k, y in enumerate(ys)]
+        return len({s["id"] for r in stop_pred.stop_rows(pairs)[0] for s in r["stops"]})
+    assert hop(-0.5) == 1 and hop(-1.5) == 2, (hop(-0.5), hop(-1.5))
     print("events: one per approach (a second lap, a U-turn), not one per sign id; a label dropout stays one approach OK")
 
 
@@ -710,6 +719,9 @@ def check_fit_is_per_recording_and_keyed_by_source_and_i() -> None:
     # paper, and must not be a fit pair
     b_after_a = _keyed_rows("B", k_brk=3.0, t_shift=len(a) * DT, v0=a[-1]["ego"]["speed_mps"])
     assert stop_pred.fit_motion(a + b_after_a, holdout_keys=set()).n_rows == 2 * (len(a) - 1), "a pair crossed two recordings"
+    # one source, one segment name, two sessions (a restart) with a contiguous clock: no step across the restart either
+    sess = [dict(r, session="s1") for r in a[:200]] + [dict(r, session="s2") for r in a[200:]]
+    assert stop_pred.fit_motion(sess, holdout_keys=set()).n_rows == len(a) - 2, "a pair crossed two sessions"
     # the same i, segment name and sim_t in two recordings: pairs never cross recordings, one map per recording
     maps = stop_pred.fit_motions(a + b, holdout_keys=set(), sources={"A", "B"})
     assert abs(maps["A"].k_brk - 5.0) < 1e-6 and abs(maps["B"].k_brk - 3.0) < 1e-6, {k: m.as_dict() for k, m in maps.items()}
@@ -892,13 +904,49 @@ def check_ctl_head_column_and_boundaries() -> None:
         return stop_pred._approach_spans(rows)
     assert spans(9) == [(0, 13)], spans(9)  # B starts on A's last row: one car, one profile
     assert spans(10) == [(0, 9), (10, 14)], spans(10)  # B starts one row after A's last: two spans
-    # (5) the profile's step from row k-1 to row k uses the ctl of row k (the row that closes the interval): a one-row
-    # brake pulse on row 3 takes 4.5 * 1.0 * 0.1 off the speed at row 3, none at row 2 or 4
+    # (5) the profile's step from row k to row k+1 uses the ctl of row k (the row that OPENS the interval: the model sees
+    # frame k, so its output cannot cause the change before row k, and the fit pairs a row's pedals with the step after it):
+    # a one-row brake pulse on row 3 takes 4.5 * 1.0 * 0.1 off the speed at row 4, none at row 3 or 5
     pulse = _approach("A", n=12, v=lambda k: 10.0, brake=lambda k: 1.0 if k == 3 else 0.0, target="stop_sign")
     rows, _ = stop_pred.stop_rows(pulse)
     stop_pred.add_predicted_speed(rows, _motion())
-    assert [round(r["pred_v"], 6) for r in rows[:6]] == [10.0, 10.0, 10.0, 9.55, 9.55, 9.55], [r["pred_v"] for r in rows[:6]]
+    assert [round(r["pred_v"], 6) for r in rows[:6]] == [10.0, 10.0, 10.0, 10.0, 9.55, 9.55], [r["pred_v"] for r in rows[:6]]
     print("pinned: ctl h=0 column, 0.1 brake gate, non-negative refit order, span touching rule, profile step convention OK")
+
+
+def check_no_reverse_gate_and_window_purge_keying() -> None:
+    """A recorded speed below 0 (reversing) is not a fit step; the manifest purge is keyed (source, i) across roots."""
+    from python.train import stop_pred
+    from python.train.trainer2_recipe import plan_train_keys, restrict_train_windows
+
+    good = _brake_rows(120, 30)
+    base = stop_pred.fit_motion(good, holdout_keys=set())
+    # reversing without the reverse flag: speeds -3.0, -2.9 (both negative), then -0.1 -> 0.2 (opens negative, closes positive)
+    odd = []
+    for k, v in enumerate((-3.0, -2.9, -0.1, 0.2, 0.3, 0.4)):
+        odd.append({"i": 5000 + k, "segment": "rev", "ego": {"sim_t": 900.0 + k * DT, "speed_mps": v},
+                    "pedals": {"throttle_ai": 0.5, "brake_ai": 0.0, "parkingbrake_ai": 0.0}, "veh": {"reverse": 0}})
+    got = stop_pred.fit_motion(good + odd, holdout_keys=set())
+    assert got.n_rows == base.n_rows + 2, (got.as_dict(), base.as_dict())  # only the steps 0.2 -> 0.3 -> 0.4 are fit rows
+
+    # window purge across roots: roots A (holdout) and B (train-only) share i 0..9 and the segment clock; A's train rows 0-4
+    # are within 4 s of its holdout and purged, B's rows 0-4 are not
+    def rows_of(src, kind):
+        return [{"i": i, "t": float(i) if kind == "train" else 6.0 + (i - 5), "source": src, "session": f"{src}:s", "kind": kind}
+                for i in (range(0, 5) if kind == "train" else range(5, 10))]
+    a_tr, a_ho, b_tr = rows_of("A", "train"), rows_of("A", "holdout"), rows_of("B", "train")
+    plan = [{"kind": "train", "rows": a_tr}, {"kind": "train", "rows": b_tr}, {"kind": "holdout", "rows": a_ho}]
+    keys = plan_train_keys(plan)
+    # A's train rows at t 3 and 4 are within 4 s of its holdout (from t 6) and purged; B's rows 3 and 4 have the same i and stay
+    assert keys == {("A", 0), ("A", 1), ("A", 2)} | {("B", i) for i in range(5)}, sorted(keys)
+    steps, removed = restrict_train_windows(plan + [{"kind": "train", "rows": a_tr[3:]}, {"kind": "train", "rows": a_tr[:3]}], keys)
+    assert removed == 2, removed  # distinct rows: A3 and A4 (a repeated window counts once), none of B's
+    kinds = [it["kind"] for it in steps]
+    assert kinds.count("train") == 3 and kinds.count("holdout") == 1, kinds  # the window of A3, A4 only is dropped, not kept empty
+    assert all(it["rows"] for it in steps) and any(it["kind"] == "holdout" and len(it["rows"]) == 5 for it in steps)
+    assert sorted((r["source"], r["i"]) for it in steps if it["kind"] == "train" for r in it["rows"]) == sorted(
+        [("A", i) for i in range(3)] * 2 + [("B", i) for i in range(5)]), steps
+    print("pinned: no reversing steps in the fit, window purge keyed (source, i) across roots, emptied windows dropped OK")
 
 
 def check_sidecar_join_keeps_each_rows_own_root() -> None:
@@ -937,7 +985,8 @@ def main() -> int:
               check_preflight_on_recording, check_fit_motion_edges, check_spans_and_profile_edges,
               check_one_event_per_approach_not_per_sign_id, check_fit_is_per_recording_and_keyed_by_source_and_i,
               check_preflight_two_recordings, check_manifest_purge_reaches_the_trainer,
-              check_ctl_head_column_and_boundaries, check_sidecar_join_keeps_each_rows_own_root)
+              check_ctl_head_column_and_boundaries, check_no_reverse_gate_and_window_purge_keying,
+              check_sidecar_join_keeps_each_rows_own_root)
     failed = 0
     for check in checks:
         try:

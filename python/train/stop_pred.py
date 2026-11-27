@@ -55,7 +55,7 @@ LIGHT_SLICES = ("red_light", "yellow_light")
 
 def row_key(row: Mapping[str, Any]) -> tuple[str, str]:
     """``(source, i)``: the identity of a row. ``i`` is a per-recording frame index, so it never stands alone."""
-    return (str(row.get("source") or row.get("source_root") or ""), str(row.get("i")))
+    return (str(row.get("source") or ""), str(row.get("i")))
 
 
 class StopNotMeasured(ValueError):
@@ -227,7 +227,7 @@ def stop_rows(pairs: Iterable[tuple[Mapping[str, Any], Any]]) -> tuple[list[dict
             stops.append({"id": str(sid), "cls": str(cls), "x": x, "y": y, "state": sign.get("state")})
         out.append({
             "i": row.get("i"), "t": t, "v": v, "split": "holdout",
-            "source": str(row.get("source") or row.get("source_root") or ""),
+            "source": str(row.get("source") or ""),
             "ctl_brake": min(1.0, max(0.0, brk)), "ctl_throttle": min(1.0, max(0.0, thr)), "stops": stops,
         })
         skipped["rows"] += 1
@@ -302,7 +302,9 @@ def add_predicted_speed(rows: list[dict[str, Any]], motion: "Motion | Mapping[st
     """Set ``pred_v`` on every row (see the module docstring). Rows are time-ordered per source.
 
     The only recorded speed read is ``v`` of the first row of an approach (t0). After t0 the update uses
-    ``ctl_throttle`` / ``ctl_brake``, the row times and the profile's own state. A row outside every approach is never
+    ``ctl_throttle`` / ``ctl_brake``, the row times and the profile's own state. The step from row k-1 to row k uses the
+    ctl of row k-1 (the row that opens the interval: the model sees frame k-1, and ``fit_motion`` pairs a row's pedals with
+    the step that follows it), so the output of row k never moves the speed at row k. A row outside every approach is never
     in a stop window; it gets ``NOT_SCORED_V`` (a speed that is not a stop), not the recorded speed.
     """
     by_source: dict[str, list[dict[str, Any]]] = {}
@@ -318,7 +320,7 @@ def add_predicted_speed(rows: list[dict[str, Any]], motion: "Motion | Mapping[st
             for k in range(first + 1, last + 1):
                 dt = float(src_rows[k]["t"]) - float(src_rows[k - 1]["t"])
                 if 0.0 < dt <= se.MAX_DT_S:
-                    speed = max(0.0, speed + fit.accel(src_rows[k]["ctl_throttle"], src_rows[k]["ctl_brake"], speed) * dt)
+                    speed = max(0.0, speed + fit.accel(src_rows[k - 1]["ctl_throttle"], src_rows[k - 1]["ctl_brake"], speed) * dt)
                 src_rows[k]["pred_v"] = speed
 
 

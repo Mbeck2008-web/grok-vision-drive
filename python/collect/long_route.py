@@ -66,6 +66,9 @@ MIN_HIGHWAY_M = 800.0
 AVG_SPEED_MPS = 11.0
 HIGHWAY_BUDGET_FRAC = 0.45
 MIN_RETURN_M = 1500.0
+# A route is at most this multiple of the clip's driving budget (duration x AVG_SPEED_MPS); it prefers at least the lower one unless that costs the requested direction.
+BUDGET_MAX_FRAC = 1.25
+BUDGET_MIN_FRAC = 0.6
 # Unpaved roads are cheaper on the return leg, so they are chosen when present.
 DIRT_COST = 0.5
 JITTER_LO, JITTER_HI = 0.85, 1.7
@@ -449,8 +452,10 @@ def plan_highway_route(
     starts = [n for n in dict.fromkeys(graph.ends) if n not in has_in] or list(dict.fromkeys(graph.ends))
     rng.shuffle(starts)
     best: Route | None = None
-    # First a real loop (>= MIN_RETURN_M back), then, only if the map has none, any loop at all.
-    for min_return in (MIN_RETURN_M, 0.0):
+    # First a real loop that fills the clip, then any real loop, then, only if the map has none, any loop.
+    # Never longer than BUDGET_MAX_FRAC x the budget: a route the clip cannot finish is not planned.
+    max_total = BUDGET_MAX_FRAC * budget
+    for min_return, min_total in ((MIN_RETURN_M, BUDGET_MIN_FRAC * budget), (MIN_RETURN_M, 0.0), (0.0, 0.0)):
         for s0 in starts[: int(tries)]:
             dist, prev = graph.dijkstra(s0, graph.highway_cost, limit=hw_cap)
             far = sorted((n for n in exits if n != s0 and dist.get(n, 0.0) >= MIN_HIGHWAY_M), key=lambda n: -dist[n])
@@ -462,14 +467,14 @@ def plan_highway_route(
                 if ret is None:
                     continue
                 route = _assemble(graph, map_name, seed, want, hw_nodes, ret)
-                if route is None or route.return_m < min_return or not graph.pose_legal(*route.start_pose()):
+                if route is None or route.return_m < min_return or not (min_total <= route.total_m <= max_total):
+                    continue
+                if not graph.pose_legal(*route.start_pose()):
                     continue
                 if route.direction == want:
                     return route
                 best = best or route
                 break
-        if best is not None:
-            return best
     return best
 
 

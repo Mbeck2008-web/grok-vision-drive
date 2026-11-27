@@ -378,6 +378,26 @@ def check_collector_hooks() -> None:
     print("collector hooks: plan loads only for its one map, first spawn is the route start, tick sends/hands back/re-sends")
 
 
+def check_route_length_fits_the_clip() -> None:
+    """total_m is bounded by the clip's driving budget (duration x 11 m/s): at most 1.25x (hard), and 0.4x or more (it prefers 0.6x, but honouring the requested direction comes first)."""
+    for map_name in ("west_coast_usa", "italy"):
+        g = _real(map_name)
+        for dur in (300.0, 600.0, 900.0):
+            for seed in range(4):
+                for d in (0, 1):
+                    r = lr.plan_highway_route(g, map_name=map_name, seed=seed, direction=d, duration_s=dur)
+                    assert r is not None, (map_name, dur, seed, d)
+                    ratio = r.total_m / (dur * 11.0)
+                    assert 0.4 <= ratio <= 1.25 + 1e-9, (map_name, dur, seed, d, round(ratio, 2))
+    # A clip too short to hold the only highway is not given an overlong route.
+    _g, r = route_of(loop_network(dirt=True), seed=1)
+    assert r is not None and r.total_m <= 1.25 * 750.0 * 11.0
+    g = lr.build_graph(loop_network(dirt=True))
+    for dur in (60.0, 200.0):
+        assert lr.plan_highway_route(g, map_name="synthetic", seed=1, direction=0, duration_s=dur) is None, dur
+    print("route length: 0.4-1.25x (never over) the clip budget on both real maps; a clip too short for the highway gets no route")
+
+
 def check_end_tolerance_and_constants() -> None:
     _g, route = route_of(loop_network(dirt=False), seed=2)
     # 25 m from the end is the end; 40 m is not.
@@ -538,6 +558,7 @@ def main() -> None:
     check_driver_resend_rules()
     check_driver_speed_caps()
     check_collector_hooks()
+    check_route_length_fits_the_clip()
     check_end_tolerance_and_constants()
     check_return_cost_jitter_and_avoid()
     check_dirt_preferred_over_equal_city_loop()

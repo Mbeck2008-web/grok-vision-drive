@@ -2,10 +2,16 @@
 
 Short clips are the edge-case batch (30-60 s). Optional ``--long-clips N`` mixes
 N 10-15 minute regular-driving clips through the batch (default 0, so current
-behaviour is unchanged). Long clips spawn at a highway end when the map has a
-highway, drive to the far end, then loop back via city and dirt roads when those
-exist; maps without highway or dirt still get a varied seeded route and are not
-skipped.
+behaviour is unchanged). A highway-loop long clip is planned from the map's road
+dump (python/collect/long_route.py): the AI spawns at one end of a highway facing
+along it, is driven to the far end (rolling ai.setLine windows), then loops back
+over non-highway roads (dirt where the dump's road material says unpaved) to a
+different route each time, the direction alternating through the batch. The
+route goes to the collector as ``--route-plan``; afterwards the recorded ego pose
+is scored against it (clip_tags.json ``route_measure``, session.json
+``long_route_totals``). Maps with no highway (or no plannable route) roam
+freely with ``--route span`` and are not skipped. Nothing here has been run
+against a live BeamNG.
 
     py -3 scripts\\collect_clips.py --clips 5 --out E:\\GVD_data\\clips_v2 \\
         --maps west_coast_usa,italy,east_coast_usa --max-traffic 6 --seed 1 --chase-cam
@@ -102,12 +108,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "the edge cases. The supervisor must pass this flag). About 5-10 "
             "is the usual ask; that is a recommendation, not a cap (N cannot "
             "exceed --clips). They are 10-15 min (see --long-clip-s), spread "
-            "by --seed. When the map has a highway, the AI starts at one end, "
-            "drives to the far end, then loops back via city and dirt roads "
-            "if present, with a different route and direction each time. "
-            "Maps without highway or dirt are not skipped: the AI drives a "
-            "varied seeded route. Tagged 'long' (and 'long_highway' only for "
-            "a highway-first route)."
+            "by --seed. When the map has a highway, the AI spawns at one end, "
+            "is driven to the far end, then loops back over non-highway roads "
+            "(dirt where the map has it), a different route each time with "
+            "the direction alternating; how far it got is recorded from the "
+            "GT pose (route_measure). Maps with no highway are not skipped: "
+            "the AI roams freely (span). Tagged 'long' (and 'long_highway' "
+            "only for a highway-first route)."
         ),
     )
     parser.add_argument(
@@ -129,8 +136,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Fraction of long clips that use a highway-first route when the "
             f"session pool has a highway map (default {DEFAULT_LONG_HIGHWAY_FRAC:g}). "
-            "The rest, and any clip on a map with no highway, use a varied "
-            "seeded route. 0-1 inclusive."
+            "The rest, and any clip on a map with no highway, roam freely "
+            "(span, seeded spawn). 0-1 inclusive."
         ),
     )
     parser.add_argument("--edge-cases", default="", help=f"Comma-separated subset of {','.join(EDGE_CASES)}.")

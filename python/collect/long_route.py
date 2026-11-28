@@ -86,6 +86,11 @@ WINDOW_M = float("inf")
 RESEND_M = 80.0
 OFF_ROUTE_M = 45.0
 OFF_TICKS = 8
+# Mid-drive wrong-deck: this many consecutive over-limit ticks, so a one-sample z glitch does not end the segment.
+DECK_TICKS = 3
+# Prefer a still-on-route projection within this forward arc over a stacked later leg
+# inside the 400 m look-ahead (smoke-c: s~2604 under s~2941, 337 m later).
+MAX_ARC_JUMP_M = 200.0
 END_TOL_M = 25.0
 FAR_END_TOL_M = 60.0
 SEND_SPEED_DELTA = 0.5
@@ -659,6 +664,7 @@ class RouteDriver:
         self.resumes = 0
         self.skipped_m = 0.0  # route metres jumped over by resumes (the nudges), not driven
         self._off = 0
+        self._deck = 0
         self._sent_at: float | None = None
         self._sent_speed: float | None = None
         self.deck_error: str | None = None
@@ -668,7 +674,11 @@ class RouteDriver:
         return self.state in ("idle", "following")
 
     def _project(self, x: float, y: float) -> tuple[int, float, float]:
-        return project_forward(self.route, x, y, self.index)
+        # Prefer a still-on-route local arc so a stacked later leg cannot steal the
+        # projection (smoke-c: s~2604 under s~2941, 337 m later).
+        return project_forward(
+            self.route, x, y, self.index, prefer_s=self.progress_m, max_jump_m=MAX_ARC_JUMP_M,
+        )
 
     def commands(self, x: float, y: float, speed_mps: float, z: float | None = None) -> list[object]:
         if not self.active:
@@ -687,9 +697,13 @@ class RouteDriver:
         if z is not None:
             err = route_place_z_error((x, y, _interp_plan_z(self.route, i, s)), (x, y, z))
             if err:
-                # Stay active so resume() still works; the collector ends the segment.
-                self.deck_error = err
-                return []
+                self._deck += 1
+                if self._deck >= DECK_TICKS:
+                    # Stay active so resume() still works; the collector ends the segment.
+                    self.deck_error = err
+                    return []
+            else:
+                self._deck = 0
         if self.progress_m >= self.route.far_end_m - FAR_END_TOL_M:
             self.far_end_reached = True
         if self.progress_m >= self.route.total_m - self.end_tol_m:
@@ -756,6 +770,7 @@ class RouteDriver:
         """The collector took the route's own start pose."""
         self.spawns += 1
         self.deck_error = None
+        self._deck = 0
 
     def resume(self) -> tuple[SpawnPick | None, str]:
         """A respawn on the route itself, ``RESUME_NUDGE_M`` past the farthest point the car reached.
@@ -782,6 +797,7 @@ class RouteDriver:
         self.resumes += 1
         self.spawns += 1
         self._off = 0
+        self._deck = 0
         self.deck_error = None
         self.reset_send()
         return pick, ""
@@ -800,28 +816,53 @@ class RouteDriver:
         }
 
 
-def project_forward(route: Route, x: float, y: float, start_index: int, *, back: int = 3, ahead_m: float = 400.0) -> tuple[int, float, float]:
+def project_forward(
+    route: Route, x: float, y: float, start_index: int, *, back: int = 3, ahead_m: float = 400.0,
+    prefer_s: float | None = None, max_jump_m: float | None = None,
+) -> tuple[int, float, float]:
     """Nearest route segment at or just behind ``start_index``, looking ``ahead_m`` forward.
 
     Returns ``(segment index, arc length m, distance m)``.
+
+    When ``max_jump_m`` is set, a near-arc candidate (arc no more than that
+    ahead of ``prefer_s`` or ``cum[start_index]``, and within ``OFF_ROUTE_M``
+    in xy) wins over a stacked later leg that is closer in xy. If there is no
+    such local candidate, the uncapped nearest is used, so a real jump ahead
+    still projects. Backward search is still the ``back`` segments already in
+    the window.
     """
     pts, cum = route.points, route.cum
     lo = max(0, int(start_index) - back)
-    best = (lo, cum[lo], math.inf)
-    j = lo
     base = cum[min(len(pts) - 1, max(0, int(start_index)))]
-    while j < len(pts) - 1 and cum[j] <= base + ahead_m:
-        ax, ay = pts[j][0], pts[j][1]
-        bx, by = pts[j + 1][0], pts[j + 1][1]
-        dx, dy = bx - ax, by - ay
-        seg2 = dx * dx + dy * dy
-        t = 0.0 if seg2 < 1e-9 else min(1.0, max(0.0, ((x - ax) * dx + (y - ay) * dy) / seg2))
-        px, py = ax + t * dx, ay + t * dy
-        d = math.hypot(x - px, y - py)
-        if d < best[2]:
-            best = (j, cum[j] + t * math.sqrt(seg2), d)
-        j += 1
-    return best
+    origin = base if prefer_s is None else float(prefer_s)
+
+    def _search(limit: float | None) -> tuple[int, float, float]:
+        best = (lo, cum[lo], math.inf)
+        j = lo
+        while j < len(pts) - 1 and cum[j] <= base + ahead_m:
+            ax, ay = pts[j][0], pts[j][1]
+            bx, by = pts[j + 1][0], pts[j + 1][1]
+            dx, dy = bx - ax, by - ay
+            seg2 = dx * dx + dy * dy
+            t = 0.0 if seg2 < 1e-9 else min(1.0, max(0.0, ((x - ax) * dx + (y - ay) * dy) / seg2))
+            px, py = ax + t * dx, ay + t * dy
+            d = math.hypot(x - px, y - py)
+            s = cum[j] + t * math.sqrt(seg2)
+            if limit is not None and s > origin + limit:
+                j += 1
+                continue
+            if d < best[2]:
+                best = (j, s, d)
+            j += 1
+        return best
+
+    if max_jump_m is not None:
+        local = _search(float(max_jump_m))
+        # Prefer a still-on-route local projection over a later stacked leg
+        # (smoke-c: lower s~2604 under upper s~2941, 0.3-1 m off the line).
+        if local[2] <= OFF_ROUTE_M:
+            return local
+    return _search(None)
 
 
 # --------------------------------------------------------------------------- collector hooks

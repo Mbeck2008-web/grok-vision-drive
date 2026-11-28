@@ -101,9 +101,9 @@ class RouteCar(sf._CrashVehicle):
         self.place_polls.append(self.polls)
         if len(self.placed) == 1:  # the car is on the first pose; later teleports do not move the fake ...
             self.s = 0.0
-        elif self.stuck_start is not None or self.restall_after_m is not None:
-            # Follow a later on-route teleport (stuck-start or a mid-route resume). A recover in place
-            # (same arc, restall) leaves the car stalled so the second abort can end the segment.
+        elif self.stuck_start is not None or self.restall_after_m is not None or self.follow_deck_after_m is not None:
+            # Follow a later on-route teleport (stuck-start, mid-drive wrong_deck resume, or a mid-route resume).
+            # A recover in place (same arc, restall) leaves the car stalled so the second abort can end the segment.
             _i, s, d = lr.project_forward(self.route, pos[0], pos[1], 0, back=0, ahead_m=1e9)
             self.teleports_on_route.append((s, d))
             if d > lr.OFF_ROUTE_M:
@@ -658,6 +658,10 @@ def check_recover_wrong_deck_uses_post_settle_z() -> None:
 def check_mid_drive_wrong_deck_ends_the_segment() -> None:
     """A mid-drive |car z − plan z| jump (smoke-c +7.8 m) must stop set_line and end the
     segment so the next open is a route resume, not off_route or recover_failed.
+
+    Exactly one wrong_deck segment end, then one resume, then the route continues
+    past the jump with no spawn_failed (kills G6: wrong_deck does not end the
+    segment; G5: deck_error left set, so every resume re-aborts to spawn_failed).
     """
     route = make_route()
     code, text, out, car = _no_excursions_flag_run(
@@ -666,13 +670,30 @@ def check_mid_drive_wrong_deck_ends_the_segment() -> None:
     assert "off the planned z" in text, text[-3000:]
     follow_lines = [line for line in text.splitlines() if "following" in line and "off the planned z" in line]
     assert follow_lines or "wrong_deck" in text, text[-3000:]
+    lines = text.splitlines()
+    ends = [line for line in lines if line.startswith("collect segment end") and "wrong_deck" in line]
+    assert len(ends) == 1, ends
+    # G6 drops wrong_deck as an immediate segment end, so the first abort falls
+    # into recover; the recover then fails z and still ends as wrong_deck. The
+    # first abort itself must end the segment, with no recover in between.
+    follow_i = next(i for i, line in enumerate(lines) if "following" in line and "off the planned z" in line)
+    end_i = next(i for i, line in enumerate(lines) if line.startswith("collect segment end") and "wrong_deck" in line)
+    between = lines[follow_i:end_i + 1]
+    assert any("collect abort wrong_deck" in line for line in between), between
+    assert not any("collect recover" in line for line in between), between
     status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
-    assert status.get("stop_reason") != "recover_failed", status
+    assert status.get("stop_reason") not in {"spawn_failed", "recover_failed"}, status
     summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
     assert summary["state"] != "off_route", summary
-    # The lift is only on the first place; a successful resume continues on plan z.
-    assert summary["resumes"] >= 1, summary
-    print("collector route run: mid-drive +7.8 m |car z-plan z| ends the segment and resumes, not off_route")
+    assert summary["resumes"] == 1, summary
+    assert summary["progress_m"] >= 80.0 + lr.RESUME_NUDGE_M - 1.0, summary
+    resume_lines = [line for line in text.splitlines() if "collect route resume" in line]
+    assert len(resume_lines) == 1, resume_lines
+    assert len(car.place_polls) >= 2, car.place_polls
+    resume_at = car.place_polls[1]
+    line_after = [p for p in car.set_line_polls if p >= resume_at]
+    assert line_after, f"set_line must go out after the resume: places={car.place_polls} lines={car.set_line_polls}"
+    print("collector route run: mid-drive +7.8 m ends the segment once, resumes once, and continues past the jump")
 
 
 def check_failed_route_place_message_surfaces_low_yield_and_segment() -> None:

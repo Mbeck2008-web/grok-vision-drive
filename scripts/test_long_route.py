@@ -855,8 +855,207 @@ def check_measure_route() -> None:
     print("measure: full drive 1.0 / far end / loop closed; half drive 0.5; elsewhere or teleport earn nothing; off-route counted")
 
 
+def check_route_place_rejects_wrong_deck() -> None:
+    """Settled z more than JOIN_DZ_M (5 m) from the requested plan z+0.5 is a failed place."""
+    assert lr.JOIN_DZ_M == 5.0
+    # Requested z is plan z + 0.5, the lift route_resume_pick / start_pose use.
+    req = (10.0, 20.0, 100.0 + 0.5)
+    # Smoke-c resume #1: +17 m at the same xy.
+    err = lr.route_place_z_error(req, (10.0, 20.0, req[2] + 17.0))
+    assert err, "a +17 m settle must be a failed place"
+    assert "17" in err, err
+    # Comparison is |dz|, not a one-sided check (a deck below is just as wrong).
+    err_lo = lr.route_place_z_error(req, (10.0, 20.0, req[2] - 17.0))
+    assert err_lo, "a -17 m settle must also be a failed place"
+    # Boundary: |dz| == JOIN_DZ_M is allowed; just over is not (kills threshold mutants).
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] + 5.0)) is None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] - 5.0)) is None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] + 5.01)) is not None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] - 5.01)) is not None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2] + 4.99)) is None
+    assert lr.route_place_z_error(req, (10.0, 20.0, req[2])) is None
+    assert lr.route_place_z_error(req, (99.0, -4.0, req[2] + 0.14)) is None  # xy may drift; z is what matters
+    assert lr.route_place_z_error(req, None) is not None
+    assert lr.route_place_z_error(req, (10.0, 20.0)) is not None
+    print("route place z: |dz| > 5 m is a failed place; |dz| == 5 m and the +17/-17 smoke-c cases are pinned")
+
+
+def synthetic_route(pts, *, far_end_index: int | None = None) -> lr.Route:
+    """A Route from raw (x, y, z) points, for driver / plan-z pins that do not need a planner."""
+    pts = tuple((float(p[0]), float(p[1]), float(p[2])) for p in pts)
+    kinds = tuple(["highway"] * len(pts))
+    cum = tuple(lr._cumulative(pts))
+    far = len(pts) - 1 if far_end_index is None else int(far_end_index)
+    return lr.Route(
+        map="synthetic", seed=1, direction=0, requested_direction=0,
+        points=pts, kinds=kinds, far_end_index=far,
+        highway_m=cum[far], return_m=max(0.0, cum[-1] - cum[far]),
+        dirt_m=0.0, city_m=0.0, ramp_m=0.0, legs=("highway",),
+        start_road="r0", far_road="r0", via=None, cum=cum,
+    )
+
+
+def _pose_ticks(drv: lr.RouteDriver, x: float, y: float, z: float, n: int, speed: float = 20.0) -> list[object]:
+    last: list[object] = []
+    for _ in range(n):
+        last = drv.commands(x, y, speed, z=z)
+    return last
+
+
+def check_following_z_guard_stops_the_line() -> None:
+    """Mid-drive |car z − plan z| > JOIN_DZ_M must not send set_line; the driver stays active for resume.
+
+    One tick over the limit is not enough (a one-sample z glitch must not end the segment);
+    DECK_TICKS consecutive ticks are.
+    """
+    assert lr.DECK_TICKS >= 2
+    _g, route = route_of(loop_network(dirt=False), seed=2)
+    drv = lr.RouteDriver(route)
+    x, y, z0 = route.points[0]
+    # On-plan first tick still sends the window.
+    cmds = drv.commands(x, y, 20.0, z=z0)
+    assert any(is_set_line_cmd(c) for c in cmds), cmds
+    assert drv.deck_error is None
+    assert drv.active
+    # A single over-limit tick must not fire (debounce).
+    one = lr.RouteDriver(route)
+    one.commands(x, y, 20.0, z=z0 + 7.8)
+    assert one.deck_error is None, one.deck_error
+    assert one.active
+    # Smoke-c row 343: +7.8 m mid-drive, held for DECK_TICKS. No new line; stay following so resume() still works.
+    high = lr.RouteDriver(route)
+    cmds = _pose_ticks(high, x, y, z0 + 7.8, lr.DECK_TICKS)
+    assert cmds == [], cmds
+    assert high.deck_error and "off the planned z" in high.deck_error, high.deck_error
+    assert "7.8" in high.deck_error or "7." in high.deck_error, high.deck_error
+    assert high.active and high.state != "off_route", high.summary()
+    # Smoke-c row 1179: -12.5 m.
+    low = lr.RouteDriver(route)
+    cmds = _pose_ticks(low, x, y, z0 - 12.5, lr.DECK_TICKS)
+    assert cmds == [], cmds
+    assert low.deck_error and "off the planned z" in low.deck_error, low.deck_error
+    assert low.active
+    # A glitch then a good z resets the counter.
+    glitch = lr.RouteDriver(route)
+    glitch.commands(x, y, 20.0, z=z0 + 7.8)
+    _pose_ticks(glitch, x, y, z0, lr.DECK_TICKS)
+    assert glitch.deck_error is None
+    # |dz| == 5 m is allowed; 5.01 is not, after DECK_TICKS. drive_tick must pass z through.
+    ok = lr.RouteDriver(route)
+    queued: list[object] = []
+    for _ in range(lr.DECK_TICKS):
+        assert lr.drive_tick(ok, [x, y, z0 + 5.0], 20.0, queued.append)
+    assert any(is_set_line_cmd(c) for c in queued), queued
+    assert ok.deck_error is None
+    bad = lr.RouteDriver(route)
+    queued = []
+    for _ in range(lr.DECK_TICKS):
+        queued = []
+        assert lr.drive_tick(bad, [x, y, z0 + 5.01], 20.0, queued.append)
+    assert queued == [], queued
+    assert bad.deck_error
+    # plan z helper matches the start point.
+    assert abs(lr.route_plan_z(route, x, y, 0) - z0) < 1e-6
+    print("following z: +7.8 / -12.5 stop the line after DECK_TICKS; one tick does not; |dz|==5 allowed; drive_tick passes z; driver stays active")
+
+
+def _self_crossing_route() -> lr.Route:
+    """Lower deck along y=0 at z=90, then a later leg recrosses (200, 0) at z=117, ~360 m later.
+
+    The arc gap is inside project_forward's 400 m look-ahead and well above MAX_ARC_JUMP_M,
+    matching smoke-c (s~2604 z 90 under s~2941 z 117, 337 m apart).
+    """
+    return synthetic_route(
+        [
+            (0.0, 0.0, 90.0),
+            (50.0, 0.0, 90.0),
+            (100.0, 0.0, 90.0),
+            (150.0, 0.0, 90.0),
+            (200.0, 0.0, 90.0),   # first pass, s=200
+            (250.0, 0.0, 90.0),
+            (300.0, 0.0, 90.0),
+            (300.0, 80.0, 100.0),
+            (200.0, 80.0, 110.0),
+            (200.0, 0.0, 117.0),  # second pass, s=560
+            (100.0, 0.0, 117.0),
+            (0.0, 0.0, 117.0),
+            (-200.0, 0.0, 117.0),
+        ],
+        far_end_index=6,
+    )
+
+
+def check_following_z_guard_stays_on_a_self_crossing() -> None:
+    """A car 0.5 m off the lower line at a self-crossing must not snap to the upper leg."""
+    route = _self_crossing_route()
+    assert route.cum[4] == 200.0 and abs(route.cum[9] - 560.0) < 1e-6, route.cum
+    assert lr.MAX_ARC_JUMP_M < (route.cum[9] - route.cum[4])
+    # Uncapped xy projection from the lower crossing jumps to the upper leg (the bug).
+    _i, s_jump, d_jump = lr.project_forward(route, 200.0, 0.5, 4, ahead_m=400.0)
+    assert s_jump > 500.0 and d_jump < 1.0, (s_jump, d_jump)
+    drv = lr.RouteDriver(route)
+    drv.note_start()
+    drv.index = 4
+    drv.progress_m = 200.0
+    for _ in range(lr.DECK_TICKS + 5):
+        drv.commands(200.0, 0.5, 20.0, z=90.15)
+        assert drv.deck_error is None, drv.deck_error
+        assert drv.progress_m < 300.0, f"progress jumped to {drv.progress_m} (upper leg is ~560 m)"
+        assert drv.active and drv.state != "off_route", drv.summary()
+    assert abs(drv.progress_m - 200.0) < 5.0, drv.progress_m
+    print("self-crossing: 0.5 m off the lower line stays on that leg; no false wrong_deck, no progress jump")
+
+
+def check_plan_z_is_interpolated_on_a_slope() -> None:
+    """Plan z is interpolated at the projected arc s, not the next node, the nearest node, or s+50 m."""
+    # 8 % grade over a 200 m segment: mid-segment is 8 m from either node (kills G4 / G4b).
+    # 50 m ahead is 4 m (G4c): on-plan stays under the limit, +5.01 m must still fire.
+    route = synthetic_route([(0.0, 0.0, 0.0), (200.0, 0.0, 16.0), (400.0, 0.0, 16.0)], far_end_index=2)
+    assert abs((16.0 / 200.0) - 0.08) < 1e-9
+    mid_z = lr._interp_plan_z(route, 0, 100.0)
+    assert abs(mid_z - 8.0) < 1e-9, mid_z
+    drv = lr.RouteDriver(route)
+    cmds = _pose_ticks(drv, 100.0, 0.0, mid_z, lr.DECK_TICKS + 2)
+    assert drv.deck_error is None, drv.deck_error
+    assert any(is_set_line_cmd(c) for c in cmds) or drv.lines_sent > 0
+    # +5.01 m at the same mid-segment pose must fire (G4c samples ~4 m high and would miss it).
+    bad = lr.RouteDriver(route)
+    _pose_ticks(bad, 100.0, 0.0, mid_z + 5.01, lr.DECK_TICKS)
+    assert bad.deck_error and "off the planned z" in bad.deck_error, bad.deck_error
+    assert bad.active
+    print("plan z: mid-segment on an 8% slope is interpolated; on-plan does not fire; +5.01 m does")
+
+
+def check_two_way_offsets_stay_outside_the_centre_deadzone() -> None:
+    """Nothing in the route/spawn offset path enters the 0.83 m two-way centre deadzone."""
+    from python.collect.spawn_mix import EDGE_MARGIN_M, LANE_CLEAR_M, _offset_candidates
+    from python.train.frame_quality import CENTER_DEADZONE_M
+
+    clear = CENTER_DEADZONE_M + LANE_CLEAR_M
+    assert abs(clear - 0.83) < 1e-9, clear
+    # 8 m two-way, two lanes: right-hand legal centres must stay past the deadzone.
+    spec = {"id": "C1", "oneWay": False, "lanes": 2, "width": 8.0, "drivability": 1.0}
+    cands = _offset_candidates(spec, 8.0)
+    assert cands, cands
+    for off in cands:
+        assert abs(off) + 1e-9 >= clear, (off, clear)
+        assert abs(off) <= 8.0 / 2.0 - EDGE_MARGIN_M + 1e-9, off
+    # Route lane_offset uses the same first candidate (no extra inset).
+    g = lr.build_graph([road("C1", line(0, 0, 400, 0), oneway=False, lanes=2, width=8.0)])
+    n = next(n for n in range(len(g.xyz)) if g.roads[g.node_road[n]]["id"] == "C1")
+    off = g.lane_offset(n)
+    assert abs(off) + 1e-9 >= clear, (off, clear)
+    assert abs(off - cands[0]) < 1e-9, (off, cands)
+    print("two-way offsets stay outside the 0.83 m centre deadzone; route lane_offset is the first candidate")
+
+
 def main() -> None:
     check_dirt_material_words()
+    check_route_place_rejects_wrong_deck()
+    check_following_z_guard_stops_the_line()
+    check_following_z_guard_stays_on_a_self_crossing()
+    check_plan_z_is_interpolated_on_a_slope()
+    check_two_way_offsets_stay_outside_the_centre_deadzone()
     check_graph_directions_and_links()
     check_route_shape_synthetic()
     check_dirt_is_used_when_present_and_omitted_when_not()

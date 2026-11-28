@@ -149,6 +149,8 @@ TRAFFIC_MIN_M = 8.0
 # TRAFFIC_MIN_M of a car already placed (a short road walk falls back to the
 # same farthest spot) is dropped, never stacked.
 TRAFFIC_STAGGER_M = 25.0
+
+
 # Legal-lane search. The first fraction is the historical 40% station.
 LEGAL_FRACTIONS = (0.40, 0.30, 0.50, 0.22, 0.62)
 LEGAL_ATTEMPTS = 8

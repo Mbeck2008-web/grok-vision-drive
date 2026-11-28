@@ -327,7 +327,11 @@ def check_driver_uses_set_line_api() -> None:
         pos = node["pos"]
         assert isinstance(pos, tuple) and len(pos) == 3, pos
         assert pos[2] != 0.0, f"pos z must be the route height, not hardcoded 0: {pos}"
-        assert node["speed"] == 20.0, node
+        assert "speed" in node
+    # Highway keeps the 20 m/s clip speed; city nodes on this route are capped at 14.
+    node_speeds = {float(n["speed"]) for n in line}
+    assert 20.0 in node_speeds and node_speeds <= {20.0, 14.0}, node_speeds
+    assert line[0]["speed"] == 20.0
     assert abs(line[0]["pos"][0] - x) < 1e-6 and abs(line[0]["pos"][1] - y) < 1e-6
     assert abs(line[0]["pos"][2] - z0) < 1e-6, (line[0]["pos"], z0)
     import scripts.collect_scene_lanes as collect
@@ -343,7 +347,8 @@ def check_driver_uses_set_line_api() -> None:
         pos = node["pos"]
         assert isinstance(pos, tuple) and len(pos) == 3, pos
         assert pos[2] != 0.0, f"pos z must be the route height, not hardcoded 0: {pos}"
-        assert "speed" in node and node["speed"] == 20.0, node
+        assert "speed" in node
+    assert {float(n["speed"]) for n in got} == node_speeds
     assert veh.lua_commands == [
         'ai.setMode("manual")',
         'ai.driveInLane("off")',
@@ -362,32 +367,82 @@ def check_driver_sends_the_route_in_order() -> None:
     lines = [c for c in veh.sent if is_set_line_cmd(c)]
     assert lines and veh.sent[0] == 'ai.setMode("manual")' and veh.sent[1] == 'ai.driveInLane("off")', veh.sent[:3]
     assert veh.sent[2] == 'ai.setSpeedMode("limit")' and veh.sent[3].startswith("ai.setSpeed(14.0)"), veh.sent[:4]
-    assert sum(1 for c in veh.sent if c == 'ai.setMode("manual")') == 1, "manual mode is set once; later sends only replace the line"
-    # Every line starts at the car's place on the route, runs forward along it, and is at most the window long.
-    prev_first = -1.0
-    for cmd in lines:
-        pts = set_line_points(cmd)
-        i0, s0, d0 = lr.project_forward(route, pts[0][0], pts[0][1], 0, ahead_m=1e9)
-        assert d0 < 3.0, "line starts on the route"
-        assert s0 >= prev_first - 1e-6, "lines move forward, never back"
-        prev_first = s0
-        i1, s1, d1 = lr.project_forward(route, pts[-1][0], pts[-1][1], i0, ahead_m=1e9)
-        assert d1 < 3.0 and s1 > s0 and s1 - s0 <= 420.0, (s0, s1)
-        if s0 < route.total_m - 700.0:
-            assert s1 - s0 >= 300.0, (s0, s1)  # a full 300 m window (plus the point past it) until the route's end
-        assert all(a[0] != b[0] or a[1] != b[1] for a, b in zip(pts, pts[1:]))
-    # The first line is the highway, a later one is the return leg (off the highway).
-    first_pts = set_line_points(lines[0])
-    assert abs(first_pts[0][0]) < 5.0 and first_pts[0][1] < 0.0 and abs(first_pts[-1][1]) < 6.0, first_pts[:2]
-    assert any(max(abs(p[1]) for p in set_line_points(c)) > 500.0 for c in lines), "return leg is sent"
+    assert sum(1 for c in veh.sent if c == 'ai.setMode("manual")') == 1, "manual mode is set once; later ticks do not re-send the line"
+    assert len(lines) == 1, f"one set_line for the whole drive, got {len(lines)}"
+    pts = set_line_points(lines[0])
+    i0, s0, d0 = lr.project_forward(route, pts[0][0], pts[0][1], 0, ahead_m=1e9)
+    assert d0 < 3.0, "line starts on the route"
+    i1, s1, d1 = lr.project_forward(route, pts[-1][0], pts[-1][1], i0, ahead_m=1e9)
+    assert d1 < 3.0 and s1 > s0 and s1 >= route.total_m - 50.0, (s0, s1, route.total_m)
+    assert all(a[0] != b[0] or a[1] != b[1] for a, b in zip(pts, pts[1:]))
+    # The one line covers the highway and the return leg (off the highway).
+    first_pts = pts
+    assert abs(first_pts[0][0]) < 5.0 and first_pts[0][1] < 0.0, first_pts[:2]
+    assert max(abs(p[1]) for p in first_pts) > 500.0, "return leg is on the one line"
     assert drv.far_end_reached and drv.state == "done", drv.summary()
     assert veh.sent[-4:] == lr.span_commands(14.0) and veh.mode == "span", "end of the route hands back to span"
     assert drv.commands(0.0, 0.0, 14.0) == [], "nothing more after done"
-    assert 4 <= drv.lines_sent <= 120, drv.lines_sent
-    print(f"driver (fake vehicle): {drv.lines_sent} set_line windows, in order, highway then return, span at the end")
+    assert drv.lines_sent == 1, drv.lines_sent
+    print("driver (fake vehicle): one set_line covers highway then return, span at the end")
+
+
+
+def _long_route(length_m: float = 6000.0, step_m: float = 25.0) -> lr.Route:
+    """A straight route of ``length_m`` metres (plan z 0.4), for mid-drive set_line counts."""
+    n = max(2, int(round(length_m / step_m)) + 1)
+    pts = tuple((0.0, i * length_m / (n - 1), 0.4) for i in range(n))
+    kinds = tuple(HIGHWAY for _ in pts)
+    cum = tuple(lr._cumulative(pts))
+    far_i = len(pts) - 1
+    return lr.Route(
+        map="synthetic", seed=1, direction=0, requested_direction=0, points=pts, kinds=kinds,
+        far_end_index=far_i, highway_m=cum[far_i], return_m=0.0, dirt_m=0.0, city_m=0.0,
+        ramp_m=0.0, legs=("highway",), start_road="hw0", far_road="hw0", via=(0.0, length_m / 2.0), cum=cum,
+    )
+
+
+def check_driver_sends_one_set_line_on_a_long_route() -> None:
+    """A 6 km drive issues exactly one set_line. Mid-drive speed or 80 m of progress must not send another.
+
+    Tech ``driveUsingPath({script=...})`` teleports to script[1] on every re-issue (speed to 0,
+    about 1.08 m back, parking brake 1.0). A new line is only for a new segment (reset_send).
+    """
+    route = _long_route(6000.0)
+    assert route.total_m >= 6000.0 - 1e-6, route.total_m
+    veh, drv = FakeVehicle(), lr.RouteDriver(route)
+    import scripts.collect_scene_lanes as collect
+
+    # Speed changes mid-drive, including past the old 80 m resend distance.
+    drive(route, veh, drv, step_m=8.0, speed=20.0, start_s=0.0, stop_s=2000.0)
+    for cmd in drv.commands(0.0, 2000.0, 25.0):
+        collect._queue(veh, cmd)
+    drive(route, veh, drv, step_m=8.0, speed=25.0, start_s=2008.0, stop_s=4000.0)
+    lines = [c for c in veh.sent if is_set_line_cmd(c)]
+    assert len(lines) == 1, f"expected one set_line for the segment, got {len(lines)} (lines_sent={drv.lines_sent})"
+    assert len(veh.set_line_calls) == 1, veh.set_line_calls
+    assert drv.lines_sent == 1 and drv.active, drv.summary()
+    pts = set_line_points(lines[0])
+    _i, s_end, d_end = lr.project_forward(route, pts[-1][0], pts[-1][1], 0, ahead_m=1e9)
+    assert d_end < 3.0 and s_end >= route.total_m - 50.0, (s_end, route.total_m, pts[-1])
+    speeds = [c for c in veh.sent if isinstance(c, str) and c.startswith("ai.setSpeed(")]
+    assert "ai.setSpeed(20.0)" in speeds and "ai.setSpeed(25.0)" in speeds, speeds
+    # A real resume / new segment (reset_send) may send one more line, not a mid-drive resend.
+    drv.reset_send()
+    more = drv.commands(0.0, 4000.0, 25.0)
+    assert any(is_set_line_cmd(c) for c in more), more
+    line2 = next(c for c in more if is_set_line_cmd(c))
+    pts2 = set_line_points(line2)
+    _i0, s0, d0 = lr.project_forward(route, pts2[0][0], pts2[0][1], 0, ahead_m=1e9)
+    _ic, car_s, _cd = lr.project_forward(route, 0.0, 4000.0, 0, ahead_m=1e9)
+    assert d0 < 3.0 and abs(s0 - car_s) <= 3.0, (s0, car_s, pts2[0])
+    for cmd in more:
+        collect._queue(veh, cmd)
+    assert drv.lines_sent == 2, drv.summary()
+    print("driver: one set_line covers a 6 km route; speed changes are setSpeed only; reset_send starts a new segment line at the car")
 
 
 def check_driver_resend_rules() -> None:
+    """Mid-drive, a speed change is setSpeed only; 80 m of progress does not re-issue set_line."""
     _g, route = route_of(loop_network(dirt=False), seed=2)
     veh, drv = FakeVehicle(), lr.RouteDriver(route)
     x, y = route.points[0][0], route.points[0][1]
@@ -398,14 +453,15 @@ def check_driver_resend_rules() -> None:
     assert drv.commands(x, y, 14.2) == [], "speed change under 0.5 m/s: nothing"
     again = drv.commands(x, y, 15.0)
     assert_no_ai_setline(again)
-    assert again and again[0] == "ai.setSpeed(15.0)" and any(is_set_line_cmd(c) for c in again), again[:1]
+    assert again == ["ai.setSpeed(15.0)"], again
+    assert not any(is_set_line_cmd(c) for c in again), "speed change must not re-issue set_line"
     assert 'ai.setMode("manual")' not in again, "the mode is not re-sent"
-    # Far enough along: a fresh window.
+    # Past the old 80 m resend distance: still no new line.
     px, py, _ = route.points[next(i for i, c in enumerate(route.cum) if c > lr.RESEND_M + 30)]
     later = drv.commands(px, py, 15.0)
-    assert_no_ai_setline(later)
-    assert any(is_set_line_cmd(c) for c in later)
-    print("driver: re-sends on 80 m of progress or a 0.5 m/s speed change, never re-sets the mode")
+    assert later == [], later
+    assert drv.lines_sent == 1, drv.summary()
+    print("driver: mid-drive speed change is setSpeed only; 80 m of progress does not re-send set_line")
 
 
 def check_driver_speed_caps() -> None:
@@ -418,9 +474,10 @@ def check_driver_speed_caps() -> None:
     assert speeds[0] == 25.0 and max(speeds) == 25.0, speeds
     assert 11.0 in speeds and min(speeds) == 11.0, speeds
     assert all(sp in (25.0, 14.0, 11.0) for sp in speeds), sorted(set(speeds))
-    # The set_line nodes carry the capped speed too.
+    # The set_line nodes carry the capped speed too (setScriptedPath clears setSpeed).
     node_speeds = {float(n["speed"]) for c in veh.sent if is_set_line_cmd(c) for n in set_line_payload(c)[0]}
     assert node_speeds == {25.0, 11.0}, node_speeds  # this route is highway then dirt
+    assert sum(1 for c in veh.sent if is_set_line_cmd(c)) == 1
 
     # A city return (no dirt): city road is capped at 14 m/s, written as a literal here, not the constant.
     _g, city_route = route_of(loop_network(dirt=False), seed=2)
@@ -431,6 +488,7 @@ def check_driver_speed_caps() -> None:
     assert max(speeds) == 25.0 and 14.0 in speeds and set(speeds) == {25.0, 14.0}, sorted(set(speeds))
     nodes = {float(n["speed"]) for c in veh.sent if is_set_line_cmd(c) for n in set_line_payload(c)[0]}
     assert nodes == {25.0, 14.0}, nodes
+    assert sum(1 for c in veh.sent if is_set_line_cmd(c)) == 1
 
     print("driver: speeds are capped by road kind (dirt 11, city 14 m/s); the highway keeps the clip speed")
 
@@ -469,7 +527,7 @@ def check_collector_hooks() -> None:
         assert f.name == "route_driver.json" and json.loads(f.read_text(encoding="utf-8")) == drv.summary()
         drv.commands(route.points[0][0], route.points[0][1], 25.0)
         lr.write_driver_summary(td, drv)
-        assert json.loads(f.read_text(encoding="utf-8"))["lines_sent"] == 2 and not list(Path(td).glob("*.tmp"))
+        assert json.loads(f.read_text(encoding="utf-8"))["lines_sent"] == 1 and not list(Path(td).glob("*.tmp"))
 
     # First spawn: the route's own start pose on its highway road, a highway pick.
     pick = lr.route_spawn_pick(route)
@@ -1064,6 +1122,7 @@ def main() -> None:
     check_json_roundtrip_and_determinism()
     check_driver_uses_set_line_api()
     check_driver_sends_the_route_in_order()
+    check_driver_sends_one_set_line_on_a_long_route()
     check_driver_resend_rules()
     check_driver_speed_caps()
     check_collector_hooks()

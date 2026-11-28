@@ -293,13 +293,12 @@ def check_route_runs_through_the_collector() -> None:
     assert "collect abort" not in text and "collect recover" not in text, "the route ends by hand-back, not by a stall abort"
     # the route commands reached the car, while the car was at rest at the start
     lines = [i for i, c in enumerate(car.commands) if _is_set_line(c)]
-    assert len(lines) >= 20, len(lines)
+    assert len(lines) == 1, f"one set_line per segment, got {len(lines)}"
     assert car.max_s >= total - lr.END_TOL_M - 3.0, (car.max_s, total)
-    assert car.cmd_s[lines[0]] == 0.0, car.cmd_s[lines[0]]  # the first window went out while the car was still at rest
-    # the AI mode is re-sent once the car is driving (the segment opens and clears the AI state), well before 80 m
+    assert car.cmd_s[lines[0]] == 0.0, car.cmd_s[lines[0]]  # the line went out while the car was still at rest
+    # Opening the segment must not re-issue set_line (that would teleport).
     manual = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("manual")' in c]
-    assert len(manual) == 2, [car.commands[i] for i in manual]
-    assert car.cmd_poll[manual[1]] - car.cmd_poll[manual[0]] <= 12, [car.cmd_poll[i] for i in manual]
+    assert len(manual) == 1, [car.commands[i] for i in manual]
     # the plain span send stays off while the route is active, and takes over once it ends
     spans = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("span")' in c and i > lines[0]]
     assert spans and min(spans) > max(lines), (spans[:3], lines[-3:])
@@ -317,7 +316,7 @@ def check_route_runs_through_the_collector() -> None:
     assert status["impact_respawn"]["on"] is False, status["impact_respawn"]
     assert "collect route west_coast_usa#0 driver" in text and "'state': 'done'" in text, text[-1500:]
     _assert_set_line_dispatched(car, z=0.4)
-    print(f"collector route run: {len(lines)} route lines over {total:.0f} m, start pose from the route, one respawn-free segment, hand-off to span, route_driver.json written")
+    print(f"collector route run: {len(lines)} set_line over {total:.0f} m, start pose from the route, one respawn-free segment, hand-off to span, route_driver.json written")
 
 
 def check_leaving_the_route_hands_back_to_span() -> None:
@@ -353,9 +352,16 @@ def check_recover_to_rest_resends_the_window() -> None:
     again = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("manual")' in c and car.cmd_s[i] >= 499.0]
     assert again, [(c[:30], s_) for c, s_ in zip(car.commands, car.cmd_s) if isinstance(c, str) and "setMode" in c]
     assert car.stall == "resumed" and car.max_s >= route.total_m - lr.END_TOL_M - 3.0, (car.stall, car.max_s)
+    # The post-recover line starts at the car's arc (±3 m), not the route start (a _window(0,0) teleport).
+    post = [i for i, c in enumerate(car.commands) if _is_set_line(c) and car.cmd_s[i] >= 499.0]
+    assert post, "recover must re-send a set_line from where the car stopped"
+    for i in post:
+        pos = car.commands[i][1][0]["pos"]
+        _j, s0, d0 = lr.project_forward(route, float(pos[0]), float(pos[1]), 0, ahead_m=1e9)
+        assert d0 < 3.0 and abs(s0 - car.cmd_s[i]) <= 3.0, (s0, car.cmd_s[i], pos)
     summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
     assert summary["state"] == "done" and summary["far_end_reached"] is True, summary
-    print("collector route run: a recover to rest mid-route re-sends mode + window and the route finishes")
+    print("collector route run: a recover to rest mid-route re-sends mode + window from the car's arc and the route finishes")
 
 
 def check_finish_or_abandon_at_rest_hands_back_to_span() -> None:
@@ -390,6 +396,14 @@ def check_stuck_start_respawns_on_the_route() -> None:
     assert summary["state"] == "done" and summary["far_end_reached"] is True, summary
     assert summary["resumes"] == 1 and abs(summary["skipped_m"] - lr.RESUME_NUDGE_M) < 1e-6, summary
     assert "collect route resume" in text and "'state': 'off_route'" not in text, text[-2500:]
+    # The post-resume line starts at the car's new arc (±3 m), not the route start.
+    resume_poll = car.place_polls[-1]
+    post = [i for i, c in enumerate(car.commands) if _is_set_line(c) and car.cmd_poll[i] >= resume_poll]
+    assert post, "resume must send a set_line from the new place"
+    for i in post:
+        pos = car.commands[i][1][0]["pos"]
+        _j, s0, d0 = lr.project_forward(route, float(pos[0]), float(pos[1]), 0, ahead_m=1e9)
+        assert d0 < 3.0 and abs(s0 - car.cmd_s[i]) <= 3.0, (s0, car.cmd_s[i], resume[0], pos)
     print(f"collector route run: stuck at the start twice -> respawn on the route at {resume[0]:.0f} m ({resume[1]:.1f} m off the line), the route finishes")
 
 

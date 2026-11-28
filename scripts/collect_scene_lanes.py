@@ -3721,8 +3721,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 from python.collect.long_route import ROUTE_AI_KEY, drive_tick
 
                 was_active = route_driver.active
-                if was_active and last_ai is None:
-                    route_driver.reset_send()  # a spawn or recover cleared the AI: send the window again
+                # Only start a new set_line when none is in flight. Resetting here
+                # when the at-rest tick already sent the remaining route would
+                # teleport (Tech driveUsingPath(script) snaps to script[1]).
+                if was_active and last_ai is None and route_driver._sent_at is None:
+                    route_driver.reset_send()  # a spawn or recover that has not yet sent a line
                 route_cmds: list[str] = []
                 # While the route is active the driver owns the AI: the plain span/excursion send stays off.
                 if drive_tick(route_driver, pos, speed, route_cmds.append):

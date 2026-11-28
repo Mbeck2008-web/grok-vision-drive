@@ -352,9 +352,16 @@ def check_recover_to_rest_resends_the_window() -> None:
     again = [i for i, c in enumerate(car.commands) if isinstance(c, str) and 'ai.setMode("manual")' in c and car.cmd_s[i] >= 499.0]
     assert again, [(c[:30], s_) for c, s_ in zip(car.commands, car.cmd_s) if isinstance(c, str) and "setMode" in c]
     assert car.stall == "resumed" and car.max_s >= route.total_m - lr.END_TOL_M - 3.0, (car.stall, car.max_s)
+    # The post-recover line starts at the car's arc (±3 m), not the route start (a _window(0,0) teleport).
+    post = [i for i, c in enumerate(car.commands) if _is_set_line(c) and car.cmd_s[i] >= 499.0]
+    assert post, "recover must re-send a set_line from where the car stopped"
+    for i in post:
+        pos = car.commands[i][1][0]["pos"]
+        _j, s0, d0 = lr.project_forward(route, float(pos[0]), float(pos[1]), 0, ahead_m=1e9)
+        assert d0 < 3.0 and abs(s0 - car.cmd_s[i]) <= 3.0, (s0, car.cmd_s[i], pos)
     summary = json.loads((out / "route_driver.json").read_text(encoding="utf-8"))
     assert summary["state"] == "done" and summary["far_end_reached"] is True, summary
-    print("collector route run: a recover to rest mid-route re-sends mode + window and the route finishes")
+    print("collector route run: a recover to rest mid-route re-sends mode + window from the car's arc and the route finishes")
 
 
 def check_finish_or_abandon_at_rest_hands_back_to_span() -> None:
@@ -389,6 +396,14 @@ def check_stuck_start_respawns_on_the_route() -> None:
     assert summary["state"] == "done" and summary["far_end_reached"] is True, summary
     assert summary["resumes"] == 1 and abs(summary["skipped_m"] - lr.RESUME_NUDGE_M) < 1e-6, summary
     assert "collect route resume" in text and "'state': 'off_route'" not in text, text[-2500:]
+    # The post-resume line starts at the car's new arc (±3 m), not the route start.
+    resume_poll = car.place_polls[-1]
+    post = [i for i, c in enumerate(car.commands) if _is_set_line(c) and car.cmd_poll[i] >= resume_poll]
+    assert post, "resume must send a set_line from the new place"
+    for i in post:
+        pos = car.commands[i][1][0]["pos"]
+        _j, s0, d0 = lr.project_forward(route, float(pos[0]), float(pos[1]), 0, ahead_m=1e9)
+        assert d0 < 3.0 and abs(s0 - car.cmd_s[i]) <= 3.0, (s0, car.cmd_s[i], resume[0], pos)
     print(f"collector route run: stuck at the start twice -> respawn on the route at {resume[0]:.0f} m ({resume[1]:.1f} m off the line), the route finishes")
 
 

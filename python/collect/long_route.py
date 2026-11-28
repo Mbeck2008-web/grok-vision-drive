@@ -712,13 +712,27 @@ class RouteDriver:
         self._sent_speed = v
         self.lines_sent += 1
         self.state = "following"
+        # Per-node caps: setScriptedPath clears setSpeed, so wpSpeeds govern.
+        # Mid-drive setSpeed may still go out, but the line must carry the caps.
         return [
             'ai.setMode("manual")',
             'ai.driveInLane("off")',
             'ai.setSpeedMode("limit")',
             f"ai.setSpeed({v})",
-            set_line_command(line, v, cling=True),
+            set_line_command(line, self._speeds_for_line(line, v), cling=True),
         ]
+
+    def _speeds_for_line(self, line: list[tuple[float, float, float]], v: float) -> list[float]:
+        """min(v, KIND_SPEED_CAP[kind]) at each line point (kinds is per point; segment i uses kinds[i+1])."""
+        out: list[float] = []
+        idx = 0
+        nkind = len(self.route.kinds)
+        for x, y, _z in line:
+            j, _s, _d = project_forward(self.route, x, y, idx, ahead_m=1e9)
+            idx = j
+            cap = KIND_SPEED_CAP.get(self.route.kinds[min(nkind - 1, j + 1)])
+            out.append(min(float(v), float(cap)) if cap is not None else float(v))
+        return out
 
     def _window(self, i: int, s: float) -> list[tuple[float, float, float]]:
         """The car's place on the route, then the remaining route (capped by window_m if finite)."""

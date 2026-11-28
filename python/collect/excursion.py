@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from python.debug.gt_geom import CURVATURE_AHEAD_M, RoadPoly, lane_center_offsets, road_ahead_split
@@ -849,7 +850,7 @@ def is_set_line(cmd: object) -> bool:
 
 def set_line_command(
     points: list[tuple[float, float]] | list[tuple[float, float, float]] | list,
-    speed_mps: float,
+    speed_mps: float | Sequence[float],
     *,
     cling: bool = True,
 ) -> tuple[str, list[dict[str, object]], bool]:
@@ -857,10 +858,17 @@ def set_line_command(
 
     Route windows pass the route's own z. A 2-D excursion path uses z=0 and
     relies on cling to snap the polyline to the ground (Tech 0.39 techCore).
+    ``speed_mps`` is one speed for every node, or one speed per point (route
+    kind caps: setScriptedPath clears setSpeed, so the node speeds govern).
     """
-    speed = float(speed_mps)
+    if isinstance(speed_mps, Sequence) and not isinstance(speed_mps, (str, bytes)):
+        speeds = [float(s) for s in speed_mps]
+        if len(speeds) != len(points):
+            raise ValueError(f"set_line speeds ({len(speeds)}) must match points ({len(points)})")
+    else:
+        speeds = [float(speed_mps)] * len(points)
     line: list[dict[str, object]] = []
-    for p in points:
+    for p, speed in zip(points, speeds):
         if len(p) < 2:
             raise ValueError(f"set_line point needs x, y: {p!r}")
         x, y = float(p[0]), float(p[1])
